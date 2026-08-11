@@ -26,16 +26,16 @@ func TestValidateRejects(t *testing.T) {
 		mutate func(*Config)
 		want   string
 	}{
-		"missing project":       {func(c *Config) { c.Project = "" }, "project must be specified"},
-		"bad project":           {func(c *Config) { c.Project = "Not A Project" }, "not a valid Google Cloud project ID"},
-		"missing dataset":       {func(c *Config) { c.Dataset = "" }, "dataset must be specified"},
-		"bad dataset":           {func(c *Config) { c.Dataset = "otel-dash" }, "letters, numbers and underscores"},
-		"empty spans table":     {func(c *Config) { c.SpansTable = "" }, "spans_table must not be empty"},
-		"request over api cap":  {func(c *Config) { c.Write.MaxRequestBytes = apiRequestLimitBytes }, "must stay below the Storage Write API"},
-		"row over request":      {func(c *Config) { c.Write.MaxRowBytes = c.Write.MaxRequestBytes + 1 }, "must not exceed"},
-		"no inflight requests":  {func(c *Config) { c.Write.MaxInflightRequests = 0 }, "max_inflight_requests must be positive"},
+		"missing project":        {func(c *Config) { c.Project = "" }, "project must be specified"},
+		"bad project":            {func(c *Config) { c.Project = "Not A Project" }, "not a valid Google Cloud project ID"},
+		"missing dataset":        {func(c *Config) { c.Dataset = "" }, "dataset must be specified"},
+		"bad dataset":            {func(c *Config) { c.Dataset = "otel-dash" }, "letters, numbers and underscores"},
+		"empty spans table":      {func(c *Config) { c.SpansTable = "" }, "spans_table must not be empty"},
+		"request over api cap":   {func(c *Config) { c.Write.MaxRequestBytes = apiRequestLimitBytes }, "must stay below the Storage Write API"},
+		"row over request":       {func(c *Config) { c.Write.MaxRowBytes = c.Write.MaxRequestBytes + 1 }, "must not exceed"},
+		"no inflight requests":   {func(c *Config) { c.Write.MaxInflightRequests = 0 }, "max_inflight_requests must be positive"},
 		"autocreate no location": {func(c *Config) { c.AutoCreate.Dataset = true }, "auto_create.location is required"},
-		"bad promoted type":     {func(c *Config) { c.PromoteAttributes = []PromotedAttribute{{Attribute: "a.b", Type: "DECIMAL"}} }, "must be one of STRING"},
+		"bad promoted type":      {func(c *Config) { c.PromoteAttributes = []PromotedAttribute{{Attribute: "a.b", Type: "DECIMAL"}} }, "must be one of STRING"},
 		"duplicate promoted column": {func(c *Config) {
 			c.PromoteAttributes = []PromotedAttribute{
 				{Attribute: "gen_ai.system", Type: "STRING"},
@@ -61,9 +61,9 @@ func TestValidateRejects(t *testing.T) {
 
 func TestSanitizeColumn(t *testing.T) {
 	for in, want := range map[string]string{
-		"gen_ai.system":   "gen_ai_system",
-		"http.route":      "http_route",
-		"already_ok":      "already_ok",
+		"gen_ai.system":    "gen_ai_system",
+		"http.route":       "http_route",
+		"already_ok":       "already_ok",
 		"weird-chars!here": "weird_chars_here",
 	} {
 		if got := sanitizeColumn(in); got != want {

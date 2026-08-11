@@ -17,13 +17,13 @@ func TestClassify(t *testing.T) {
 		err  error
 		want ErrorClass
 	}{
-		"unavailable is retryable":     {status.Error(codes.Unavailable, "backend down"), Retryable},
-		"internal is retryable":        {status.Error(codes.Internal, "oops"), Retryable},
-		"deadline is uncertain":        {status.Error(codes.DeadlineExceeded, "too slow"), Uncertain},
+		"unavailable is retryable":       {status.Error(codes.Unavailable, "backend down"), Retryable},
+		"internal is retryable":          {status.Error(codes.Internal, "oops"), Retryable},
+		"deadline is uncertain":          {status.Error(codes.DeadlineExceeded, "too slow"), Uncertain},
 		"permission denied is permanent": {status.Error(codes.PermissionDenied, "no"), Permanent},
-		"invalid argument is permanent": {status.Error(codes.InvalidArgument, "bad row"), Permanent},
-		"eof is retryable":             {io.EOF, Retryable},
-		"random error is permanent":    {errors.New("boom"), Permanent},
+		"invalid argument is permanent":  {status.Error(codes.InvalidArgument, "bad row"), Permanent},
+		"eof is retryable":               {io.EOF, Retryable},
+		"random error is permanent":      {errors.New("boom"), Permanent},
 		"throughput quota is retryable": {
 			status.Error(codes.ResourceExhausted, throughputQuotaPrefix+" for project X"), Retryable,
 		},
