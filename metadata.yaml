@@ -1,0 +1,21 @@
+type: bigquery
+display_name: BigQuery Exporter
+
+status:
+  class: exporter
+  stability:
+    development: [traces, logs]
+  distributions: []
+  codeowners:
+    active: [haiyuan-eng-google]
+
+# Metrics are deliberately out of scope for v1 (decision N1 in the design doc):
+# the OTLP metrics signal needs its own relational design (five data-point
+# types, delta vs cumulative temporality, exemplars, per-series identity) and
+# getting that wrong would freeze it into a versioned schema contract.
+
+tests:
+  config:
+    project: my-project
+    dataset: otel
+  skip_lifecycle: true

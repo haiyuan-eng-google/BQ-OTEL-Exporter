@@ -1,0 +1,14 @@
+services:
+  otelcollector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otel/config.yml"]
+    environment:
+      - BQ_PROJECT=${BQ_PROJECT}
+      - BQ_DATASET=${BQ_DATASET}
+      - GOOGLE_APPLICATION_CREDENTIALS=/creds/adc.json
+    volumes:
+      - ./otel-collector-config.yml:/etc/otel/config.yml:ro
+      - ${HOME}/.config/gcloud/application_default_credentials.json:/creds/adc.json:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"

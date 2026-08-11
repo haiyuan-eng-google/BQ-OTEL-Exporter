@@ -1,0 +1,43 @@
+# Minimal pipeline: OTLP in, BigQuery out.
+#
+# Credentials come from application default credentials. Nothing about the
+# exporter requires a Google-hosted collector; it serves any OTLP producer.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 1000
+
+exporters:
+  bigquery:
+    project: ${env:BQ_PROJECT}
+    dataset: ${env:BQ_DATASET}
+    spans_table: otel_spans
+    logs_table: otel_logs
+    retry_on_failure:
+      enabled: true
+      max_elapsed_time: 900s
+    sending_queue:
+      enabled: true
+
+service:
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [bigquery]
