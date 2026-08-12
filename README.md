@@ -31,8 +31,10 @@ sample, downsample, or interpret telemetry.
 
 ## Design
 
-Full design doc: **go/o11y-bq-exporter** (Google-internal). Section references
-in the code and in this README point at it.
+This component is built against an internal design document. Section
+references in the code and in this README (§7.3, FR6, and so on) point at that
+document; the rationale behind each decision is restated here and in the code
+comments so the repository stands on its own.
 
 ## Getting started
 
