@@ -7,6 +7,7 @@ package bigqueryexporter // import "github.com/haiyuan-eng-google/BQ-OTEL-Export
 
 import (
 	"context"
+	"time"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/config/configoptional"
@@ -15,27 +16,42 @@ import (
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
 
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/metadata"
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
 )
+
+// schemaVersion is the contract version this build writes.
+const schemaVersion = schema.Version
 
 const (
 	defaultSpansTable = "otel_spans"
 	defaultLogsTable  = "otel_logs"
 
-	// defaultMaxRequestBytes leaves roughly a megabyte of headroom under the
-	// Storage Write API per-request limit. This is our threshold, not the
-	// API's; the gap absorbs protobuf framing overhead we do not model.
-	defaultMaxRequestBytes = 9 * 1024 * 1024
+	// defaultMaxRequestBytes leaves headroom under the Storage Write API
+	// per-request limit. This is our threshold, not the API's; the gap
+	// absorbs protobuf framing overhead we do not model.
+	defaultMaxRequestBytes = 8 * 1024 * 1024
 	// defaultMaxRowBytes bounds a single serialized row.
 	defaultMaxRowBytes = 1024 * 1024
 
-	defaultMaxInflightRequests = 1000
-	defaultMaxInflightBytes    = 100 * 1024 * 1024
+	// Flow control uses managedwriter's native in-flight limits rather than a
+	// bespoke window. These match its documented defaults.
+	defaultMaxInflightRequests = 8
+	defaultMaxInflightBytes    = 64 * 1024 * 1024
+
+	// defaultMaxElapsedTime sits deliberately above the ten-minute outage the
+	// reliability journey exercises. Horizon expiry is terminal — the
+	// persistent queue deletes the item — so a sub-outage horizon would break
+	// the no-loss promise, while an unbounded one would make the duplicate
+	// bound meaningless.
+	defaultMaxElapsedTime = 900 * time.Second
 )
 
 // NewFactory creates a factory for the BigQuery exporter.
 //
 // Traces and logs only. The OTLP metrics signal is an independent future
-// proposal (N1) rather than a missing feature.
+// proposal rather than a missing feature: it needs its own relational design,
+// and guessing at one would freeze the guess into a versioned contract.
 func NewFactory() exporter.Factory {
 	return exporter.NewFactory(
 		metadata.Type,
@@ -46,17 +62,30 @@ func NewFactory() exporter.Factory {
 }
 
 func createDefaultConfig() component.Config {
+	backoff := configretry.NewDefaultBackOffConfig()
+	backoff.MaxElapsedTime = defaultMaxElapsedTime
+
+	limits := transform.DefaultLimits()
+
 	return &Config{
 		TimeoutSettings: exporterhelper.NewDefaultTimeoutConfig(),
 		QueueSettings:   configoptional.Some(exporterhelper.NewDefaultQueueConfig()),
-		BackOffConfig:   configretry.NewDefaultBackOffConfig(),
-		SpansTable:      defaultSpansTable,
-		LogsTable:       defaultLogsTable,
+		BackOffConfig:   backoff,
+		Traces:          SignalConfig{Table: defaultSpansTable},
+		Logs:            LogsConfig{Table: defaultLogsTable},
 		Write: WriteConfig{
 			MaxRequestBytes:     defaultMaxRequestBytes,
 			MaxRowBytes:         defaultMaxRowBytes,
 			MaxInflightRequests: defaultMaxInflightRequests,
 			MaxInflightBytes:    defaultMaxInflightBytes,
+		},
+		Limits: LimitsConfig{
+			MaxAttributeCount: limits.MaxAttributeCount,
+			MaxEventCount:     limits.MaxEventCount,
+			MaxLinkCount:      limits.MaxLinkCount,
+			MaxNestingDepth:   limits.MaxNestingDepth,
+			MaxCollectionSize: limits.MaxCollectionSize,
+			MaxValueBytes:     limits.MaxValueBytes,
 		},
 	}
 }
@@ -67,7 +96,10 @@ func createTracesExporter(
 	cfg component.Config,
 ) (exporter.Traces, error) {
 	c := cfg.(*Config)
-	exp := newTracesExporter(set.TelemetrySettings, c)
+	exp, err := newTracesExporter(set.TelemetrySettings, c)
+	if err != nil {
+		return nil, err
+	}
 
 	return exporterhelper.NewTraces(
 		ctx,
@@ -78,6 +110,8 @@ func createTracesExporter(
 		exporterhelper.WithShutdown(exp.shutdown),
 		exporterhelper.WithTimeout(c.TimeoutSettings),
 		exporterhelper.WithQueue(c.QueueSettings),
+		// exporterhelper is the single owner of append replay. managedwriter's
+		// own write retries are disabled, so attempts are never multiplied.
 		exporterhelper.WithRetry(c.BackOffConfig),
 	)
 }
@@ -88,7 +122,10 @@ func createLogsExporter(
 	cfg component.Config,
 ) (exporter.Logs, error) {
 	c := cfg.(*Config)
-	exp := newLogsExporter(set.TelemetrySettings, c)
+	exp, err := newLogsExporter(set.TelemetrySettings, c)
+	if err != nil {
+		return nil, err
+	}
 
 	return exporterhelper.NewLogs(
 		ctx,

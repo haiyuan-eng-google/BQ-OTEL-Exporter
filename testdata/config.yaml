@@ -6,23 +6,32 @@ exporters:
   bigquery/full:
     project: my-project
     dataset: otel
-    spans_table: spans
-    logs_table: logs
+    location: US
+    traces:
+      table: spans
+    logs:
+      table: logs
+      # Both halves are required together: an ID without a trusted namespace
+      # is not a record identity.
+      source_record_namespace: prod-fleet
+      source_record_id_attribute: log.record.uid
+    credentials:
+      impersonate_service_account: writer@my-project.iam.gserviceaccount.com
     auto_create:
       dataset: true
       tables: true
-      location: US
     write:
-      max_request_bytes: 9437184
+      max_request_bytes: 8388608
       max_row_bytes: 1048576
-      max_inflight_requests: 1000
-      max_inflight_bytes: 104857600
-    promote_attributes:
-      - attribute: gen_ai.system
-        type: STRING
-      - attribute: gen_ai.usage.input_tokens
-        column: input_tokens
-        type: INT64
+      max_inflight_requests: 8
+      max_inflight_bytes: 67108864
+    limits:
+      max_attribute_count: 1024
+      max_event_count: 1024
+      max_link_count: 1024
+      max_nesting_depth: 16
+      max_collection_size: 4096
+      max_value_bytes: 262144
     sending_queue:
       enabled: true
       num_consumers: 10
@@ -32,3 +41,13 @@ exporters:
       initial_interval: 5s
       max_elapsed_time: 900s
     timeout: 30s
+
+  # Emulator only. Insecure transport and disabled auth are refused unless the
+  # endpoint is a loopback address.
+  bigquery/emulator:
+    project: my-project
+    dataset: otel
+    endpoint:
+      url: localhost:9050
+      insecure: true
+      without_authentication: true

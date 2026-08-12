@@ -23,9 +23,11 @@ This component has exactly one job: **reliable transport with a stable,
 documented schema.** It is not an analytics product. It does not aggregate,
 sample, downsample, or interpret telemetry.
 
-> **Status: pre-alpha.** The configuration surface, schema and factory wiring
-> are real; the write path is not implemented yet and `pushTraceData` /
-> `pushLogData` return an explicit error. See the milestones below.
+> **Status: pre-alpha.** All twelve P0 requirements are implemented and unit
+> tested: the write path is real and appends through `managedwriter` on the
+> default stream. What is *not* yet done is proving it against live BigQuery —
+> there are no integration tests, no crash-replay test, and no performance
+> evidence. Treat the numbers in this README as targets, not measurements.
 
 ## Design
 
@@ -39,8 +41,10 @@ exporters:
   bigquery:
     project: my-project
     dataset: otel
-    spans_table: otel_spans
-    logs_table: otel_logs
+    traces:
+      table: otel_spans
+    logs:
+      table: otel_logs
 
 service:
   pipelines:
@@ -54,55 +58,57 @@ service:
 
 ## Configuration
 
-| Option                         | Default             | Description |
-| ------------------------------ | ------------------- | ----------- |
-| `project`                      | *required*          | Google Cloud project owning the destination dataset. |
-| `dataset`                      | *required*          | Destination BigQuery dataset ID. |
-| `spans_table`                  | `otel_spans`        | Destination table for OTLP spans. |
-| `logs_table`                   | `otel_logs`         | Destination table for OTLP log records. |
-| `auto_create.dataset`          | `false`             | Create the dataset if absent. Requires `auto_create.location`. |
-| `auto_create.tables`           | `false`             | Create the destination tables if absent. |
-| `auto_create.location`         | —                   | Dataset location used when creating a dataset. |
-| `write.max_request_bytes`      | `9437184` (9 MiB)   | Our request-size headroom threshold, enforced after protobuf serialization and before `AppendRows`. Distinct from, and below, the API's own per-request limit. |
-| `write.max_row_bytes`          | `1048576` (1 MiB)   | Rejects individual rows above this serialized size. |
-| `write.max_inflight_requests`  | `1000`              | Bounds asynchronous in-flight appends. |
-| `write.max_inflight_bytes`     | `104857600` (100 MiB) | Bounds memory held by in-flight appends. |
-| `promote_attributes`           | `[]`                | Lifts named attributes into their own nullable top-level columns. |
-| `sending_queue`                | collector defaults  | Standard `exporterhelper` queue, including the persistent queue. |
-| `retry_on_failure`             | collector defaults  | Standard `exporterhelper` retry with backoff. |
-| `timeout`                      | collector defaults  | Per-request timeout. |
+| Option                          | Default               | Description |
+| ------------------------------- | --------------------- | ----------- |
+| `project`                       | *required*            | Google Cloud project owning the destination dataset. |
+| `dataset`                       | *required*            | Destination BigQuery dataset ID. |
+| `location`                      | —                     | Dataset location. Required only when creating a dataset. |
+| `traces.table`                  | `otel_spans`          | Destination table for OTLP spans. |
+| `logs.table`                    | `otel_logs`           | Destination table for OTLP log records. |
+| `logs.source_record_namespace`  | —                     | Trusted namespace for `source_record_id`. Deployment-controlled, never taken from a payload attribute. |
+| `logs.source_record_id_attribute` | —                   | Log attribute carrying a stable source record ID. Only honored alongside a namespace. |
+| `credentials.file`              | ADC                   | Path to a service account key file. |
+| `credentials.impersonate_service_account` | —           | Target principal for impersonation, using ambient credentials as the source. |
+| `endpoint.url`                  | —                     | Alternate Storage Write API endpoint. Emulator and development only. |
+| `endpoint.insecure`             | `false`               | Disables TLS. Refused unless the endpoint is loopback. |
+| `endpoint.without_authentication` | `false`             | Sends no credentials. Refused unless the endpoint is loopback. |
+| `auto_create.dataset`           | `false`               | Create the dataset if absent. Requires `location`. |
+| `auto_create.tables`            | `false`               | Create the destination tables if absent. |
+| `write.max_request_bytes`       | `8388608` (8 MiB)     | Our request-size headroom threshold, enforced after protobuf serialization and before `AppendRows`. Distinct from, and below, the API's own per-request limit. |
+| `write.max_row_bytes`           | `1048576` (1 MiB)     | Rejects individual serialized rows above this size. |
+| `write.max_inflight_requests`   | `8`                   | Bounds asynchronous in-flight appends. |
+| `write.max_inflight_bytes`      | `67108864` (64 MiB)   | Bounds memory held by in-flight appends. |
+| `limits.*`                      | see below             | Structural bounds applied before serialization. |
+| `sending_queue`                 | collector defaults    | Standard `exporterhelper` queue, including the persistent queue. |
+| `retry_on_failure`              | `max_elapsed_time: 900s` | Standard `exporterhelper` retry. The horizon must be finite. |
+| `timeout`                       | collector defaults    | Per-request timeout. |
+
+### Structural limits
+
+Applied before serialization, these stop pathological payloads from becoming
+unqueryable rows or consuming unbounded memory. A breach drops only the
+offending record, counted under `rejected_rows{reason}`.
+
+| Option                      | Default  |
+| --------------------------- | -------- |
+| `limits.max_attribute_count`| `1024`   |
+| `limits.max_event_count`    | `1024`   |
+| `limits.max_link_count`     | `1024`   |
+| `limits.max_nesting_depth`  | `16`     |
+| `limits.max_collection_size`| `4096`   |
+| `limits.max_value_bytes`    | `262144` |
 
 `auto_create` is off by default deliberately: leaving it off keeps the exporter
 on a write-only IAM path.
 
-### Promoted attributes
+### Promoted attributes — not in v1
 
-Attributes live in a JSON bag by default. Promotion lifts a named attribute into
-its own nullable column so it can be filtered and clustered on:
-
-```yaml
-exporters:
-  bigquery:
-    project: my-project
-    dataset: otel
-    promote_attributes:
-      - attribute: gen_ai.system
-        type: STRING
-      - attribute: gen_ai.usage.input_tokens
-        column: input_tokens
-        type: INT64
-```
-
-Rules:
-
-- Promoted columns are **nullable and additive**; adding one is a minor schema
-  version bump.
-- The attribute bag remains the source of truth. A promoted column is an index,
-  not a replacement.
-- Removing an entry from the config does **not** drop the column.
-- Promoted columns are **excluded from the record fingerprint**, so a fleet
-  running heterogeneous promotion configs still produces identical fingerprints
-  for the same logical record.
+Lifting named attributes into their own top-level columns is a **proposed
+amendment**, not part of this contract. It is not implemented and not
+configurable here. When it lands, promoted columns will be nullable, additive,
+and excluded from the record fingerprint, so a fleet running heterogeneous
+promotion configs still produces identical fingerprints for the same logical
+record.
 
 ## Delivery semantics
 
@@ -183,8 +189,8 @@ write access. Preflight warns; it does not gate startup on its own verdict.
 
 | Milestone | Contents |
 | --------- | -------- |
-| **M1** | Write path on the Storage Write API default stream; schema v1 for traces and logs; request sizing and the error matrix; throughput target validated. |
-| **M2** | Provisional performance envelope; dedup view DDL shipped and exercised; reliability CUJ. |
+| **M1** | Write path on the Storage Write API default stream; `v0alpha1` schema for traces and logs; request sizing and the error matrix. **Code complete; throughput not yet validated.** |
+| **M2** | Provisional performance envelope; dedup views exercised; crash-replay and in-process subset-retry tests; delivery-critical telemetry proven under fault injection. |
 | **M3** | Optional `auto_create` plus startup validation; security guide; formal performance and cost evidence. |
 
 ## Contributing

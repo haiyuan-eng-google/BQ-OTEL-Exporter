@@ -9,5 +9,11 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m)
+	// The managedwriter client pulls in opencensus, whose stats view worker
+	// starts at package init and runs for the life of the process. It is not
+	// a leak this package can close, so it is ignored explicitly rather than
+	// by disabling the check.
+	goleak.VerifyTestMain(m,
+		goleak.IgnoreTopFunction("go.opencensus.io/stats/view.(*worker).start"),
+	)
 }

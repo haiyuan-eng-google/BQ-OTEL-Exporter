@@ -126,3 +126,71 @@ func TestDDLTemplatesFormatCleanly(t *testing.T) {
 		}
 	}
 }
+
+// The DDL and the storagepb.TableSchema describe the same contract from two
+// directions: the DDL is what an operator runs, the TableSchema is what the
+// exporter writes against. If they drift, rows get written against a shape the
+// table does not have, so diff them column for column.
+func TestDDLAndTableSchemaAgree(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ddl  string
+		cols []string
+	}{
+		{"spans", SpansDDL, FieldNames(SpansTableSchema())},
+		{"logs", LogsDDL, FieldNames(LogsTableSchema())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inDDL := ddlColumns(tc.ddl)
+
+			for _, c := range tc.cols {
+				if !inDDL[c] {
+					t.Errorf("column %q is in the TableSchema but not the DDL", c)
+				}
+				delete(inDDL, c)
+			}
+			for c := range inDDL {
+				t.Errorf("column %q is in the DDL but not the TableSchema", c)
+			}
+		})
+	}
+}
+
+// ddlColumns extracts top-level column names, skipping the nested STRUCT
+// fields of the events and links arrays.
+func ddlColumns(ddl string) map[string]bool {
+	out := map[string]bool{}
+	depth := 0
+	for _, line := range strings.Split(ddl, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if depth == 0 {
+			if f := strings.Fields(trimmed); len(f) >= 2 {
+				if name := f[0]; isColumnName(name) && !isDDLKeyword(name) {
+					out[name] = true
+				}
+			}
+		}
+		depth += strings.Count(line, "<") - strings.Count(line, ">")
+	}
+	return out
+}
+
+func isColumnName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if !(r == '_' || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')) {
+			return false
+		}
+	}
+	return true
+}
+
+func isDDLKeyword(s string) bool {
+	switch s {
+	case "create", "partition", "cluster", "select", "from", "qualify", "order", "where":
+		return true
+	}
+	return false
+}

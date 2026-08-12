@@ -2,6 +2,9 @@
 #
 # Credentials come from application default credentials. Nothing about the
 # exporter requires a Google-hosted collector; it serves any OTLP producer.
+#
+# Delivery is at least once and may duplicate data. Query the shipped
+# otel_spans_dedup and otel_logs_dedup views rather than the base tables.
 
 receivers:
   otlp:
@@ -20,10 +23,14 @@ exporters:
   bigquery:
     project: ${env:BQ_PROJECT}
     dataset: ${env:BQ_DATASET}
-    spans_table: otel_spans
-    logs_table: otel_logs
+    traces:
+      table: otel_spans
+    logs:
+      table: otel_logs
     retry_on_failure:
       enabled: true
+      # Finite on purpose: an unbounded horizon would remove the bound on how
+      # many physical copies one logical record can produce.
       max_elapsed_time: 900s
     sending_queue:
       enabled: true

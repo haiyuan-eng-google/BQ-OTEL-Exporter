@@ -9,13 +9,106 @@ status:
   codeowners:
     active: [haiyuan-eng-google]
 
-# Metrics are deliberately out of scope for v1 (decision N1 in the design doc):
-# the OTLP metrics signal needs its own relational design (five data-point
-# types, delta vs cumulative temporality, exemplars, per-series identity) and
-# getting that wrong would freeze it into a versioned schema contract.
+# Metrics are deliberately out of scope for v1: the OTLP metrics signal needs
+# its own relational design (five data-point types, delta vs cumulative
+# temporality, exemplars, per-series identity) and guessing at one would freeze
+# the guess into a versioned schema contract.
 
 tests:
   config:
     project: my-project
     dataset: otel
   skip_lifecycle: true
+
+# Delivery-critical self-telemetry.
+#
+# These exist so an operator can answer "is this pipeline losing data?" from
+# the collector alone, without querying BigQuery. Every label domain below is
+# closed: nothing derived from telemetry content is ever used as a label, both
+# because it would be unbounded cardinality and because it would leak payload
+# into the metrics pipeline.
+#
+# Queue depth and queue drops are deliberately absent. exporterhelper already
+# publishes them for the sending queue, and a second set of counters measuring
+# the same queue would disagree under load and be worse than none.
+telemetry:
+  metrics:
+    otelcol_exporter_bigquery_acknowledged_rows:
+      enabled: true
+      description: >-
+        Rows acknowledged by the BigQuery Storage Write API. Incremented only
+        after acknowledgement, never at enqueue time, so it can be compared
+        against what the producer sent.
+      unit: "{row}"
+      sum:
+        value_type: int
+        monotonic: true
+
+    otelcol_exporter_bigquery_rejected_rows:
+      enabled: true
+      description: >-
+        Rows permanently rejected and dropped, by reason. There is no
+        dead-letter destination in v1, so this counter is the only record that
+        the data existed.
+      unit: "{row}"
+      sum:
+        value_type: int
+        monotonic: true
+      attributes: [reason]
+
+    otelcol_exporter_bigquery_retries:
+      enabled: true
+      description: Retryable append failures, by error class.
+      unit: "{failure}"
+      sum:
+        value_type: int
+        monotonic: true
+      attributes: [class]
+
+    otelcol_exporter_bigquery_uncertain_ack_replays:
+      enabled: true
+      description: >-
+        Append replays triggered by an uncertain acknowledgement. This is the
+        observable side of the duplicate bound: N replays permit at most N+1
+        physical copies of a logical record. Crash replays from the persistent
+        queue are explicitly out of scope and are not counted here.
+      unit: "{replay}"
+      sum:
+        value_type: int
+        monotonic: true
+
+  attributes:
+    reason:
+      description: >-
+        Why a row was permanently rejected. Bounded by construction; this
+        enumeration is the whole domain.
+      type: string
+      enum:
+        - attribute_count
+        - event_count
+        - link_count
+        - nesting_depth
+        - collection_size
+        - value_size
+        - serialization
+        - row_bytes
+        - row_error
+
+    class:
+      description: >-
+        The error class of a retryable append failure. Bounded by
+        construction; this enumeration is the whole domain.
+      type: string
+      enum:
+        - quota_exhausted
+        - unavailable
+        - internal
+        - permission_denied
+        - credential
+        - invalid_stream
+        - schema_mismatch
+        - invalid_argument
+        - uncertain_ack
+        - connection
+        - shutdown_timeout
+        - unknown
