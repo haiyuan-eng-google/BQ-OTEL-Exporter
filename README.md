@@ -32,7 +32,7 @@ sample, downsample, or interpret telemetry.
 ## Design
 
 This component is built against an internal design document. Section
-references in the code and in this README (§7.3, FR6, and so on) point at that
+references in the code and in this README point at that
 document; the rationale behind each decision is restated here and in the code
 comments so the repository stands on its own.
 
