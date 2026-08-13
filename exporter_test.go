@@ -8,6 +8,7 @@ import (
 	"errors"
 	"testing"
 
+	bq "cloud.google.com/go/bigquery"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer/consumererror"
@@ -251,7 +252,21 @@ func TestSignalExporterShutdownIsIdempotent(t *testing.T) {
 // context instead of leaking that background lifetime.
 func TestSignalExporterStartFailureCancelsOwnedLifetime(t *testing.T) {
 	original := newManagedWriterClient
-	t.Cleanup(func() { newManagedWriterClient = original })
+	originalAdmin := newDestinationAdmin
+	t.Cleanup(func() {
+		newManagedWriterClient = original
+		newDestinationAdmin = originalAdmin
+	})
+	newDestinationAdmin = func(
+		context.Context, string, string, ...option.ClientOption,
+	) (destinationAdmin, error) {
+		return &fakeDestinationAdmin{
+			datasetMetadata: &bq.DatasetMetadata{},
+			tableMetadata: &bq.TableMetadata{
+				Schema: mustBigQuerySchema(t, schema.SpansTableSchema()),
+			},
+		}, nil
+	}
 
 	wantErr := errors.New("client construction failed")
 	var retained context.Context

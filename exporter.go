@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 
-	bq "cloud.google.com/go/bigquery"
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
 	"go.opentelemetry.io/collector/component"
@@ -30,6 +29,14 @@ const writeAPITraceID = "otel-bigqueryexporter"
 
 // scopeWrite is the minimum OAuth scope for appending rows.
 const scopeWrite = "https://www.googleapis.com/auth/bigquery.insertdata"
+
+// scopeRead is sufficient for existence and schema validation when startup is
+// not authorized to create control-plane resources.
+const scopeRead = "https://www.googleapis.com/auth/bigquery.readonly"
+
+// scopeAdmin allows the metadata client to inspect and, when explicitly
+// configured, create datasets, tables, and views.
+const scopeAdmin = "https://www.googleapis.com/auth/bigquery"
 
 // newManagedWriterClient is the external constructor seam. Keeping it narrow
 // lets lifecycle tests prove which context is retained without opening a real
@@ -86,8 +93,11 @@ func newSignalExporter(
 	}
 }
 
-// clientOptions renders the authentication and endpoint configuration.
-func (e *signalExporter) clientOptions(ctx context.Context) ([]option.ClientOption, error) {
+// authenticationOptions renders the configured identity for either BigQuery
+// client. Service endpoint overrides remain a Storage Write-only concern.
+func (e *signalExporter) authenticationOptions(
+	ctx context.Context, scopes []string,
+) ([]option.ClientOption, error) {
 	var opts []option.ClientOption
 
 	switch {
@@ -97,7 +107,7 @@ func (e *signalExporter) clientOptions(ctx context.Context) ([]option.ClientOpti
 	case e.cfg.Credentials.ImpersonateServiceAccount != "":
 		ts, err := impersonate.CredentialsTokenSource(ctx, impersonate.CredentialsConfig{
 			TargetPrincipal: e.cfg.Credentials.ImpersonateServiceAccount,
-			Scopes:          []string{scopeWrite},
+			Scopes:          scopes,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("configuring impersonation of %s: %w",
@@ -106,6 +116,25 @@ func (e *signalExporter) clientOptions(ctx context.Context) ([]option.ClientOpti
 		opts = append(opts, option.WithTokenSource(ts))
 	}
 
+	return opts, nil
+}
+
+func (e *signalExporter) metadataClientOptions(ctx context.Context) ([]option.ClientOption, error) {
+	return e.authenticationOptions(ctx, e.metadataScopes())
+}
+
+func (e *signalExporter) metadataScopes() []string {
+	if e.cfg.AutoCreate.Dataset || e.cfg.AutoCreate.Tables {
+		return []string{scopeAdmin}
+	}
+	return []string{scopeRead}
+}
+
+func (e *signalExporter) writerClientOptions(ctx context.Context) ([]option.ClientOption, error) {
+	opts, err := e.authenticationOptions(ctx, []string{scopeWrite})
+	if err != nil {
+		return nil, err
+	}
 	if url := e.cfg.Endpoint.URL; url != "" {
 		opts = append(opts, option.WithEndpoint(url))
 		if e.cfg.Endpoint.Insecure {
@@ -133,23 +162,28 @@ func (e *signalExporter) start(ctx context.Context, _ component.Host) (err error
 		}
 	}()
 
-	copts, err := e.clientOptions(lifetimeCtx)
+	metadataOpts, err := e.metadataClientOptions(ctx)
 	if err != nil {
 		return err
 	}
+	admin, err := newDestinationAdmin(ctx, e.cfg.Project, e.cfg.Dataset, metadataOpts...)
+	if err != nil {
+		return fmt.Errorf("creating BigQuery metadata client: %w", err)
+	}
+	defer func() { err = errors.Join(err, admin.Close()) }()
+	if err := e.prepareDestination(ctx, admin); err != nil {
+		return err
+	}
 
-	client, err := newManagedWriterClient(lifetimeCtx, e.cfg.Project, copts...)
+	writerOpts, err := e.writerClientOptions(lifetimeCtx)
+	if err != nil {
+		return err
+	}
+	client, err := newManagedWriterClient(lifetimeCtx, e.cfg.Project, writerOpts...)
 	if err != nil {
 		return fmt.Errorf("creating BigQuery Storage Write client: %w", err)
 	}
 	e.client = client
-
-	// Validate the destination before the first append. A schema mismatch
-	// discovered at append time costs a batch and produces a confusing error;
-	// discovered at startup it is a clear configuration failure.
-	if err := e.validateDestination(ctx); err != nil {
-		return err
-	}
 
 	enc, err := protoenc.New(e.schema)
 	if err != nil {
@@ -174,60 +208,6 @@ func (e *signalExporter) start(ctx context.Context, _ component.Host) (err error
 		zap.String("schema_version", schemaVersion),
 	)
 	return nil
-}
-
-// validateDestination compares the table's real schema against the contract.
-//
-// Best-effort by design: BigQuery documents that testIamPermissions is not
-// intended for authorization checking and can fail open, and a metadata read
-// proves metadata access rather than write access. A read failure therefore
-// warns rather than blocking startup — refusing to start on a permission
-// preflight that is documented as unreliable would be worse than trying the
-// append and reporting a real error.
-func (e *signalExporter) validateDestination(ctx context.Context) error {
-	client, err := bq.NewClient(ctx, e.cfg.Project)
-	if err != nil {
-		e.logger.Warn("skipping destination validation: could not create a metadata client",
-			zap.String("destination", e.tableID()), zap.Error(err))
-		return nil
-	}
-	defer func() { _ = client.Close() }()
-
-	md, err := client.Dataset(e.cfg.Dataset).Table(e.table).Metadata(ctx)
-	if err != nil {
-		e.logger.Warn("skipping destination validation: table metadata is unreadable. "+
-			"This proves nothing about write access; appends will report the real error.",
-			zap.String("destination", e.tableID()), zap.Error(err))
-		return nil
-	}
-
-	have, err := bqSchemaToStorage(md.Schema)
-	if err != nil {
-		e.logger.Warn("skipping destination validation: unsupported column type in the destination table",
-			zap.String("destination", e.tableID()), zap.Error(err))
-		return nil
-	}
-
-	// A missing column is fatal: rows would target a shape the table cannot
-	// accept, and every append would fail identically.
-	if missing := protoenc.SchemaMismatch(e.schema, have); len(missing) > 0 {
-		return fmt.Errorf(
-			"destination table %s is missing %d column(s) required by schema %s: %v"+
-				" — create or migrate the table before starting",
-			e.tableID(), len(missing), schemaVersion, missing)
-	}
-	return nil
-}
-
-func bqSchemaToStorage(s bq.Schema) (*storagepb.TableSchema, error) {
-	out := &storagepb.TableSchema{}
-	for _, f := range s {
-		out.Fields = append(out.Fields, &storagepb.TableFieldSchema{Name: f.Name})
-	}
-	if len(out.Fields) == 0 {
-		return nil, errors.New("destination table reports no columns")
-	}
-	return out, nil
 }
 
 func (e *signalExporter) tableID() string {

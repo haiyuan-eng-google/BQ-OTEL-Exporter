@@ -75,7 +75,7 @@ service:
 | `endpoint.insecure`             | `false`               | Disables TLS. Refused unless the endpoint is loopback. |
 | `endpoint.without_authentication` | `false`             | Sends no credentials. Refused unless the endpoint is loopback. |
 | `auto_create.dataset`           | `false`               | Create the dataset if absent. Requires `location`. |
-| `auto_create.tables`            | `false`               | Create the destination tables if absent. |
+| `auto_create.tables`            | `false`               | Create the active signal's destination table and create-only `_dedup` view if absent. Existing views are never replaced. |
 | `write.max_request_bytes`       | `8388608` (8 MiB)     | Our request-size headroom threshold, enforced after protobuf serialization and before `AppendRows`. Distinct from, and below, the API's own per-request limit. |
 | `write.max_row_bytes`           | `1048576` (1 MiB)     | Rejects individual serialized rows above this size. |
 | `write.max_inflight_requests`   | `8`                   | Bounds asynchronous in-flight appends. |
@@ -100,8 +100,13 @@ offending record, counted under `rejected_rows{reason}`.
 | `limits.max_collection_size`| `4096`   |
 | `limits.max_value_bytes`    | `262144` |
 
-`auto_create` is off by default deliberately: leaving it off keeps the exporter
-on a write-only IAM path.
+`auto_create` is off by default deliberately: leaving it off avoids dataset,
+table, and view creation permissions. Startup still reads destination metadata
+to distinguish an absent resource from an authorization ambiguity and to
+validate the complete typed schema before opening the Storage Write client.
+An authoritative `NotFound` fails startup with the corresponding
+`auto_create` setting named in the error; other metadata-read failures warn and
+defer the authorization verdict to the real append.
 
 ### Promoted attributes — not in v1
 
@@ -160,16 +165,19 @@ the `MERGE` is only ever the optimization.
 
 ## IAM
 
-The least-privilege path for pre-created tables is a **write-only custom role**
-centered on `bigquery.tables.updateData`, plus `bigquery.tables.get` for startup
-validation. `roles/bigquery.dataEditor` is the convenient broader alternative,
-not the least-privilege one. Create permissions are needed only when the
-corresponding `auto_create` flag is on.
+The least-privilege path for pre-created tables is a custom role centered on
+`bigquery.tables.updateData`, plus `bigquery.datasets.get` and
+`bigquery.tables.get` for startup validation. `roles/bigquery.dataEditor` is
+the convenient broader alternative, not the least-privilege one. Dataset,
+table, and view create permissions are needed only when the corresponding
+`auto_create` flag is on. Both the metadata and Storage Write clients use the
+same configured credentials or impersonated service-account identity.
 
-Startup permission preflight is **best-effort, not authoritative**: BigQuery
-documents that `tables.testIamPermissions` is not intended for authorization
-checking and may fail open, and `tables.get` proves metadata access rather than
-write access. Preflight warns; it does not gate startup on its own verdict.
+Startup permission preflight is **best-effort, not authoritative**: a metadata
+`NotFound` is authoritative for provisioning and fails fast when creation is
+disabled. Other metadata failures prove neither absence nor write denial, so
+they warn rather than blocking startup; the append reports the real write
+authorization result.
 
 ## What this deliberately does not do
 
