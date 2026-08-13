@@ -70,6 +70,9 @@ func TestClassifyMatrix(t *testing.T) {
 		"context deadline is uncertain": {
 			context.DeadlineExceeded, Uncertain, OwnerExporterHelper, LabelUncertainAck, false,
 		},
+		"runtime context cancellation is not mislabeled as shutdown": {
+			context.Canceled, Retryable, OwnerExporterHelper, LabelCanceled, false,
+		},
 		"unknown error is permanent": {
 			errors.New("boom"), Permanent, OwnerExporter, LabelUnknown, false,
 		},

@@ -71,18 +71,35 @@ type appendResult interface {
 
 // Writer owns one default-stream ManagedStream per destination table.
 type Writer struct {
-	opts    WriterOptions
-	factory streamFactory
+	opts        WriterOptions
+	factory     streamFactory
+	lifetimeCtx context.Context
+	drainCtx    context.Context
+	drainCancel context.CancelFunc
 
 	mu     sync.Mutex
-	ms     stream
+	ms     *streamGeneration
 	closed bool
+
+	appendWG sync.WaitGroup
+	drainWG  sync.WaitGroup
 }
 
-// NewWriter builds a writer over an existing managedwriter client.
-func NewWriter(client *managedwriter.Client, opts WriterOptions) *Writer {
+// streamGeneration binds an append result to the exact stream that dispatched
+// it. Pointer identity is the generation token: a late failure can retire this
+// generation only while it is still the writer's current stream.
+type streamGeneration struct {
+	stream
+}
+
+// NewWriter builds a writer whose managed streams retain lifetimeCtx for their
+// entire component lifetime.
+func NewWriter(
+	lifetimeCtx context.Context, client *managedwriter.Client, opts WriterOptions,
+) *Writer {
 	return &Writer{
-		opts: opts,
+		opts:        opts,
+		lifetimeCtx: lifetimeCtx,
 		factory: func(ctx context.Context, wopts ...managedwriter.WriterOption) (stream, error) {
 			ms, err := client.NewManagedStream(ctx, wopts...)
 			if err != nil {
@@ -114,8 +131,12 @@ func (w *Writer) writerOptions() []managedwriter.WriterOption {
 	}
 }
 
-// ensureStream returns the live stream, creating it on first use.
-func (w *Writer) ensureStream(ctx context.Context) (stream, error) {
+// ensureStream returns the live stream generation, creating it on first use.
+//
+// managedwriter retains the stream-construction context. It must therefore be
+// the component-owned lifetime context, never an exporterhelper attempt
+// context that is canceled as soon as one Consume call returns.
+func (w *Writer) ensureStream() (*streamGeneration, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
@@ -124,22 +145,64 @@ func (w *Writer) ensureStream(ctx context.Context) (stream, error) {
 	if w.ms != nil {
 		return w.ms, nil
 	}
+	ctx := w.lifetimeCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	ms, err := w.factory(ctx, w.writerOptions()...)
 	if err != nil {
 		return nil, fmt.Errorf("creating write stream for %s: %w", w.opts.TableID(), err)
 	}
-	w.ms = ms
-	return ms, nil
+	gen := &streamGeneration{stream: ms}
+	w.ms = gen
+	return gen, nil
 }
 
-// recreateStream tears down the current stream so the next append rebuilds it.
-func (w *Writer) recreateStream() {
+// beginAppend prevents shutdown from starting a Wait while a new append can
+// still register work. The WaitGroup Add happens under the same lock that
+// closes the writer, so Close's Wait cannot race an Add from a new call.
+func (w *Writer) beginAppend() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.ms != nil {
-		_ = w.ms.Close()
-		w.ms = nil
+	if w.closed {
+		return errors.New("writer is closed")
 	}
+	if w.drainCtx == nil {
+		ctx := w.lifetimeCtx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		w.drainCtx, w.drainCancel = context.WithCancel(ctx)
+	}
+	w.appendWG.Add(1)
+	return nil
+}
+
+// trackResult keeps terminal ownership after an attempt context expires.
+// managedwriter's GetResult only reports that caller cancellation; it does not
+// make the underlying AppendResult terminal. This waiter lives until the
+// result resolves or Writer.Close cancels the bounded drain context.
+func (w *Writer) trackResult(res appendResult) {
+	w.drainWG.Add(1)
+	ctx := w.drainCtx
+	go func() {
+		defer w.drainWG.Done()
+		_, _ = res.GetResult(ctx)
+	}()
+}
+
+// retireStream tears down gen only if it is still current. Another append may
+// already have retired gen and installed a replacement; a late result from the
+// old generation must not close that replacement.
+func (w *Writer) retireStream(gen *streamGeneration) {
+	w.mu.Lock()
+	if w.ms != gen {
+		w.mu.Unlock()
+		return
+	}
+	w.ms = nil
+	w.mu.Unlock()
+	_ = gen.Close()
 }
 
 // RowError identifies a row the service rejected within an append.
@@ -177,8 +240,12 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 	if len(rows) == 0 {
 		return AppendOutcome{}
 	}
+	if err := w.beginAppend(); err != nil {
+		return AppendOutcome{Verdict: Classify(err), Err: err}
+	}
+	defer w.appendWG.Done()
 
-	ms, err := w.ensureStream(ctx)
+	gen, err := w.ensureStream()
 	if err != nil {
 		return AppendOutcome{Verdict: Classify(err), Err: err}
 	}
@@ -191,24 +258,27 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 		count int
 	}
 	inflight := make([]pending, 0, len(requests))
+	out := AppendOutcome{}
 
 	offset := 0
 	for _, req := range requests {
-		res, aerr := ms.AppendRows(ctx, req)
+		res, aerr := gen.AppendRows(ctx, req)
 		if aerr != nil {
-			// A dispatch failure is transport-level: nothing in this request
-			// was appended.
-			v := Classify(aerr)
-			if v.StreamRecreate {
-				w.recreateStream()
+			// AppendRows can return the attempt-context error after handing a
+			// request to the bidirectional stream. Its acknowledgement is then
+			// ambiguous, and this generation cannot safely be reused.
+			v, attemptEnded := w.classifyAppendFailure(ctx, aerr)
+			if v.StreamRecreate || attemptEnded || v.Class == Uncertain {
+				w.retireStream(gen)
 			}
-			return AppendOutcome{Verdict: v, Err: aerr}
+			out.Verdict = v
+			out.Err = aerr
+			break
 		}
 		inflight = append(inflight, pending{res: res, start: offset, count: len(req)})
 		offset += len(req)
 	}
 
-	out := AppendOutcome{}
 	for _, p := range inflight {
 		if _, rerr := p.res.GetResult(ctx); rerr != nil {
 			// Row errors arrive alongside the error; the whole request is not
@@ -218,17 +288,39 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 				out.RowErrors = append(out.RowErrors, rowErrs...)
 				continue
 			}
-			v := Classify(rerr)
-			if v.StreamRecreate {
-				w.recreateStream()
+			v, attemptEnded := w.classifyAppendFailure(ctx, rerr)
+			if v.StreamRecreate || attemptEnded || v.Class == Uncertain {
+				w.retireStream(gen)
 			}
-			out.Verdict = v
-			out.Err = rerr
-			return out
+			if attemptEnded {
+				w.trackResult(p.res)
+			}
+			// Preserve the first transport failure as the batch verdict, but
+			// keep draining all other results already dispatched by this call.
+			if out.Err == nil {
+				out.Verdict = v
+				out.Err = rerr
+			}
+			continue
 		}
 		out.AcknowledgedRows += p.count
 	}
 	return out
+}
+
+// classifyAttemptFailure distinguishes an ordinary server failure from the
+// attempt context ending after AppendRows was invoked. Cancellation at that
+// point has the same delivery ambiguity as a deadline: the server may have
+// applied the rows even though the caller did not observe the acknowledgement.
+func (w *Writer) classifyAppendFailure(ctx context.Context, err error) (Verdict, bool) {
+	ctxErr := ctx.Err()
+	if ctxErr != nil && errors.Is(err, ctxErr) {
+		return Verdict{Uncertain, OwnerExporterHelper, LabelUncertainAck, false}, true
+	}
+	if w.lifetimeCtx != nil && w.lifetimeCtx.Err() != nil && errors.Is(err, context.Canceled) {
+		return Verdict{Retryable, OwnerExporterHelper, LabelShutdown, false}, false
+	}
+	return Classify(err), false
 }
 
 // extractRowErrors pulls per-row failures out of a response, translating
@@ -285,13 +377,27 @@ func SplitRequests(rows [][]byte, maxBytes int) [][][]byte {
 // context deadline before this is called.
 func (w *Writer) Close() error {
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.closed = true
-	if w.ms == nil {
+	if w.closed {
+		w.mu.Unlock()
 		return nil
 	}
-	err := w.ms.Close()
+	w.closed = true
+	gen := w.ms
 	w.ms = nil
+	drainCancel := w.drainCancel
+	w.drainCancel = nil
+	w.mu.Unlock()
+	var err error
+	if gen != nil {
+		err = gen.Close()
+	}
+	// All Append calls must finish registering any asynchronous result owner
+	// before cancellation and Wait; this ordering avoids Add/Wait races.
+	w.appendWG.Wait()
+	if drainCancel != nil {
+		drainCancel()
+	}
+	w.drainWG.Wait()
 	return err
 }
 

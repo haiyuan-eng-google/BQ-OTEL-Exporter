@@ -6,7 +6,9 @@ package bigquery
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
+	"time"
 
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
@@ -114,6 +116,128 @@ func newTestWriter(s *fakeStream) *Writer {
 	}
 }
 
+type controlledResult struct {
+	started chan struct{}
+	ready   chan struct{}
+	once    sync.Once
+
+	mu       sync.Mutex
+	getCalls int
+	err      error
+}
+
+func newControlledResult() *controlledResult {
+	return &controlledResult{
+		started: make(chan struct{}),
+		ready:   make(chan struct{}),
+	}
+}
+
+func (r *controlledResult) GetResult(ctx context.Context) (int64, error) {
+	r.mu.Lock()
+	r.getCalls++
+	r.mu.Unlock()
+	r.once.Do(func() { close(r.started) })
+	select {
+	case <-r.ready:
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return 0, r.err
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+func (r *controlledResult) FullResponse(context.Context) (*storagepb.AppendRowsResponse, error) {
+	return nil, nil
+}
+
+func (r *controlledResult) calls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.getCalls
+}
+
+func (r *controlledResult) complete(err error) {
+	r.mu.Lock()
+	r.err = err
+	r.mu.Unlock()
+	close(r.ready)
+}
+
+func (r *controlledResult) waitForCalls(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if r.calls() >= want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("GetResult called %d times, want at least %d", r.calls(), want)
+}
+
+type scriptedStream struct {
+	mu sync.Mutex
+
+	results        []appendResult
+	dispatchErrors []error
+	calls          int
+	closed         int
+}
+
+func (s *scriptedStream) AppendRows(
+	_ context.Context, _ [][]byte, _ ...managedwriter.AppendOption,
+) (appendResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := s.calls
+	s.calls++
+	if i < len(s.dispatchErrors) && s.dispatchErrors[i] != nil {
+		return nil, s.dispatchErrors[i]
+	}
+	if i >= len(s.results) {
+		return nil, errors.New("unexpected append")
+	}
+	return s.results[i], nil
+}
+
+func (s *scriptedStream) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed++
+	return nil
+}
+
+func (s *scriptedStream) closeCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
+}
+
+func newScriptedWriter(streams ...stream) (*Writer, *[]context.Context) {
+	createdWith := []context.Context{}
+	next := 0
+	w := &Writer{
+		opts: WriterOptions{
+			Project:         "p",
+			Dataset:         "d",
+			Table:           "t",
+			MaxRequestBytes: 1,
+		},
+		factory: func(ctx context.Context, _ ...managedwriter.WriterOption) (stream, error) {
+			createdWith = append(createdWith, ctx)
+			if next >= len(streams) {
+				return nil, errors.New("unexpected stream creation")
+			}
+			s := streams[next]
+			next++
+			return s, nil
+		},
+	}
+	return w, &createdWith
+}
+
 func TestAppendSuccess(t *testing.T) {
 	s := &fakeStream{results: []appendResult{fakeResult{}}}
 	out := newTestWriter(s).Append(context.Background(), [][]byte{{1}, {2}, {3}})
@@ -123,6 +247,211 @@ func TestAppendSuccess(t *testing.T) {
 	}
 	if out.AcknowledgedRows != 3 {
 		t.Fatalf("acknowledged %d rows, want 3", out.AcknowledgedRows)
+	}
+}
+
+// A managed stream retains the context used to create it. An exporterhelper
+// attempt context is canceled as soon as that attempt returns, so retaining it
+// here would poison every later append on the same stream.
+func TestStreamFactoryDoesNotRetainAttemptContext(t *testing.T) {
+	s := &scriptedStream{results: []appendResult{fakeResult{}}}
+	w, createdWith := newScriptedWriter(s)
+
+	attemptCtx, cancelAttempt := context.WithCancel(context.Background())
+	out := w.Append(attemptCtx, [][]byte{{1}})
+	if out.Err != nil {
+		t.Fatalf("append failed: %v", out.Err)
+	}
+	cancelAttempt()
+
+	if len(*createdWith) != 1 {
+		t.Fatalf("created %d streams, want 1", len(*createdWith))
+	}
+	select {
+	case <-(*createdWith)[0].Done():
+		t.Fatal("stream factory retained the canceled append-attempt context")
+	default:
+	}
+}
+
+// Every result already handed back by AppendRows must be observed even when
+// an earlier split fails. Returning early leaves managedwriter flow-control
+// capacity occupied by results the exporter never accounts for.
+func TestAppendDrainsEveryDispatchedResultAfterResultFailure(t *testing.T) {
+	failed := newControlledResult()
+	succeeded := newControlledResult()
+	failed.complete(status.Error(codes.Unavailable, "down"))
+	succeeded.complete(nil)
+	s := &scriptedStream{results: []appendResult{failed, succeeded}}
+	w, _ := newScriptedWriter(s)
+
+	out := w.Append(context.Background(), [][]byte{{1}, {2}})
+	if out.Verdict.Class != Retryable {
+		t.Fatalf("class = %s, want retryable", out.Verdict.Class)
+	}
+	if failed.calls() != 1 || succeeded.calls() != 1 {
+		t.Fatalf("GetResult calls = failed:%d succeeded:%d, want 1 each",
+			failed.calls(), succeeded.calls())
+	}
+}
+
+// A later dispatch can fail after earlier split requests have already been
+// accepted. Those earlier append results still need to be drained.
+func TestAppendDrainsDispatchedResultsAfterLaterDispatchFailure(t *testing.T) {
+	dispatched := newControlledResult()
+	dispatched.complete(nil)
+	s := &scriptedStream{
+		results:        []appendResult{dispatched, nil},
+		dispatchErrors: []error{nil, status.Error(codes.Unavailable, "down")},
+	}
+	w, _ := newScriptedWriter(s)
+
+	out := w.Append(context.Background(), [][]byte{{1}, {2}})
+	if out.Verdict.Class != Retryable {
+		t.Fatalf("class = %s, want retryable", out.Verdict.Class)
+	}
+	if dispatched.calls() != 1 {
+		t.Fatalf("first dispatched result was observed %d times, want 1", dispatched.calls())
+	}
+}
+
+// Once AppendRows returns a result, cancellation makes the acknowledgement
+// ambiguous. The affected stream generation must be retired before another
+// exporterhelper attempt can reuse it.
+func TestAppendRetiresGenerationWhenAttemptEndsAfterDispatch(t *testing.T) {
+	for name, cancel := range map[string]func() (context.Context, context.CancelFunc){
+		"canceled": func() (context.Context, context.CancelFunc) {
+			return context.WithCancel(context.Background())
+		},
+		"deadline": func() (context.Context, context.CancelFunc) {
+			return context.WithTimeout(context.Background(), time.Nanosecond)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			pending := newControlledResult()
+			first := &scriptedStream{results: []appendResult{pending}}
+			second := &scriptedStream{results: []appendResult{fakeResult{}}}
+			w, createdWith := newScriptedWriter(first, second)
+			defer func() { _ = w.Close() }()
+
+			ctx, stop := cancel()
+			stop()
+			out := w.Append(ctx, [][]byte{{1}})
+
+			if out.Verdict.Class != Uncertain || out.Verdict.Label != LabelUncertainAck {
+				t.Fatalf("verdict = %s/%s, want uncertain/%s",
+					out.Verdict.Class, out.Verdict.Label, LabelUncertainAck)
+			}
+			if first.closeCount() != 1 {
+				t.Fatalf("retired stream was closed %d times, want 1", first.closeCount())
+			}
+
+			if next := w.Append(context.Background(), [][]byte{{2}}); next.Err != nil {
+				t.Fatalf("next attempt failed: %v", next.Err)
+			}
+			if len(*createdWith) != 2 {
+				t.Fatalf("created %d streams, want a fresh generation", len(*createdWith))
+			}
+		})
+	}
+}
+
+// Two append attempts can still be awaiting results from the same generation.
+// A late failure from that retired generation must never close the replacement
+// stream another attempt has already created.
+func TestLateOldGenerationFailureCannotRetireReplacement(t *testing.T) {
+	late := newControlledResult()
+	retireFirst := newControlledResult()
+	retireFirst.complete(status.Error(codes.FailedPrecondition, "finalized"))
+	old := &scriptedStream{results: []appendResult{late, retireFirst}}
+	replacement := &scriptedStream{results: []appendResult{fakeResult{}}}
+	w, _ := newScriptedWriter(old, replacement)
+
+	lateDone := make(chan AppendOutcome, 1)
+	go func() {
+		lateDone <- w.Append(context.Background(), [][]byte{{1}})
+	}()
+	<-late.started
+
+	if out := w.Append(context.Background(), [][]byte{{2}}); !out.Verdict.StreamRecreate {
+		t.Fatal("first failure should retire the old generation")
+	}
+	if out := w.Append(context.Background(), [][]byte{{3}}); out.Err != nil {
+		t.Fatalf("replacement append failed: %v", out.Err)
+	}
+
+	late.complete(status.Error(codes.FailedPrecondition, "finalized"))
+	select {
+	case <-lateDone:
+	case <-time.After(time.Second):
+		t.Fatal("late append did not finish")
+	}
+	if replacement.closeCount() != 0 {
+		t.Fatal("late failure from the old generation closed its replacement")
+	}
+}
+
+// GetResult returning the canceled attempt context does not mean the
+// managedwriter result itself is terminal. The writer must keep a bounded
+// lifecycle owner for that result until it resolves or the writer shuts down.
+func TestCanceledAttemptTracksResultToTerminalState(t *testing.T) {
+	pending := newControlledResult()
+	first := &scriptedStream{results: []appendResult{pending}}
+	w, _ := newScriptedWriter(first)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	out := w.Append(ctx, [][]byte{{1}})
+	if out.Verdict.Class != Uncertain {
+		t.Fatalf("class = %s, want uncertain", out.Verdict.Class)
+	}
+
+	// One call belongs to the canceled attempt; the second is the retained
+	// lifecycle owner. Without it the pending result is abandoned.
+	pending.waitForCalls(t, 2)
+	pending.complete(nil)
+	if err := w.Close(); err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+}
+
+func TestCanceledManagedStreamIsDistinguishedFromShutdown(t *testing.T) {
+	lifetimeCtx, cancelLifetime := context.WithCancel(context.Background())
+	w := &Writer{lifetimeCtx: lifetimeCtx}
+
+	v, ended := w.classifyAppendFailure(context.Background(), context.Canceled)
+	if ended || v.Label != LabelCanceled {
+		t.Fatalf("runtime cancellation = %s ended=%v, want %s/false", v.Label, ended, LabelCanceled)
+	}
+
+	cancelLifetime()
+	v, ended = w.classifyAppendFailure(context.Background(), context.Canceled)
+	if ended || v.Label != LabelShutdown {
+		t.Fatalf("shutdown cancellation = %s ended=%v, want %s/false", v.Label, ended, LabelShutdown)
+	}
+}
+
+// A backend may never resolve an abandoned result. Shutdown must cancel and
+// join the lifecycle waiter rather than leak it indefinitely.
+func TestCloseJoinsUnresolvedResultOwner(t *testing.T) {
+	pending := newControlledResult()
+	first := &scriptedStream{results: []appendResult{pending}}
+	w, _ := newScriptedWriter(first)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_ = w.Append(ctx, [][]byte{{1}})
+	pending.waitForCalls(t, 2)
+
+	closed := make(chan error, 1)
+	go func() { closed <- w.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("close failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not cancel and join the unresolved result owner")
 	}
 }
 

@@ -31,6 +31,11 @@ const writeAPITraceID = "otel-bigqueryexporter"
 // scopeWrite is the minimum OAuth scope for appending rows.
 const scopeWrite = "https://www.googleapis.com/auth/bigquery.insertdata"
 
+// newManagedWriterClient is the external constructor seam. Keeping it narrow
+// lets lifecycle tests prove which context is retained without opening a real
+// Storage Write API connection.
+var newManagedWriterClient = managedwriter.NewClient
+
 // rowAppender is the append surface the push paths depend on. Narrowing it to
 // an interface is what lets the FR6 subset logic be tested without a live
 // BigQuery client, which is the part most worth testing.
@@ -51,6 +56,8 @@ type signalExporter struct {
 	table  string
 	logger *zap.Logger
 	tel    *metadata.Telemetry
+
+	lifetimeCancel context.CancelFunc
 
 	client *managedwriter.Client
 	writer rowAppender
@@ -114,13 +121,24 @@ func (e *signalExporter) clientOptions(ctx context.Context) ([]option.ClientOpti
 	return opts, nil
 }
 
-func (e *signalExporter) start(ctx context.Context, _ component.Host) error {
-	copts, err := e.clientOptions(ctx)
+func (e *signalExporter) start(ctx context.Context, _ component.Host) (err error) {
+	// Start's context is scoped to component startup. managedwriter retains
+	// both its client and stream constructor contexts for background work, so
+	// give them an exporter-owned lifetime that ends only during cleanup.
+	lifetimeCtx, lifetimeCancel := context.WithCancel(context.Background())
+	e.lifetimeCancel = lifetimeCancel
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, e.shutdown(context.Background()))
+		}
+	}()
+
+	copts, err := e.clientOptions(lifetimeCtx)
 	if err != nil {
 		return err
 	}
 
-	client, err := managedwriter.NewClient(ctx, e.cfg.Project, copts...)
+	client, err := newManagedWriterClient(lifetimeCtx, e.cfg.Project, copts...)
 	if err != nil {
 		return fmt.Errorf("creating BigQuery Storage Write client: %w", err)
 	}
@@ -130,20 +148,16 @@ func (e *signalExporter) start(ctx context.Context, _ component.Host) error {
 	// discovered at append time costs a batch and produces a confusing error;
 	// discovered at startup it is a clear configuration failure.
 	if err := e.validateDestination(ctx); err != nil {
-		_ = client.Close()
-		e.client = nil
 		return err
 	}
 
 	enc, err := protoenc.New(e.schema)
 	if err != nil {
-		_ = client.Close()
-		e.client = nil
 		return err
 	}
 	e.enc = enc
 
-	e.writer = bqi.NewWriter(client, bqi.WriterOptions{
+	e.writer = bqi.NewWriter(lifetimeCtx, client, bqi.WriterOptions{
 		Project:             e.cfg.Project,
 		Dataset:             e.cfg.Dataset,
 		Table:               e.table,
@@ -229,11 +243,17 @@ func (e *signalExporter) shutdown(_ context.Context) error {
 		if err := e.writer.Close(); err != nil {
 			errs = append(errs, err)
 		}
+		e.writer = nil
 	}
 	if e.client != nil {
 		if err := e.client.Close(); err != nil {
 			errs = append(errs, err)
 		}
+		e.client = nil
+	}
+	if e.lifetimeCancel != nil {
+		e.lifetimeCancel()
+		e.lifetimeCancel = nil
 	}
 	return errors.Join(errs...)
 }

@@ -8,12 +8,15 @@ import (
 	"errors"
 	"testing"
 
+	"cloud.google.com/go/bigquery/storage/managedwriter"
+	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer/consumererror"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/otel/metric/noop"
 	"go.uber.org/zap"
+	"google.golang.org/api/option"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -28,6 +31,7 @@ type fakeAppender struct {
 	outcome  bqi.AppendOutcome
 	gotRows  int
 	appended int
+	closed   int
 }
 
 func (f *fakeAppender) Append(_ context.Context, rows [][]byte) bqi.AppendOutcome {
@@ -36,7 +40,7 @@ func (f *fakeAppender) Append(_ context.Context, rows [][]byte) bqi.AppendOutcom
 	return f.outcome
 }
 
-func (f *fakeAppender) Close() error { return nil }
+func (f *fakeAppender) Close() error { f.closed++; return nil }
 
 func newTestTraces(spans int) ptrace.Traces {
 	td := ptrace.NewTraces()
@@ -221,5 +225,59 @@ func TestPushLogs(t *testing.T) {
 	}
 	if app.gotRows != 2 {
 		t.Fatalf("appended %d rows, want 2", app.gotRows)
+	}
+}
+
+// Collector shutdown can be invoked again after a partial lifecycle failure.
+// Resource ownership must be consumed exactly once rather than closing an
+// already-closed stream a second time.
+func TestSignalExporterShutdownIsIdempotent(t *testing.T) {
+	app := &fakeAppender{}
+	e := &signalExporter{writer: app}
+
+	if err := e.shutdown(context.Background()); err != nil {
+		t.Fatalf("first shutdown failed: %v", err)
+	}
+	if err := e.shutdown(context.Background()); err != nil {
+		t.Fatalf("second shutdown failed: %v", err)
+	}
+	if app.closed != 1 {
+		t.Fatalf("writer closed %d times, want exactly once", app.closed)
+	}
+}
+
+// managedwriter retains its constructor context for background connection
+// management. Even a partial Start failure must cancel the exporter-owned
+// context instead of leaking that background lifetime.
+func TestSignalExporterStartFailureCancelsOwnedLifetime(t *testing.T) {
+	original := newManagedWriterClient
+	t.Cleanup(func() { newManagedWriterClient = original })
+
+	wantErr := errors.New("client construction failed")
+	var retained context.Context
+	newManagedWriterClient = func(
+		ctx context.Context, _ string, _ ...option.ClientOption,
+	) (*managedwriter.Client, error) {
+		retained = ctx
+		return nil, wantErr
+	}
+
+	cfg := validConfig()
+	e := newSignalExporter(
+		component.TelemetrySettings{Logger: zap.NewNop()},
+		cfg,
+		cfg.Traces.Table,
+		schema.SpansTableSchema(),
+	)
+	if err := e.start(context.Background(), nil); !errors.Is(err, wantErr) {
+		t.Fatalf("start error = %v, want %v", err, wantErr)
+	}
+	if retained == nil {
+		t.Fatal("managedwriter constructor did not receive a context")
+	}
+	select {
+	case <-retained.Done():
+	default:
+		t.Fatal("partial Start failure left the managedwriter lifetime context live")
 	}
 }
