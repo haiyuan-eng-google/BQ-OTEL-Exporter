@@ -4,6 +4,7 @@
 *.test
 /local/
 /bin/
+/otelcol-bq-dist/
 
 # Go workspace
 go.work

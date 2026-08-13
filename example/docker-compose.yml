@@ -1,14 +1,18 @@
 services:
   otelcollector:
-    image: otel/opentelemetry-collector-contrib:latest
+    image: bq-otel-collector:0.1.0-dev
+    build:
+      context: ..
+      dockerfile: example/Dockerfile
     command: ["--config=/etc/otel/config.yml"]
     environment:
       - BQ_PROJECT=${BQ_PROJECT}
       - BQ_DATASET=${BQ_DATASET}
+      - BQ_LOCATION=${BQ_LOCATION:-US}
       - GOOGLE_APPLICATION_CREDENTIALS=/creds/adc.json
     volumes:
       - ./otel-collector-config.yml:/etc/otel/config.yml:ro
-      - ${HOME}/.config/gcloud/application_default_credentials.json:/creds/adc.json:ro
+      - ${BQ_ADC_PATH:?Set BQ_ADC_PATH to an ADC JSON file}:/creds/adc.json:ro
     ports:
       - "4317:4317"
       - "4318:4318"

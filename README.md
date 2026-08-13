@@ -23,11 +23,10 @@ This component has exactly one job: **reliable transport with a stable,
 documented schema.** It is not an analytics product. It does not aggregate,
 sample, downsample, or interpret telemetry.
 
-> **Status: pre-alpha.** All twelve P0 requirements are implemented and unit
-> tested: the write path is real and appends through `managedwriter` on the
-> default stream. What is *not* yet done is proving it against live BigQuery —
-> there are no integration tests, no crash-replay test, and no performance
-> evidence. Treat the numbers in this README as targets, not measurements.
+> **Status: pre-alpha.** The write path has run against live BigQuery, and the
+> repository now includes an opt-in live lifecycle test. The test is not run by
+> pull-request CI, and there is still no crash-replay or performance evidence.
+> Treat throughput numbers in this README as targets, not measurements.
 
 ## Design
 
@@ -37,6 +36,34 @@ document; the rationale behind each decision is restated here and in the code
 comments so the repository stands on its own.
 
 ## Getting started
+
+The stock `otelcol-contrib` image does not contain this repository's exporter.
+Build the pinned custom distribution and verify both component registration and
+configuration parsing without credentials:
+
+```bash
+make collector-check
+```
+
+For the Docker Compose path, choose a dataset name and an ADC file. The example
+opts into creating the dataset, the active trace/log tables, and their
+create-only deduplication views, so the identity needs the creation permissions
+listed under [IAM](#iam).
+
+```bash
+export BQ_PROJECT=my-project
+export BQ_DATASET=otel
+export BQ_LOCATION=US
+export BQ_ADC_PATH="$HOME/.config/gcloud/application_default_credentials.json"
+docker compose -f example/docker-compose.yml up --build
+```
+
+The collector listens on OTLP/gRPC `localhost:4317` and OTLP/HTTP
+`localhost:4318`. For a pre-provisioned destination, disable the two
+`auto_create` flags in the example config and grant only metadata-read plus
+append permissions.
+
+The equivalent exporter fragment is:
 
 ```yaml
 exporters:
@@ -201,7 +228,7 @@ authorization result.
 | --------- | -------- |
 | **M1** | Write path on the Storage Write API default stream; `v0alpha1` schema for traces and logs; request sizing and the error matrix. **Code complete; throughput not yet validated.** |
 | **M2** | Provisional performance envelope; dedup views exercised; crash-replay and in-process subset-retry tests; delivery-critical telemetry proven under fault injection. |
-| **M3** | Optional `auto_create` plus startup validation; security guide; formal performance and cost evidence. |
+| **M3** | Optional `auto_create` plus startup validation are implemented; security guide and formal performance/cost evidence remain. |
 
 ## Contributing
 

@@ -23,6 +23,10 @@ exporters:
   bigquery:
     project: ${env:BQ_PROJECT}
     dataset: ${env:BQ_DATASET}
+    location: ${env:BQ_LOCATION}
+    auto_create:
+      dataset: true
+      tables: true
     traces:
       table: otel_spans
     logs:
@@ -34,6 +38,21 @@ exporters:
       max_elapsed_time: 900s
     sending_queue:
       enabled: true
+
+  # Optional diagnostic sink. Do not enable casually: OTLP JSON can contain
+  # prompts, completions, task descriptions, and other customer data. Keep the
+  # file on an access-controlled encrypted volume and set an explicit retention
+  # policy. append defaults to false, so a collector restart truncates the file;
+  # append: true preserves it but cannot be combined with rotation.
+  # file/diagnostic:
+  #   path: /var/lib/otel/diagnostic.jsonl
+  #   append: false
+  #   create_directory: true
+  #   directory_permissions: "0700"
+  #   rotation:
+  #     max_megabytes: 100
+  #     max_days: 1
+  #     max_backups: 2
 
 service:
   telemetry:

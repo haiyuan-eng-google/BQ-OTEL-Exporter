@@ -29,3 +29,21 @@ jobs:
         run: go vet ./...
       - name: Test
         run: go test -race -cover ./...
+
+  collector-example:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build pinned custom Collector image
+        run: docker build --tag bq-otel-collector:test --file example/Dockerfile .
+      - name: Verify BigQuery component is registered
+        run: docker run --rm bq-otel-collector:test components | grep -q bigquery
+      - name: Validate example config without credentials
+        run: >-
+          docker run --rm
+          -e BQ_PROJECT=my-project
+          -e BQ_DATASET=otel
+          -e BQ_LOCATION=US
+          -v "${{ github.workspace }}/example/otel-collector-config.yml:/etc/otel/config.yml:ro"
+          bq-otel-collector:test
+          validate --config=/etc/otel/config.yml
