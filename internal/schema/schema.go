@@ -4,10 +4,10 @@
 // Package schema holds the versioned BigQuery table contract (§7 of the design
 // doc) and the canonical deduplication SQL that goes with it (§7.4).
 //
-// The DDL here is the source of truth for the table shape. It must track §7.1
-// and §7.2 column for column: downstream queries and dbt models pin against
-// this contract, so a divergence between the doc and this file is a bug in
-// whichever one is wrong.
+// The DDL here is the operator-facing representation of the typed TableSchema
+// contract in tableschema.go. It must track §7.1 and §7.2 column for column:
+// downstream queries and dbt models pin against this contract, so divergence
+// between either representation is a bug.
 package schema // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 
 // Version is the per-row schema_version value.
@@ -143,12 +143,18 @@ PARTITION BY DATE(timestamp);
 // of the approved §7.1 contract.
 const SpansDedupViewDDL = `
 CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s.%[3]s_dedup`" + ` AS
+` + SpansDedupViewQuery + `;
+`
+
+// SpansDedupViewQuery is shared by operator-run DDL and metadata-API view
+// creation so their deduplication behavior cannot drift.
+const SpansDedupViewQuery = `
 SELECT * FROM ` + "`%[1]s.%[2]s.%[3]s`" + `
 QUALIFY ROW_NUMBER() OVER (
   PARTITION BY trace_id, span_id
   ORDER BY CAST(end_time_unix_nano AS BIGNUMERIC) DESC,
            export_received_timestamp DESC
-) = 1;
+) = 1
 `
 
 // LogsDedupViewDDL is the canonical log deduplication view (§7.4).
@@ -169,6 +175,12 @@ QUALIFY ROW_NUMBER() OVER (
 // available only through the trusted namespace/ID tuple.
 const LogsDedupViewDDL = `
 CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s.%[3]s_dedup`" + ` AS
+` + LogsDedupViewQuery + `;
+`
+
+// LogsDedupViewQuery is shared by operator-run DDL and metadata-API view
+// creation so their deduplication behavior cannot drift.
+const LogsDedupViewQuery = `
 SELECT * FROM ` + "`%[1]s.%[2]s.%[3]s`" + `
 QUALIFY ROW_NUMBER() OVER (
   PARTITION BY
@@ -177,7 +189,7 @@ QUALIFY ROW_NUMBER() OVER (
     IF(source_record_namespace IS NOT NULL AND source_record_id IS NOT NULL,
        source_record_id, record_fingerprint)
   ORDER BY export_received_timestamp DESC
-) = 1;
+) = 1
 `
 
 // FingerprintPrefix is the version tag on record_fingerprint values, which are

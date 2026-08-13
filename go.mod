@@ -4,6 +4,7 @@ go 1.26.5
 
 require (
 	cloud.google.com/go/bigquery v1.79.1
+	github.com/googleapis/gax-go/v2 v2.23.0
 	go.opentelemetry.io/collector/component v1.64.0
 	go.opentelemetry.io/collector/config/configoptional v1.64.0
 	go.opentelemetry.io/collector/config/configretry v1.64.0
@@ -41,7 +42,6 @@ require (
 	github.com/google/s2a-go v0.1.9 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.20 // indirect
-	github.com/googleapis/gax-go/v2 v2.23.0 // indirect
 	github.com/hashicorp/go-version v1.9.0 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect

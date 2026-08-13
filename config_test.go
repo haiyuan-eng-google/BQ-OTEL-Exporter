@@ -46,8 +46,22 @@ func TestValidateRejects(t *testing.T) {
 			c.Credentials.File = "/k.json"
 			c.Credentials.ImpersonateServiceAccount = "sa@p.iam.gserviceaccount.com"
 		}, "mutually exclusive"},
-		"insecure without endpoint":   {func(c *Config) { c.Endpoint.Insecure = true }, "endpoint.insecure requires endpoint.url"},
-		"no-auth without endpoint":    {func(c *Config) { c.Endpoint.WithoutAuthentication = true }, "requires endpoint.url"},
+		"insecure without endpoint": {func(c *Config) { c.Endpoint.Insecure = true }, "endpoint.insecure requires endpoint.url"},
+		"no-auth without endpoint":  {func(c *Config) { c.Endpoint.WithoutAuthentication = true }, "requires endpoint.url"},
+		"no-auth with dataset creation": {func(c *Config) {
+			c.Endpoint.URL = "localhost:9050"
+			c.Endpoint.WithoutAuthentication = true
+			c.AutoCreate.Dataset = true
+			c.Location = "US"
+		}, "auto_create.dataset cannot be enabled"},
+		"no-auth with table creation": {func(c *Config) {
+			c.Endpoint.URL = "localhost:9050"
+			c.Endpoint.WithoutAuthentication = true
+			c.AutoCreate.Tables = true
+		}, "auto_create.tables cannot be enabled"},
+		"zero exporter timeout": {func(c *Config) {
+			c.TimeoutSettings.Timeout = 0
+		}, "timeout must be positive"},
 		"unbounded retry horizon":     {func(c *Config) { c.BackOffConfig.MaxElapsedTime = 0 }, "must be finite"},
 		"source id without namespace": {func(c *Config) { c.Logs.SourceRecordIDAttribute = "uid" }, "not a record identity"},
 	}

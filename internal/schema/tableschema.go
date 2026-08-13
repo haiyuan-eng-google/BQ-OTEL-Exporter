@@ -7,10 +7,9 @@ import (
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 )
 
-// The DDL in schema.go is what an operator runs; the TableSchema values here
-// are what the exporter writes against. They describe the same contract and
-// must not drift, which schema_test.go enforces by diffing the column names in
-// one against the other.
+// The TableSchema values here are the canonical typed contracts. Table
+// creation and row encoding both derive from them; schema.go carries the
+// equivalent operator-run DDL and the shared deduplication queries.
 
 const (
 	req  = storagepb.TableFieldSchema_REQUIRED

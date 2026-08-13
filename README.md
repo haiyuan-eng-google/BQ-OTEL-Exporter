@@ -23,11 +23,10 @@ This component has exactly one job: **reliable transport with a stable,
 documented schema.** It is not an analytics product. It does not aggregate,
 sample, downsample, or interpret telemetry.
 
-> **Status: pre-alpha.** All twelve P0 requirements are implemented and unit
-> tested: the write path is real and appends through `managedwriter` on the
-> default stream. What is *not* yet done is proving it against live BigQuery —
-> there are no integration tests, no crash-replay test, and no performance
-> evidence. Treat the numbers in this README as targets, not measurements.
+> **Status: pre-alpha.** The write path has run against live BigQuery, and the
+> repository now includes an opt-in live lifecycle test. The test is not run by
+> pull-request CI, and there is still no crash-replay or performance evidence.
+> Treat throughput numbers in this README as targets, not measurements.
 
 ## Design
 
@@ -37,6 +36,34 @@ document; the rationale behind each decision is restated here and in the code
 comments so the repository stands on its own.
 
 ## Getting started
+
+The stock `otelcol-contrib` image does not contain this repository's exporter.
+Build the pinned custom distribution and verify both component registration and
+configuration parsing without credentials:
+
+```bash
+make collector-check
+```
+
+For the Docker Compose path, choose a dataset name and an ADC file. The example
+opts into creating the dataset, the active trace/log tables, and their
+create-only deduplication views, so the identity needs the creation permissions
+listed under [IAM](#iam).
+
+```bash
+export BQ_PROJECT=my-project
+export BQ_DATASET=otel
+export BQ_LOCATION=US
+export BQ_ADC_PATH="$HOME/.config/gcloud/application_default_credentials.json"
+docker compose -f example/docker-compose.yml up --build
+```
+
+The collector listens on OTLP/gRPC `localhost:4317` and OTLP/HTTP
+`localhost:4318`. For a pre-provisioned destination, disable the two
+`auto_create` flags in the example config and grant only metadata-read plus
+append permissions.
+
+The equivalent exporter fragment is:
 
 ```yaml
 exporters:
@@ -58,6 +85,19 @@ service:
       exporters: [bigquery]
 ```
 
+## Agent framework inputs
+
+“Supports OTLP” is not the same as “works with environment variables only.”
+The execution-verified [agent framework guide](docs/agent-frameworks.md) records
+the activation tier, gRPC/HTTP support, signal placement, content defaults, and
+privacy caveats for Claude Code/Agent SDK, Google ADK, LangGraph, OpenAI,
+CrewAI, AWS Bedrock, and Microsoft Agent Framework.
+
+Two collector settings are non-negotiable for that matrix: enable both OTLP
+receivers because ADK and LangGraph are HTTP-only on their built-in paths, and
+keep the logs pipeline because several frameworks emit model content or cost
+as log events rather than span attributes.
+
 ## Configuration
 
 | Option                          | Default               | Description |
@@ -75,13 +115,13 @@ service:
 | `endpoint.insecure`             | `false`               | Disables TLS. Refused unless the endpoint is loopback. |
 | `endpoint.without_authentication` | `false`             | Sends no credentials. Refused unless the endpoint is loopback. |
 | `auto_create.dataset`           | `false`               | Create the dataset if absent. Requires `location`. |
-| `auto_create.tables`            | `false`               | Create the destination tables if absent. |
+| `auto_create.tables`            | `false`               | Create the active signal's destination table and create-only `_dedup` view if absent. Existing views are never replaced. |
 | `write.max_request_bytes`       | `8388608` (8 MiB)     | Our request-size headroom threshold, enforced after protobuf serialization and before `AppendRows`. Distinct from, and below, the API's own per-request limit. |
 | `write.max_row_bytes`           | `1048576` (1 MiB)     | Rejects individual serialized rows above this size. |
 | `write.max_inflight_requests`   | `8`                   | Bounds asynchronous in-flight appends. |
 | `write.max_inflight_bytes`      | `67108864` (64 MiB)   | Bounds memory held by in-flight appends. |
 | `limits.*`                      | see below             | Structural bounds applied before serialization. |
-| `sending_queue`                 | collector defaults    | Standard `exporterhelper` queue, including the persistent queue. |
+| `sending_queue`                 | 8 consumers           | Standard `exporterhelper` queue, including the persistent queue. Consumer concurrency defaults to the managedwriter request window. |
 | `retry_on_failure`              | `max_elapsed_time: 900s` | Standard `exporterhelper` retry. The horizon must be finite. |
 | `timeout`                       | collector defaults    | Per-request timeout. |
 
@@ -100,8 +140,13 @@ offending record, counted under `rejected_rows{reason}`.
 | `limits.max_collection_size`| `4096`   |
 | `limits.max_value_bytes`    | `262144` |
 
-`auto_create` is off by default deliberately: leaving it off keeps the exporter
-on a write-only IAM path.
+`auto_create` is off by default deliberately: leaving it off avoids dataset,
+table, and view creation permissions. Startup still reads destination metadata
+to distinguish an absent resource from an authorization ambiguity and to
+validate the complete typed schema before opening the Storage Write client.
+An authoritative `NotFound` fails startup with the corresponding
+`auto_create` setting named in the error; other metadata-read failures warn and
+defer the authorization verdict to the real append.
 
 ### Promoted attributes — not in v1
 
@@ -141,6 +186,36 @@ default object an analyst touches is already deduplicated. See
 > byte-identical log records collapse into one. This is inherent to
 > fingerprinting.
 
+### Stream recovery and diagnostics
+
+The managedwriter client and stream use an exporter-owned lifecycle context;
+per-attempt timeouts are used only for dispatch/result waits. If an attempt
+ends after dispatch, that stream generation is retired before exporterhelper
+replays the batch, and every returned `AppendResult` keeps a lifecycle owner
+until it resolves or the exporter shuts down. This is what lets a later append
+recover without restarting the collector.
+
+The default queue has eight consumers, matching
+`write.max_inflight_requests: 8`. If you raise queue concurrency above the
+managedwriter request window, blocked senders consume their timeout budget
+while waiting for flow-control capacity; load-test that relationship before
+deploying it.
+
+Use these content-free self-telemetry instruments to detect a stuck path:
+
+| Metric | Meaning |
+| --- | --- |
+| `otelcol_exporter_bigquery_inflight_requests` | Dispatched append results not yet terminal. |
+| `otelcol_exporter_bigquery_unresolved_results` | Results being drained after their original attempt ended. |
+| `otelcol_exporter_bigquery_append_result_wait` | Dispatch-to-terminal wait duration in seconds. |
+| `otelcol_exporter_bigquery_timeouts_after_dispatch` | Attempts that ended after dispatch began. |
+| `otelcol_exporter_bigquery_stream_retirements` | Unsafe stream generations retired for recovery. |
+
+Both current-value instruments should return to zero after recovery or clean
+shutdown. A sustained nonzero value, rising timeout/retirement counters, or
+queue drops indicates “accepted by the collector, not yet confirmed by
+BigQuery.”
+
 ### Materializing the dedup view
 
 If per-query scan cost matters, materialize it — but **not** as a
@@ -160,16 +235,19 @@ the `MERGE` is only ever the optimization.
 
 ## IAM
 
-The least-privilege path for pre-created tables is a **write-only custom role**
-centered on `bigquery.tables.updateData`, plus `bigquery.tables.get` for startup
-validation. `roles/bigquery.dataEditor` is the convenient broader alternative,
-not the least-privilege one. Create permissions are needed only when the
-corresponding `auto_create` flag is on.
+The least-privilege path for pre-created tables is a custom role centered on
+`bigquery.tables.updateData`, plus `bigquery.datasets.get` and
+`bigquery.tables.get` for startup validation. `roles/bigquery.dataEditor` is
+the convenient broader alternative, not the least-privilege one. Dataset,
+table, and view create permissions are needed only when the corresponding
+`auto_create` flag is on. Both the metadata and Storage Write clients use the
+same configured credentials or impersonated service-account identity.
 
-Startup permission preflight is **best-effort, not authoritative**: BigQuery
-documents that `tables.testIamPermissions` is not intended for authorization
-checking and may fail open, and `tables.get` proves metadata access rather than
-write access. Preflight warns; it does not gate startup on its own verdict.
+Startup permission preflight is **best-effort, not authoritative**: a metadata
+`NotFound` is authoritative for provisioning and fails fast when creation is
+disabled. Other metadata failures prove neither absence nor write denial, so
+they warn rather than blocking startup; the append reports the real write
+authorization result.
 
 ## What this deliberately does not do
 
@@ -193,7 +271,7 @@ write access. Preflight warns; it does not gate startup on its own verdict.
 | --------- | -------- |
 | **M1** | Write path on the Storage Write API default stream; `v0alpha1` schema for traces and logs; request sizing and the error matrix. **Code complete; throughput not yet validated.** |
 | **M2** | Provisional performance envelope; dedup views exercised; crash-replay and in-process subset-retry tests; delivery-critical telemetry proven under fault injection. |
-| **M3** | Optional `auto_create` plus startup validation; security guide; formal performance and cost evidence. |
+| **M3** | Optional `auto_create` plus startup validation are implemented; security guide and formal performance/cost evidence remain. |
 
 ## Contributing
 

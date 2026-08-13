@@ -93,6 +93,7 @@ const (
 	LabelInvalidArgument = "invalid_argument"
 	LabelUncertainAck    = "uncertain_ack"
 	LabelConnection      = "connection"
+	LabelCanceled        = "request_canceled"
 	LabelShutdown        = "shutdown_timeout"
 	LabelUnknown         = "unknown"
 )
@@ -131,7 +132,7 @@ func Classify(err error) Verdict {
 			// fired, so a replay can duplicate.
 			return Verdict{Uncertain, OwnerExporterHelper, LabelUncertainAck, false}
 		case errors.Is(err, context.Canceled):
-			return Verdict{Retryable, OwnerExporterHelper, LabelShutdown, false}
+			return Verdict{Retryable, OwnerExporterHelper, LabelCanceled, false}
 		default:
 			return Verdict{Permanent, OwnerExporter, LabelUnknown, false}
 		}
@@ -154,7 +155,7 @@ func Classify(err error) Verdict {
 		return Verdict{Uncertain, OwnerExporterHelper, LabelUncertainAck, false}
 
 	case codes.Canceled:
-		return Verdict{Retryable, OwnerExporterHelper, LabelShutdown, false}
+		return Verdict{Retryable, OwnerExporterHelper, LabelCanceled, false}
 
 	case codes.PermissionDenied:
 		// Fail fast and name the permission: an operator cannot fix this by
