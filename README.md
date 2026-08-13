@@ -85,6 +85,19 @@ service:
       exporters: [bigquery]
 ```
 
+## Agent framework inputs
+
+“Supports OTLP” is not the same as “works with environment variables only.”
+The execution-verified [agent framework guide](docs/agent-frameworks.md) records
+the activation tier, gRPC/HTTP support, signal placement, content defaults, and
+privacy caveats for Claude Code/Agent SDK, Google ADK, LangGraph, OpenAI,
+CrewAI, AWS Bedrock, and Microsoft Agent Framework.
+
+Two collector settings are non-negotiable for that matrix: enable both OTLP
+receivers because ADK and LangGraph are HTTP-only on their built-in paths, and
+keep the logs pipeline because several frameworks emit model content or cost
+as log events rather than span attributes.
+
 ## Configuration
 
 | Option                          | Default               | Description |
