@@ -6,6 +6,7 @@ package bigquery
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -96,7 +97,7 @@ type fakeObserver struct {
 	unresolved  int64
 	waits       int
 	timeouts    int
-	recreations int
+	retirements int
 }
 
 func (o *fakeObserver) RecordInflightRequests(_ context.Context, delta int64) {
@@ -123,16 +124,16 @@ func (o *fakeObserver) RecordTimeoutAfterDispatch(context.Context) {
 	o.timeouts++
 }
 
-func (o *fakeObserver) RecordStreamRecreation(context.Context) {
+func (o *fakeObserver) RecordStreamRetirement(context.Context) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.recreations++
+	o.retirements++
 }
 
-func (o *fakeObserver) snapshot() (inflight, unresolved int64, waits, timeouts, recreations int) {
+func (o *fakeObserver) snapshot() (inflight, unresolved int64, waits, timeouts, retirements int) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	return o.inflight, o.unresolved, o.waits, o.timeouts, o.recreations
+	return o.inflight, o.unresolved, o.waits, o.timeouts, o.retirements
 }
 
 func (f *fakeStream) AppendRows(_ context.Context, _ [][]byte, _ ...managedwriter.AppendOption) (appendResult, error) {
@@ -266,10 +267,11 @@ func newScriptedWriter(streams ...stream) (*Writer, *[]context.Context) {
 	next := 0
 	w := &Writer{
 		opts: WriterOptions{
-			Project:         "p",
-			Dataset:         "d",
-			Table:           "t",
-			MaxRequestBytes: 1,
+			Project:             "p",
+			Dataset:             "d",
+			Table:               "t",
+			MaxRequestBytes:     1,
+			MaxInflightRequests: 8,
 		},
 		factory: func(ctx context.Context, _ ...managedwriter.WriterOption) (stream, error) {
 			createdWith = append(createdWith, ctx)
@@ -284,6 +286,205 @@ func newScriptedWriter(streams ...stream) (*Writer, *[]context.Context) {
 	return w, &createdWith
 }
 
+type blockingFactory struct {
+	mu sync.Mutex
+
+	calls    int
+	started  chan struct{}
+	release  chan struct{}
+	canceled chan struct{}
+	stream   stream
+	once     sync.Once
+}
+
+func newBlockingFactory(s stream) *blockingFactory {
+	return &blockingFactory{
+		started:  make(chan struct{}),
+		release:  make(chan struct{}),
+		canceled: make(chan struct{}),
+		stream:   s,
+	}
+}
+
+func (f *blockingFactory) create(ctx context.Context, _ ...managedwriter.WriterOption) (stream, error) {
+	f.mu.Lock()
+	f.calls++
+	f.mu.Unlock()
+	f.once.Do(func() { close(f.started) })
+	select {
+	case <-ctx.Done():
+		close(f.canceled)
+		return nil, ctx.Err()
+	case <-f.release:
+		return f.stream, nil
+	}
+}
+
+func (f *blockingFactory) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+type stickyNoACKStream struct {
+	result *controlledResult
+
+	mu     sync.Mutex
+	closed int
+}
+
+func newStickyNoACKStream() *stickyNoACKStream {
+	return &stickyNoACKStream{result: newControlledResult()}
+}
+
+func (s *stickyNoACKStream) AppendRows(
+	context.Context, [][]byte, ...managedwriter.AppendOption,
+) (appendResult, error) {
+	return s.result, nil
+}
+
+func (s *stickyNoACKStream) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed++
+	return nil
+}
+
+type flowWindowResult struct {
+	once    sync.Once
+	release func()
+}
+
+func (r *flowWindowResult) GetResult(context.Context) (int64, error) {
+	r.once.Do(r.release)
+	return 0, nil
+}
+
+func (r *flowWindowResult) FullResponse(context.Context) (*storagepb.AppendRowsResponse, error) {
+	return nil, nil
+}
+
+type flowWindowStream struct {
+	slots     chan struct{}
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func newFlowWindowStream(size int) *flowWindowStream {
+	return &flowWindowStream{slots: make(chan struct{}, size), closed: make(chan struct{})}
+}
+
+func (s *flowWindowStream) AppendRows(
+	ctx context.Context, _ [][]byte, _ ...managedwriter.AppendOption,
+) (appendResult, error) {
+	select {
+	case s.slots <- struct{}{}:
+		return &flowWindowResult{release: func() { <-s.slots }}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-s.closed:
+		return nil, context.Canceled
+	}
+}
+
+func (s *flowWindowStream) Close() error {
+	s.closeOnce.Do(func() { close(s.closed) })
+	return nil
+}
+
+type concurrentFlowWindowStream struct {
+	slots  chan struct{}
+	closed chan struct{}
+
+	mu         sync.Mutex
+	firstByRow map[byte]bool
+	firstsSeen chan struct{}
+	firstsOnce sync.Once
+	closeOnce  sync.Once
+}
+
+func newConcurrentFlowWindowStream(size int) *concurrentFlowWindowStream {
+	return &concurrentFlowWindowStream{
+		slots:      make(chan struct{}, size),
+		closed:     make(chan struct{}),
+		firstByRow: make(map[byte]bool),
+		firstsSeen: make(chan struct{}),
+	}
+}
+
+func (s *concurrentFlowWindowStream) AppendRows(
+	ctx context.Context, rows [][]byte, _ ...managedwriter.AppendOption,
+) (appendResult, error) {
+	select {
+	case s.slots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-s.closed:
+		return nil, context.Canceled
+	}
+
+	rowID := rows[0][0]
+	s.mu.Lock()
+	first := !s.firstByRow[rowID]
+	s.firstByRow[rowID] = true
+	if len(s.firstByRow) == 2 {
+		s.firstsOnce.Do(func() { close(s.firstsSeen) })
+	}
+	s.mu.Unlock()
+	if first {
+		select {
+		case <-s.firstsSeen:
+		case <-ctx.Done():
+			<-s.slots
+			return nil, ctx.Err()
+		case <-s.closed:
+			<-s.slots
+			return nil, context.Canceled
+		}
+	}
+	return &flowWindowResult{release: func() { <-s.slots }}, nil
+}
+
+func (s *concurrentFlowWindowStream) Close() error {
+	s.closeOnce.Do(func() { close(s.closed) })
+	return nil
+}
+
+type closeCompletesStream struct {
+	result *controlledResult
+	once   sync.Once
+}
+
+func (s *closeCompletesStream) AppendRows(
+	context.Context, [][]byte, ...managedwriter.AppendOption,
+) (appendResult, error) {
+	return s.result, nil
+}
+
+func (s *closeCompletesStream) Close() error {
+	s.once.Do(func() { s.result.complete(context.Canceled) })
+	return nil
+}
+
+type lifecycleBoundCloseStream struct {
+	ctx context.Context
+}
+
+func (s *lifecycleBoundCloseStream) AppendRows(
+	context.Context, [][]byte, ...managedwriter.AppendOption,
+) (appendResult, error) {
+	return fakeResult{}, nil
+}
+
+func (s *lifecycleBoundCloseStream) Close() error {
+	select {
+	case <-s.ctx.Done():
+		return nil
+	case <-time.After(100 * time.Millisecond):
+		return errors.New("stream lifecycle was not canceled before Close")
+	}
+}
+
 func TestAppendSuccess(t *testing.T) {
 	s := &fakeStream{results: []appendResult{fakeResult{}}}
 	out := newTestWriter(s).Append(context.Background(), [][]byte{{1}, {2}, {3}})
@@ -293,6 +494,358 @@ func TestAppendSuccess(t *testing.T) {
 	}
 	if out.AcknowledgedRows != 3 {
 		t.Fatalf("acknowledged %d rows, want 3", out.AcknowledgedRows)
+	}
+}
+
+func TestAppendStopsWaitingForStreamCreationAndCloseCancelsConstructor(t *testing.T) {
+	factory := newBlockingFactory(&scriptedStream{results: []appendResult{fakeResult{}}})
+	w := &Writer{
+		opts:        WriterOptions{Project: "p", Dataset: "d", Table: "t", MaxRequestBytes: 1},
+		lifetimeCtx: context.Background(),
+		factory:     factory.create,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	appendDone := make(chan AppendOutcome, 1)
+	go func() { appendDone <- w.Append(ctx, [][]byte{{1}}) }()
+	<-factory.started
+
+	var out AppendOutcome
+	select {
+	case out = <-appendDone:
+	case <-time.After(250 * time.Millisecond):
+		close(factory.release)
+		<-appendDone
+		_ = w.Close()
+		t.Fatal("Append did not stop waiting when its attempt context expired")
+	}
+	if !errors.Is(out.Err, context.DeadlineExceeded) {
+		t.Fatalf("append error = %v, want deadline exceeded", out.Err)
+	}
+	if out.Verdict.Class != Retryable || out.Verdict.Label == LabelUncertainAck {
+		t.Fatalf("pre-dispatch verdict = %s/%s, want retryable and not uncertain",
+			out.Verdict.Class, out.Verdict.Label)
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- w.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not cancel and join the stream constructor")
+	}
+	select {
+	case <-factory.canceled:
+	default:
+		t.Fatal("stream constructor context was not canceled by Close")
+	}
+}
+
+func TestCloseJoinsAndDiscardsLateConstructedStream(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	late := &scriptedStream{}
+	w := &Writer{
+		opts: WriterOptions{Project: "p", Dataset: "d", Table: "t", MaxRequestBytes: 1},
+		factory: func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+			close(started)
+			<-release
+			return late, nil
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	appendDone := make(chan AppendOutcome, 1)
+	go func() { appendDone <- w.Append(ctx, [][]byte{{1}}) }()
+	<-started
+	if out := <-appendDone; !errors.Is(out.Err, context.DeadlineExceeded) {
+		t.Fatalf("append error = %v, want deadline exceeded", out.Err)
+	}
+
+	firstClose := make(chan error, 1)
+	secondClose := make(chan error, 1)
+	go func() { firstClose <- w.Close() }()
+	go func() { secondClose <- w.Close() }()
+	select {
+	case <-firstClose:
+		t.Fatal("Close returned before the in-progress constructor terminated")
+	case <-secondClose:
+		t.Fatal("concurrent Close returned before the first Close completed")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	for i, result := range []<-chan error{firstClose, secondClose} {
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatalf("Close %d returned %v", i+1, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("Close %d did not join the constructor", i+1)
+		}
+	}
+	if got := late.closeCount(); got != 1 {
+		t.Fatalf("late constructed stream closed %d times, want once", got)
+	}
+}
+
+func TestConcurrentAppendsShareStreamCreation(t *testing.T) {
+	s := &scriptedStream{results: []appendResult{fakeResult{}}}
+	factory := newBlockingFactory(s)
+	w := &Writer{
+		opts:        WriterOptions{Project: "p", Dataset: "d", Table: "t", MaxRequestBytes: 1},
+		lifetimeCtx: context.Background(),
+		factory:     factory.create,
+	}
+	defer func() { _ = w.Close() }()
+
+	firstDone := make(chan AppendOutcome, 1)
+	go func() { firstDone <- w.Append(context.Background(), [][]byte{{1}}) }()
+	<-factory.started
+
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancelWait()
+	waiterDone := make(chan AppendOutcome, 1)
+	go func() { waiterDone <- w.Append(waitCtx, [][]byte{{2}}) }()
+	select {
+	case out := <-waiterDone:
+		if !errors.Is(out.Err, context.DeadlineExceeded) {
+			t.Fatalf("waiting append error = %v, want deadline exceeded", out.Err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		close(factory.release)
+		<-firstDone
+		<-waiterDone
+		t.Fatal("concurrent waiter ignored its attempt deadline")
+	}
+	if got := factory.callCount(); got != 1 {
+		t.Fatalf("stream factory called %d times while creation was shared, want 1", got)
+	}
+
+	close(factory.release)
+	if out := <-firstDone; out.Err != nil {
+		t.Fatalf("first append failed after shared creation: %v", out.Err)
+	}
+	if got := factory.callCount(); got != 1 {
+		t.Fatalf("stream factory called %d times, want 1", got)
+	}
+}
+
+func TestRetiredGenerationWindowBoundsRepeatedNoACK(t *testing.T) {
+	var mu sync.Mutex
+	var streams []*stickyNoACKStream
+	w := &Writer{
+		opts:        WriterOptions{Project: "p", Dataset: "d", Table: "t", MaxRequestBytes: 1},
+		lifetimeCtx: context.Background(),
+		factory: func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+			s := newStickyNoACKStream()
+			mu.Lock()
+			streams = append(streams, s)
+			mu.Unlock()
+			return s, nil
+		},
+	}
+
+	appendAndCancel := func() AppendOutcome {
+		mu.Lock()
+		before := len(streams)
+		mu.Unlock()
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan AppendOutcome, 1)
+		go func() { done <- w.Append(ctx, [][]byte{{1}}) }()
+		for {
+			mu.Lock()
+			var latest *stickyNoACKStream
+			if len(streams) > before {
+				latest = streams[len(streams)-1]
+			}
+			mu.Unlock()
+			if latest != nil {
+				select {
+				case <-latest.result.started:
+					cancel()
+					return <-done
+				default:
+				}
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	for range 2 {
+		if out := appendAndCancel(); out.Verdict.Class != Uncertain {
+			t.Fatalf("canceled append class = %s, want uncertain", out.Verdict.Class)
+		}
+	}
+
+	thirdCtx, cancelThird := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	third := w.Append(thirdCtx, [][]byte{{3}})
+	cancelThird()
+	if !errors.Is(third.Err, context.DeadlineExceeded) {
+		t.Fatalf("third append error = %v, want deadline while generation window is full", third.Err)
+	}
+	if third.Verdict.Class != Retryable || third.Verdict.Label == LabelUncertainAck {
+		t.Fatalf("pre-dispatch verdict = %s/%s, want retryable and not uncertain",
+			third.Verdict.Class, third.Verdict.Label)
+	}
+
+	mu.Lock()
+	created := len(streams)
+	owned := append([]*stickyNoACKStream(nil), streams...)
+	mu.Unlock()
+	for _, s := range owned {
+		s.result.complete(nil)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if created != 2 {
+		t.Fatalf("created %d unresolved stream generations, want hard bound 2", created)
+	}
+}
+
+func TestAppendDrainsAtConfiguredFlowWindow(t *testing.T) {
+	s := newFlowWindowStream(2)
+	w := &Writer{
+		opts: WriterOptions{
+			Project: "p", Dataset: "d", Table: "t", MaxRequestBytes: 1, MaxInflightRequests: 2,
+		},
+		factory: func(context.Context, ...managedwriter.WriterOption) (stream, error) { return s, nil },
+	}
+
+	done := make(chan AppendOutcome, 1)
+	go func() { done <- w.Append(context.Background(), [][]byte{{1}, {2}, {3}, {4}, {5}}) }()
+	select {
+	case out := <-done:
+		if out.Err != nil || out.AcknowledgedRows != 5 {
+			t.Fatalf("append outcome = %+v, want all five rows acknowledged", out)
+		}
+	case <-time.After(time.Second):
+		_ = w.Close()
+		<-done
+		t.Fatal("Append self-deadlocked after filling its managedwriter flow window")
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConcurrentAppendsShareGenerationFlowWindow(t *testing.T) {
+	s := newConcurrentFlowWindowStream(2)
+	w := &Writer{
+		opts: WriterOptions{
+			Project: "p", Dataset: "d", Table: "t", MaxRequestBytes: 1, MaxInflightRequests: 2,
+		},
+		factory: func(context.Context, ...managedwriter.WriterOption) (stream, error) { return s, nil },
+	}
+
+	done := make(chan AppendOutcome, 2)
+	go func() { done <- w.Append(context.Background(), [][]byte{{1}, {1}}) }()
+	go func() { done <- w.Append(context.Background(), [][]byte{{2}, {2}}) }()
+	for i := 0; i < 2; i++ {
+		select {
+		case out := <-done:
+			if out.Err != nil || out.AcknowledgedRows != 2 {
+				t.Fatalf("append outcome = %+v, want two acknowledged rows", out)
+			}
+		case <-time.After(time.Second):
+			_ = w.Close()
+			t.Fatal("concurrent Appends deadlocked on the stream-wide flow window")
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAppendWaitingForGenerationSlotTimesOutBeforeDispatch(t *testing.T) {
+	pending := newControlledResult()
+	s := &scriptedStream{results: []appendResult{pending, fakeResult{}}}
+	w, createdWith := newScriptedWriter(s)
+	w.opts.MaxInflightRequests = 1
+
+	firstDone := make(chan AppendOutcome, 1)
+	go func() { firstDone <- w.Append(context.Background(), [][]byte{{1}}) }()
+	<-pending.started
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	waiting := w.Append(ctx, [][]byte{{2}})
+	if !errors.Is(waiting.Err, context.DeadlineExceeded) {
+		t.Fatalf("waiting append error = %v, want deadline exceeded", waiting.Err)
+	}
+	if waiting.Verdict.Class != Retryable || waiting.Verdict.Label == LabelUncertainAck {
+		t.Fatalf("pre-dispatch verdict = %s/%s, want retryable and not uncertain",
+			waiting.Verdict.Class, waiting.Verdict.Label)
+	}
+	if s.calls != 1 {
+		t.Fatalf("AppendRows calls = %d, want timed-out request not dispatched", s.calls)
+	}
+
+	pending.complete(nil)
+	if out := <-firstDone; out.Err != nil {
+		t.Fatalf("first append failed: %v", out.Err)
+	}
+	if out := w.Append(context.Background(), [][]byte{{3}}); out.Err != nil {
+		t.Fatalf("append after slot release failed: %v", out.Err)
+	}
+	if len(*createdWith) != 1 {
+		t.Fatalf("created %d streams, want pre-dispatch timeout to keep the generation", len(*createdWith))
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCloseOverlappingActiveAppend(t *testing.T) {
+	result := newControlledResult()
+	s := &closeCompletesStream{result: result}
+	w := &Writer{
+		opts:    WriterOptions{Project: "p", Dataset: "d", Table: "t", MaxRequestBytes: 1},
+		factory: func(context.Context, ...managedwriter.WriterOption) (stream, error) { return s, nil },
+	}
+
+	appendDone := make(chan AppendOutcome, 1)
+	go func() { appendDone <- w.Append(context.Background(), [][]byte{{1}}) }()
+	<-result.started
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- w.Close() }()
+
+	select {
+	case <-appendDone:
+	case <-time.After(time.Second):
+		t.Fatal("active Append did not finish after Close retired its stream")
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close deadlocked with an active Append")
+	}
+	if out := w.Append(context.Background(), [][]byte{{2}}); out.Err == nil {
+		t.Fatal("append after Close unexpectedly succeeded")
+	}
+}
+
+func TestCloseCancelsOwnedContextBeforeClosingStream(t *testing.T) {
+	w := &Writer{
+		opts: WriterOptions{Project: "p", Dataset: "d", Table: "t", MaxRequestBytes: 1},
+		factory: func(ctx context.Context, _ ...managedwriter.WriterOption) (stream, error) {
+			return &lifecycleBoundCloseStream{ctx: ctx}, nil
+		},
+	}
+	if out := w.Append(context.Background(), [][]byte{{1}}); out.Err != nil {
+		t.Fatalf("creating the lifecycle-bound stream: %v", out.Err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -330,6 +883,7 @@ func TestAppendDrainsEveryDispatchedResultAfterResultFailure(t *testing.T) {
 	succeeded.complete(nil)
 	s := &scriptedStream{results: []appendResult{failed, succeeded}}
 	w, _ := newScriptedWriter(s)
+	w.opts.MaxInflightRequests = 2
 
 	out := w.Append(context.Background(), [][]byte{{1}, {2}})
 	if out.Verdict.Class != Retryable {
@@ -337,6 +891,28 @@ func TestAppendDrainsEveryDispatchedResultAfterResultFailure(t *testing.T) {
 	}
 	if failed.calls() != 1 || succeeded.calls() != 1 {
 		t.Fatalf("GetResult calls = failed:%d succeeded:%d, want 1 each",
+			failed.calls(), succeeded.calls())
+	}
+}
+
+func TestAppendStopsDispatchingAfterWindowedResultFailure(t *testing.T) {
+	failed := newControlledResult()
+	succeeded := newControlledResult()
+	failed.complete(status.Error(codes.Unavailable, "down"))
+	succeeded.complete(nil)
+	s := &scriptedStream{results: []appendResult{failed, succeeded, fakeResult{}}}
+	w, _ := newScriptedWriter(s)
+	w.opts.MaxInflightRequests = 2
+
+	out := w.Append(context.Background(), [][]byte{{1}, {2}, {3}})
+	if out.Verdict.Class != Retryable {
+		t.Fatalf("class = %s, want retryable", out.Verdict.Class)
+	}
+	if s.calls != 2 {
+		t.Fatalf("AppendRows calls = %d, want the two requests dispatched before the failure", s.calls)
+	}
+	if failed.calls() != 1 || succeeded.calls() != 1 {
+		t.Fatalf("GetResult calls = failed:%d succeeded:%d, want every dispatched result once",
 			failed.calls(), succeeded.calls())
 	}
 }
@@ -361,16 +937,34 @@ func TestAppendDrainsDispatchedResultsAfterLaterDispatchFailure(t *testing.T) {
 	}
 }
 
+func TestAppendPreservesFirstFailureWhileDrainingWindow(t *testing.T) {
+	firstFailure := newControlledResult()
+	firstFailure.complete(status.Error(codes.Unavailable, "first result failed"))
+	s := &scriptedStream{results: []appendResult{
+		firstFailure,
+		fakeResult{err: status.Error(codes.InvalidArgument, "second result failed")},
+	}}
+	w, _ := newScriptedWriter(s)
+	w.opts.MaxInflightRequests = 2
+
+	out := w.Append(context.Background(), [][]byte{{1}, {2}})
+	if got := status.Code(out.Err); got != codes.Unavailable {
+		t.Fatalf("error code = %s, want first transport failure %s", got, codes.Unavailable)
+	}
+}
+
 // Once AppendRows returns a result, cancellation makes the acknowledgement
 // ambiguous. The affected stream generation must be retired before another
 // exporterhelper attempt can reuse it.
 func TestAppendRetiresGenerationWhenAttemptEndsAfterDispatch(t *testing.T) {
-	for name, cancel := range map[string]func() (context.Context, context.CancelFunc){
-		"canceled": func() (context.Context, context.CancelFunc) {
-			return context.WithCancel(context.Background())
+	for name, makeAttempt := range map[string]func() (context.Context, func()){
+		"canceled": func() (context.Context, func()) {
+			ctx, cancel := context.WithCancel(context.Background())
+			return ctx, cancel
 		},
-		"deadline": func() (context.Context, context.CancelFunc) {
-			return context.WithTimeout(context.Background(), time.Nanosecond)
+		"deadline": func() (context.Context, func()) {
+			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			return ctx, cancel
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -380,9 +974,12 @@ func TestAppendRetiresGenerationWhenAttemptEndsAfterDispatch(t *testing.T) {
 			w, createdWith := newScriptedWriter(first, second)
 			defer func() { _ = w.Close() }()
 
-			ctx, stop := cancel()
+			ctx, stop := makeAttempt()
+			done := make(chan AppendOutcome, 1)
+			go func() { done <- w.Append(ctx, [][]byte{{1}}) }()
+			<-pending.started
 			stop()
-			out := w.Append(ctx, [][]byte{{1}})
+			out := <-done
 
 			if out.Verdict.Class != Uncertain || out.Verdict.Label != LabelUncertainAck {
 				t.Fatalf("verdict = %s/%s, want uncertain/%s",
@@ -446,8 +1043,11 @@ func TestCanceledAttemptTracksResultToTerminalState(t *testing.T) {
 	w, _ := newScriptedWriter(first)
 
 	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan AppendOutcome, 1)
+	go func() { done <- w.Append(ctx, [][]byte{{1}}) }()
+	<-pending.started
 	cancel()
-	out := w.Append(ctx, [][]byte{{1}})
+	out := <-done
 	if out.Verdict.Class != Uncertain {
 		t.Fatalf("class = %s, want uncertain", out.Verdict.Class)
 	}
@@ -469,17 +1069,20 @@ func TestCanceledAttemptTelemetryReturnsToZero(t *testing.T) {
 	w.opts.Observer = observer
 
 	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan AppendOutcome, 1)
+	go func() { done <- w.Append(ctx, [][]byte{{1}}) }()
+	<-pending.started
 	cancel()
-	out := w.Append(ctx, [][]byte{{1}})
+	out := <-done
 	if out.Verdict.Class != Uncertain {
 		t.Fatalf("class = %s, want uncertain", out.Verdict.Class)
 	}
 	pending.waitForCalls(t, 2)
 
-	inflight, unresolved, _, timeouts, recreations := observer.snapshot()
-	if inflight != 1 || unresolved != 1 || timeouts != 1 || recreations != 1 {
-		t.Fatalf("during drain: inflight=%d unresolved=%d timeouts=%d recreations=%d, want 1 each",
-			inflight, unresolved, timeouts, recreations)
+	inflight, unresolved, _, timeouts, retirements := observer.snapshot()
+	if inflight != 1 || unresolved != 1 || timeouts != 1 || retirements != 1 {
+		t.Fatalf("during drain: inflight=%d unresolved=%d timeouts=%d retirements=%d, want 1 each",
+			inflight, unresolved, timeouts, retirements)
 	}
 
 	pending.complete(nil)
@@ -509,7 +1112,7 @@ func TestTenConcurrentAttemptsRecoverFromEightSlotNoACK(t *testing.T) {
 		cancels[i] = cancel
 		go func() { done <- w.Append(ctx, [][]byte{{1}}) }()
 	}
-	stuck.waitForCalls(t, attempts)
+	stuck.waitForCalls(t, 8)
 	for _, cancel := range cancels {
 		cancel()
 	}
@@ -618,8 +1221,11 @@ func TestCloseJoinsUnresolvedResultOwner(t *testing.T) {
 	w, _ := newScriptedWriter(first)
 
 	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan AppendOutcome, 1)
+	go func() { done <- w.Append(ctx, [][]byte{{1}}) }()
+	<-pending.started
 	cancel()
-	_ = w.Append(ctx, [][]byte{{1}})
+	_ = <-done
 	pending.waitForCalls(t, 2)
 
 	closed := make(chan error, 1)
@@ -708,13 +1314,25 @@ func TestWriterOptionsRefs(t *testing.T) {
 func TestWriteRetriesAreExplicitlyDisabled(t *testing.T) {
 	w := newTestWriter(&fakeStream{})
 	w.opts.Descriptor = nil
+	managedStream := &managedwriter.ManagedStream{}
 	opts := w.writerOptions()
 	if len(opts) == 0 {
 		t.Fatal("expected writer options")
 	}
-	// The option set is opaque, so assert on the count as a change detector
-	// alongside the explicit EnableWriteRetries(false) call in writerOptions.
-	if len(opts) != 7 {
-		t.Fatalf("writer option count changed to %d; confirm EnableWriteRetries(false) is still set", len(opts))
+	// The retry-ownership option is deliberately last in writerOptions. Apply
+	// it in isolation because the other options require a fully constructed
+	// ManagedStream and are unrelated to this contract.
+	opts[len(opts)-1](managedStream)
+
+	// WriterOption intentionally exposes behavior rather than state. The
+	// dependency is pinned, so inspecting its configured retry strategy here
+	// gives us a direct regression assertion instead of counting opaque
+	// options: EnableWriteRetries(true) makes this field non-nil.
+	retry := reflect.ValueOf(managedStream).Elem().FieldByName("retry")
+	if !retry.IsValid() {
+		t.Fatal("managedwriter retry field changed; re-verify the pinned dependency's retry contract")
+	}
+	if !retry.IsNil() {
+		t.Fatal("managedwriter write retries are enabled; exporterhelper must be the sole retry owner")
 	}
 }

@@ -33,8 +33,9 @@ type WriterOptions struct {
 	MaxRequestBytes int
 
 	// MaxInflightRequests and MaxInflightBytes bound asynchronous appends.
-	// Flow control is managedwriter's native limits rather than a bespoke
-	// window; the exporter only maps acknowledgements back to batches.
+	// managedwriter enforces the native limits; the exporter mirrors the
+	// request-count window so concurrent calls drain results before they can
+	// collectively block inside AppendRows.
 	MaxInflightRequests int
 	MaxInflightBytes    int
 
@@ -55,7 +56,7 @@ type Observer interface {
 	RecordUnresolvedResults(context.Context, int64)
 	RecordAppendResultWait(context.Context, time.Duration)
 	RecordTimeoutAfterDispatch(context.Context)
-	RecordStreamRecreation(context.Context)
+	RecordStreamRetirement(context.Context)
 }
 
 // TableRef renders the fully qualified destination table path.
@@ -89,15 +90,30 @@ type Writer struct {
 	opts        WriterOptions
 	factory     streamFactory
 	lifetimeCtx context.Context
-	drainCtx    context.Context
-	drainCancel context.CancelFunc
+	ownedCtx    context.Context
+	ownedCancel context.CancelFunc
 
-	mu     sync.Mutex
-	ms     *streamGeneration
-	closed bool
+	mu                sync.Mutex
+	ms                *streamGeneration
+	creation          *streamCreation
+	generationSignal  chan struct{}
+	activeGenerations int
+	closed            bool
+	closeDone         chan struct{}
+	closeErr          error
 
-	appendWG sync.WaitGroup
-	drainWG  sync.WaitGroup
+	appendWG      sync.WaitGroup
+	constructorWG sync.WaitGroup
+	drainWG       sync.WaitGroup
+}
+
+const maxActiveStreamGenerations = 2
+
+var errStreamRetired = errors.New("write stream generation is retired")
+
+type streamCreation struct {
+	done chan struct{}
+	err  error
 }
 
 // streamGeneration binds an append result to the exact stream that dispatched
@@ -105,6 +121,12 @@ type Writer struct {
 // generation only while it is still the writer's current stream.
 type streamGeneration struct {
 	stream
+	users         int
+	pending       int
+	retired       bool
+	slotHeld      bool
+	dispatchSlots chan struct{}
+	retiredDone   chan struct{}
 }
 
 // NewWriter builds a writer whose managed streams retain lifetimeCtx for their
@@ -151,26 +173,122 @@ func (w *Writer) writerOptions() []managedwriter.WriterOption {
 // managedwriter retains the stream-construction context. It must therefore be
 // the component-owned lifetime context, never an exporterhelper attempt
 // context that is canceled as soon as one Consume call returns.
-func (w *Writer) ensureStream() (*streamGeneration, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.closed {
-		return nil, errors.New("writer is closed")
+func (w *Writer) ensureStream(ctx context.Context) (*streamGeneration, error) {
+	for {
+		w.mu.Lock()
+		if w.closed {
+			w.mu.Unlock()
+			return nil, errors.New("writer is closed")
+		}
+		if err := ctx.Err(); err != nil {
+			w.mu.Unlock()
+			return nil, err
+		}
+		if w.ms != nil {
+			gen := w.ms
+			gen.users++
+			w.mu.Unlock()
+			return gen, nil
+		}
+
+		if w.creation == nil && w.activeGenerations < maxActiveStreamGenerations {
+			w.startStreamCreationLocked()
+		}
+		if creation := w.creation; creation != nil {
+			done := creation.done
+			w.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-done:
+				if creation.err != nil {
+					return nil, fmt.Errorf("creating write stream for %s: %w", w.opts.TableID(), creation.err)
+				}
+				continue
+			}
+		}
+
+		signal := w.generationSignalLocked()
+		w.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-signal:
+		}
 	}
-	if w.ms != nil {
-		return w.ms, nil
+}
+
+func (w *Writer) startStreamCreationLocked() {
+	creation := &streamCreation{done: make(chan struct{})}
+	w.creation = creation
+	w.activeGenerations++
+	ctx := w.ownedContextLocked()
+	w.constructorWG.Add(1)
+	go func() {
+		defer w.constructorWG.Done()
+		ms, err := w.factory(ctx, w.writerOptions()...)
+		var discard stream
+
+		w.mu.Lock()
+		switch {
+		case err != nil:
+			creation.err = err
+			w.activeGenerations--
+		case w.closed || ctx.Err() != nil:
+			discard = ms
+			creation.err = errors.New("writer is closed")
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				creation.err = ctxErr
+			}
+			w.activeGenerations--
+		default:
+			window := w.opts.MaxInflightRequests
+			if window <= 0 {
+				window = 1
+			}
+			w.ms = &streamGeneration{
+				stream:        ms,
+				slotHeld:      true,
+				dispatchSlots: make(chan struct{}, window),
+				retiredDone:   make(chan struct{}),
+			}
+		}
+		if w.creation == creation {
+			w.creation = nil
+		}
+		close(creation.done)
+		w.notifyGenerationChangeLocked()
+		w.mu.Unlock()
+
+		if discard != nil {
+			_ = discard.Close()
+		}
+	}()
+}
+
+func (w *Writer) ownedContextLocked() context.Context {
+	if w.ownedCtx == nil {
+		parent := w.lifetimeCtx
+		if parent == nil {
+			parent = context.Background()
+		}
+		w.ownedCtx, w.ownedCancel = context.WithCancel(parent)
 	}
-	ctx := w.lifetimeCtx
-	if ctx == nil {
-		ctx = context.Background()
+	return w.ownedCtx
+}
+
+func (w *Writer) generationSignalLocked() <-chan struct{} {
+	if w.generationSignal == nil {
+		w.generationSignal = make(chan struct{})
 	}
-	ms, err := w.factory(ctx, w.writerOptions()...)
-	if err != nil {
-		return nil, fmt.Errorf("creating write stream for %s: %w", w.opts.TableID(), err)
+	return w.generationSignal
+}
+
+func (w *Writer) notifyGenerationChangeLocked() {
+	if w.generationSignal != nil {
+		close(w.generationSignal)
+		w.generationSignal = nil
 	}
-	gen := &streamGeneration{stream: ms}
-	w.ms = gen
-	return gen, nil
 }
 
 // beginAppend prevents shutdown from starting a Wait while a new append can
@@ -182,13 +300,7 @@ func (w *Writer) beginAppend() error {
 	if w.closed {
 		return errors.New("writer is closed")
 	}
-	if w.drainCtx == nil {
-		ctx := w.lifetimeCtx
-		if ctx == nil {
-			ctx = context.Background()
-		}
-		w.drainCtx, w.drainCancel = context.WithCancel(ctx)
-	}
+	w.ownedContextLocked()
 	w.appendWG.Add(1)
 	return nil
 }
@@ -196,16 +308,19 @@ func (w *Writer) beginAppend() error {
 // trackResult keeps terminal ownership after an attempt context expires.
 // managedwriter's GetResult only reports that caller cancellation; it does not
 // make the underlying AppendResult terminal. This waiter lives until the
-// result resolves or Writer.Close cancels the bounded drain context.
-func (w *Writer) trackResult(res appendResult, started time.Time) {
+// result resolves or Writer.Close cancels the component lifecycle context.
+func (w *Writer) trackResult(gen *streamGeneration, res appendResult, started time.Time) {
 	w.drainWG.Add(1)
-	ctx := w.drainCtx
+	w.mu.Lock()
+	ctx := w.ownedCtx
+	w.mu.Unlock()
 	w.observeUnresolved(1)
 	go func() {
 		defer func() {
 			w.observeInflight(-1)
 			w.observeUnresolved(-1)
 			w.observeResultWait(started)
+			w.releaseResult(gen)
 			w.drainWG.Done()
 		}()
 		_, _ = res.GetResult(ctx)
@@ -222,11 +337,109 @@ func (w *Writer) retireStream(gen *streamGeneration) {
 		return
 	}
 	w.ms = nil
+	w.markGenerationRetiredLocked(gen)
+	w.releaseGenerationSlotLocked(gen)
+	w.notifyGenerationChangeLocked()
 	w.mu.Unlock()
 	_ = gen.Close()
 	if w.opts.Observer != nil {
-		w.opts.Observer.RecordStreamRecreation(context.Background())
+		w.opts.Observer.RecordStreamRetirement(context.Background())
 	}
+}
+
+func (w *Writer) markGenerationRetiredLocked(gen *streamGeneration) {
+	if gen.retired {
+		return
+	}
+	gen.retired = true
+	close(gen.retiredDone)
+}
+
+func (w *Writer) tryAcquireDispatchSlot(
+	ctx context.Context, gen *streamGeneration,
+) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	select {
+	case <-gen.retiredDone:
+		return false, errStreamRetired
+	default:
+	}
+	select {
+	case gen.dispatchSlots <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			w.releaseDispatchSlot(gen)
+			return false, err
+		}
+		select {
+		case <-gen.retiredDone:
+			w.releaseDispatchSlot(gen)
+			return false, errStreamRetired
+		default:
+			return true, nil
+		}
+	default:
+		return false, nil
+	}
+}
+
+func (w *Writer) waitForDispatchSlot(ctx context.Context, gen *streamGeneration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case gen.dispatchSlots <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			w.releaseDispatchSlot(gen)
+			return err
+		}
+		select {
+		case <-gen.retiredDone:
+			w.releaseDispatchSlot(gen)
+			return errStreamRetired
+		default:
+			return nil
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-gen.retiredDone:
+		return errStreamRetired
+	}
+}
+
+func (w *Writer) releaseDispatchSlot(gen *streamGeneration) {
+	<-gen.dispatchSlots
+}
+
+func (w *Writer) registerResult(gen *streamGeneration) {
+	w.mu.Lock()
+	gen.pending++
+	w.mu.Unlock()
+}
+
+func (w *Writer) releaseResult(gen *streamGeneration) {
+	w.mu.Lock()
+	gen.pending--
+	w.releaseGenerationSlotLocked(gen)
+	w.mu.Unlock()
+	w.releaseDispatchSlot(gen)
+}
+
+func (w *Writer) releaseGenerationUser(gen *streamGeneration) {
+	w.mu.Lock()
+	gen.users--
+	w.releaseGenerationSlotLocked(gen)
+	w.mu.Unlock()
+}
+
+func (w *Writer) releaseGenerationSlotLocked(gen *streamGeneration) {
+	if !gen.slotHeld || !gen.retired || gen.users != 0 || gen.pending != 0 {
+		return
+	}
+	gen.slotHeld = false
+	w.activeGenerations--
+	w.notifyGenerationChangeLocked()
 }
 
 func (w *Writer) observeInflight(delta int64) {
@@ -253,9 +466,10 @@ func (w *Writer) observeTimeoutAfterDispatch() {
 	}
 }
 
-func (w *Writer) finishResult(started time.Time) {
+func (w *Writer) finishResult(gen *streamGeneration, started time.Time) {
 	w.observeInflight(-1)
 	w.observeResultWait(started)
+	w.releaseResult(gen)
 }
 
 func (w *Writer) classifyAndRetire(
@@ -269,6 +483,17 @@ func (w *Writer) classifyAndRetire(
 		w.observeTimeoutAfterDispatch()
 	}
 	return verdict, attemptEnded
+}
+
+func classifyPreDispatchFailure(err error) Verdict {
+	switch {
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return Verdict{Retryable, OwnerExporterHelper, LabelCanceled, false}
+	case errors.Is(err, errStreamRetired):
+		return Verdict{Retryable, OwnerExporterHelper, LabelInvalidStream, false}
+	default:
+		return Classify(err)
+	}
 }
 
 // RowError identifies a row the service rejected within an append.
@@ -298,10 +523,9 @@ type AppendOutcome struct {
 // Append splits rows into requests under the size threshold and sends them,
 // then waits for every acknowledgement.
 //
-// Requests are dispatched before any result is awaited: waiting inline would
-// serialize the path and defeat the point of an asynchronous API. Rows that do
-// not fit any request are reported as row errors rather than failing the
-// batch.
+// Requests are dispatched up to the configured flow-control window before a
+// result is awaited. Rows that do not fit any request are reported as row
+// errors rather than failing the batch.
 func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 	if len(rows) == 0 {
 		return AppendOutcome{}
@@ -311,10 +535,11 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 	}
 	defer w.appendWG.Done()
 
-	gen, err := w.ensureStream()
+	gen, err := w.ensureStream(ctx)
 	if err != nil {
-		return AppendOutcome{Verdict: Classify(err), Err: err}
+		return AppendOutcome{Verdict: classifyPreDispatchFailure(err), Err: err}
 	}
+	defer w.releaseGenerationUser(gen)
 
 	requests := SplitRequests(rows, w.opts.MaxRequestBytes)
 
@@ -326,20 +551,82 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 	}
 	inflight := make([]pending, 0, len(requests))
 	out := AppendOutcome{}
+	drainOne := func(p pending) {
+		if _, rerr := p.res.GetResult(ctx); rerr != nil {
+			// Row errors arrive alongside the error; the whole request is not
+			// appended when any row in it fails.
+			rowErrs := extractRowErrors(ctx, p.res, p.start)
+			if len(rowErrs) > 0 {
+				w.finishResult(gen, p.dispatched)
+				out.RowErrors = append(out.RowErrors, rowErrs...)
+				return
+			}
+			v, attemptEnded := w.classifyAndRetire(ctx, rerr, gen)
+			if attemptEnded {
+				w.trackResult(gen, p.res, p.dispatched)
+			} else {
+				w.finishResult(gen, p.dispatched)
+			}
+			// Preserve the first transport failure as the batch verdict, but
+			// keep draining all other results already dispatched by this call.
+			if out.Err == nil {
+				out.Verdict = v
+				out.Err = rerr
+			}
+			return
+		}
+		w.finishResult(gen, p.dispatched)
+		out.AcknowledgedRows += p.count
+	}
 
 	offset := 0
+	dispatching := true
 	for _, req := range requests {
+		for {
+			acquired, acquireErr := w.tryAcquireDispatchSlot(ctx, gen)
+			if acquireErr != nil {
+				out.Verdict = classifyPreDispatchFailure(acquireErr)
+				out.Err = acquireErr
+				dispatching = false
+				break
+			}
+			if acquired {
+				break
+			}
+			if len(inflight) > 0 {
+				drainOne(inflight[0])
+				inflight = inflight[1:]
+				if out.Err != nil {
+					dispatching = false
+					break
+				}
+				continue
+			}
+			if acquireErr := w.waitForDispatchSlot(ctx, gen); acquireErr != nil {
+				out.Verdict = classifyPreDispatchFailure(acquireErr)
+				out.Err = acquireErr
+				dispatching = false
+			}
+			break
+		}
+		if !dispatching {
+			break
+		}
 		dispatched := time.Now()
 		res, aerr := gen.AppendRows(ctx, req)
 		if aerr != nil {
+			w.releaseDispatchSlot(gen)
 			// AppendRows can return the attempt-context error after handing a
 			// request to the bidirectional stream. Its acknowledgement is then
 			// ambiguous, and this generation cannot safely be reused.
 			v, _ := w.classifyAndRetire(ctx, aerr, gen)
-			out.Verdict = v
-			out.Err = aerr
+			if out.Err == nil {
+				out.Verdict = v
+				out.Err = aerr
+			}
 			break
 		}
+		w.registerResult(gen)
 		w.observeInflight(1)
 		inflight = append(inflight, pending{
 			res: res, start: offset, count: len(req), dispatched: dispatched,
@@ -348,31 +635,7 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 	}
 
 	for _, p := range inflight {
-		if _, rerr := p.res.GetResult(ctx); rerr != nil {
-			// Row errors arrive alongside the error; the whole request is not
-			// appended when any row in it fails.
-			rowErrs := extractRowErrors(ctx, p.res, p.start)
-			if len(rowErrs) > 0 {
-				w.finishResult(p.dispatched)
-				out.RowErrors = append(out.RowErrors, rowErrs...)
-				continue
-			}
-			v, attemptEnded := w.classifyAndRetire(ctx, rerr, gen)
-			if attemptEnded {
-				w.trackResult(p.res, p.dispatched)
-			} else {
-				w.finishResult(p.dispatched)
-			}
-			// Preserve the first transport failure as the batch verdict, but
-			// keep draining all other results already dispatched by this call.
-			if out.Err == nil {
-				out.Verdict = v
-				out.Err = rerr
-			}
-			continue
-		}
-		w.finishResult(p.dispatched)
-		out.AcknowledgedRows += p.count
+		drainOne(p)
 	}
 	return out
 }
@@ -386,7 +649,13 @@ func (w *Writer) classifyAppendFailure(ctx context.Context, err error) (Verdict,
 	if ctxErr != nil && errors.Is(err, ctxErr) {
 		return Verdict{Uncertain, OwnerExporterHelper, LabelUncertainAck, false}, true
 	}
-	if w.lifetimeCtx != nil && w.lifetimeCtx.Err() != nil && errors.Is(err, context.Canceled) {
+	w.mu.Lock()
+	ownedCtx := w.ownedCtx
+	if ownedCtx == nil {
+		ownedCtx = w.lifetimeCtx
+	}
+	w.mu.Unlock()
+	if ownedCtx != nil && ownedCtx.Err() != nil && errors.Is(err, context.Canceled) {
 		return Verdict{Retryable, OwnerExporterHelper, LabelShutdown, false}, false
 	}
 	return Classify(err), false
@@ -447,26 +716,43 @@ func SplitRequests(rows [][]byte, maxBytes int) [][][]byte {
 func (w *Writer) Close() error {
 	w.mu.Lock()
 	if w.closed {
+		done := w.closeDone
 		w.mu.Unlock()
-		return nil
+		if done != nil {
+			<-done
+		}
+		w.mu.Lock()
+		err := w.closeErr
+		w.mu.Unlock()
+		return err
 	}
 	w.closed = true
+	w.closeDone = make(chan struct{})
 	gen := w.ms
 	w.ms = nil
-	drainCancel := w.drainCancel
-	w.drainCancel = nil
+	if gen != nil {
+		w.markGenerationRetiredLocked(gen)
+		w.releaseGenerationSlotLocked(gen)
+	}
+	cancel := w.ownedCancel
+	w.notifyGenerationChangeLocked()
 	w.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	var err error
 	if gen != nil {
 		err = gen.Close()
 	}
+	w.constructorWG.Wait()
 	// All Append calls must finish registering any asynchronous result owner
 	// before cancellation and Wait; this ordering avoids Add/Wait races.
 	w.appendWG.Wait()
-	if drainCancel != nil {
-		drainCancel()
-	}
 	w.drainWG.Wait()
+	w.mu.Lock()
+	w.closeErr = err
+	close(w.closeDone)
+	w.mu.Unlock()
 	return err
 }
 
