@@ -113,12 +113,11 @@ telemetry:
         value_type: int
         monotonic: true
 
-    otelcol_exporter_bigquery_stream_recreations:
+    otelcol_exporter_bigquery_stream_retirements:
       enabled: true
       description: >-
-        Managed stream generations retired and recreated after an unsafe
-        append outcome.
-      unit: "{recreation}"
+        Managed stream generations retired after an unsafe append outcome.
+      unit: "{retirement}"
       sum:
         value_type: int
         monotonic: true

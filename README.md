@@ -209,10 +209,10 @@ Use these content-free self-telemetry instruments to detect a stuck path:
 | `otelcol_exporter_bigquery_unresolved_results` | Results being drained after their original attempt ended. |
 | `otelcol_exporter_bigquery_append_result_wait` | Dispatch-to-terminal wait duration in seconds. |
 | `otelcol_exporter_bigquery_timeouts_after_dispatch` | Attempts that ended after dispatch began. |
-| `otelcol_exporter_bigquery_stream_recreations` | Unsafe stream generations retired for recovery. |
+| `otelcol_exporter_bigquery_stream_retirements` | Unsafe stream generations retired for recovery. |
 
 Both current-value instruments should return to zero after recovery or clean
-shutdown. A sustained nonzero value, rising timeout/recreation counters, or
+shutdown. A sustained nonzero value, rising timeout/retirement counters, or
 queue drops indicates “accepted by the collector, not yet confirmed by
 BigQuery.”
 

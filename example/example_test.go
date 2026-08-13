@@ -7,6 +7,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"go.yaml.in/yaml/v3"
 )
 
 func TestCustomCollectorExampleIsSelfContainedAndPinned(t *testing.T) {
@@ -61,5 +63,50 @@ func TestCustomCollectorExampleIsSelfContainedAndPinned(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestComposePublishesOTLPOnlyOnLoopback(t *testing.T) {
+	raw, err := os.ReadFile("docker-compose.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var compose struct {
+		Services map[string]struct {
+			Ports []string `yaml:"ports"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(raw, &compose); err != nil {
+		t.Fatal(err)
+	}
+	got := compose.Services["otelcollector"].Ports
+	want := []string{"127.0.0.1:4317:4317", "127.0.0.1:4318:4318"}
+	if len(got) != len(want) {
+		t.Fatalf("published ports = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("published ports = %v, want loopback-only %v", got, want)
+		}
+	}
+}
+
+func TestDockerBuildContextExcludesCommonCredentialFiles(t *testing.T) {
+	raw, err := os.ReadFile("../.dockerignore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	patterns := strings.Fields(string(raw))
+	for _, want := range []string{".env", "**/*.json", "**/*.key", "**/*.pem"} {
+		found := false
+		for _, pattern := range patterns {
+			if pattern == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf(".dockerignore does not exclude common credential pattern %q", want)
+		}
 	}
 }

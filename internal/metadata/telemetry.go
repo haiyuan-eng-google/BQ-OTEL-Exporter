@@ -55,7 +55,7 @@ type Telemetry struct {
 
 	AppendResultWait      metric.Float64Histogram
 	TimeoutsAfterDispatch metric.Int64Counter
-	StreamRecreations     metric.Int64Counter
+	StreamRetirements     metric.Int64Counter
 }
 
 // Metric names, matching metadata.yaml.
@@ -68,7 +68,7 @@ const (
 	nameUnresolvedResults     = "otelcol_exporter_bigquery_unresolved_results"
 	nameAppendResultWait      = "otelcol_exporter_bigquery_append_result_wait"
 	nameTimeoutsAfterDispatch = "otelcol_exporter_bigquery_timeouts_after_dispatch"
-	nameStreamRecreations     = "otelcol_exporter_bigquery_stream_recreations"
+	nameStreamRetirements     = "otelcol_exporter_bigquery_stream_retirements"
 )
 
 // Label keys.
@@ -115,7 +115,8 @@ func NewTelemetry(mp metric.MeterProvider) (*Telemetry, error) {
 	}
 	if t.AppendResultWait, err = m.Float64Histogram(nameAppendResultWait,
 		metric.WithDescription("Time from append dispatch until its result owner finishes."),
-		metric.WithUnit("s")); err != nil {
+		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(0.001, 0.01, 0.1, 1, 5, 30, 70, 120)); err != nil {
 		return nil, fmt.Errorf("creating %s: %w", nameAppendResultWait, err)
 	}
 	if t.TimeoutsAfterDispatch, err = m.Int64Counter(nameTimeoutsAfterDispatch,
@@ -123,10 +124,10 @@ func NewTelemetry(mp metric.MeterProvider) (*Telemetry, error) {
 		metric.WithUnit("{timeout}")); err != nil {
 		return nil, fmt.Errorf("creating %s: %w", nameTimeoutsAfterDispatch, err)
 	}
-	if t.StreamRecreations, err = m.Int64Counter(nameStreamRecreations,
-		metric.WithDescription("Managed stream generations retired and recreated after an unsafe outcome."),
-		metric.WithUnit("{recreation}")); err != nil {
-		return nil, fmt.Errorf("creating %s: %w", nameStreamRecreations, err)
+	if t.StreamRetirements, err = m.Int64Counter(nameStreamRetirements,
+		metric.WithDescription("Managed stream generations retired after an unsafe outcome."),
+		metric.WithUnit("{retirement}")); err != nil {
+		return nil, fmt.Errorf("creating %s: %w", nameStreamRetirements, err)
 	}
 	return t, nil
 }
@@ -191,9 +192,9 @@ func (t *Telemetry) RecordTimeoutAfterDispatch(ctx context.Context) {
 	t.TimeoutsAfterDispatch.Add(ctx, 1)
 }
 
-func (t *Telemetry) RecordStreamRecreation(ctx context.Context) {
+func (t *Telemetry) RecordStreamRetirement(ctx context.Context) {
 	if t == nil {
 		return
 	}
-	t.StreamRecreations.Add(ctx, 1)
+	t.StreamRetirements.Add(ctx, 1)
 }

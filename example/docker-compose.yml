@@ -14,5 +14,5 @@ services:
       - ./otel-collector-config.yml:/etc/otel/config.yml:ro
       - ${BQ_ADC_PATH:?Set BQ_ADC_PATH to an ADC JSON file}:/creds/adc.json:ro
     ports:
-      - "4317:4317"
-      - "4318:4318"
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:4318:4318"

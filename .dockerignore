@@ -1,0 +1,10 @@
+.git
+.github
+otelcol-bq-dist
+.env
+.env.*
+**/.env
+**/.env.*
+**/*.json
+**/*.key
+**/*.pem
