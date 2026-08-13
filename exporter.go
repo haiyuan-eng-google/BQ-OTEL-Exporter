@@ -200,6 +200,7 @@ func (e *signalExporter) start(ctx context.Context, _ component.Host) (err error
 		MaxInflightRequests: e.cfg.Write.MaxInflightRequests,
 		MaxInflightBytes:    e.cfg.Write.MaxInflightBytes,
 		TraceID:             writeAPITraceID,
+		Observer:            e.tel,
 	})
 
 	e.logger.Info("BigQuery exporter started",

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
@@ -41,6 +42,20 @@ type WriterOptions struct {
 	// producer-side attribution possible when the service team is debugging
 	// on our behalf.
 	TraceID string
+
+	// Observer receives bounded, content-free stream lifecycle telemetry.
+	Observer Observer
+}
+
+// Observer is the delivery-critical stream telemetry surface. The exporter
+// implementation records only counts and durations; no payload-derived value
+// crosses this boundary.
+type Observer interface {
+	RecordInflightRequests(context.Context, int64)
+	RecordUnresolvedResults(context.Context, int64)
+	RecordAppendResultWait(context.Context, time.Duration)
+	RecordTimeoutAfterDispatch(context.Context)
+	RecordStreamRecreation(context.Context)
 }
 
 // TableRef renders the fully qualified destination table path.
@@ -182,11 +197,17 @@ func (w *Writer) beginAppend() error {
 // managedwriter's GetResult only reports that caller cancellation; it does not
 // make the underlying AppendResult terminal. This waiter lives until the
 // result resolves or Writer.Close cancels the bounded drain context.
-func (w *Writer) trackResult(res appendResult) {
+func (w *Writer) trackResult(res appendResult, started time.Time) {
 	w.drainWG.Add(1)
 	ctx := w.drainCtx
+	w.observeUnresolved(1)
 	go func() {
-		defer w.drainWG.Done()
+		defer func() {
+			w.observeInflight(-1)
+			w.observeUnresolved(-1)
+			w.observeResultWait(started)
+			w.drainWG.Done()
+		}()
 		_, _ = res.GetResult(ctx)
 	}()
 }
@@ -203,6 +224,33 @@ func (w *Writer) retireStream(gen *streamGeneration) {
 	w.ms = nil
 	w.mu.Unlock()
 	_ = gen.Close()
+	if w.opts.Observer != nil {
+		w.opts.Observer.RecordStreamRecreation(context.Background())
+	}
+}
+
+func (w *Writer) observeInflight(delta int64) {
+	if w.opts.Observer != nil {
+		w.opts.Observer.RecordInflightRequests(context.Background(), delta)
+	}
+}
+
+func (w *Writer) observeUnresolved(delta int64) {
+	if w.opts.Observer != nil {
+		w.opts.Observer.RecordUnresolvedResults(context.Background(), delta)
+	}
+}
+
+func (w *Writer) observeResultWait(started time.Time) {
+	if w.opts.Observer != nil {
+		w.opts.Observer.RecordAppendResultWait(context.Background(), time.Since(started))
+	}
+}
+
+func (w *Writer) observeTimeoutAfterDispatch() {
+	if w.opts.Observer != nil {
+		w.opts.Observer.RecordTimeoutAfterDispatch(context.Background())
+	}
 }
 
 // RowError identifies a row the service rejected within an append.
@@ -253,15 +301,17 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 	requests := SplitRequests(rows, w.opts.MaxRequestBytes)
 
 	type pending struct {
-		res   appendResult
-		start int
-		count int
+		res        appendResult
+		start      int
+		count      int
+		dispatched time.Time
 	}
 	inflight := make([]pending, 0, len(requests))
 	out := AppendOutcome{}
 
 	offset := 0
 	for _, req := range requests {
+		dispatched := time.Now()
 		res, aerr := gen.AppendRows(ctx, req)
 		if aerr != nil {
 			// AppendRows can return the attempt-context error after handing a
@@ -271,11 +321,17 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 			if v.StreamRecreate || attemptEnded || v.Class == Uncertain {
 				w.retireStream(gen)
 			}
+			if attemptEnded {
+				w.observeTimeoutAfterDispatch()
+			}
 			out.Verdict = v
 			out.Err = aerr
 			break
 		}
-		inflight = append(inflight, pending{res: res, start: offset, count: len(req)})
+		w.observeInflight(1)
+		inflight = append(inflight, pending{
+			res: res, start: offset, count: len(req), dispatched: dispatched,
+		})
 		offset += len(req)
 	}
 
@@ -285,6 +341,8 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 			// appended when any row in it fails.
 			rowErrs := extractRowErrors(ctx, p.res, p.start)
 			if len(rowErrs) > 0 {
+				w.observeInflight(-1)
+				w.observeResultWait(p.dispatched)
 				out.RowErrors = append(out.RowErrors, rowErrs...)
 				continue
 			}
@@ -293,7 +351,11 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 				w.retireStream(gen)
 			}
 			if attemptEnded {
-				w.trackResult(p.res)
+				w.observeTimeoutAfterDispatch()
+				w.trackResult(p.res, p.dispatched)
+			} else {
+				w.observeInflight(-1)
+				w.observeResultWait(p.dispatched)
 			}
 			// Preserve the first transport failure as the batch verdict, but
 			// keep draining all other results already dispatched by this call.
@@ -303,6 +365,8 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 			}
 			continue
 		}
+		w.observeInflight(-1)
+		w.observeResultWait(p.dispatched)
 		out.AcknowledgedRows += p.count
 	}
 	return out

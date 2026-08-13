@@ -64,12 +64,16 @@ func NewFactory() exporter.Factory {
 func createDefaultConfig() component.Config {
 	backoff := configretry.NewDefaultBackOffConfig()
 	backoff.MaxElapsedTime = defaultMaxElapsedTime
+	queue := exporterhelper.NewDefaultQueueConfig()
+	// Keep exporterhelper's sender concurrency within managedwriter's request
+	// window. Higher values only add blocked attempt contexts under pressure.
+	queue.NumConsumers = defaultMaxInflightRequests
 
 	limits := transform.DefaultLimits()
 
 	return &Config{
 		TimeoutSettings: exporterhelper.NewDefaultTimeoutConfig(),
-		QueueSettings:   configoptional.Some(exporterhelper.NewDefaultQueueConfig()),
+		QueueSettings:   configoptional.Some(queue),
 		BackOffConfig:   backoff,
 		Traces:          SignalConfig{Table: defaultSpansTable},
 		Logs:            LogsConfig{Table: defaultLogsTable},

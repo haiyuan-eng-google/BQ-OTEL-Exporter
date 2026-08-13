@@ -30,6 +30,18 @@ func TestCreateExporters(t *testing.T) {
 	}
 }
 
+func TestDefaultQueueConcurrencyFitsManagedWriterWindow(t *testing.T) {
+	cfg := createDefaultConfig().(*Config)
+	queue := cfg.QueueSettings.Get()
+	if queue == nil {
+		t.Fatal("default sending queue is disabled")
+	}
+	if queue.NumConsumers != cfg.Write.MaxInflightRequests {
+		t.Fatalf("queue consumers = %d, managedwriter request slots = %d; defaults must not oversubscribe the stream",
+			queue.NumConsumers, cfg.Write.MaxInflightRequests)
+	}
+}
+
 // Metrics are out of scope for v1. Asserting the absence keeps the decision
 // honest: if someone wires metrics up, this test makes them revisit the
 // decision record rather than slip it in.

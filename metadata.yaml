@@ -77,6 +77,52 @@ telemetry:
         value_type: int
         monotonic: true
 
+    otelcol_exporter_bigquery_inflight_requests:
+      enabled: true
+      description: >-
+        Dispatched append results that have not reached an exporter-owned
+        terminal state.
+      unit: "{request}"
+      sum:
+        value_type: int
+        monotonic: false
+
+    otelcol_exporter_bigquery_unresolved_results:
+      enabled: true
+      description: >-
+        Append results retained by lifecycle drainers after their original
+        exporterhelper attempt ended.
+      unit: "{result}"
+      sum:
+        value_type: int
+        monotonic: false
+
+    otelcol_exporter_bigquery_append_result_wait:
+      enabled: true
+      description: Time from append dispatch until its result owner finishes.
+      unit: s
+      histogram:
+        value_type: double
+        bucket_boundaries: [0.001, 0.01, 0.1, 1, 5, 30, 70, 120]
+
+    otelcol_exporter_bigquery_timeouts_after_dispatch:
+      enabled: true
+      description: Append attempts whose context ended after dispatch began.
+      unit: "{timeout}"
+      sum:
+        value_type: int
+        monotonic: true
+
+    otelcol_exporter_bigquery_stream_recreations:
+      enabled: true
+      description: >-
+        Managed stream generations retired and recreated after an unsafe
+        append outcome.
+      unit: "{recreation}"
+      sum:
+        value_type: int
+        monotonic: true
+
   attributes:
     reason:
       description: >-
@@ -110,5 +156,6 @@ telemetry:
         - invalid_argument
         - uncertain_ack
         - connection
+        - request_canceled
         - shutdown_timeout
         - unknown

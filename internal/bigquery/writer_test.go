@@ -89,6 +89,52 @@ type fakeStream struct {
 	closed   int
 }
 
+type fakeObserver struct {
+	mu sync.Mutex
+
+	inflight    int64
+	unresolved  int64
+	waits       int
+	timeouts    int
+	recreations int
+}
+
+func (o *fakeObserver) RecordInflightRequests(_ context.Context, delta int64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.inflight += delta
+}
+
+func (o *fakeObserver) RecordUnresolvedResults(_ context.Context, delta int64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.unresolved += delta
+}
+
+func (o *fakeObserver) RecordAppendResultWait(_ context.Context, _ time.Duration) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.waits++
+}
+
+func (o *fakeObserver) RecordTimeoutAfterDispatch(context.Context) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.timeouts++
+}
+
+func (o *fakeObserver) RecordStreamRecreation(context.Context) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.recreations++
+}
+
+func (o *fakeObserver) snapshot() (inflight, unresolved int64, waits, timeouts, recreations int) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.inflight, o.unresolved, o.waits, o.timeouts, o.recreations
+}
+
 func (f *fakeStream) AppendRows(_ context.Context, _ [][]byte, _ ...managedwriter.AppendOption) (appendResult, error) {
 	if f.dispatch != nil {
 		return nil, f.dispatch
@@ -413,6 +459,139 @@ func TestCanceledAttemptTracksResultToTerminalState(t *testing.T) {
 	if err := w.Close(); err != nil {
 		t.Fatalf("close failed: %v", err)
 	}
+}
+
+func TestCanceledAttemptTelemetryReturnsToZero(t *testing.T) {
+	pending := newControlledResult()
+	first := &scriptedStream{results: []appendResult{pending}}
+	observer := &fakeObserver{}
+	w, _ := newScriptedWriter(first)
+	w.opts.Observer = observer
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	out := w.Append(ctx, [][]byte{{1}})
+	if out.Verdict.Class != Uncertain {
+		t.Fatalf("class = %s, want uncertain", out.Verdict.Class)
+	}
+	pending.waitForCalls(t, 2)
+
+	inflight, unresolved, _, timeouts, recreations := observer.snapshot()
+	if inflight != 1 || unresolved != 1 || timeouts != 1 || recreations != 1 {
+		t.Fatalf("during drain: inflight=%d unresolved=%d timeouts=%d recreations=%d, want 1 each",
+			inflight, unresolved, timeouts, recreations)
+	}
+
+	pending.complete(nil)
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	inflight, unresolved, waits, _, _ := observer.snapshot()
+	if inflight != 0 || unresolved != 0 || waits != 1 {
+		t.Fatalf("after drain: inflight=%d unresolved=%d waits=%d, want 0/0/1",
+			inflight, unresolved, waits)
+	}
+}
+
+// This matches the historical shipped relationship: ten queue consumers and
+// eight managedwriter flow-control slots. All ten attempts must return after a
+// no-ACK timeout, and a later append must recover on a fresh generation.
+func TestTenConcurrentAttemptsRecoverFromEightSlotNoACK(t *testing.T) {
+	stuck := newBoundedNoACKStream(8)
+	replacement := &scriptedStream{results: []appendResult{fakeResult{}}}
+	w, _ := newScriptedWriter(stuck, replacement)
+
+	const attempts = 10
+	cancels := make([]context.CancelFunc, attempts)
+	done := make(chan AppendOutcome, attempts)
+	for i := range attempts {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancels[i] = cancel
+		go func() { done <- w.Append(ctx, [][]byte{{1}}) }()
+	}
+	stuck.waitForCalls(t, attempts)
+	for _, cancel := range cancels {
+		cancel()
+	}
+	for range attempts {
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("concurrent append did not return after cancellation")
+		}
+	}
+
+	if out := w.Append(context.Background(), [][]byte{{2}}); out.Err != nil {
+		t.Fatalf("append after no-ACK generation failed: %v", out.Err)
+	}
+	if stuck.closeCount() != 1 {
+		t.Fatalf("stuck generation closed %d times, want once", stuck.closeCount())
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type boundedNoACKStream struct {
+	mu      sync.Mutex
+	calls   int
+	closed  int
+	slots   chan struct{}
+	results []*controlledResult
+}
+
+func newBoundedNoACKStream(slots int) *boundedNoACKStream {
+	return &boundedNoACKStream{slots: make(chan struct{}, slots)}
+}
+
+func (s *boundedNoACKStream) AppendRows(
+	ctx context.Context, _ [][]byte, _ ...managedwriter.AppendOption,
+) (appendResult, error) {
+	s.mu.Lock()
+	s.calls++
+	s.mu.Unlock()
+	select {
+	case s.slots <- struct{}{}:
+		result := newControlledResult()
+		s.mu.Lock()
+		s.results = append(s.results, result)
+		s.mu.Unlock()
+		return result, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (s *boundedNoACKStream) Close() error {
+	s.mu.Lock()
+	s.closed++
+	results := append([]*controlledResult(nil), s.results...)
+	s.mu.Unlock()
+	for _, result := range results {
+		result.complete(context.Canceled)
+	}
+	return nil
+}
+
+func (s *boundedNoACKStream) closeCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
+}
+
+func (s *boundedNoACKStream) waitForCalls(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		s.mu.Lock()
+		calls := s.calls
+		s.mu.Unlock()
+		if calls == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("AppendRows calls did not reach %d", want)
 }
 
 func TestCanceledManagedStreamIsDistinguishedFromShutdown(t *testing.T) {

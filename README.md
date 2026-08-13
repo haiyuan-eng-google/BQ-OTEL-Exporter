@@ -121,7 +121,7 @@ as log events rather than span attributes.
 | `write.max_inflight_requests`   | `8`                   | Bounds asynchronous in-flight appends. |
 | `write.max_inflight_bytes`      | `67108864` (64 MiB)   | Bounds memory held by in-flight appends. |
 | `limits.*`                      | see below             | Structural bounds applied before serialization. |
-| `sending_queue`                 | collector defaults    | Standard `exporterhelper` queue, including the persistent queue. |
+| `sending_queue`                 | 8 consumers           | Standard `exporterhelper` queue, including the persistent queue. Consumer concurrency defaults to the managedwriter request window. |
 | `retry_on_failure`              | `max_elapsed_time: 900s` | Standard `exporterhelper` retry. The horizon must be finite. |
 | `timeout`                       | collector defaults    | Per-request timeout. |
 
@@ -185,6 +185,36 @@ default object an analyst touches is already deduplicated. See
 > content-equivalence rather than identity. Two genuinely distinct but
 > byte-identical log records collapse into one. This is inherent to
 > fingerprinting.
+
+### Stream recovery and diagnostics
+
+The managedwriter client and stream use an exporter-owned lifecycle context;
+per-attempt timeouts are used only for dispatch/result waits. If an attempt
+ends after dispatch, that stream generation is retired before exporterhelper
+replays the batch, and every returned `AppendResult` keeps a lifecycle owner
+until it resolves or the exporter shuts down. This is what lets a later append
+recover without restarting the collector.
+
+The default queue has eight consumers, matching
+`write.max_inflight_requests: 8`. If you raise queue concurrency above the
+managedwriter request window, blocked senders consume their timeout budget
+while waiting for flow-control capacity; load-test that relationship before
+deploying it.
+
+Use these content-free self-telemetry instruments to detect a stuck path:
+
+| Metric | Meaning |
+| --- | --- |
+| `otelcol_exporter_bigquery_inflight_requests` | Dispatched append results not yet terminal. |
+| `otelcol_exporter_bigquery_unresolved_results` | Results being drained after their original attempt ended. |
+| `otelcol_exporter_bigquery_append_result_wait` | Dispatch-to-terminal wait duration in seconds. |
+| `otelcol_exporter_bigquery_timeouts_after_dispatch` | Attempts that ended after dispatch began. |
+| `otelcol_exporter_bigquery_stream_recreations` | Unsafe stream generations retired for recovery. |
+
+Both current-value instruments should return to zero after recovery or clean
+shutdown. A sustained nonzero value, rising timeout/recreation counters, or
+queue drops indicates “accepted by the collector, not yet confirmed by
+BigQuery.”
 
 ### Materializing the dedup view
 

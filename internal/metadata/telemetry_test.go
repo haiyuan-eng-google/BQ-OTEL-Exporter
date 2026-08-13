@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"go.opentelemetry.io/otel/metric/noop"
 )
@@ -23,6 +24,13 @@ func TestNewTelemetry(t *testing.T) {
 	tel.RecordRejected(ctx, "row_error", 2)
 	tel.RecordRetry(ctx, "unavailable")
 	tel.RecordUncertainAckReplay(ctx)
+	tel.RecordInflightRequests(ctx, 1)
+	tel.RecordInflightRequests(ctx, -1)
+	tel.RecordUnresolvedResults(ctx, 1)
+	tel.RecordUnresolvedResults(ctx, -1)
+	tel.RecordAppendResultWait(ctx, time.Millisecond)
+	tel.RecordTimeoutAfterDispatch(ctx)
+	tel.RecordStreamRecreation(ctx)
 }
 
 // A nil Telemetry must be inert rather than panic: a metrics failure should
@@ -34,6 +42,11 @@ func TestNilTelemetryIsSafe(t *testing.T) {
 	tel.RecordRejected(ctx, "x", 1)
 	tel.RecordRetry(ctx, "y")
 	tel.RecordUncertainAckReplay(ctx)
+	tel.RecordInflightRequests(ctx, 1)
+	tel.RecordUnresolvedResults(ctx, 1)
+	tel.RecordAppendResultWait(ctx, time.Millisecond)
+	tel.RecordTimeoutAfterDispatch(ctx)
+	tel.RecordStreamRecreation(ctx)
 }
 
 // The instrument names in code must match the ones metadata.yaml documents.
@@ -51,6 +64,11 @@ func TestMetricNamesMatchMetadataYAML(t *testing.T) {
 		nameRejectedRows,
 		nameRetries,
 		nameUncertainAckReplays,
+		nameInflightRequests,
+		nameUnresolvedResults,
+		nameAppendResultWait,
+		nameTimeoutsAfterDispatch,
+		nameStreamRecreations,
 	} {
 		if !strings.Contains(doc, name+":") {
 			t.Errorf("metric %q is emitted in code but not declared in metadata.yaml", name)

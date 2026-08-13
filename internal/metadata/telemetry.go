@@ -6,6 +6,7 @@ package metadata // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/inter
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -43,14 +44,31 @@ type Telemetry struct {
 	// Crash replays from the persistent queue are explicitly out of scope and
 	// are not counted here.
 	UncertainAckReplays metric.Int64Counter
+
+	// InflightRequests is the number of dispatched AppendResults that have not
+	// reached an exporter-owned terminal state.
+	InflightRequests metric.Int64UpDownCounter
+
+	// UnresolvedResults is the subset owned by lifecycle drainers after an
+	// exporterhelper attempt context ended.
+	UnresolvedResults metric.Int64UpDownCounter
+
+	AppendResultWait      metric.Float64Histogram
+	TimeoutsAfterDispatch metric.Int64Counter
+	StreamRecreations     metric.Int64Counter
 }
 
 // Metric names, matching metadata.yaml.
 const (
-	nameAcknowledgedRows    = "otelcol_exporter_bigquery_acknowledged_rows"
-	nameRejectedRows        = "otelcol_exporter_bigquery_rejected_rows"
-	nameRetries             = "otelcol_exporter_bigquery_retries"
-	nameUncertainAckReplays = "otelcol_exporter_bigquery_uncertain_ack_replays"
+	nameAcknowledgedRows      = "otelcol_exporter_bigquery_acknowledged_rows"
+	nameRejectedRows          = "otelcol_exporter_bigquery_rejected_rows"
+	nameRetries               = "otelcol_exporter_bigquery_retries"
+	nameUncertainAckReplays   = "otelcol_exporter_bigquery_uncertain_ack_replays"
+	nameInflightRequests      = "otelcol_exporter_bigquery_inflight_requests"
+	nameUnresolvedResults     = "otelcol_exporter_bigquery_unresolved_results"
+	nameAppendResultWait      = "otelcol_exporter_bigquery_append_result_wait"
+	nameTimeoutsAfterDispatch = "otelcol_exporter_bigquery_timeouts_after_dispatch"
+	nameStreamRecreations     = "otelcol_exporter_bigquery_stream_recreations"
 )
 
 // Label keys.
@@ -85,6 +103,31 @@ func NewTelemetry(mp metric.MeterProvider) (*Telemetry, error) {
 		metric.WithUnit("{replay}")); err != nil {
 		return nil, fmt.Errorf("creating %s: %w", nameUncertainAckReplays, err)
 	}
+	if t.InflightRequests, err = m.Int64UpDownCounter(nameInflightRequests,
+		metric.WithDescription("Dispatched append results awaiting an exporter-owned terminal state."),
+		metric.WithUnit("{request}")); err != nil {
+		return nil, fmt.Errorf("creating %s: %w", nameInflightRequests, err)
+	}
+	if t.UnresolvedResults, err = m.Int64UpDownCounter(nameUnresolvedResults,
+		metric.WithDescription("Append results retained by lifecycle drainers after their attempt ended."),
+		metric.WithUnit("{result}")); err != nil {
+		return nil, fmt.Errorf("creating %s: %w", nameUnresolvedResults, err)
+	}
+	if t.AppendResultWait, err = m.Float64Histogram(nameAppendResultWait,
+		metric.WithDescription("Time from append dispatch until its result owner finishes."),
+		metric.WithUnit("s")); err != nil {
+		return nil, fmt.Errorf("creating %s: %w", nameAppendResultWait, err)
+	}
+	if t.TimeoutsAfterDispatch, err = m.Int64Counter(nameTimeoutsAfterDispatch,
+		metric.WithDescription("Append attempts whose context ended after dispatch began."),
+		metric.WithUnit("{timeout}")); err != nil {
+		return nil, fmt.Errorf("creating %s: %w", nameTimeoutsAfterDispatch, err)
+	}
+	if t.StreamRecreations, err = m.Int64Counter(nameStreamRecreations,
+		metric.WithDescription("Managed stream generations retired and recreated after an unsafe outcome."),
+		metric.WithUnit("{recreation}")); err != nil {
+		return nil, fmt.Errorf("creating %s: %w", nameStreamRecreations, err)
+	}
 	return t, nil
 }
 
@@ -118,4 +161,39 @@ func (t *Telemetry) RecordUncertainAckReplay(ctx context.Context) {
 		return
 	}
 	t.UncertainAckReplays.Add(ctx, 1)
+}
+
+func (t *Telemetry) RecordInflightRequests(ctx context.Context, delta int64) {
+	if t == nil || delta == 0 {
+		return
+	}
+	t.InflightRequests.Add(ctx, delta)
+}
+
+func (t *Telemetry) RecordUnresolvedResults(ctx context.Context, delta int64) {
+	if t == nil || delta == 0 {
+		return
+	}
+	t.UnresolvedResults.Add(ctx, delta)
+}
+
+func (t *Telemetry) RecordAppendResultWait(ctx context.Context, elapsed time.Duration) {
+	if t == nil {
+		return
+	}
+	t.AppendResultWait.Record(ctx, elapsed.Seconds())
+}
+
+func (t *Telemetry) RecordTimeoutAfterDispatch(ctx context.Context) {
+	if t == nil {
+		return
+	}
+	t.TimeoutsAfterDispatch.Add(ctx, 1)
+}
+
+func (t *Telemetry) RecordStreamRecreation(ctx context.Context) {
+	if t == nil {
+		return
+	}
+	t.StreamRecreations.Add(ctx, 1)
 }
