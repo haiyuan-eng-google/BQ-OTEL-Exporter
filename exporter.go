@@ -12,6 +12,7 @@ import (
 	"cloud.google.com/go/bigquery/storage/managedwriter"
 	"go.opentelemetry.io/collector/component"
 	"go.uber.org/zap"
+	bigqueryapi "google.golang.org/api/bigquery/v2"
 	"google.golang.org/api/impersonate"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
@@ -27,16 +28,9 @@ import (
 // writeAPITraceID identifies this client to the Storage Write API backend.
 const writeAPITraceID = "otel-bigqueryexporter"
 
-// scopeWrite is the minimum OAuth scope for appending rows.
-const scopeWrite = "https://www.googleapis.com/auth/bigquery.insertdata"
-
 // scopeRead is sufficient for existence and schema validation when startup is
 // not authorized to create control-plane resources.
 const scopeRead = "https://www.googleapis.com/auth/bigquery.readonly"
-
-// scopeAdmin allows the metadata client to inspect and, when explicitly
-// configured, create datasets, tables, and views.
-const scopeAdmin = "https://www.googleapis.com/auth/bigquery"
 
 // newManagedWriterClient is the external constructor seam. Keeping it narrow
 // lets lifecycle tests prove which context is retained without opening a real
@@ -125,13 +119,13 @@ func (e *signalExporter) metadataClientOptions(ctx context.Context) ([]option.Cl
 
 func (e *signalExporter) metadataScopes() []string {
 	if e.cfg.AutoCreate.Dataset || e.cfg.AutoCreate.Tables {
-		return []string{scopeAdmin}
+		return []string{bigqueryapi.BigqueryScope}
 	}
 	return []string{scopeRead}
 }
 
 func (e *signalExporter) writerClientOptions(ctx context.Context) ([]option.ClientOption, error) {
-	opts, err := e.authenticationOptions(ctx, []string{scopeWrite})
+	opts, err := e.authenticationOptions(ctx, []string{bigqueryapi.BigqueryInsertdataScope})
 	if err != nil {
 		return nil, err
 	}

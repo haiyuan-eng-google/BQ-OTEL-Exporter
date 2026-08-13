@@ -12,6 +12,7 @@ import (
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"go.opentelemetry.io/collector/component"
 	"go.uber.org/zap"
+	bigqueryapi "google.golang.org/api/bigquery/v2"
 	"google.golang.org/api/googleapi"
 
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
@@ -61,15 +62,10 @@ func (f *fakeDestinationAdmin) CreateTable(_ context.Context, id string, md *bq.
 		f.createdTables = make(map[string]*bq.TableMetadata)
 	}
 	f.createdTables[id] = md
-	return f.createTableErr
-}
-
-func (f *fakeDestinationAdmin) CreateView(_ context.Context, id, query string) error {
-	if f.createdTables == nil {
-		f.createdTables = make(map[string]*bq.TableMetadata)
+	if strings.HasSuffix(id, "_dedup") {
+		return f.createViewErr
 	}
-	f.createdTables[id] = &bq.TableMetadata{ViewQuery: query}
-	return f.createViewErr
+	return f.createTableErr
 }
 
 func (f *fakeDestinationAdmin) Close() error { return nil }
@@ -314,12 +310,12 @@ func TestMetadataScopesAreLeastPrivilege(t *testing.T) {
 	}
 
 	cfg.AutoCreate.Dataset = true
-	if got := e.metadataScopes(); !equalStrings(got, []string{scopeAdmin}) {
+	if got := e.metadataScopes(); !equalStrings(got, []string{bigqueryapi.BigqueryScope}) {
 		t.Fatalf("dataset creation scopes = %v, want admin", got)
 	}
 	cfg.AutoCreate.Dataset = false
 	cfg.AutoCreate.Tables = true
-	if got := e.metadataScopes(); !equalStrings(got, []string{scopeAdmin}) {
+	if got := e.metadataScopes(); !equalStrings(got, []string{bigqueryapi.BigqueryScope}) {
 		t.Fatalf("table creation scopes = %v, want admin", got)
 	}
 }

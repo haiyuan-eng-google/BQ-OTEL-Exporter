@@ -60,7 +60,7 @@ type Observer interface {
 
 // TableRef renders the fully qualified destination table path.
 func (o WriterOptions) TableRef() string {
-	return fmt.Sprintf("projects/%s/datasets/%s/tables/%s", o.Project, o.Dataset, o.Table)
+	return managedwriter.TableParentFromParts(o.Project, o.Dataset, o.Table)
 }
 
 // TableID renders the BigQuery-style project.dataset.table identifier used in
@@ -253,6 +253,24 @@ func (w *Writer) observeTimeoutAfterDispatch() {
 	}
 }
 
+func (w *Writer) finishResult(started time.Time) {
+	w.observeInflight(-1)
+	w.observeResultWait(started)
+}
+
+func (w *Writer) classifyAndRetire(
+	ctx context.Context, err error, gen *streamGeneration,
+) (Verdict, bool) {
+	verdict, attemptEnded := w.classifyAppendFailure(ctx, err)
+	if verdict.StreamRecreate || attemptEnded || verdict.Class == Uncertain {
+		w.retireStream(gen)
+	}
+	if attemptEnded {
+		w.observeTimeoutAfterDispatch()
+	}
+	return verdict, attemptEnded
+}
+
 // RowError identifies a row the service rejected within an append.
 type RowError struct {
 	// Index is the row's position within the request that carried it.
@@ -317,13 +335,7 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 			// AppendRows can return the attempt-context error after handing a
 			// request to the bidirectional stream. Its acknowledgement is then
 			// ambiguous, and this generation cannot safely be reused.
-			v, attemptEnded := w.classifyAppendFailure(ctx, aerr)
-			if v.StreamRecreate || attemptEnded || v.Class == Uncertain {
-				w.retireStream(gen)
-			}
-			if attemptEnded {
-				w.observeTimeoutAfterDispatch()
-			}
+			v, _ := w.classifyAndRetire(ctx, aerr, gen)
 			out.Verdict = v
 			out.Err = aerr
 			break
@@ -341,21 +353,15 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 			// appended when any row in it fails.
 			rowErrs := extractRowErrors(ctx, p.res, p.start)
 			if len(rowErrs) > 0 {
-				w.observeInflight(-1)
-				w.observeResultWait(p.dispatched)
+				w.finishResult(p.dispatched)
 				out.RowErrors = append(out.RowErrors, rowErrs...)
 				continue
 			}
-			v, attemptEnded := w.classifyAppendFailure(ctx, rerr)
-			if v.StreamRecreate || attemptEnded || v.Class == Uncertain {
-				w.retireStream(gen)
-			}
+			v, attemptEnded := w.classifyAndRetire(ctx, rerr, gen)
 			if attemptEnded {
-				w.observeTimeoutAfterDispatch()
 				w.trackResult(p.res, p.dispatched)
 			} else {
-				w.observeInflight(-1)
-				w.observeResultWait(p.dispatched)
+				w.finishResult(p.dispatched)
 			}
 			// Preserve the first transport failure as the batch verdict, but
 			// keep draining all other results already dispatched by this call.
@@ -365,14 +371,13 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 			}
 			continue
 		}
-		w.observeInflight(-1)
-		w.observeResultWait(p.dispatched)
+		w.finishResult(p.dispatched)
 		out.AcknowledgedRows += p.count
 	}
 	return out
 }
 
-// classifyAttemptFailure distinguishes an ordinary server failure from the
+// classifyAppendFailure distinguishes an ordinary server failure from the
 // attempt context ending after AppendRows was invoked. Cancellation at that
 // point has the same delivery ambiguity as a deadline: the server may have
 // applied the rows even though the caller did not observe the acknowledgement.

@@ -7,13 +7,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 
 	bq "cloud.google.com/go/bigquery"
+	"github.com/googleapis/gax-go/v2/apierror"
 	"go.uber.org/zap"
-	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 )
@@ -26,7 +26,6 @@ type destinationAdmin interface {
 	CreateDataset(context.Context, *bq.DatasetMetadata) error
 	TableMetadata(context.Context, string) (*bq.TableMetadata, error)
 	CreateTable(context.Context, string, *bq.TableMetadata) error
-	CreateView(context.Context, string, string) error
 	Close() error
 }
 
@@ -51,12 +50,6 @@ func (a *bigQueryDestinationAdmin) CreateTable(ctx context.Context, id string, m
 	return a.dataset.Table(id).Create(ctx, md)
 }
 
-func (a *bigQueryDestinationAdmin) CreateView(ctx context.Context, id, query string) error {
-	// Table.Create is intentionally create-only. An existing view produces
-	// AlreadyExists and is never replaced or mutated by exporter startup.
-	return a.dataset.Table(id).Create(ctx, &bq.TableMetadata{ViewQuery: query, UseLegacySQL: false})
-}
-
 func (a *bigQueryDestinationAdmin) Close() error { return a.client.Close() }
 
 var newDestinationAdmin = func(
@@ -70,21 +63,8 @@ var newDestinationAdmin = func(
 }
 
 func (e *signalExporter) prepareDestination(ctx context.Context, admin destinationAdmin) error {
-	_, datasetErr := admin.DatasetMetadata(ctx)
-	switch {
-	case datasetErr == nil:
-	case isNotFound(datasetErr):
-		if !e.cfg.AutoCreate.Dataset {
-			return fmt.Errorf(
-				"destination dataset %s.%s does not exist; create it or enable auto_create.dataset",
-				e.cfg.Project, e.cfg.Dataset)
-		}
-		if err := admin.CreateDataset(ctx, &bq.DatasetMetadata{Location: e.cfg.Location}); err != nil && !isAlreadyExists(err) {
-			return fmt.Errorf("creating destination dataset %s.%s: %w", e.cfg.Project, e.cfg.Dataset, err)
-		}
-	default:
-		e.logger.Warn("dataset metadata is unreadable; deferring authorization to the real append",
-			zap.String("dataset", e.cfg.Project+"."+e.cfg.Dataset), zap.Error(datasetErr))
+	if err := e.ensureDataset(ctx, admin); err != nil {
+		return err
 	}
 
 	tableMD, tableErr := admin.TableMetadata(ctx, e.table)
@@ -99,7 +79,7 @@ func (e *signalExporter) prepareDestination(ctx context.Context, admin destinati
 				"destination table %s does not exist; create it or enable auto_create.tables",
 				e.tableID())
 		}
-	case tableErr != nil:
+	default:
 		e.logger.Warn("table metadata is unreadable; deferring authorization to the real append",
 			zap.String("destination", e.tableID()), zap.Error(tableErr))
 		return nil
@@ -115,22 +95,60 @@ func (e *signalExporter) prepareDestination(ctx context.Context, admin destinati
 		return fmt.Errorf("deriving destination metadata: %w", err)
 	}
 	if isNotFound(tableErr) {
-		if err := admin.CreateTable(ctx, e.table, createMD); err != nil {
-			if !isAlreadyExists(err) {
-				return fmt.Errorf("creating destination table %s: %w", e.tableID(), err)
-			}
-			winner, metadataErr := admin.TableMetadata(ctx, e.table)
-			if metadataErr != nil {
-				return fmt.Errorf(
-					"validating concurrently created destination table %s: %w", e.tableID(), metadataErr)
-			}
-			if err := e.validateTableMetadata(winner); err != nil {
-				return err
-			}
+		if err := e.createDestinationTable(ctx, admin, createMD); err != nil {
+			return err
 		}
 	}
+	return e.createDedupView(ctx, admin, viewQuery)
+}
+
+func (e *signalExporter) ensureDataset(ctx context.Context, admin destinationAdmin) error {
+	_, datasetErr := admin.DatasetMetadata(ctx)
+	switch {
+	case datasetErr == nil:
+		return nil
+	case isNotFound(datasetErr):
+		if !e.cfg.AutoCreate.Dataset {
+			return fmt.Errorf(
+				"destination dataset %s.%s does not exist; create it or enable auto_create.dataset",
+				e.cfg.Project, e.cfg.Dataset)
+		}
+		if err := admin.CreateDataset(ctx, &bq.DatasetMetadata{Location: e.cfg.Location}); err != nil && !isAlreadyExists(err) {
+			return fmt.Errorf("creating destination dataset %s.%s: %w", e.cfg.Project, e.cfg.Dataset, err)
+		}
+		return nil
+	default:
+		e.logger.Warn("dataset metadata is unreadable; deferring authorization to the real append",
+			zap.String("dataset", e.cfg.Project+"."+e.cfg.Dataset), zap.Error(datasetErr))
+		return nil
+	}
+}
+
+func (e *signalExporter) createDestinationTable(
+	ctx context.Context, admin destinationAdmin, md *bq.TableMetadata,
+) error {
+	if err := admin.CreateTable(ctx, e.table, md); err != nil {
+		if !isAlreadyExists(err) {
+			return fmt.Errorf("creating destination table %s: %w", e.tableID(), err)
+		}
+		winner, metadataErr := admin.TableMetadata(ctx, e.table)
+		if metadataErr != nil {
+			return fmt.Errorf(
+				"validating concurrently created destination table %s: %w", e.tableID(), metadataErr)
+		}
+		return e.validateTableMetadata(winner)
+	}
+	return nil
+}
+
+func (e *signalExporter) createDedupView(
+	ctx context.Context, admin destinationAdmin, query string,
+) error {
 	viewID := e.table + "_dedup"
-	if err := admin.CreateView(ctx, viewID, viewQuery); err != nil && !isAlreadyExists(err) {
+	md := &bq.TableMetadata{ViewQuery: query, UseLegacySQL: false}
+	// Table.Create is intentionally create-only. An existing view produces
+	// AlreadyExists and is never replaced or mutated by exporter startup.
+	if err := admin.CreateTable(ctx, viewID, md); err != nil && !isAlreadyExists(err) {
 		return fmt.Errorf("creating deduplication view %s.%s.%s: %w",
 			e.cfg.Project, e.cfg.Dataset, viewID, err)
 	}
@@ -154,17 +172,14 @@ func (e *signalExporter) validateTableMetadata(md *bq.TableMetadata) error {
 }
 
 func isNotFound(err error) bool {
-	return errorCodeIs(err, 404, codes.NotFound)
+	return errorCodeIs(err, http.StatusNotFound, codes.NotFound)
 }
 
 func isAlreadyExists(err error) bool {
-	return errorCodeIs(err, 409, codes.AlreadyExists)
+	return errorCodeIs(err, http.StatusConflict, codes.AlreadyExists)
 }
 
 func errorCodeIs(err error, httpCode int, grpcCode codes.Code) bool {
-	if status.Code(err) == grpcCode {
-		return true
-	}
-	var apiErr *googleapi.Error
-	return errors.As(err, &apiErr) && apiErr.Code == httpCode
+	apiErr, ok := apierror.FromError(err)
+	return ok && (apiErr.HTTPCode() == httpCode || apiErr.GRPCStatus().Code() == grpcCode)
 }

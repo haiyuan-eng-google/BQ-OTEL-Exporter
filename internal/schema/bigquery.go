@@ -38,43 +38,40 @@ func DestinationMetadata(
 	return md, fmt.Sprintf(queryTemplate, project, dataset, table), nil
 }
 
-var storageToBigQueryType = map[storagepb.TableFieldSchema_Type]bq.FieldType{
-	storagepb.TableFieldSchema_STRING:     bq.StringFieldType,
-	storagepb.TableFieldSchema_INT64:      bq.IntegerFieldType,
-	storagepb.TableFieldSchema_DOUBLE:     bq.FloatFieldType,
-	storagepb.TableFieldSchema_STRUCT:     bq.RecordFieldType,
-	storagepb.TableFieldSchema_BYTES:      bq.BytesFieldType,
-	storagepb.TableFieldSchema_BOOL:       bq.BooleanFieldType,
-	storagepb.TableFieldSchema_TIMESTAMP:  bq.TimestampFieldType,
-	storagepb.TableFieldSchema_DATE:       bq.DateFieldType,
-	storagepb.TableFieldSchema_TIME:       bq.TimeFieldType,
-	storagepb.TableFieldSchema_DATETIME:   bq.DateTimeFieldType,
-	storagepb.TableFieldSchema_GEOGRAPHY:  bq.GeographyFieldType,
-	storagepb.TableFieldSchema_NUMERIC:    bq.NumericFieldType,
-	storagepb.TableFieldSchema_BIGNUMERIC: bq.BigNumericFieldType,
-	storagepb.TableFieldSchema_INTERVAL:   bq.IntervalFieldType,
-	storagepb.TableFieldSchema_JSON:       bq.JSONFieldType,
-	storagepb.TableFieldSchema_RANGE:      bq.RangeFieldType,
+var fieldTypePairs = []struct {
+	storage  storagepb.TableFieldSchema_Type
+	bigQuery bq.FieldType
+}{
+	{storagepb.TableFieldSchema_STRING, bq.StringFieldType},
+	{storagepb.TableFieldSchema_INT64, bq.IntegerFieldType},
+	{storagepb.TableFieldSchema_DOUBLE, bq.FloatFieldType},
+	{storagepb.TableFieldSchema_STRUCT, bq.RecordFieldType},
+	{storagepb.TableFieldSchema_BYTES, bq.BytesFieldType},
+	{storagepb.TableFieldSchema_BOOL, bq.BooleanFieldType},
+	{storagepb.TableFieldSchema_TIMESTAMP, bq.TimestampFieldType},
+	{storagepb.TableFieldSchema_DATE, bq.DateFieldType},
+	{storagepb.TableFieldSchema_TIME, bq.TimeFieldType},
+	{storagepb.TableFieldSchema_DATETIME, bq.DateTimeFieldType},
+	{storagepb.TableFieldSchema_GEOGRAPHY, bq.GeographyFieldType},
+	{storagepb.TableFieldSchema_NUMERIC, bq.NumericFieldType},
+	{storagepb.TableFieldSchema_BIGNUMERIC, bq.BigNumericFieldType},
+	{storagepb.TableFieldSchema_INTERVAL, bq.IntervalFieldType},
+	{storagepb.TableFieldSchema_JSON, bq.JSONFieldType},
+	{storagepb.TableFieldSchema_RANGE, bq.RangeFieldType},
 }
 
-var bigQueryToStorageType = map[bq.FieldType]storagepb.TableFieldSchema_Type{
-	bq.StringFieldType:     storagepb.TableFieldSchema_STRING,
-	bq.BytesFieldType:      storagepb.TableFieldSchema_BYTES,
-	bq.IntegerFieldType:    storagepb.TableFieldSchema_INT64,
-	bq.FloatFieldType:      storagepb.TableFieldSchema_DOUBLE,
-	bq.BooleanFieldType:    storagepb.TableFieldSchema_BOOL,
-	bq.TimestampFieldType:  storagepb.TableFieldSchema_TIMESTAMP,
-	bq.RecordFieldType:     storagepb.TableFieldSchema_STRUCT,
-	bq.DateFieldType:       storagepb.TableFieldSchema_DATE,
-	bq.TimeFieldType:       storagepb.TableFieldSchema_TIME,
-	bq.DateTimeFieldType:   storagepb.TableFieldSchema_DATETIME,
-	bq.NumericFieldType:    storagepb.TableFieldSchema_NUMERIC,
-	bq.GeographyFieldType:  storagepb.TableFieldSchema_GEOGRAPHY,
-	bq.BigNumericFieldType: storagepb.TableFieldSchema_BIGNUMERIC,
-	bq.IntervalFieldType:   storagepb.TableFieldSchema_INTERVAL,
-	bq.JSONFieldType:       storagepb.TableFieldSchema_JSON,
-	bq.RangeFieldType:      storagepb.TableFieldSchema_RANGE,
-}
+var storageToBigQueryType, bigQueryToStorageType = func() (
+	map[storagepb.TableFieldSchema_Type]bq.FieldType,
+	map[bq.FieldType]storagepb.TableFieldSchema_Type,
+) {
+	toBigQuery := make(map[storagepb.TableFieldSchema_Type]bq.FieldType, len(fieldTypePairs))
+	toStorage := make(map[bq.FieldType]storagepb.TableFieldSchema_Type, len(fieldTypePairs))
+	for _, pair := range fieldTypePairs {
+		toBigQuery[pair.storage] = pair.bigQuery
+		toStorage[pair.bigQuery] = pair.storage
+	}
+	return toBigQuery, toStorage
+}()
 
 // ToBigQuery derives the metadata API schema from the Storage Write API
 // schema. The storagepb value is the single typed contract used for both table
