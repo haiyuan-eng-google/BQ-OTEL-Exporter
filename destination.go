@@ -7,13 +7,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
+	stdhttp "net/http"
 
 	bq "cloud.google.com/go/bigquery"
 	"github.com/googleapis/gax-go/v2/apierror"
 	"go.uber.org/zap"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
+	htransport "google.golang.org/api/transport/http"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 )
@@ -30,8 +33,9 @@ type destinationAdmin interface {
 }
 
 type bigQueryDestinationAdmin struct {
-	client  *bq.Client
-	dataset *bq.Dataset
+	client   *bq.Client
+	httpBase *stdhttp.Transport
+	dataset  *bq.Dataset
 }
 
 func (a *bigQueryDestinationAdmin) DatasetMetadata(ctx context.Context) (*bq.DatasetMetadata, error) {
@@ -50,16 +54,43 @@ func (a *bigQueryDestinationAdmin) CreateTable(ctx context.Context, id string, m
 	return a.dataset.Table(id).Create(ctx, md)
 }
 
-func (a *bigQueryDestinationAdmin) Close() error { return a.client.Close() }
+func (a *bigQueryDestinationAdmin) Close() error {
+	err := a.client.Close()
+	a.httpBase.CloseIdleConnections()
+	return err
+}
+
+var newBigQueryHTTPClient = func(
+	ctx context.Context, opts ...option.ClientOption,
+) (*stdhttp.Client, *stdhttp.Transport, error) {
+	defaultTransport, ok := stdhttp.DefaultTransport.(*stdhttp.Transport)
+	if !ok {
+		return nil, nil, errors.New("default HTTP transport is not configurable")
+	}
+	base := defaultTransport.Clone()
+	authenticated, err := htransport.NewTransport(ctx, base, opts...)
+	if err != nil {
+		base.CloseIdleConnections()
+		return nil, nil, err
+	}
+	return &stdhttp.Client{Transport: authenticated}, base, nil
+}
 
 var newDestinationAdmin = func(
 	ctx context.Context, project, dataset string, opts ...option.ClientOption,
 ) (destinationAdmin, error) {
-	client, err := bq.NewClient(ctx, project, opts...)
+	httpClient, httpBase, err := newBigQueryHTTPClient(ctx, opts...)
 	if err != nil {
 		return nil, err
 	}
-	return &bigQueryDestinationAdmin{client: client, dataset: client.Dataset(dataset)}, nil
+	client, err := bq.NewClient(ctx, project, option.WithHTTPClient(httpClient))
+	if err != nil {
+		httpBase.CloseIdleConnections()
+		return nil, err
+	}
+	return &bigQueryDestinationAdmin{
+		client: client, httpBase: httpBase, dataset: client.Dataset(dataset),
+	}, nil
 }
 
 func (e *signalExporter) prepareDestination(ctx context.Context, admin destinationAdmin) error {
@@ -190,14 +221,21 @@ func (e *signalExporter) validateTableMetadata(md *bq.TableMetadata) error {
 }
 
 func isNotFound(err error) bool {
-	return errorCodeIs(err, http.StatusNotFound, codes.NotFound)
+	return errorCodeIs(err, stdhttp.StatusNotFound, codes.NotFound)
 }
 
 func isAlreadyExists(err error) bool {
-	return errorCodeIs(err, http.StatusConflict, codes.AlreadyExists)
+	return errorCodeIs(err, stdhttp.StatusConflict, codes.AlreadyExists)
 }
 
 func errorCodeIs(err error, httpCode int, grpcCode codes.Code) bool {
+	var googleErr *googleapi.Error
+	if errors.As(err, &googleErr) && googleErr.Code == httpCode {
+		return true
+	}
+	if status.Code(err) == grpcCode {
+		return true
+	}
 	apiErr, ok := apierror.FromError(err)
 	return ok && (apiErr.HTTPCode() == httpCode || apiErr.GRPCStatus().Code() == grpcCode)
 }
