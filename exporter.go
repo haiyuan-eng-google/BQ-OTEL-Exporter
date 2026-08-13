@@ -96,7 +96,10 @@ func (e *signalExporter) authenticationOptions(
 
 	switch {
 	case e.cfg.Credentials.File != "":
-		opts = append(opts, option.WithCredentialsFile(e.cfg.Credentials.File))
+		opts = append(opts,
+			option.WithCredentialsFile(e.cfg.Credentials.File),
+			option.WithScopes(scopes...),
+		)
 
 	case e.cfg.Credentials.ImpersonateServiceAccount != "":
 		ts, err := impersonate.CredentialsTokenSource(ctx, impersonate.CredentialsConfig{
@@ -108,6 +111,9 @@ func (e *signalExporter) authenticationOptions(
 				e.cfg.Credentials.ImpersonateServiceAccount, err)
 		}
 		opts = append(opts, option.WithTokenSource(ts))
+
+	default:
+		opts = append(opts, option.WithScopes(scopes...))
 	}
 
 	return opts, nil
@@ -125,9 +131,13 @@ func (e *signalExporter) metadataScopes() []string {
 }
 
 func (e *signalExporter) writerClientOptions(ctx context.Context) ([]option.ClientOption, error) {
-	opts, err := e.authenticationOptions(ctx, []string{bigqueryapi.BigqueryInsertdataScope})
-	if err != nil {
-		return nil, err
+	var opts []option.ClientOption
+	if !e.cfg.Endpoint.WithoutAuthentication {
+		var err error
+		opts, err = e.authenticationOptions(ctx, []string{bigqueryapi.BigqueryInsertdataScope})
+		if err != nil {
+			return nil, err
+		}
 	}
 	if url := e.cfg.Endpoint.URL; url != "" {
 		opts = append(opts, option.WithEndpoint(url))
@@ -156,17 +166,34 @@ func (e *signalExporter) start(ctx context.Context, _ component.Host) (err error
 		}
 	}()
 
-	metadataOpts, err := e.metadataClientOptions(ctx)
-	if err != nil {
-		return err
-	}
-	admin, err := newDestinationAdmin(ctx, e.cfg.Project, e.cfg.Dataset, metadataOpts...)
-	if err != nil {
-		return fmt.Errorf("creating BigQuery metadata client: %w", err)
-	}
-	defer func() { err = errors.Join(err, admin.Close()) }()
-	if err := e.prepareDestination(ctx, admin); err != nil {
-		return err
+	if !e.cfg.Endpoint.WithoutAuthentication {
+		startupCtx, startupCancel := context.WithTimeout(ctx, e.cfg.TimeoutSettings.Timeout)
+		defer startupCancel()
+
+		metadataOpts, metadataErr := e.metadataClientOptions(startupCtx)
+		if metadataErr != nil {
+			return metadataErr
+		}
+		admin, adminErr := newDestinationAdmin(
+			startupCtx, e.cfg.Project, e.cfg.Dataset, metadataOpts...)
+		if adminErr != nil {
+			return fmt.Errorf("creating BigQuery metadata client: %w", adminErr)
+		}
+		defer func() {
+			closeErr := admin.Close()
+			if closeErr == nil {
+				return
+			}
+			closeErr = fmt.Errorf("closing BigQuery metadata client: %w", closeErr)
+			if err != nil {
+				err = errors.Join(err, closeErr)
+				return
+			}
+			e.logger.Warn("closing BigQuery metadata client failed", zap.Error(closeErr))
+		}()
+		if prepareErr := e.prepareDestination(startupCtx, admin); prepareErr != nil {
+			return prepareErr
+		}
 	}
 
 	writerOpts, err := e.writerClientOptions(lifetimeCtx)
@@ -302,6 +329,26 @@ func (e *signalExporter) appendEncoded(
 	}
 
 	out := e.writer.Append(ctx, encoded)
+	e.tel.RecordAcknowledged(ctx, out.AcknowledgedRows)
+
+	invalid := make(map[int]bool, len(out.RowErrors))
+	for _, re := range out.RowErrors {
+		pos := int(re.Index)
+		if pos < 0 || pos >= len(keptIndex) {
+			continue
+		}
+		invalid[pos] = true
+		e.tel.RecordRejected(ctx, string(transform.ReasonRowError), 1)
+		e.logger.Debug("service rejected a row",
+			diag.RowError(e.tableID(), opID, re.Index, re.Code, re.Message)...)
+	}
+
+	retryable := make([]int, 0, len(keptIndex)-len(invalid))
+	for pos, origIdx := range keptIndex {
+		if !invalid[pos] {
+			retryable = append(retryable, origIdx)
+		}
+	}
 
 	if out.Err != nil {
 		v := out.Verdict
@@ -332,38 +379,21 @@ func (e *signalExporter) appendEncoded(
 		if v.Class == bqi.Permanent {
 			return appendDecision{err: out.Err, permanent: true}
 		}
-		// Everything in this append is still unacknowledged.
-		return appendDecision{retryableIndices: keptIndex, err: out.Err}
+		// AcknowledgedRows is a count rather than an index set. Conservatively
+		// retry every row not permanently rejected; this may replay confirmed
+		// rows, which the at-least-once contract permits.
+		return appendDecision{retryableIndices: retryable, err: out.Err}
 	}
 
 	if len(out.RowErrors) > 0 {
-		invalid := make(map[int]bool, len(out.RowErrors))
-		for _, re := range out.RowErrors {
-			pos := int(re.Index)
-			if pos < 0 || pos >= len(keptIndex) {
-				continue
-			}
-			invalid[pos] = true
-			e.tel.RecordRejected(ctx, string(transform.ReasonRowError), 1)
-			e.logger.Debug("service rejected a row",
-				diag.RowError(e.tableID(), opID, re.Index, re.Code, re.Message)...)
-		}
-
 		// The whole request was refused, so the valid rows that travelled with
 		// the invalid ones still need delivering. Permanently invalid rows are
 		// dropped here and never routed back through consumererror.
-		var retry []int
-		for pos, origIdx := range keptIndex {
-			if !invalid[pos] {
-				retry = append(retry, origIdx)
-			}
-		}
 		return appendDecision{
-			retryableIndices: retry,
+			retryableIndices: retryable,
 			err:              fmt.Errorf("%d row(s) rejected by the service; re-sending the valid subset", len(invalid)),
 		}
 	}
 
-	e.tel.RecordAcknowledged(ctx, out.AcknowledgedRows)
 	return appendDecision{}
 }

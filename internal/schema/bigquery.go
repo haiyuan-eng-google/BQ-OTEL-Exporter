@@ -235,6 +235,35 @@ func fieldDifferences(prefix string, want, have []*storagepb.TableFieldSchema) [
 			differences = append(differences, fmt.Sprintf(
 				"%s has mode %s, want %s", path, actual.GetMode(), expected.GetMode()))
 		}
+		if actual.GetMaxLength() != expected.GetMaxLength() {
+			differences = append(differences, fmt.Sprintf(
+				"%s has max length %d, want %d", path, actual.GetMaxLength(), expected.GetMaxLength()))
+		}
+		if actual.GetPrecision() != expected.GetPrecision() {
+			differences = append(differences, fmt.Sprintf(
+				"%s has precision %d, want %d", path, actual.GetPrecision(), expected.GetPrecision()))
+		}
+		if actual.GetScale() != expected.GetScale() {
+			differences = append(differences, fmt.Sprintf(
+				"%s has scale %d, want %d", path, actual.GetScale(), expected.GetScale()))
+		}
+		if actual.GetDefaultValueExpression() != expected.GetDefaultValueExpression() {
+			differences = append(differences, fmt.Sprintf(
+				"%s has default value expression %q, want %q", path,
+				actual.GetDefaultValueExpression(), expected.GetDefaultValueExpression()))
+		}
+		if actual.GetTimestampPrecision().GetValue() != expected.GetTimestampPrecision().GetValue() {
+			differences = append(differences, fmt.Sprintf(
+				"%s has timestamp precision %d, want %d", path,
+				actual.GetTimestampPrecision().GetValue(), expected.GetTimestampPrecision().GetValue()))
+		}
+		actualRangeType, expectedRangeType := actual.GetRangeElementType(), expected.GetRangeElementType()
+		if (actualRangeType == nil) != (expectedRangeType == nil) ||
+			actualRangeType.GetType() != expectedRangeType.GetType() {
+			differences = append(differences, fmt.Sprintf(
+				"%s has range element type %s, want %s", path,
+				actualRangeType.GetType(), expectedRangeType.GetType()))
+		}
 		differences = append(differences,
 			fieldDifferences(path, expected.GetFields(), actual.GetFields())...)
 	}

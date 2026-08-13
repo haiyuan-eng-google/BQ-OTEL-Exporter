@@ -115,6 +115,9 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 		if err := waitForRows(ctx, admin, project, dataset, table); err != nil {
 			t.Error(err)
 		}
+		if err := waitForRows(ctx, admin, project, dataset, table+"_dedup"); err != nil {
+			t.Error(err)
+		}
 	}
 }
 

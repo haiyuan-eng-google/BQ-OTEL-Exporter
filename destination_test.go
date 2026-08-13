@@ -5,6 +5,7 @@ package bigqueryexporter
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -14,6 +15,8 @@ import (
 	"go.uber.org/zap"
 	bigqueryapi "google.golang.org/api/bigquery/v2"
 	"google.golang.org/api/googleapi"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 )
@@ -26,6 +29,8 @@ type fakeDestinationAdmin struct {
 	createDatasetErr   error
 	createTableErr     error
 	createViewErr      error
+	closeErr           error
+	blockDatasetRead   bool
 
 	createdDataset *bq.DatasetMetadata
 	createdTables  map[string]*bq.TableMetadata
@@ -38,7 +43,11 @@ type fakeTableMetadataResponse struct {
 	err      error
 }
 
-func (f *fakeDestinationAdmin) DatasetMetadata(context.Context) (*bq.DatasetMetadata, error) {
+func (f *fakeDestinationAdmin) DatasetMetadata(ctx context.Context) (*bq.DatasetMetadata, error) {
+	if f.blockDatasetRead {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	return f.datasetMetadata, f.datasetMetadataErr
 }
 
@@ -68,7 +77,7 @@ func (f *fakeDestinationAdmin) CreateTable(_ context.Context, id string, md *bq.
 	return f.createTableErr
 }
 
-func (f *fakeDestinationAdmin) Close() error { return nil }
+func (f *fakeDestinationAdmin) Close() error { return f.closeErr }
 
 func newTestSignalExporter(cfg *Config, table string, tableSchema *storagepb.TableSchema) *signalExporter {
 	return newSignalExporter(componentTelemetryForTest(), cfg, table, tableSchema)
@@ -263,11 +272,8 @@ func TestPrepareDestinationRejectsTypeModeAndNestedSchemaDrift(t *testing.T) {
 	}
 }
 
-func TestPrepareDestinationPermissionAmbiguityDoesNotBlockWritesOrCreate(t *testing.T) {
+func TestPrepareDestinationPermissionAmbiguityDefersWhenCreationIsDisabled(t *testing.T) {
 	cfg := validConfig()
-	cfg.AutoCreate.Dataset = true
-	cfg.AutoCreate.Tables = true
-	cfg.Location = "US"
 	admin := &fakeDestinationAdmin{datasetMetadataErr: forbidden(), tableMetadataErr: forbidden()}
 	e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
 
@@ -275,7 +281,66 @@ func TestPrepareDestinationPermissionAmbiguityDoesNotBlockWritesOrCreate(t *test
 		t.Fatalf("ambiguous metadata permission must defer to real append: %v", err)
 	}
 	if admin.createdDataset != nil || len(admin.createdTables) != 0 {
-		t.Fatal("permission ambiguity must not be mistaken for a missing resource")
+		t.Fatal("permission ambiguity must not trigger creation when creation is disabled")
+	}
+}
+
+func TestPrepareDestinationUnreadableTableAttemptsEnabledCreation(t *testing.T) {
+	cfg := validConfig()
+	cfg.AutoCreate.Tables = true
+	createErr := status.Error(codes.PermissionDenied, "cannot create")
+	admin := &fakeDestinationAdmin{
+		datasetMetadata:  &bq.DatasetMetadata{},
+		tableMetadataErr: forbidden(),
+		createTableErr:   createErr,
+	}
+	e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+
+	err := e.prepareDestination(context.Background(), admin)
+	if !errors.Is(err, createErr) {
+		t.Fatalf("error = %v, want table creation failure %v", err, createErr)
+	}
+	if admin.createdTables[cfg.Traces.Table] == nil {
+		t.Fatal("enabled idempotent table creation was not attempted after an unreadable metadata probe")
+	}
+}
+
+func TestPrepareDestinationReturnsNonConflictCreationFailure(t *testing.T) {
+	cfg := validConfig()
+	cfg.AutoCreate.Tables = true
+	createErr := status.Error(codes.Unavailable, "control plane unavailable")
+	admin := &fakeDestinationAdmin{
+		datasetMetadata:  &bq.DatasetMetadata{},
+		tableMetadataErr: notFound(),
+		createTableErr:   createErr,
+	}
+	e := newTestSignalExporter(cfg, cfg.Logs.Table, schema.LogsTableSchema())
+
+	err := e.prepareDestination(context.Background(), admin)
+	if !errors.Is(err, createErr) {
+		t.Fatalf("error = %v, want non-conflict creation error %v", err, createErr)
+	}
+}
+
+func TestPrepareDestinationRecognizesGRPCProvisioningCodes(t *testing.T) {
+	cfg := validConfig()
+	cfg.AutoCreate.Tables = true
+	admin := &fakeDestinationAdmin{
+		datasetMetadata: &bq.DatasetMetadata{},
+		tableResponses: []fakeTableMetadataResponse{
+			{err: status.Error(codes.NotFound, "missing")},
+			{metadata: &bq.TableMetadata{Schema: mustBigQuerySchema(t, schema.SpansTableSchema())}},
+		},
+		createTableErr: status.Error(codes.AlreadyExists, "concurrent winner"),
+		createViewErr:  status.Error(codes.AlreadyExists, "existing view"),
+	}
+	e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+
+	if err := e.prepareDestination(context.Background(), admin); err != nil {
+		t.Fatalf("gRPC NotFound/AlreadyExists provisioning should be idempotent: %v", err)
+	}
+	if admin.tableReads != 2 {
+		t.Fatalf("table reads = %d, want initial gRPC NotFound and concurrent-winner validation", admin.tableReads)
 	}
 }
 
@@ -294,11 +359,45 @@ func TestClientOptionsSeparateMetadataFromStorageEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(metadataOpts) != 1 {
-		t.Fatalf("metadata options = %d, want only the configured credential", len(metadataOpts))
+	if len(metadataOpts) != 2 {
+		t.Fatalf("metadata options = %d, want configured credential and explicit scope", len(metadataOpts))
 	}
-	if len(writerOpts) != 3 {
-		t.Fatalf("writer options = %d, want credential plus endpoint and transport", len(writerOpts))
+	if len(writerOpts) != 4 {
+		t.Fatalf("writer options = %d, want credential, explicit scope, endpoint, and transport", len(writerOpts))
+	}
+}
+
+func TestAuthenticationOptionsApplyScopesToADC(t *testing.T) {
+	cfg := validConfig()
+	e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+
+	metadataOpts, err := e.metadataClientOptions(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writerOpts, err := e.writerClientOptions(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(metadataOpts) != 1 || len(writerOpts) != 1 {
+		t.Fatalf("ADC options metadata=%d writer=%d, want one explicit scope for each", len(metadataOpts), len(writerOpts))
+	}
+}
+
+func TestWriterClientOptionsWithoutAuthenticationSkipAuthOptions(t *testing.T) {
+	cfg := validConfig()
+	cfg.Credentials.File = "/credentials-that-must-not-be-used.json"
+	cfg.Endpoint.URL = "localhost:9050"
+	cfg.Endpoint.Insecure = true
+	cfg.Endpoint.WithoutAuthentication = true
+	e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+
+	opts, err := e.writerClientOptions(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(opts) != 3 {
+		t.Fatalf("no-auth writer options = %d, want only endpoint, transport, and WithoutAuthentication", len(opts))
 	}
 }
 

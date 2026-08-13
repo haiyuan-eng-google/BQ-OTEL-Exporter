@@ -161,6 +161,9 @@ func (l LimitsConfig) toTransform() transform.Limits {
 // Validate checks the configuration and fails fast at startup.
 func (cfg *Config) Validate() error {
 	var errs []error
+	if cfg.TimeoutSettings.Timeout <= 0 {
+		errs = append(errs, errors.New("timeout must be positive so startup and export attempts are bounded"))
+	}
 
 	if cfg.Project == "" {
 		errs = append(errs, errors.New("project must be specified"))
@@ -195,6 +198,16 @@ func (cfg *Config) Validate() error {
 
 	if cfg.AutoCreate.Dataset && cfg.Location == "" {
 		errs = append(errs, errors.New("location is required when auto_create.dataset is enabled"))
+	}
+	if cfg.Endpoint.WithoutAuthentication {
+		if cfg.AutoCreate.Dataset {
+			errs = append(errs, errors.New(
+				"auto_create.dataset cannot be enabled with endpoint.without_authentication"))
+		}
+		if cfg.AutoCreate.Tables {
+			errs = append(errs, errors.New(
+				"auto_create.tables cannot be enabled with endpoint.without_authentication"))
+		}
 	}
 
 	// An ID without a namespace is not an identity: two producers could mint

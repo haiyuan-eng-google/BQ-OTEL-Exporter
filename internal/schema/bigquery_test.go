@@ -4,11 +4,13 @@
 package schema
 
 import (
+	"strings"
 	"testing"
 
 	bq "cloud.google.com/go/bigquery"
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 func TestToBigQueryPreservesCompleteSchema(t *testing.T) {
@@ -105,6 +107,92 @@ func TestCompatibilityDifferencesAllowsOnlyAdditiveNullableFields(t *testing.T) 
 	})
 	if got := CompatibilityDifferences(want, withRequired); len(got) != 1 {
 		t.Fatalf("extra required field differences = %v, want one incompatibility", got)
+	}
+}
+
+func TestCompatibilityDifferencesRejectsNestedConstraintDrift(t *testing.T) {
+	want := &storagepb.TableSchema{Fields: []*storagepb.TableFieldSchema{
+		{
+			Name: "nested", Type: storagepb.TableFieldSchema_STRUCT, Mode: storagepb.TableFieldSchema_NULLABLE,
+			Fields: []*storagepb.TableFieldSchema{
+				{
+					Name: "limited", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE,
+					MaxLength: 64, DefaultValueExpression: "'unknown'",
+				},
+				{
+					Name: "decimal", Type: storagepb.TableFieldSchema_NUMERIC, Mode: storagepb.TableFieldSchema_NULLABLE,
+					Precision: 38, Scale: 9,
+				},
+				{
+					Name: "occurred_at", Type: storagepb.TableFieldSchema_TIMESTAMP, Mode: storagepb.TableFieldSchema_NULLABLE,
+					TimestampPrecision: wrapperspb.Int64(6),
+				},
+				{
+					Name: "window", Type: storagepb.TableFieldSchema_RANGE, Mode: storagepb.TableFieldSchema_NULLABLE,
+					RangeElementType: &storagepb.TableFieldSchema_FieldElementType{Type: storagepb.TableFieldSchema_DATE},
+				},
+			},
+		},
+	}}
+
+	tests := []struct {
+		name       string
+		mutate     func(*storagepb.TableSchema)
+		wantDetail string
+	}{
+		{
+			name: "max length",
+			mutate: func(s *storagepb.TableSchema) {
+				s.Fields[0].Fields[0].MaxLength = 32
+			},
+			wantDetail: "nested.limited has max length 32, want 64",
+		},
+		{
+			name: "default expression",
+			mutate: func(s *storagepb.TableSchema) {
+				s.Fields[0].Fields[0].DefaultValueExpression = "'other'"
+			},
+			wantDetail: `nested.limited has default value expression "'other'", want "'unknown'"`,
+		},
+		{
+			name: "precision",
+			mutate: func(s *storagepb.TableSchema) {
+				s.Fields[0].Fields[1].Precision = 20
+			},
+			wantDetail: "nested.decimal has precision 20, want 38",
+		},
+		{
+			name: "scale",
+			mutate: func(s *storagepb.TableSchema) {
+				s.Fields[0].Fields[1].Scale = 4
+			},
+			wantDetail: "nested.decimal has scale 4, want 9",
+		},
+		{
+			name: "timestamp precision",
+			mutate: func(s *storagepb.TableSchema) {
+				s.Fields[0].Fields[2].TimestampPrecision = wrapperspb.Int64(3)
+			},
+			wantDetail: "nested.occurred_at has timestamp precision 3, want 6",
+		},
+		{
+			name: "range element type",
+			mutate: func(s *storagepb.TableSchema) {
+				s.Fields[0].Fields[3].RangeElementType.Type = storagepb.TableFieldSchema_DATETIME
+			},
+			wantDetail: "nested.window has range element type DATETIME, want DATE",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			have := proto.Clone(want).(*storagepb.TableSchema)
+			tc.mutate(have)
+			differences := CompatibilityDifferences(want, have)
+			if len(differences) != 1 || !strings.Contains(differences[0], tc.wantDetail) {
+				t.Fatalf("differences = %v, want one containing %q", differences, tc.wantDetail)
+			}
+		})
 	}
 }
 

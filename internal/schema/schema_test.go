@@ -127,6 +127,32 @@ func TestDDLTemplatesFormatCleanly(t *testing.T) {
 	}
 }
 
+func TestDedupQueriesAreBodiesAndDDLsAreStatements(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		query string
+		ddl   string
+	}{
+		{name: "spans", query: SpansDedupViewQuery, ddl: SpansDedupViewDDL},
+		{name: "logs", query: LogsDedupViewQuery, ddl: LogsDedupViewDDL},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			query := strings.TrimSpace(fmt.Sprintf(tc.query, "proj", "ds", "tbl"))
+			if strings.HasSuffix(query, ";") {
+				t.Fatalf("metadata API query must be a bare query body, got %q", query)
+			}
+
+			ddl := strings.TrimSpace(fmt.Sprintf(tc.ddl, "proj", "ds", "tbl"))
+			if !strings.HasSuffix(ddl, ";") {
+				t.Fatalf("operator-run DDL must end with a statement terminator, got %q", ddl)
+			}
+			if !strings.Contains(ddl, query) {
+				t.Fatal("operator-run DDL does not contain the metadata API query body")
+			}
+		})
+	}
+}
+
 // The DDL and the storagepb.TableSchema describe the same contract from two
 // directions: the DDL is what an operator runs, the TableSchema is what the
 // exporter writes against. If they drift, rows get written against a shape the

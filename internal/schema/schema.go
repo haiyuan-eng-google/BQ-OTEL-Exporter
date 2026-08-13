@@ -143,7 +143,8 @@ PARTITION BY DATE(timestamp);
 // of the approved §7.1 contract.
 const SpansDedupViewDDL = `
 CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s.%[3]s_dedup`" + ` AS
-` + SpansDedupViewQuery
+` + SpansDedupViewQuery + `;
+`
 
 // SpansDedupViewQuery is shared by operator-run DDL and metadata-API view
 // creation so their deduplication behavior cannot drift.
@@ -153,7 +154,7 @@ QUALIFY ROW_NUMBER() OVER (
   PARTITION BY trace_id, span_id
   ORDER BY CAST(end_time_unix_nano AS BIGNUMERIC) DESC,
            export_received_timestamp DESC
-) = 1;
+) = 1
 `
 
 // LogsDedupViewDDL is the canonical log deduplication view (§7.4).
@@ -174,7 +175,8 @@ QUALIFY ROW_NUMBER() OVER (
 // available only through the trusted namespace/ID tuple.
 const LogsDedupViewDDL = `
 CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s.%[3]s_dedup`" + ` AS
-` + LogsDedupViewQuery
+` + LogsDedupViewQuery + `;
+`
 
 // LogsDedupViewQuery is shared by operator-run DDL and metadata-API view
 // creation so their deduplication behavior cannot drift.
@@ -187,7 +189,7 @@ QUALIFY ROW_NUMBER() OVER (
     IF(source_record_namespace IS NOT NULL AND source_record_id IS NOT NULL,
        source_record_id, record_fingerprint)
   ORDER BY export_received_timestamp DESC
-) = 1;
+) = 1
 `
 
 // FingerprintPrefix is the version tag on record_fingerprint values, which are

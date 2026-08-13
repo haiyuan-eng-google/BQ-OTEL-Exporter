@@ -68,6 +68,10 @@ func (e *signalExporter) prepareDestination(ctx context.Context, admin destinati
 	}
 
 	tableMD, tableErr := admin.TableMetadata(ctx, e.table)
+	if tableErr != nil && isContextError(tableErr) {
+		return fmt.Errorf("reading destination table metadata for %s: %w", e.tableID(), tableErr)
+	}
+	createTable := false
 	switch {
 	case tableErr == nil:
 		if err := e.validateTableMetadata(tableMD); err != nil {
@@ -79,10 +83,16 @@ func (e *signalExporter) prepareDestination(ctx context.Context, admin destinati
 				"destination table %s does not exist; create it or enable auto_create.tables",
 				e.tableID())
 		}
+		createTable = true
 	default:
-		e.logger.Warn("table metadata is unreadable; deferring authorization to the real append",
+		if !e.cfg.AutoCreate.Tables {
+			e.logger.Warn("table metadata is unreadable; deferring authorization to the real append",
+				zap.String("destination", e.tableID()), zap.Error(tableErr))
+			return nil
+		}
+		e.logger.Warn("table metadata is unreadable; attempting idempotent creation because auto_create.tables is enabled",
 			zap.String("destination", e.tableID()), zap.Error(tableErr))
-		return nil
+		createTable = true
 	}
 
 	if !e.cfg.AutoCreate.Tables {
@@ -94,7 +104,7 @@ func (e *signalExporter) prepareDestination(ctx context.Context, admin destinati
 	if err != nil {
 		return fmt.Errorf("deriving destination metadata: %w", err)
 	}
-	if isNotFound(tableErr) {
+	if createTable {
 		if err := e.createDestinationTable(ctx, admin, createMD); err != nil {
 			return err
 		}
@@ -104,6 +114,10 @@ func (e *signalExporter) prepareDestination(ctx context.Context, admin destinati
 
 func (e *signalExporter) ensureDataset(ctx context.Context, admin destinationAdmin) error {
 	_, datasetErr := admin.DatasetMetadata(ctx)
+	if datasetErr != nil && isContextError(datasetErr) {
+		return fmt.Errorf("reading destination dataset metadata for %s.%s: %w",
+			e.cfg.Project, e.cfg.Dataset, datasetErr)
+	}
 	switch {
 	case datasetErr == nil:
 		return nil
@@ -122,6 +136,10 @@ func (e *signalExporter) ensureDataset(ctx context.Context, admin destinationAdm
 			zap.String("dataset", e.cfg.Project+"."+e.cfg.Dataset), zap.Error(datasetErr))
 		return nil
 	}
+}
+
+func isContextError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 func (e *signalExporter) createDestinationTable(
