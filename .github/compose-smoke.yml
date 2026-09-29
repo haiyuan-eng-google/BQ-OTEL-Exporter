@@ -1,0 +1,14 @@
+# CI-only overlay for example/docker-compose.yml, not a deployment journey.
+#
+# It keeps the example config and layers on a Storage Write endpoint at a
+# closed loopback port inside the container, with authentication disabled. The
+# collector therefore starts and serves OTLP without Google credentials:
+# startup skips the metadata preflight, BQ_ADC_PATH is never read, and every
+# append fails inside the container, so nothing reaches BigQuery. Expect
+# "connection refused" warnings from the exporter's gRPC client.
+services:
+  otelcollector:
+    command:
+      - --config=/etc/otel/config.yml
+      - "--config=yaml:exporters::bigquery::endpoint: {url: '127.0.0.1:1', insecure: true, without_authentication: true}"
+      - "--config=yaml:exporters::bigquery::auto_create: {dataset: false, tables: false}"

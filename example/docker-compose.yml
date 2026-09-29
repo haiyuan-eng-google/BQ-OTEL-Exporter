@@ -4,6 +4,10 @@ services:
     build:
       context: ..
       dockerfile: example/Dockerfile
+    # gcloud writes ADC owner-only (0600), which the image's distroless nonroot
+    # user cannot read through a Linux bind mount. Set
+    # BQ_CONTAINER_USER="$(id -u):$(id -g)" to run as the file's owner instead.
+    user: "${BQ_CONTAINER_USER:-65532:65532}"
     command: ["--config=/etc/otel/config.yml"]
     environment:
       - BQ_PROJECT=${BQ_PROJECT}

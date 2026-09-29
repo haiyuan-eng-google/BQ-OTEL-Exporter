@@ -38,23 +38,27 @@ comments so the repository stands on its own.
 ## Getting started
 
 The stock `otelcol-contrib` image does not contain this repository's exporter.
-Build the pinned custom distribution and verify both component registration and
-configuration parsing without credentials:
+Build the pinned custom distribution defined in
+[`example/otelcol-builder.yaml`](example/otelcol-builder.yaml) and verify both
+component registration and configuration parsing without credentials:
 
 ```bash
 make collector-check
 ```
 
-For the Docker Compose path, choose a dataset name and an ADC file. The example
-opts into creating the dataset, the active trace/log tables, and their
-create-only deduplication views, so the identity needs the creation permissions
-listed under [IAM](#iam).
+For the Docker Compose path, choose a dataset name and an ADC file. Compose
+builds the same distribution into a non-root image with
+[`example/Dockerfile`](example/Dockerfile). The example opts into creating the
+dataset, the active trace/log tables, and their create-only deduplication
+views, so the identity needs the creation permissions listed under [IAM](#iam).
 
 ```bash
 export BQ_PROJECT=my-project
 export BQ_DATASET=otel
 export BQ_LOCATION=US
 export BQ_ADC_PATH="$HOME/.config/gcloud/application_default_credentials.json"
+# gcloud writes that file owner-only; run the container as its owner.
+export BQ_CONTAINER_USER="$(id -u):$(id -g)"
 docker compose -f example/docker-compose.yml up --build
 ```
 
@@ -84,6 +88,72 @@ service:
       receivers: [otlp]
       exporters: [bigquery]
 ```
+
+### Startup errors
+
+None of these is the stock image's `'exporters' unknown type: "bigquery"`,
+which means the binary is not this distribution. The collector prints the
+exporter's startup errors after `Error: cannot start pipelines: failed to
+start "bigquery" exporter:`, and credential errors after a further
+`creating BigQuery metadata client: google:`. Messages use the example values
+above.
+
+| Look for | Cause and action |
+| --- | --- |
+| `required variable BQ_ADC_PATH is missing a value: Set BQ_ADC_PATH to an ADC JSON file` | From Compose, before any container starts. Export `BQ_ADC_PATH`. |
+| `could not find default credentials` | No credentials reach the collector. Mount an ADC or service-account key file, as Compose does from `BQ_ADC_PATH`. |
+| `open /creds/adc.json: permission denied` | The image's non-root user cannot read an owner-only file. Export `BQ_CONTAINER_USER` as above. |
+| `missing 'type' field in credentials` | `BQ_ADC_PATH` names a file that is not a credential. |
+| `destination dataset my-project.otel does not exist; create it or enable auto_create.dataset` | The dataset is absent and creation is off. |
+| `destination table my-project.otel.otel_spans does not exist; create it or enable auto_create.tables` | The table is absent and creation is off. Run the DDL in [`internal/schema`](internal/schema/schema.go), or enable creation. |
+| `creating destination table my-project.otel.otel_spans:` followed by the BigQuery error | Creation is on but the identity may not create the table; the dataset and `_dedup` view fail the same way. Grant the [IAM](#iam) create permission, or pre-create and turn `auto_create` off. |
+| `append denied on my-project.otel.otel_spans: the writing identity needs bigquery.tables.updateData on this table (the write-only custom role, or roles/bigquery.dataEditor)` | Logged when an append is refused. The collector keeps running and does not retry that batch. Grant the write permission. |
+
+### Credentialed smoke
+
+CI builds the image through Compose and starts it without credentials, with
+the destination pointed at a closed loopback port. It shows both OTLP ports
+accepting data and every credential error above, but nothing reaches BigQuery.
+Landing rows is this manual check, which has not been run yet
+([#4](https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter/issues/4)). With
+the collector above running, send one span and one log that share a trace ID:
+
+```bash
+TRACE_ID=$(openssl rand -hex 16)
+SPAN_ID=$(openssl rand -hex 8)
+NOW="$(date +%s)000000000"
+curl -fsS -H 'Content-Type: application/json' --data-binary @- \
+  http://localhost:4318/v1/traces <<EOF
+{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"compose-smoke"}}]},
+  "scopeSpans":[{"spans":[{"traceId":"$TRACE_ID","spanId":"$SPAN_ID","name":"compose-smoke","kind":1,
+  "startTimeUnixNano":"$NOW","endTimeUnixNano":"$NOW"}]}]}]}
+EOF
+curl -fsS -H 'Content-Type: application/json' --data-binary @- \
+  http://localhost:4318/v1/logs <<EOF
+{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"compose-smoke"}}]},
+  "scopeLogs":[{"logRecords":[{"timeUnixNano":"$NOW","traceId":"$TRACE_ID","spanId":"$SPAN_ID",
+  "severityText":"INFO","body":{"stringValue":"compose-smoke"}}]}]}]}
+EOF
+```
+
+After the 5 s batch interval, each deduplication view must hold exactly one
+logical row for that ID:
+
+```bash
+sleep 10
+bq query --project_id="$BQ_PROJECT" --nouse_legacy_sql \
+  --parameter="trace_id::$TRACE_ID" --parameter="span_id::$SPAN_ID" "
+SELECT 'span' AS signal, COUNT(*) AS logical_rows
+FROM \`$BQ_PROJECT.$BQ_DATASET.otel_spans_dedup\`
+WHERE trace_id = @trace_id AND span_id = @span_id
+UNION ALL
+SELECT 'log', COUNT(*)
+FROM \`$BQ_PROJECT.$BQ_DATASET.otel_logs_dedup\`
+WHERE trace_id = @trace_id AND span_id = @span_id"
+```
+
+The collector log should show no `append failed` line. Stop it with
+`docker compose -f example/docker-compose.yml down`.
 
 ## Agent framework inputs
 
