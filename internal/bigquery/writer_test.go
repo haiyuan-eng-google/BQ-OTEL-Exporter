@@ -834,6 +834,22 @@ func TestCloseOverlappingActiveAppend(t *testing.T) {
 	}
 }
 
+// A caller that reaches the writer after shutdown began gets its batch handed
+// back to exporterhelper, labeled as shutdown. A permanent verdict would drop
+// telemetry the persistent queue could otherwise keep.
+func TestAppendAfterCloseIsShutdownNotPermanent(t *testing.T) {
+	w := newTestWriter(&fakeStream{results: []appendResult{fakeResult{}}})
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	out := w.Append(context.Background(), [][]byte{{1}})
+	if out.Verdict.Class != Retryable || out.Verdict.Label != LabelShutdown {
+		t.Fatalf("append after Close = %s/%s (%v), want retryable/%s",
+			out.Verdict.Class, out.Verdict.Label, out.Err, LabelShutdown)
+	}
+}
+
 func TestCloseCancelsOwnedContextBeforeClosingStream(t *testing.T) {
 	w := &Writer{
 		opts: WriterOptions{Project: "p", Dataset: "d", Table: "t", MaxRequestBytes: 1},
@@ -1034,6 +1050,170 @@ func TestLateOldGenerationFailureCannotRetireReplacement(t *testing.T) {
 	}
 }
 
+// retiredMidDispatchStream holds the first AppendRows until released and then
+// fails it the way managedwriter fails a call whose stream was closed during
+// the call: with a plain error from its own writer bookkeeping. Later calls
+// return a result that retires the generation.
+type retiredMidDispatchStream struct {
+	entered chan struct{}
+	release chan struct{}
+
+	mu    sync.Mutex
+	calls int
+}
+
+func (s *retiredMidDispatchStream) AppendRows(
+	context.Context, [][]byte, ...managedwriter.AppendOption,
+) (appendResult, error) {
+	s.mu.Lock()
+	s.calls++
+	call := s.calls
+	s.mu.Unlock()
+	if call == 1 {
+		close(s.entered)
+		<-s.release
+		return nil, errors.New(`writer "w" unknown`)
+	}
+	return fakeResult{err: status.Error(codes.FailedPrecondition, "finalized")}, nil
+}
+
+func (s *retiredMidDispatchStream) Close() error { return nil }
+
+// A dispatch that fails because another attempt retired its generation during
+// the call failed on this writer's own teardown, not on a service verdict. The
+// request may already be on the wire, so it is uncertain; a permanent verdict
+// would drop the batch.
+func TestDispatchFailureOnRetiredGenerationIsUncertain(t *testing.T) {
+	s := &retiredMidDispatchStream{entered: make(chan struct{}), release: make(chan struct{})}
+	w, _ := newScriptedWriter(s)
+
+	dispatching := make(chan AppendOutcome, 1)
+	go func() { dispatching <- w.Append(context.Background(), [][]byte{{1}}) }()
+	<-s.entered
+	if out := w.Append(context.Background(), [][]byte{{2}}); !out.Verdict.StreamRecreate {
+		t.Fatal("second append should retire the shared generation")
+	}
+	close(s.release)
+
+	out := <-dispatching
+	if out.Verdict.Class != Uncertain || out.Verdict.Label != LabelUncertainAck {
+		t.Fatalf("dispatch failed by a concurrent retirement = %s/%s, want uncertain/%s",
+			out.Verdict.Class, out.Verdict.Label, LabelUncertainAck)
+	}
+}
+
+// orphanedResultStream reproduces a race in managedwriter's AppendRows: when
+// the call's context ends, or the stream closes, while the call is under way,
+// AppendRows can still report success and hand back an AppendResult for a
+// request it never sent. Nothing ever resolves that result.
+type orphanedResultStream struct{}
+
+func (orphanedResultStream) AppendRows(
+	ctx context.Context, _ [][]byte, _ ...managedwriter.AppendOption,
+) (appendResult, error) {
+	<-ctx.Done()
+	return newControlledResult(), nil
+}
+
+func (orphanedResultStream) Close() error { return nil }
+
+// Tracking such a result pins its retired generation forever. After two
+// attempts hit the race, the two-generation bound would leave no room for a
+// replacement and every later append would fail until restart.
+func TestOrphanedAppendResultsCannotWedgeWriter(t *testing.T) {
+	healthy := &scriptedStream{results: []appendResult{fakeResult{}}}
+	w, createdWith := newScriptedWriter(orphanedResultStream{}, orphanedResultStream{}, healthy)
+	defer func() { _ = w.Close() }()
+
+	for i := 1; i <= 2; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		out := w.Append(ctx, [][]byte{{byte(i)}})
+		cancel()
+		if out.Verdict.Class != Uncertain || out.Verdict.Label != LabelUncertainAck {
+			t.Fatalf("append %d racing its deadline = %s/%s (%v), want uncertain/%s",
+				i, out.Verdict.Class, out.Verdict.Label, out.Err, LabelUncertainAck)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if out := w.Append(ctx, [][]byte{{3}}); out.Err != nil {
+		t.Fatalf("append after two orphaned results failed: %v (error_code=%s)", out.Err, out.Verdict.Label)
+	}
+	if len(*createdWith) != 3 {
+		t.Fatalf("created %d stream generations, want a third after the two retired ones", len(*createdWith))
+	}
+}
+
+// closedUnderDispatchStream holds the first AppendRows until released while a
+// sibling's call retires the generation, then reports success for a request
+// it never sent: the stream-closure half of the managedwriter race above.
+type closedUnderDispatchStream struct {
+	entered chan struct{}
+	release chan struct{}
+
+	mu    sync.Mutex
+	calls int
+}
+
+func (s *closedUnderDispatchStream) AppendRows(
+	context.Context, [][]byte, ...managedwriter.AppendOption,
+) (appendResult, error) {
+	s.mu.Lock()
+	s.calls++
+	call := s.calls
+	s.mu.Unlock()
+	if call == 1 {
+		close(s.entered)
+		<-s.release
+		return newControlledResult(), nil
+	}
+	return fakeResult{err: status.Error(codes.FailedPrecondition, "finalized")}, nil
+}
+
+func (s *closedUnderDispatchStream) Close() error { return nil }
+
+// A success reported after the generation was retired under the call, with
+// the attempt still live, is ambiguous too. Tracking it would pin the retired
+// generation exactly as an expired attempt's orphan does.
+func TestRetiredDispatchSuccessCannotWedgeWriter(t *testing.T) {
+	newStream := func() *closedUnderDispatchStream {
+		return &closedUnderDispatchStream{entered: make(chan struct{}), release: make(chan struct{})}
+	}
+	first, second := newStream(), newStream()
+	w, _ := newScriptedWriter(first, second, &scriptedStream{results: []appendResult{fakeResult{}}})
+	observer := &fakeObserver{}
+	w.opts.Observer = observer
+	defer func() { _ = w.Close() }()
+
+	for i, s := range []*closedUnderDispatchStream{first, second} {
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		done := make(chan AppendOutcome, 1)
+		go func() { done <- w.Append(ctx, [][]byte{{1}}) }()
+		<-s.entered
+		if out := w.Append(context.Background(), [][]byte{{2}}); !out.Verdict.StreamRecreate {
+			cancel()
+			t.Fatalf("round %d: the sibling should retire the generation", i+1)
+		}
+		close(s.release)
+		out := <-done
+		cancel()
+		if out.Verdict.Class != Uncertain || out.Verdict.Label != LabelUncertainAck {
+			t.Fatalf("round %d: success after retirement = %s/%s, want uncertain/%s",
+				i+1, out.Verdict.Class, out.Verdict.Label, LabelUncertainAck)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if out := w.Append(ctx, [][]byte{{3}}); out.Err != nil {
+		t.Fatalf("append after two closed-under-dispatch successes failed: %v", out.Err)
+	}
+	if inflight, unresolved, _, _, _ := observer.snapshot(); inflight != 0 || unresolved != 0 {
+		t.Fatalf("inflight=%d unresolved=%d, want 0/0", inflight, unresolved)
+	}
+}
+
 // GetResult returning the canceled attempt context does not mean the
 // managedwriter result itself is terminal. The writer must keep a bounded
 // lifecycle owner for that result until it resolves or the writer shuts down.
@@ -1105,17 +1285,17 @@ func TestTenConcurrentAttemptsRecoverFromEightSlotNoACK(t *testing.T) {
 	w, _ := newScriptedWriter(stuck, replacement)
 
 	const attempts = 10
-	cancels := make([]context.CancelFunc, attempts)
+	// The attempts end together, as a shared deadline would. Ending them one
+	// at a time would let an attempt scheduled late start after the stuck
+	// generation retired, with a live context, and consume the replacement's
+	// only scripted result.
+	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan AppendOutcome, attempts)
-	for i := range attempts {
-		ctx, cancel := context.WithCancel(context.Background())
-		cancels[i] = cancel
+	for range attempts {
 		go func() { done <- w.Append(ctx, [][]byte{{1}}) }()
 	}
 	stuck.waitForCalls(t, 8)
-	for _, cancel := range cancels {
-		cancel()
-	}
+	cancel()
 	for range attempts {
 		select {
 		case <-done:
