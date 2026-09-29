@@ -1145,6 +1145,75 @@ func TestOrphanedAppendResultsCannotWedgeWriter(t *testing.T) {
 	}
 }
 
+// closedUnderDispatchStream holds the first AppendRows until released while a
+// sibling's call retires the generation, then reports success for a request
+// it never sent: the stream-closure half of the managedwriter race above.
+type closedUnderDispatchStream struct {
+	entered chan struct{}
+	release chan struct{}
+
+	mu    sync.Mutex
+	calls int
+}
+
+func (s *closedUnderDispatchStream) AppendRows(
+	context.Context, [][]byte, ...managedwriter.AppendOption,
+) (appendResult, error) {
+	s.mu.Lock()
+	s.calls++
+	call := s.calls
+	s.mu.Unlock()
+	if call == 1 {
+		close(s.entered)
+		<-s.release
+		return newControlledResult(), nil
+	}
+	return fakeResult{err: status.Error(codes.FailedPrecondition, "finalized")}, nil
+}
+
+func (s *closedUnderDispatchStream) Close() error { return nil }
+
+// A success reported after the generation was retired under the call, with
+// the attempt still live, is ambiguous too. Tracking it would pin the retired
+// generation exactly as an expired attempt's orphan does.
+func TestRetiredDispatchSuccessCannotWedgeWriter(t *testing.T) {
+	newStream := func() *closedUnderDispatchStream {
+		return &closedUnderDispatchStream{entered: make(chan struct{}), release: make(chan struct{})}
+	}
+	first, second := newStream(), newStream()
+	w, _ := newScriptedWriter(first, second, &scriptedStream{results: []appendResult{fakeResult{}}})
+	observer := &fakeObserver{}
+	w.opts.Observer = observer
+	defer func() { _ = w.Close() }()
+
+	for i, s := range []*closedUnderDispatchStream{first, second} {
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		done := make(chan AppendOutcome, 1)
+		go func() { done <- w.Append(ctx, [][]byte{{1}}) }()
+		<-s.entered
+		if out := w.Append(context.Background(), [][]byte{{2}}); !out.Verdict.StreamRecreate {
+			cancel()
+			t.Fatalf("round %d: the sibling should retire the generation", i+1)
+		}
+		close(s.release)
+		out := <-done
+		cancel()
+		if out.Verdict.Class != Uncertain || out.Verdict.Label != LabelUncertainAck {
+			t.Fatalf("round %d: success after retirement = %s/%s, want uncertain/%s",
+				i+1, out.Verdict.Class, out.Verdict.Label, LabelUncertainAck)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if out := w.Append(ctx, [][]byte{{3}}); out.Err != nil {
+		t.Fatalf("append after two closed-under-dispatch successes failed: %v", out.Err)
+	}
+	if inflight, unresolved, _, _, _ := observer.snapshot(); inflight != 0 || unresolved != 0 {
+		t.Fatalf("inflight=%d unresolved=%d, want 0/0", inflight, unresolved)
+	}
+}
+
 // GetResult returning the canceled attempt context does not mean the
 // managedwriter result itself is terminal. The writer must keep a bounded
 // lifecycle owner for that result until it resolves or the writer shuts down.

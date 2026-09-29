@@ -498,6 +498,21 @@ func (w *Writer) classifyAndRetire(
 	return verdict, attemptEnded
 }
 
+// deliveryRank orders verdict classes by what a batch still owes its rows:
+// uncertain rows may already be applied and are replayed with duplicate
+// accounting, retryable rows certainly were not and are replayed, and only
+// permanently rejected rows may be dropped.
+func deliveryRank(c Class) int {
+	switch c {
+	case Uncertain:
+		return 2
+	case Retryable:
+		return 1
+	default:
+		return 0
+	}
+}
+
 func (w *Writer) isRetired(gen *streamGeneration) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -537,9 +552,11 @@ type AppendOutcome struct {
 	// RowErrors lists rows the service rejected, indexed within the batch
 	// passed to Append.
 	RowErrors []RowError
-	// Verdict classifies a transport-level failure, if any.
+	// Verdict classifies the batch's transport-level failures, if any. With
+	// several requests it is the failure that still owes its rows the most:
+	// uncertain over retryable over permanent.
 	Verdict Verdict
-	// Err is the transport-level error, if any.
+	// Err is the first transport-level error, kept for diagnosis.
 	Err error
 }
 
@@ -574,6 +591,27 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 	}
 	inflight := make([]pending, 0, len(requests))
 	out := AppendOutcome{}
+	// fail folds one request's failure into the batch. Err keeps the first
+	// failure for diagnosis, but the verdict follows delivery precedence
+	// across every request: the exporter drops all rows of a permanent batch,
+	// so one request's permanent rejection must not decide for rows another
+	// request still owes.
+	fail := func(v Verdict, err error) {
+		if out.Err == nil {
+			out.Err = err
+			out.Verdict = v
+			return
+		}
+		if deliveryRank(v.Class) > deliveryRank(out.Verdict.Class) {
+			out.Verdict = v
+		}
+	}
+	// Once the batch must be replayed anyway, dispatching more of it would
+	// only send those rows twice. Until then, a permanent rejection of one
+	// request does not keep the others from being sent.
+	replayOwed := func() bool {
+		return out.Err != nil && out.Verdict.Class != Permanent
+	}
 	drainOne := func(p pending) {
 		if _, rerr := p.res.GetResult(ctx); rerr != nil {
 			// Row errors arrive alongside the error; the whole request is not
@@ -590,12 +628,8 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 			} else {
 				w.finishResult(gen, p.dispatched)
 			}
-			// Preserve the first transport failure as the batch verdict, but
-			// keep draining all other results already dispatched by this call.
-			if out.Err == nil {
-				out.Verdict = v
-				out.Err = rerr
-			}
+			// Keep draining all other results already dispatched by this call.
+			fail(v, rerr)
 			return
 		}
 		w.finishResult(gen, p.dispatched)
@@ -603,15 +637,18 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 	}
 
 	offset := 0
-	dispatching := true
+dispatch:
 	for _, req := range requests {
+		start := offset
+		offset += len(req)
 		for {
+			if replayOwed() {
+				break dispatch
+			}
 			acquired, acquireErr := w.tryAcquireDispatchSlot(ctx, gen)
 			if acquireErr != nil {
-				out.Verdict = classifyPreDispatchFailure(acquireErr)
-				out.Err = acquireErr
-				dispatching = false
-				break
+				fail(classifyPreDispatchFailure(acquireErr), acquireErr)
+				break dispatch
 			}
 			if acquired {
 				break
@@ -619,20 +656,12 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 			if len(inflight) > 0 {
 				drainOne(inflight[0])
 				inflight = inflight[1:]
-				if out.Err != nil {
-					dispatching = false
-					break
-				}
 				continue
 			}
 			if acquireErr := w.waitForDispatchSlot(ctx, gen); acquireErr != nil {
-				out.Verdict = classifyPreDispatchFailure(acquireErr)
-				out.Err = acquireErr
-				dispatching = false
+				fail(classifyPreDispatchFailure(acquireErr), acquireErr)
+				break dispatch
 			}
-			break
-		}
-		if !dispatching {
 			break
 		}
 		dispatched := time.Now()
@@ -655,18 +684,14 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 			// request to the bidirectional stream. Its acknowledgement is then
 			// ambiguous, and this generation cannot safely be reused.
 			v, _ := w.classifyAndRetire(ctx, aerr, gen)
-			if out.Err == nil {
-				out.Verdict = v
-				out.Err = aerr
-			}
-			break
+			fail(v, aerr)
+			continue
 		}
 		w.registerResult(gen)
 		w.observeInflight(1)
 		inflight = append(inflight, pending{
-			res: res, start: offset, count: len(req), dispatched: dispatched,
+			res: res, start: start, count: len(req), dispatched: dispatched,
 		})
-		offset += len(req)
 	}
 
 	for _, p := range inflight {

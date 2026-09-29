@@ -222,18 +222,26 @@ every acknowledgement.
   same number of consumers, so each can keep a request in flight without
   waiting. A batch that needs more requests than there are free slots drains
   its own earlier acknowledgements before waiting on anyone else's.
-- **Timeout before dispatch** (waiting for the stream or a slot): nothing was
-  sent. The batch goes back to exporterhelper as retryable and the stream is
-  kept.
+- **Timeout before dispatch** (waiting for the stream or a slot): nothing of
+  that request was sent, and the stream is kept. If no earlier request of the
+  batch was sent either, the batch goes back to exporterhelper as retryable.
 - **Timeout after dispatch:** the rows may already be applied. The batch goes
   back as `uncertain_ack` (counted in `uncertain_ack_replays`), the stream
   generation is retired, and the next attempt opens a new one. Requests still
   in flight on the retired generation are handed back the same way. A replay
   can duplicate rows; the `_dedup` views collapse them.
-- **Bound on stuck results.** At most two stream generations, the current one
-  and one retired, may hold unresolved results. While both are held, new
-  attempts wait for the older one to drain, within their own timeout, instead
-  of opening more connections.
+- **Split batches.** A batch sent as several requests takes the verdict of the
+  request that still owes the most. An uncertain request outranks a retryable
+  one, and a retryable one outranks a permanent rejection. The batch is
+  dropped only when every row that was not acknowledged was rejected
+  permanently. A permanent rejection of one request does not stop the others
+  from being sent. A replay resends every row of the batch that the service
+  did not reject, including rows it already acknowledged.
+- **Bound on stuck results.** At most two stream generations can be held at
+  once: the current one, and retired ones whose results have not resolved.
+  Both slots can hold retired generations. While both are taken, new attempts
+  wait for either one to drain, within their own timeout, instead of opening
+  more connections.
 - **Sizing.** Keep `timeout` above the acknowledgement latency of a full batch:
   one round trip per `write.max_inflight_requests` requests it splits into.
   Keep `sending_queue.num_consumers` at or below `write.max_inflight_requests`;

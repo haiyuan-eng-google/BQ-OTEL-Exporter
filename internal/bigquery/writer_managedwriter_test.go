@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/descriptorpb"
@@ -44,6 +45,12 @@ const (
 	// fakeFailOnce answers the next request with Unavailable, then
 	// acknowledges.
 	fakeFailOnce
+	// fakeReject rejects a request with InvalidArgument and no row errors:
+	// a permanent verdict on the whole request.
+	fakeReject
+	// fakeDeadline answers a request with the service's own
+	// DeadlineExceeded, which leaves its outcome uncertain.
+	fakeDeadline
 )
 
 // storageWriteFake is an in-process BigQuery Storage Write service with a
@@ -53,6 +60,7 @@ type storageWriteFake struct {
 
 	mu          sync.Mutex
 	mode        fakeMode
+	plan        []fakeMode
 	connections int
 	requests    int
 	ackedRows   int
@@ -62,6 +70,14 @@ func (f *storageWriteFake) setMode(m fakeMode) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.mode = m
+}
+
+// setPlan answers the next requests with the given modes, in order, before
+// the current mode applies again.
+func (f *storageWriteFake) setPlan(modes ...fakeMode) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.plan = modes
 }
 
 func (f *storageWriteFake) counts() (connections, requests, ackedRows int) {
@@ -88,7 +104,9 @@ func (f *storageWriteFake) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServ
 		f.mu.Lock()
 		f.requests++
 		mode := f.mode
-		if mode == fakeFailOnce {
+		if len(f.plan) > 0 {
+			mode, f.plan = f.plan[0], f.plan[1:]
+		} else if mode == fakeFailOnce {
 			f.mode = fakeAck
 		}
 		if mode == fakeAck {
@@ -111,6 +129,10 @@ func (f *storageWriteFake) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServ
 			resp = errorResponse(codes.PermissionDenied, "table access denied")
 		case fakeFailOnce:
 			resp = errorResponse(codes.Unavailable, "backend unavailable")
+		case fakeReject:
+			resp = errorResponse(codes.InvalidArgument, "request rejected")
+		case fakeDeadline:
+			resp = errorResponse(codes.DeadlineExceeded, "append deadline exceeded")
 		default:
 			resp = &storagepb.AppendRowsResponse{
 				Response: &storagepb.AppendRowsResponse_AppendResult_{
@@ -347,6 +369,114 @@ func TestSplitFailureDrainsEveryManagedStreamResult(t *testing.T) {
 	if inflight, unresolved, waits, _, _ := observer.snapshot(); inflight != 0 || unresolved != 0 || waits != 4 {
 		t.Fatalf("after Append returned: inflight=%d unresolved=%d waits=%d, want 0/0/4",
 			inflight, unresolved, waits)
+	}
+}
+
+// A split batch takes its verdict from the request that still owes the most,
+// not from whichever failure is drained first: rows that may already be
+// applied (uncertain) outrank rows that certainly were not (retryable), which
+// outrank rows that never can be (permanent). The exporter drops every row of
+// a permanent batch, so a permanent first request must not decide the batch.
+// The diagnostic error stays the first failure.
+func TestSplitVerdictFollowsDeliveryPrecedenceOnManagedStream(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		plan      []fakeMode
+		class     Class
+		label     string
+		firstCode codes.Code
+	}{
+		{"rejected then unacknowledged", []fakeMode{fakeReject, fakeNoACK},
+			Uncertain, LabelUncertainAck, codes.InvalidArgument},
+		{"rejected then service deadline", []fakeMode{fakeReject, fakeDeadline},
+			Uncertain, LabelUncertainAck, codes.InvalidArgument},
+		{"rejected then unavailable", []fakeMode{fakeReject, fakeFailOnce},
+			Retryable, LabelUnavailable, codes.InvalidArgument},
+		{"service deadline then rejected", []fakeMode{fakeDeadline, fakeReject},
+			Uncertain, LabelUncertainAck, codes.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w, backend, _ := newManagedWriterUnderTest(t, 8, 1)
+			backend.setPlan(tc.plan...)
+			observer := &dispatchObserver{}
+			w.opts.Observer = observer
+
+			out := appendWithin(w, 300*time.Millisecond, rowsOf(2))
+			if n := observer.dispatches.Load(); n != 2 {
+				t.Fatalf("dispatched %d requests, want both halves of the split", n)
+			}
+			if out.Verdict.Class != tc.class || out.Verdict.Label != tc.label {
+				t.Fatalf("batch verdict = %s/%s (%v), want %s/%s",
+					out.Verdict.Class, out.Verdict.Label, out.Err, tc.class, tc.label)
+			}
+			if got := status.Code(out.Err); got != tc.firstCode {
+				t.Fatalf("diagnostic error code = %s, want the first failure's %s", got, tc.firstCode)
+			}
+		})
+	}
+}
+
+// dispatchObserver counts the requests Writer handed to managedwriter, and can
+// act at that moment. Whether the service then read a request can race a
+// retirement that tears the connection down, so the client-side count is the
+// deterministic one.
+type dispatchObserver struct {
+	fakeObserver
+	dispatches atomic.Int32
+	onDispatch func()
+}
+
+func (o *dispatchObserver) RecordInflightRequests(ctx context.Context, delta int64) {
+	o.fakeObserver.RecordInflightRequests(ctx, delta)
+	if delta > 0 {
+		o.dispatches.Add(1)
+		if o.onDispatch != nil {
+			o.onDispatch()
+		}
+	}
+}
+
+// When the attempt ends between the requests of a split batch, the unsent
+// request is a certain retry but the sent one may already be applied: the
+// batch is an uncertain replay, not a routine cancellation.
+func TestPartialSplitDispatchIsUncertainOnManagedStream(t *testing.T) {
+	w, backend, _ := newManagedWriterUnderTest(t, 8, 1)
+	backend.setMode(fakeNoACK)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// End the attempt the moment its first request is handed over.
+	observer := &dispatchObserver{onDispatch: cancel}
+	w.opts.Observer = observer
+
+	out := w.Append(ctx, rowsOf(2))
+	if n := observer.dispatches.Load(); n != 1 {
+		t.Fatalf("dispatched %d requests, want only the first before the attempt ended", n)
+	}
+	if _, requests, _ := backend.counts(); requests > 1 {
+		t.Fatalf("backend received %d requests, want at most the first", requests)
+	}
+	if out.Verdict.Class != Uncertain || out.Verdict.Label != LabelUncertainAck {
+		t.Fatalf("partially dispatched batch = %s/%s (%v), want uncertain/%s",
+			out.Verdict.Class, out.Verdict.Label, out.Err, LabelUncertainAck)
+	}
+}
+
+// With a one-slot window the second request of a split can only be sent after
+// the first is drained. A permanent rejection of the first must not stop the
+// second from being sent; a batch dropped as permanent would otherwise lose
+// rows nobody ever tried to deliver.
+func TestPermanentRejectionDoesNotStopSplitDispatchOnManagedStream(t *testing.T) {
+	w, backend, _ := newManagedWriterUnderTest(t, 1, 1)
+	backend.setPlan(fakeReject)
+
+	out := appendWithin(w, 5*time.Second, rowsOf(2))
+	if _, requests, acked := backend.counts(); requests != 2 || acked != 1 {
+		t.Fatalf("backend received %d requests and acknowledged %d rows, want both requests sent and the second acknowledged",
+			requests, acked)
+	}
+	if out.AcknowledgedRows != 1 || out.Verdict.Class != Permanent || out.Verdict.Label != LabelInvalidArgument {
+		t.Fatalf("outcome = %s/%s acknowledged=%d (%v), want permanent/%s with the second request acknowledged",
+			out.Verdict.Class, out.Verdict.Label, out.AcknowledgedRows, out.Err, LabelInvalidArgument)
 	}
 }
 

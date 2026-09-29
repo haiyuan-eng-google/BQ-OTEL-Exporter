@@ -201,6 +201,30 @@ func TestPushTracesMixedOutcomeRetriesOnlyNonRejectedRows(t *testing.T) {
 	}
 }
 
+// A request refused for row errors appended none of its rows, so its valid
+// rows still owe delivery. A permanent rejection of another request in the
+// same batch must not drop them with it.
+func TestPushTracesPermanentSiblingKeepsRowErrorSubset(t *testing.T) {
+	e, _ := newTestTracesExporter(t, bqi.AppendOutcome{
+		RowErrors: []bqi.RowError{{Index: 1, Code: "FIELDS_ERROR", Message: "bad field body"}},
+		Verdict:   bqi.Classify(status.Error(codes.InvalidArgument, "request rejected")),
+		Err:       status.Error(codes.InvalidArgument, "request rejected"),
+	})
+
+	err := e.pushTraceData(context.Background(), newTestTraces(3))
+	if consumererror.IsPermanent(err) {
+		t.Fatalf("batch with valid rows still owed was dropped as permanent: %v", err)
+	}
+	var traceErr consumererror.Traces
+	if !errors.As(err, &traceErr) {
+		t.Fatalf("expected a retryable trace subset, got %T: %v", err, err)
+	}
+	spans := traceErr.Data().ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+	if spans.Len() != 2 || spans.At(0).Name() != "a" || spans.At(1).Name() != "c" {
+		t.Fatalf("retry subset = %v, want the rows that were not rejected: a and c", spanNames(spans))
+	}
+}
+
 // Records dropped for breaching a structural limit are never handed back:
 // they are permanently invalid, and the surviving records must still be sent.
 func TestPushTracesDropsStructurallyInvalidRecords(t *testing.T) {

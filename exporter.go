@@ -376,7 +376,11 @@ func (e *signalExporter) appendEncoded(
 				)...)
 		}
 
-		if v.Class == bqi.Permanent {
+		// A permanent verdict means every request that failed outright was
+		// rejected permanently. A request refused for row errors appended none
+		// of its rows, though, and still owes its valid ones, so only a batch
+		// without row errors is dropped.
+		if v.Class == bqi.Permanent && len(out.RowErrors) == 0 {
 			return appendDecision{err: out.Err, permanent: true}
 		}
 		// AcknowledgedRows is a count rather than an index set. Conservatively
