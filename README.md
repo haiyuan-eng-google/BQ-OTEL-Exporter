@@ -123,7 +123,7 @@ as log events rather than span attributes.
 | `limits.*`                      | see below             | Structural bounds applied before serialization. |
 | `sending_queue`                 | 8 consumers           | Standard `exporterhelper` queue, including the persistent queue. Consumer concurrency defaults to the managedwriter request window. |
 | `retry_on_failure`              | `max_elapsed_time: 900s` | Standard `exporterhelper` retry. The horizon must be finite. |
-| `timeout`                       | collector defaults    | Per-request timeout. |
+| `timeout`                       | `5s`                  | Budget for one export attempt, including slot waits and every acknowledgement. See [Timeout and concurrency envelope](#timeout-and-concurrency-envelope). |
 
 ### Structural limits
 
@@ -195,12 +195,6 @@ replays the batch, and every returned `AppendResult` keeps a lifecycle owner
 until it resolves or the exporter shuts down. This is what lets a later append
 recover without restarting the collector.
 
-The default queue has eight consumers, matching
-`write.max_inflight_requests: 8`. If you raise queue concurrency above the
-managedwriter request window, blocked senders consume their timeout budget
-while waiting for flow-control capacity; load-test that relationship before
-deploying it.
-
 Use these content-free self-telemetry instruments to detect a stuck path:
 
 | Metric | Meaning |
@@ -215,6 +209,46 @@ Both current-value instruments should return to zero after recovery or clean
 shutdown. A sustained nonzero value, rising timeout/retirement counters, or
 queue drops indicates “accepted by the collector, not yet confirmed by
 BigQuery.”
+
+### Timeout and concurrency envelope
+
+`timeout` (exporterhelper default `5s`) is the budget for one export attempt.
+Within it a batch waits for the shared write stream, waits for request slots,
+sends every request it splits into at `write.max_request_bytes`, and waits for
+every acknowledgement.
+
+- **Slots.** `write.max_inflight_requests` (default 8) bounds unacknowledged
+  requests per stream, shared by all queue consumers. The queue defaults to the
+  same number of consumers, so each can keep a request in flight without
+  waiting. A batch that needs more requests than there are free slots drains
+  its own earlier acknowledgements before waiting on anyone else's.
+- **Timeout before dispatch** (waiting for the stream or a slot): nothing was
+  sent. The batch goes back to exporterhelper as retryable and the stream is
+  kept.
+- **Timeout after dispatch:** the rows may already be applied. The batch goes
+  back as `uncertain_ack` (counted in `uncertain_ack_replays`), the stream
+  generation is retired, and the next attempt opens a new one. Requests still
+  in flight on the retired generation are handed back the same way. A replay
+  can duplicate rows; the `_dedup` views collapse them.
+- **Bound on stuck results.** At most two stream generations, the current one
+  and one retired, may hold unresolved results. While both are held, new
+  attempts wait for the older one to drain, within their own timeout, instead
+  of opening more connections.
+- **Sizing.** Keep `timeout` above the acknowledgement latency of a full batch:
+  one round trip per `write.max_inflight_requests` requests it splits into.
+  Keep `sending_queue.num_consumers` at or below `write.max_inflight_requests`;
+  consumers beyond the window only wait for slots and spend their timeout doing
+  so. `retry_on_failure.max_elapsed_time` bounds how long a batch is replayed
+  before it is dropped.
+
+**What is validated.** The `internal/bigquery` suite drives the real
+managedwriter client against an in-process Storage Write service. With ten
+concurrent senders on an eight-slot stream that never acknowledges and a 300 ms
+deadline, every sender returns at its deadline, only eight requests reach the
+stream, and the next append recovers on a new stream without a restart. No
+throughput, latency or live-timeout numbers have been measured against
+BigQuery. The burst/timeout/recovery test in `make integration-test` has not
+yet been run against a live dataset.
 
 ### Materializing the dedup view
 

@@ -10,11 +10,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/descriptorpb"
 )
 
@@ -109,7 +112,10 @@ type Writer struct {
 
 const maxActiveStreamGenerations = 2
 
-var errStreamRetired = errors.New("write stream generation is retired")
+var (
+	errStreamRetired = errors.New("write stream generation is retired")
+	errWriterClosed  = errors.New("writer is closed")
+)
 
 type streamCreation struct {
 	done chan struct{}
@@ -178,7 +184,7 @@ func (w *Writer) ensureStream(ctx context.Context) (*streamGeneration, error) {
 		w.mu.Lock()
 		if w.closed {
 			w.mu.Unlock()
-			return nil, errors.New("writer is closed")
+			return nil, errWriterClosed
 		}
 		if err := ctx.Err(); err != nil {
 			w.mu.Unlock()
@@ -236,7 +242,7 @@ func (w *Writer) startStreamCreationLocked() {
 			w.activeGenerations--
 		case w.closed || ctx.Err() != nil:
 			discard = ms
-			creation.err = errors.New("writer is closed")
+			creation.err = errWriterClosed
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				creation.err = ctxErr
 			}
@@ -298,7 +304,7 @@ func (w *Writer) beginAppend() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
-		return errors.New("writer is closed")
+		return errWriterClosed
 	}
 	w.ownedContextLocked()
 	w.appendWG.Add(1)
@@ -476,6 +482,13 @@ func (w *Writer) classifyAndRetire(
 	ctx context.Context, err error, gen *streamGeneration,
 ) (Verdict, bool) {
 	verdict, attemptEnded := w.classifyAppendFailure(ctx, err)
+	if !attemptEnded && verdict.Label != LabelShutdown && isTeardown(err) && w.isRetired(gen) {
+		// Another attempt retired this generation and closed the connection
+		// under this request. It may already have reached the service, so the
+		// outcome is as ambiguous as an expired attempt's and its replay can
+		// duplicate.
+		verdict = Verdict{Uncertain, OwnerExporterHelper, LabelUncertainAck, false}
+	}
 	if verdict.StreamRecreate || attemptEnded || verdict.Class == Uncertain {
 		w.retireStream(gen)
 	}
@@ -485,8 +498,18 @@ func (w *Writer) classifyAndRetire(
 	return verdict, attemptEnded
 }
 
+func (w *Writer) isRetired(gen *streamGeneration) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return gen.retired
+}
+
 func classifyPreDispatchFailure(err error) Verdict {
 	switch {
+	case errors.Is(err, errWriterClosed):
+		// Nothing was sent. The batch goes back to exporterhelper: a permanent
+		// verdict would drop telemetry the persistent queue could keep.
+		return Verdict{Retryable, OwnerExporterHelper, LabelShutdown, false}
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return Verdict{Retryable, OwnerExporterHelper, LabelCanceled, false}
 	case errors.Is(err, errStreamRetired):
@@ -531,7 +554,7 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 		return AppendOutcome{}
 	}
 	if err := w.beginAppend(); err != nil {
-		return AppendOutcome{Verdict: Classify(err), Err: err}
+		return AppendOutcome{Verdict: classifyPreDispatchFailure(err), Err: err}
 	}
 	defer w.appendWG.Done()
 
@@ -614,6 +637,18 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 		}
 		dispatched := time.Now()
 		res, aerr := gen.AppendRows(ctx, req)
+		if aerr == nil {
+			// managedwriter's AppendRows can report success for a request it
+			// never sent when the call races the end of the attempt or the
+			// stream's closure, and nothing ever resolves that AppendResult.
+			// Tracking it would pin this generation's window slot forever, so
+			// such a success is as ambiguous as the attempt error itself.
+			if err := ctx.Err(); err != nil {
+				aerr = err
+			} else if w.isRetired(gen) {
+				aerr = errStreamRetired
+			}
+		}
 		if aerr != nil {
 			w.releaseDispatchSlot(gen)
 			// AppendRows can return the attempt-context error after handing a
@@ -644,6 +679,8 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 // attempt context ending after AppendRows was invoked. Cancellation at that
 // point has the same delivery ambiguity as a deadline: the server may have
 // applied the rows even though the caller did not observe the acknowledgement.
+// Once the writer's lifecycle has ended, a teardown failure is shutdown however
+// managedwriter reports it.
 func (w *Writer) classifyAppendFailure(ctx context.Context, err error) (Verdict, bool) {
 	ctxErr := ctx.Err()
 	if ctxErr != nil && errors.Is(err, ctxErr) {
@@ -655,10 +692,22 @@ func (w *Writer) classifyAppendFailure(ctx context.Context, err error) (Verdict,
 		ownedCtx = w.lifetimeCtx
 	}
 	w.mu.Unlock()
-	if ownedCtx != nil && ownedCtx.Err() != nil && errors.Is(err, context.Canceled) {
+	if ownedCtx != nil && ownedCtx.Err() != nil && isTeardown(err) {
 		return Verdict{Retryable, OwnerExporterHelper, LabelShutdown, false}, false
 	}
 	return Classify(err), false
+}
+
+// isTeardown reports whether err is how managedwriter fails a request whose
+// stream or connection was closed under it, rather than a status the service
+// returned: a cancellation, as a context error or a gRPC status; the io.EOF it
+// records for a closed stream; or a plain error from its writer bookkeeping.
+func isTeardown(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, io.EOF) {
+		return true
+	}
+	s, ok := status.FromError(err)
+	return !ok || s.Code() == codes.Canceled
 }
 
 // extractRowErrors pulls per-row failures out of a response, translating
@@ -763,4 +812,14 @@ func (r realStream) AppendRows(ctx context.Context, data [][]byte, opts ...manag
 	return r.ms.AppendRows(ctx, data, opts...)
 }
 
-func (r realStream) Close() error { return r.ms.Close() }
+// Close reports a stream's expected terminal state as success. managedwriter
+// records io.EOF for a stream closed on purpose, and the cancellation of the
+// lifecycle context Writer.Close cancels just before closing the stream; a
+// clean shutdown is not a failure.
+func (r realStream) Close() error {
+	err := r.ms.Close()
+	if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
+}
