@@ -30,20 +30,192 @@ jobs:
       - name: Test
         run: go test -race -cover ./...
 
+  # Credential-free proof of the image and the Compose journey. Every step
+  # prints what it checked, so the job log is the evidence. Writing to
+  # BigQuery stays a manual, credentialed check (README "Credentialed smoke").
   collector-example:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      BQ_PROJECT: my-project
+      BQ_DATASET: otel
+      BQ_LOCATION: US
+      IMAGE: bq-otel-collector:0.1.0-dev
+      # Used only to show that the stock distribution rejects the example.
+      STOCK_IMAGE: otel/opentelemetry-collector-contrib:0.158.0@sha256:c5918f78992ee73b0d6f0e599423ac5ec52dd5d9726733114d6eca53d5a32ed5
     steps:
       - uses: actions/checkout@v4
-      - name: Build pinned custom Collector image
-        run: docker build --tag bq-otel-collector:test --file example/Dockerfile .
-      - name: Verify BigQuery component is registered
-        run: docker run --rm bq-otel-collector:test components | grep -q bigquery
-      - name: Validate example config without credentials
-        run: >-
-          docker run --rm
-          -e BQ_PROJECT=my-project
-          -e BQ_DATASET=otel
-          -e BQ_LOCATION=US
-          -v "${{ github.workspace }}/example/otel-collector-config.yml:/etc/otel/config.yml:ro"
-          bq-otel-collector:test
-          validate --config=/etc/otel/config.yml
+
+      - name: Docker and Compose versions
+        run: |
+          docker version
+          docker compose version
+
+      - name: "Before: the stock contrib image rejects the example config"
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          docker pull --quiet "$STOCK_IMAGE"
+          status=0
+          out=$(docker run --rm -e BQ_PROJECT -e BQ_DATASET -e BQ_LOCATION \
+            -v "$PWD/example/otel-collector-config.yml:/etc/otel/config.yml:ro" \
+            "$STOCK_IMAGE" validate --config=/etc/otel/config.yml 2>&1) || status=$?
+          # The list of valid component types runs to hundreds; show its start.
+          printf '%s\n' "$out" | cut -c1-200
+          echo "exit status: $status"
+          [ "$status" -ne 0 ] || fail "the stock image accepted the example config"
+          grep -qF 'unknown type: "bigquery"' <<<"$out" || fail "expected an unknown bigquery exporter"
+
+      - name: Compose refuses to start without BQ_ADC_PATH
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          status=0
+          out=$(env -u BQ_ADC_PATH docker compose -f example/docker-compose.yml config 2>&1) || status=$?
+          printf '%s\n' "$out"
+          echo "exit status: $status"
+          [ "$status" -ne 0 ] || fail "Compose accepted a missing BQ_ADC_PATH"
+          grep -qF 'required variable BQ_ADC_PATH is missing a value: Set BQ_ADC_PATH to an ADC JSON file' <<<"$out" ||
+            fail "Compose did not name BQ_ADC_PATH"
+
+      - name: Stage an owner-only placeholder ADC file
+        # 0600 is how gcloud writes ADC. The content is deliberately not a
+        # credential; no step below can authenticate to Google.
+        run: |
+          install -d -m 0700 "$RUNNER_TEMP/adc"
+          printf '{}\n' > "$RUNNER_TEMP/adc/not-a-credential.json"
+          chmod 0600 "$RUNNER_TEMP/adc/not-a-credential.json"
+          ls -l "$RUNNER_TEMP/adc/not-a-credential.json"
+          echo "BQ_ADC_PATH=$RUNNER_TEMP/adc/not-a-credential.json" >> "$GITHUB_ENV"
+
+      - name: Build the collector image through Compose
+        run: |
+          docker compose -f example/docker-compose.yml config
+          docker compose -f example/docker-compose.yml build
+          docker image ls "$IMAGE"
+
+      - name: The component listing contains this repository's bigquery exporter
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          docker run --rm "$IMAGE" components | tee "$RUNNER_TEMP/components.yaml"
+          grep -qE '^[[:space:]]+- name: bigquery$' "$RUNNER_TEMP/components.yaml" ||
+            fail "no bigquery exporter in the component listing"
+          grep -qF 'module: github.com/haiyuan-eng-google/BQ-OTEL-Exporter ' "$RUNNER_TEMP/components.yaml" ||
+            fail "the bigquery exporter is not this repository's module"
+
+      - name: The example config validates without credentials
+        run: |
+          docker run --rm -e BQ_PROJECT -e BQ_DATASET -e BQ_LOCATION \
+            -v "$PWD/example/otel-collector-config.yml:/etc/otel/config.yml:ro" \
+            "$IMAGE" validate --config=/etc/otel/config.yml
+          echo "validate accepted the example config, including exporters: bigquery"
+
+      - name: Without ADC the exporter fails fast with a credential error
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          status=0
+          out=$(timeout 120 docker run --rm --network none -e BQ_PROJECT -e BQ_DATASET -e BQ_LOCATION \
+            -v "$PWD/example/otel-collector-config.yml:/etc/otel/config.yml:ro" \
+            "$IMAGE" 2>&1) || status=$?
+          printf '%s\n' "$out"
+          echo "exit status: $status"
+          if [ "$status" -eq 0 ] || [ "$status" -eq 124 ]; then fail "expected a prompt startup failure"; fi
+          grep -qF 'could not find default credentials' <<<"$out" || fail "expected the missing-ADC message"
+          if grep -qF 'unknown type' <<<"$out"; then fail "failed as an unknown component"; fi
+
+      - name: The Compose service reads an owner-only ADC file only with BQ_CONTAINER_USER
+        # Unmodified example config. Each run stops at the exporter's
+        # credential step, which proves config and components are fine.
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          attempt() {
+            local log=$1 status=0
+            timeout 120 docker compose -f example/docker-compose.yml up --no-build --exit-code-from otelcollector 2>&1 |
+              tee "$log.up" || status=$?
+            docker compose -f example/docker-compose.yml logs --no-color otelcollector > "$log" 2>&1
+            docker compose -f example/docker-compose.yml down
+            echo "exit status: $status"
+            if [ "$status" -eq 0 ] || [ "$status" -eq 124 ]; then fail "expected a prompt startup failure"; fi
+            if grep -qF 'unknown type' "$log"; then fail "failed as an unknown component"; fi
+          }
+          echo "== default image user (65532)"
+          attempt "$RUNNER_TEMP/default-user.log"
+          grep -qF 'open /creds/adc.json: permission denied' "$RUNNER_TEMP/default-user.log" ||
+            fail "expected the nonroot user to be denied the owner-only file"
+          BQ_CONTAINER_USER="$(id -u):$(id -g)"
+          export BQ_CONTAINER_USER
+          echo "== BQ_CONTAINER_USER=$BQ_CONTAINER_USER"
+          attempt "$RUNNER_TEMP/owner-user.log"
+          grep -qF "missing 'type' field in credentials" "$RUNNER_TEMP/owner-user.log" ||
+            fail "expected the file owner to read the placeholder and reject its content"
+
+      - name: Compose up with a credential-free loopback destination
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          compose() { docker compose -f example/docker-compose.yml -f .github/compose-smoke.yml "$@"; }
+          compose config
+          compose up --build --detach
+          cid=$(compose ps --all --quiet otelcollector)
+          ready=false
+          for _ in $(seq 60); do
+            docker logs "$cid" > "$RUNNER_TEMP/smoke.log" 2>&1
+            if grep -qF 'Everything is ready' "$RUNNER_TEMP/smoke.log"; then ready=true; break; fi
+            [ "$(docker inspect -f '{{.State.Running}}' "$cid")" = true ] || break
+            sleep 1
+          done
+          grep -E 'BigQuery exporter started|Starting (GRPC|HTTP) server|Everything is ready' "$RUNNER_TEMP/smoke.log" || true
+          compose ps
+          "$ready" || fail "the collector did not become ready"
+
+      - name: OTLP/gRPC 4317 and OTLP/HTTP 4318 accept one trace and one log
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          # A gRPC frame holding an empty ExportTraceServiceRequest.
+          head -c 5 /dev/zero > "$RUNNER_TEMP/empty.grpc"
+          curl -sS --http2-prior-knowledge -H 'content-type: application/grpc' -H 'te: trailers' \
+            --data-binary @"$RUNNER_TEMP/empty.grpc" -D "$RUNNER_TEMP/grpc.headers" -o /dev/null \
+            http://127.0.0.1:4317/opentelemetry.proto.collector.trace.v1.TraceService/Export
+          cat "$RUNNER_TEMP/grpc.headers"
+          grep -qi '^grpc-status: 0' "$RUNNER_TEMP/grpc.headers" || fail "OTLP/gRPC did not return grpc-status 0"
+
+          now="$(date +%s)000000000"
+          trace_id=5b8efff798038103d269b633813fc60c
+          span_id=eee19b7ec3c1b174
+          curl -fsS -w ' HTTP %{http_code}\n' -H 'Content-Type: application/json' --data-binary @- \
+            http://127.0.0.1:4318/v1/traces <<EOF
+          {"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"compose-smoke"}}]},"scopeSpans":[{"spans":[{"traceId":"$trace_id","spanId":"$span_id","name":"compose-smoke","kind":1,"startTimeUnixNano":"$now","endTimeUnixNano":"$now"}]}]}]}
+          EOF
+          curl -fsS -w ' HTTP %{http_code}\n' -H 'Content-Type: application/json' --data-binary @- \
+            http://127.0.0.1:4318/v1/logs <<EOF
+          {"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"compose-smoke"}}]},"scopeLogs":[{"logRecords":[{"timeUnixNano":"$now","traceId":"$trace_id","spanId":"$span_id","severityText":"INFO","body":{"stringValue":"compose-smoke"}}]}]}]}
+          EOF
+
+      - name: The collector stays up and hands both records to the bigquery exporter
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          compose() { docker compose -f example/docker-compose.yml -f .github/compose-smoke.yml "$@"; }
+          cid=$(compose ps --all --quiet otelcollector)
+          # After the 5s batch interval the exporter tries each destination and
+          # logs the failed append against the closed loopback endpoint.
+          for table in otel_spans otel_logs; do
+            want="\"destination\": \"$BQ_PROJECT.$BQ_DATASET.$table\""
+            for _ in $(seq 90); do
+              docker logs "$cid" > "$RUNNER_TEMP/smoke.log" 2>&1
+              grep -F 'append failed' "$RUNNER_TEMP/smoke.log" > "$RUNNER_TEMP/append-failed.log" || true
+              if grep -qF "$want" "$RUNNER_TEMP/append-failed.log"; then break; fi
+              sleep 1
+            done
+            grep -m1 -F "$want" "$RUNNER_TEMP/append-failed.log" || fail "no append attempt for $table"
+          done
+          [ "$(docker inspect -f '{{.State.Running}}' "$cid")" = true ] || fail "the collector exited"
+          docker inspect -f 'state={{.State.Status}} restarts={{.RestartCount}} user={{.Config.User}} started={{.State.StartedAt}}' "$cid"
+          compose ps
+
+      - name: Collector logs
+        if: always()
+        run: docker compose -f example/docker-compose.yml -f .github/compose-smoke.yml logs --no-color || true
+
+      - name: Compose down
+        if: always()
+        run: docker compose -f example/docker-compose.yml -f .github/compose-smoke.yml down --remove-orphans || true
