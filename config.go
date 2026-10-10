@@ -77,17 +77,21 @@ type SignalConfig struct {
 type LogsConfig struct {
 	Table string `mapstructure:"table"`
 
-	// SourceRecordNamespace is the trusted namespace for source_record_id.
-	//
-	// It must come from deployment-controlled configuration, never from an
-	// application-supplied attribute: it participates in record identity, so
-	// letting a payload choose it would let a payload claim another
-	// producer's identity.
-	SourceRecordNamespace string `mapstructure:"source_record_namespace"`
+	// LogNameAttribute names a string log record attribute that carries the
+	// log_name column. When unset, or absent on a record, log_name falls back
+	// to well-known log name attributes, then to the service name, then to
+	// "default".
+	LogNameAttribute string `mapstructure:"log_name_attribute"`
 
-	// SourceRecordIDAttribute names the log attribute carrying a stable
-	// source record ID. Only honored when SourceRecordNamespace is also set.
-	SourceRecordIDAttribute string `mapstructure:"source_record_id_attribute"`
+	// InsertIDAttribute names a string log record attribute that carries an
+	// upstream record ID for the insert_id column. When unset, or absent on a
+	// record, insert_id falls back to well-known insert ID attributes, then to
+	// the record fingerprint.
+	//
+	// The dedup view treats insert_id as record identity within a log stream
+	// and timestamp, so only name an attribute whose values are unique per
+	// record.
+	InsertIDAttribute string `mapstructure:"insert_id_attribute"`
 }
 
 // CredentialsConfig selects an authentication method. At most one may be set;
@@ -208,14 +212,6 @@ func (cfg *Config) Validate() error {
 			errs = append(errs, errors.New(
 				"auto_create.tables cannot be enabled with endpoint.without_authentication"))
 		}
-	}
-
-	// An ID without a namespace is not an identity: two producers could mint
-	// the same ID, and the dedup view would merge unrelated records.
-	if cfg.Logs.SourceRecordIDAttribute != "" && cfg.Logs.SourceRecordNamespace == "" {
-		errs = append(errs, errors.New(
-			"logs.source_record_id_attribute requires logs.source_record_namespace: "+
-				"an ID without a trusted namespace is not a record identity"))
 	}
 
 	if !cfg.BackOffConfig.Enabled {

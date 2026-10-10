@@ -74,31 +74,24 @@ func Rejection(table, operationID string, index int, reason, fieldPath string, l
 // knownFieldTokens are the column and structural names that may legitimately
 // appear in a diagnostic path. Anything outside this set is dropped rather
 // than passed through, because the only way to be sure a token is not
-// telemetry content is to recognize it.
+// telemetry content is to recognize it. The set is exactly the column and
+// nested STRUCT field names of the span and log contracts.
 var knownFieldTokens = map[string]bool{
-	"start_timestamp": true, "start_time_unix_nano": true,
-	"end_timestamp": true, "end_time_unix_nano": true,
-	"export_received_timestamp": true, "duration_ns": true,
+	"start_time_unix_nano": true, "end_time_unix_nano": true,
 	"trace_id": true, "span_id": true, "parent_span_id": true,
 	"trace_state": true, "flags": true, "name": true, "kind": true,
-	"status_code": true, "status_message": true, "service_name": true,
-	"resource_attributes": true, "resource_schema_url": true,
-	"resource_dropped_attributes_count": true,
-	"scope_name":                        true, "scope_version": true, "scope_attributes": true,
-	"scope_schema_url": true, "scope_dropped_attributes_count": true,
-	"schema_version": true, "span_attributes": true,
+	"service_name": true, "resource_schema_url": true,
+	"scope_schema_url": true, "schema_version": true,
 	"dropped_attributes_count": true, "dropped_events_count": true,
 	"dropped_links_count": true, "events": true, "links": true,
 	"timestamp": true, "timestamp_source": true, "time_unix_nano": true,
 	"observed_timestamp": true, "observed_time_unix_nano": true,
 	"event_name": true, "severity_number": true, "severity_text": true,
-	"body": true, "log_attributes": true,
-	"source_record_namespace": true, "source_record_id": true,
-	"record_fingerprint": true, "attributes": true,
+	"body": true, "record_fingerprint": true, "attributes": true,
 
-	// v0alpha2 columns and nested STRUCT fields. A message names a nested
-	// field by its dotted path, which the separator split reduces to these
-	// parts.
+	// Columns and nested STRUCT fields added in v0alpha2. A message names a
+	// nested field by its dotted path, which the separator split reduces to
+	// these parts.
 	"start_time": true, "end_time": true, "receive_time": true,
 	"receive_time_unix_nano": true, "duration_nano": true,
 	"kind_name": true, "status": true, "code": true, "code_name": true,

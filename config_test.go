@@ -62,8 +62,7 @@ func TestValidateRejects(t *testing.T) {
 		"zero exporter timeout": {func(c *Config) {
 			c.TimeoutSettings.Timeout = 0
 		}, "timeout must be positive"},
-		"unbounded retry horizon":     {func(c *Config) { c.BackOffConfig.MaxElapsedTime = 0 }, "must be finite"},
-		"source id without namespace": {func(c *Config) { c.Logs.SourceRecordIDAttribute = "uid" }, "not a record identity"},
+		"unbounded retry horizon": {func(c *Config) { c.BackOffConfig.MaxElapsedTime = 0 }, "must be finite"},
 	}
 
 	for name, tc := range tests {
@@ -76,6 +75,27 @@ func TestValidateRejects(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("expected error containing %q, got: %v", tc.want, err)
+			}
+		})
+	}
+}
+
+// The log identity attributes are independent: either may be set alone.
+func TestValidateAcceptsLogIdentityAttributes(t *testing.T) {
+	tests := map[string]func(*Config){
+		"log name only":  func(c *Config) { c.Logs.LogNameAttribute = "log.file.name" },
+		"insert id only": func(c *Config) { c.Logs.InsertIDAttribute = "log.record.uid" },
+		"both": func(c *Config) {
+			c.Logs.LogNameAttribute = "log.file.name"
+			c.Logs.InsertIDAttribute = "log.record.uid"
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			cfg := validConfig()
+			mutate(cfg)
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate() = %v, want nil", err)
 			}
 		})
 	}

@@ -139,44 +139,48 @@ func payloadRefsRecord() *storagepb.TableFieldSchema {
 	)
 }
 
-// LogsTableSchema is the §7.2 log contract.
+// LogsTableSchema is the v0alpha2 log contract: 27 columns, grouped by family
+// in the same order as LogsDDL.
 func LogsTableSchema() *storagepb.TableSchema {
 	return &storagepb.TableSchema{Fields: []*storagepb.TableFieldSchema{
+		// Time family.
 		f("timestamp", ts, req),
-		f("timestamp_source", str, opt),
-		f("time_unix_nano", str, req),
+		f("timestamp_source", str, req),
+		f("time_unix_nano", i64, req),
 		f("observed_timestamp", ts, opt),
-		f("observed_time_unix_nano", str, req),
-		f("export_received_timestamp", ts, req),
+		f("observed_time_unix_nano", i64, req),
+		f("receive_time", ts, req),
+		f("receive_time_unix_nano", i64, req),
 
+		// Identity and correlation family.
 		f("trace_id", str, opt),
 		f("span_id", str, opt),
 		f("flags", i64, opt),
 
+		// Log payload family.
 		f("event_name", str, opt),
 		f("severity_number", i64, opt),
 		f("severity_text", str, opt),
 		f("body", jsn, opt),
-
-		f("service_name", str, opt),
-		f("resource_attributes", jsn, opt),
-		f("resource_schema_url", str, opt),
-		f("resource_dropped_attributes_count", i64, opt),
-
-		f("scope_name", str, opt),
-		f("scope_version", str, opt),
-		f("scope_attributes", jsn, opt),
-		f("scope_schema_url", str, opt),
-		f("scope_dropped_attributes_count", i64, opt),
-
-		f("log_attributes", jsn, opt),
+		f("attributes", jsn, opt),
+		f("attributes_schema", jsn, opt),
 		f("dropped_attributes_count", i64, opt),
 
-		f("schema_version", str, req),
+		// Resource and instrumentation scope family.
+		f("service_name", str, opt),
+		resourceRecord(),
+		f("resource_schema_url", str, opt),
+		scopeRecord(),
+		f("scope_schema_url", str, opt),
 
-		f("source_record_namespace", str, opt),
-		f("source_record_id", str, opt),
-		f("record_fingerprint", str, req),
+		// Multimodal and oversized payload offloading.
+		payloadRefsRecord(),
+
+		// Dedup identity and contract family.
+		f("log_name", str, req),
+		f("insert_id", str, req),
+		f("record_fingerprint", str, opt),
+		f("schema_version", str, req),
 	}}
 }
 

@@ -90,10 +90,12 @@ func TestDestinationMetadata(t *testing.T) {
 			viewQuery:     SpansDedupViewQuery,
 		},
 		{
-			name:      "logs",
-			in:        LogsTableSchema(),
-			partition: "timestamp",
-			viewQuery: LogsDedupViewQuery,
+			name:          "logs",
+			in:            LogsTableSchema(),
+			partitionType: bq.DayPartitioningType,
+			partition:     "timestamp",
+			cluster:       []string{"service_name", "trace_id", "severity_number"},
+			viewQuery:     LogsDedupViewQuery,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

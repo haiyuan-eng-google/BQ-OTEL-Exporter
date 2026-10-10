@@ -194,7 +194,7 @@ func TestPrepareDestinationCreatesOnlyActiveSignalTableAndView(t *testing.T) {
 		cluster       []string
 	}{
 		{"traces", defaultSpansTable, schema.SpansTableSchema(), defaultLogsTable, bq.HourPartitioningType, "start_time", []string{"service_name", "trace_id", "name"}},
-		{"logs", defaultLogsTable, schema.LogsTableSchema(), defaultSpansTable, "", "timestamp", nil},
+		{"logs", defaultLogsTable, schema.LogsTableSchema(), defaultSpansTable, bq.DayPartitioningType, "timestamp", []string{"service_name", "trace_id", "severity_number"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

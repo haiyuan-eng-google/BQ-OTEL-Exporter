@@ -206,3 +206,35 @@ func TestLogBodyLimit(t *testing.T) {
 		t.Errorf("field path = %q, want body", rejects[0].FieldPath)
 	}
 }
+
+// A log record's bags and body report the column, or nested field, they are
+// written to, as span bags do.
+func TestLogViolationPathNamesTheColumn(t *testing.T) {
+	const long = "this string is definitely longer than sixteen bytes"
+	for want, build := range map[string]func(plog.ResourceLogs, plog.LogRecord){
+		"resource.attributes": func(rl plog.ResourceLogs, _ plog.LogRecord) {
+			rl.Resource().Attributes().PutStr("k", long)
+		},
+		"instrumentation_scope.attributes": func(rl plog.ResourceLogs, _ plog.LogRecord) {
+			rl.ScopeLogs().At(0).Scope().Attributes().PutStr("k", long)
+		},
+		"attributes": func(_ plog.ResourceLogs, lr plog.LogRecord) {
+			lr.Attributes().PutStr("k", long)
+		},
+		"body": func(_ plog.ResourceLogs, lr plog.LogRecord) {
+			lr.Body().SetStr(long)
+		},
+	} {
+		t.Run(want, func(t *testing.T) {
+			ld := plog.NewLogs()
+			rl := ld.ResourceLogs().AppendEmpty()
+			lr := rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+			build(rl, lr)
+
+			_, rejects := LogRows(ld, Options{Limits: tightLimits()})
+			if len(rejects) != 1 || rejects[0].FieldPath != want {
+				t.Fatalf("rejections = %+v, want field path %q", rejects, want)
+			}
+		})
+	}
+}

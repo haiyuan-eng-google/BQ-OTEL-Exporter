@@ -80,9 +80,9 @@ func newSignalExporter(
 		logger: set.Logger,
 		schema: tableSchema,
 		opts: transform.Options{
-			Limits:                  cfg.Limits.toTransform(),
-			SourceRecordNamespace:   cfg.Logs.SourceRecordNamespace,
-			SourceRecordIDAttribute: cfg.Logs.SourceRecordIDAttribute,
+			Limits:            cfg.Limits.toTransform(),
+			LogNameAttribute:  cfg.Logs.LogNameAttribute,
+			InsertIDAttribute: cfg.Logs.InsertIDAttribute,
 		},
 	}
 }
@@ -296,11 +296,11 @@ func (e *signalExporter) encodeRows(
 }
 
 // recordRejections counts and logs records the transform stage dropped for
-// breaching a structural limit.
+// violating the table contract or breaching a structural limit.
 func (e *signalExporter) recordRejections(ctx context.Context, rejects []transform.Rejection, opID string) {
 	for _, r := range rejects {
 		e.tel.RecordRejected(ctx, string(r.Reason), 1)
-		e.logger.Debug("dropping record that breached a structural limit",
+		e.logger.Debug("dropping record that violated the table contract or breached a structural limit",
 			diag.Rejection(e.tableID(), opID, r.Index, string(r.Reason), r.FieldPath, r.Limit, r.Actual)...)
 	}
 }

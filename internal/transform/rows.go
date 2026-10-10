@@ -38,14 +38,18 @@ type Rejection struct {
 // Options configures row construction.
 type Options struct {
 	Limits Limits
-	// SourceRecordNamespace is the trusted namespace for source_record_id.
-	// It comes from deployment-controlled configuration, never from an
-	// application-supplied attribute, because it participates in record
-	// identity.
-	SourceRecordNamespace string
-	// SourceRecordIDAttribute names the log attribute carrying a stable
-	// source record ID, when the instrumentation supplies one.
-	SourceRecordIDAttribute string
+	// LogNameAttribute names a string log record attribute that carries the
+	// record's log_name. A record without it falls back to the well-known log
+	// name attributes, then to its service name, then to "default".
+	LogNameAttribute string
+	// InsertIDAttribute names a string log record attribute that carries an
+	// upstream record ID for insert_id. A record without it falls back to the
+	// well-known insert ID attributes, then to its record fingerprint.
+	//
+	// An upstream ID is trusted as the record's identity: the dedup view keeps
+	// one row per (timestamp, time_unix_nano, service_name, log_name,
+	// insert_id), so records that share all five collapse into one.
+	InsertIDAttribute string
 	// Now supplies the exporter receive time stamped on every row.
 	// Injectable so tests are deterministic.
 	Now func() time.Time
@@ -58,7 +62,18 @@ func (o Options) now() time.Time {
 	return time.Now()
 }
 
-const serviceNameAttr = "service.name"
+const (
+	serviceNameAttr = "service.name"
+	eventNameAttr   = "event.name"
+	defaultLogName  = "default"
+)
+
+// Well-known log record attributes consulted, in order, for log_name and
+// insert_id when the configured attribute is unset or absent.
+var (
+	logNameAttrs  = []string{"gcp.log_name", "logging.googleapis.com/logName", "log.iostream"}
+	insertIDAttrs = []string{"logging.googleapis.com/insertId", "gcp.insert.id", "gcp.insert_id", "log.record.uid"}
+)
 
 // SpanRows converts a traces batch into rows, dropping records that violate
 // the span contract or breach the FR8 structural limits and reporting them as
@@ -340,21 +355,40 @@ func sanitize(s string) string {
 	return strings.ToValidUTF8(s, "\uFFFD")
 }
 
-// LogRows converts a logs batch into rows.
+// LogRows converts a logs batch into rows, dropping records that violate the
+// log contract or breach the FR8 structural limits and reporting them as
+// rejections.
+//
+// Index in a rejection is the position of the record in a flattened walk of
+// the batch, which is the same order the caller sees. Fingerprints are
+// assigned in the same walk, so a retry of the batch reproduces them.
 func LogRows(ld plog.Logs, opts Options) ([]Row, []Rejection) {
 	received := opts.now()
 	rows := make([]Row, 0, ld.LogRecordCount())
 	var rejects []Rejection
+	fingerprints := fingerprinter{}
 	idx := -1
 
 	for _, rl := range ld.ResourceLogs().All() {
 		resource := rl.Resource()
-		resAttrs := otlpjson.EncodeMap(resource.Attributes())
-		svc := stringAttr(resource.Attributes(), serviceNameAttr)
+		res := encodeBag(resource.Attributes(), resource.DroppedAttributesCount())
+		svc := sanitize(stringAttr(resource.Attributes(), serviceNameAttr))
 
 		for _, sl := range rl.ScopeLogs().All() {
 			scope := sl.Scope()
-			scopeAttrs := otlpjson.EncodeMap(scope.Attributes())
+			sc := encodedScope{
+				name:    sanitize(scope.Name()),
+				version: sanitize(scope.Version()),
+				bag:     encodeBag(scope.Attributes(), scope.DroppedAttributesCount()),
+			}
+			origin := logOrigin{
+				res:            res,
+				resSchemaURL:   rl.SchemaUrl(),
+				scope:          sc,
+				scopeSchemaURL: sl.SchemaUrl(),
+				svc:            svc,
+				canonical:      canonicalOrigin(res, rl.SchemaUrl(), scope, sc.bag, sl.SchemaUrl()),
+			}
 
 			for _, lr := range sl.LogRecords().All() {
 				idx++
@@ -362,8 +396,10 @@ func LogRows(ld plog.Logs, opts Options) ([]Row, []Rejection) {
 					rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
 					continue
 				}
-				rows = append(rows, logRow(lr, rl.SchemaUrl(), sl.SchemaUrl(),
-					resource, scope, resAttrs, scopeAttrs, svc, received, opts))
+				// Only kept records consume an intra_batch_ordinal. A rejected
+				// record is rejected again on every retry, so the ordinals of
+				// the others still repeat.
+				rows = append(rows, logRow(lr, origin, fingerprints, received, opts))
 			}
 		}
 	}
@@ -371,30 +407,59 @@ func LogRows(ld plog.Logs, opts Options) ([]Row, []Rejection) {
 }
 
 func checkLog(lr plog.LogRecord, resource pcommon.Resource, scope pcommon.InstrumentationScope, l Limits) *Violation {
-	if bad := l.checkMap(resource.Attributes(), "resource_attributes"); bad != nil {
+	if bad := validateLog(lr); bad != nil {
 		return bad
 	}
-	if bad := l.checkMap(scope.Attributes(), "scope_attributes"); bad != nil {
+	if bad := l.checkMap(resource.Attributes(), "resource.attributes"); bad != nil {
 		return bad
 	}
-	if bad := l.checkMap(lr.Attributes(), "log_attributes"); bad != nil {
+	if bad := l.checkMap(scope.Attributes(), "instrumentation_scope.attributes"); bad != nil {
+		return bad
+	}
+	if bad := l.checkMap(lr.Attributes(), "attributes"); bad != nil {
 		return bad
 	}
 	return l.checkValue(lr.Body(), "body", 1)
 }
 
+// validateLog enforces the INT64 columns of the log contract before any row is
+// built. Unlike a span, a log record may leave both of its times unset: the
+// partition key then falls back to the receive time, and the raw columns keep
+// the zeros as sent.
+func validateLog(lr plog.LogRecord) *Violation {
+	switch {
+	case overflowsInt64(lr.Timestamp()):
+		return &Violation{Reason: ReasonTimestampOverflow, FieldPath: "time_unix_nano"}
+	case overflowsInt64(lr.ObservedTimestamp()):
+		return &Violation{Reason: ReasonTimestampOverflow, FieldPath: "observed_time_unix_nano"}
+	}
+	return nil
+}
+
+// logOrigin is the resource and scope context that every log record under one
+// scope shares, encoded once.
+type logOrigin struct {
+	res            encodedBag
+	resSchemaURL   string
+	scope          encodedScope
+	scopeSchemaURL string
+	svc            string
+	// canonical is the part of each record's canonical form that the
+	// resource and scope contribute.
+	canonical string
+}
+
 func logRow(
 	lr plog.LogRecord,
-	resSchemaURL, scopeSchemaURL string,
-	resource pcommon.Resource,
-	scope pcommon.InstrumentationScope,
-	resAttrs, scopeAttrs, svc string,
+	origin logOrigin,
+	fingerprints fingerprinter,
 	received time.Time,
 	opts Options,
 ) Row {
-	// §7.2: the partition key falls back through event time, observed time,
-	// then ingestion time. OTLP permits both timestamps to be zero, and a row
-	// with no partition key cannot be written at all.
+	// The partition key falls back through event time, observed time, then
+	// receive time. OTLP permits both record times to be zero, and a row with
+	// no partition key cannot be written at all. validateLog has already
+	// guaranteed both raw times fit INT64, so these conversions are exact.
 	partitionMicros := received.UnixMicro()
 	source := schema.TimestampSourceExporter
 	switch {
@@ -406,76 +471,107 @@ func logRow(
 		source = schema.TimestampSourceObserved
 	}
 
-	r := Row{
-		"timestamp":                 partitionMicros,
-		"timestamp_source":          source,
-		"time_unix_nano":            nanoString(lr.Timestamp()),
-		"observed_time_unix_nano":   nanoString(lr.ObservedTimestamp()),
-		"export_received_timestamp": received.UnixMicro(),
-		"flags":                     int64(lr.Flags()),
-		"severity_number":           int64(lr.SeverityNumber()),
-		"body":                      otlpjson.EncodeValue(lr.Body()),
-		"resource_attributes":       resAttrs,
-		"scope_attributes":          scopeAttrs,
-		"log_attributes":            otlpjson.EncodeMap(lr.Attributes()),
-		"dropped_attributes_count":  int64(lr.DroppedAttributesCount()),
-		"schema_version":            schema.Version,
-		"record_fingerprint": LogFingerprint(
-			lr, resource, resSchemaURL, scope, scopeSchemaURL),
+	attrs := encodeBag(lr.Attributes(), lr.DroppedAttributesCount())
+	body, bodySchema := otlpjson.EncodePlainValueWithSchema(lr.Body())
+	fingerprint := fingerprints.next(canonicalLogRecord(lr, attrs, body, bodySchema, origin.canonical))
 
-		"resource_dropped_attributes_count": int64(resource.DroppedAttributesCount()),
-		"scope_dropped_attributes_count":    int64(scope.DroppedAttributesCount()),
+	r := Row{
+		"timestamp":               partitionMicros,
+		"timestamp_source":        source,
+		"time_unix_nano":          int64(lr.Timestamp()),
+		"observed_time_unix_nano": int64(lr.ObservedTimestamp()),
+		"receive_time":            received.UnixMicro(),
+		"receive_time_unix_nano":  received.UnixNano(),
+
+		"flags": int64(lr.Flags()),
+
+		"severity_number":          int64(lr.SeverityNumber()),
+		"attributes":               attrs.attributes,
+		"attributes_schema":        attrs.schema,
+		"dropped_attributes_count": attrs.dropped,
+
+		"resource":              origin.res.row(),
+		"instrumentation_scope": origin.scope.row(),
+
+		"log_name":           logName(lr.Attributes(), origin.svc, opts.LogNameAttribute),
+		"insert_id":          insertID(lr.Attributes(), fingerprint, opts.InsertIDAttribute),
+		"record_fingerprint": fingerprint,
+		"schema_version":     schema.Version,
 	}
 
+	// Absent optional values are omitted so the column stays NULL. OTLP lets
+	// a record omit its observed time: the raw column keeps the zero as sent,
+	// but the TIMESTAMP stays NULL rather than claiming the Unix epoch. An
+	// empty body is likewise absent rather than JSON null.
 	if lr.ObservedTimestamp() != 0 {
 		r["observed_timestamp"] = micros(lr.ObservedTimestamp())
 	}
+	if lr.Body().Type() != pcommon.ValueTypeEmpty {
+		r["body"] = body
+	}
 	putStrIfSet(r, "trace_id", traceIDString(lr.TraceID()))
 	putStrIfSet(r, "span_id", spanIDString(lr.SpanID()))
-	putStrIfSet(r, "event_name", lr.EventName())
-	putStrIfSet(r, "severity_text", lr.SeverityText())
-	putStrIfSet(r, "service_name", svc)
-	putStrIfSet(r, "resource_schema_url", resSchemaURL)
-	putStrIfSet(r, "scope_schema_url", scopeSchemaURL)
-	putStrIfSet(r, "scope_name", scope.Name())
-	putStrIfSet(r, "scope_version", scope.Version())
+	putStrIfSet(r, "event_name", eventName(lr))
+	putStrIfSet(r, "severity_text", sanitize(lr.SeverityText()))
+	putStrIfSet(r, "service_name", origin.svc)
+	putStrIfSet(r, "resource_schema_url", sanitize(origin.resSchemaURL))
+	putStrIfSet(r, "scope_schema_url", sanitize(origin.scopeSchemaURL))
 
-	// Exact identity is only claimed when both halves of the tuple are
-	// present: an ID without a trusted namespace is not an identity, since
-	// two producers could mint the same ID.
-	if opts.SourceRecordNamespace != "" && opts.SourceRecordIDAttribute != "" {
-		if id := stringAttr(lr.Attributes(), opts.SourceRecordIDAttribute); id != "" {
-			r["source_record_namespace"] = opts.SourceRecordNamespace
-			r["source_record_id"] = id
+	// payload_refs stays NULL: every payload is currently written inline.
+	return r
+}
+
+// eventName returns the record's event name, falling back to a string
+// event.name attribute, which carried event names before OTLP gave log
+// records a top-level field for them.
+func eventName(lr plog.LogRecord) string {
+	if name := sanitize(lr.EventName()); name != "" {
+		return name
+	}
+	return sanitize(stringAttr(lr.Attributes(), eventNameAttr))
+}
+
+// logName resolves log_name: the configured attribute, then the well-known
+// log name attributes, then the service name, then "default".
+func logName(attrs pcommon.Map, svc, configured string) string {
+	if name := firstStringAttr(attrs, configured, logNameAttrs); name != "" {
+		return name
+	}
+	if svc != "" {
+		return svc
+	}
+	return defaultLogName
+}
+
+// insertID resolves insert_id: the configured attribute, then the well-known
+// insert ID attributes, then the record fingerprint.
+func insertID(attrs pcommon.Map, fingerprint, configured string) string {
+	if id := firstStringAttr(attrs, configured, insertIDAttrs); id != "" {
+		return id
+	}
+	return fingerprint
+}
+
+// firstStringAttr returns the first non-empty string value among the
+// configured key, when set, and then the well-known keys, made valid UTF-8.
+// A value of any other type is skipped rather than rendered: these columns
+// hold names and identifiers, which OTLP producers send as strings.
+func firstStringAttr(attrs pcommon.Map, configured string, wellKnown []string) string {
+	if configured != "" {
+		if v := sanitize(stringAttr(attrs, configured)); v != "" {
+			return v
 		}
 	}
-
-	return r
+	for _, key := range wellKnown {
+		if v := sanitize(stringAttr(attrs, key)); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func micros(t pcommon.Timestamp) int64 {
 	return int64(t) / int64(time.Microsecond)
-}
-
-// nanoString renders raw OTLP nanos as a decimal string. The value is an
-// unsigned fixed64, so it does not fit INT64 across its whole domain, and
-// BigQuery TIMESTAMP cannot hold nanosecond precision either.
-func nanoString(t pcommon.Timestamp) string {
-	return uint64String(uint64(t))
-}
-
-func uint64String(v uint64) string {
-	if v == 0 {
-		return "0"
-	}
-	var buf [20]byte
-	i := len(buf)
-	for v > 0 {
-		i--
-		buf[i] = byte('0' + v%10)
-		v /= 10
-	}
-	return string(buf[i:])
 }
 
 func putStrIfSet(r Row, key, val string) {

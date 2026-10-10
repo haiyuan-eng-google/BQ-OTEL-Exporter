@@ -6,6 +6,7 @@ package bigqueryexporter
 import (
 	"context"
 	"errors"
+	"math"
 	"path/filepath"
 	"testing"
 	"time"
@@ -288,7 +289,8 @@ func TestPushTracesEmptyBatch(t *testing.T) {
 	}
 }
 
-func TestPushLogs(t *testing.T) {
+func newTestLogsExporter(t *testing.T, out bqi.AppendOutcome) (*logsExporter, *fakeAppender) {
+	t.Helper()
 	cfg := validConfig()
 	tel, err := metadata.NewTelemetry(noop.NewMeterProvider())
 	if err != nil {
@@ -298,12 +300,17 @@ func TestPushLogs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	app := &fakeAppender{outcome: bqi.AppendOutcome{AcknowledgedRows: 2}}
+	app := &fakeAppender{outcome: out}
 	e := &logsExporter{&signalExporter{
 		cfg: cfg, table: cfg.Logs.Table, logger: zap.NewNop(), tel: tel,
 		writer: app, enc: enc, schema: schema.LogsTableSchema(),
 		opts: transform.Options{Limits: cfg.Limits.toTransform()},
 	}}
+	return e, app
+}
+
+func TestPushLogs(t *testing.T) {
+	e, app := newTestLogsExporter(t, bqi.AppendOutcome{AcknowledgedRows: 2})
 
 	ld := plog.NewLogs()
 	sl := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty()
@@ -318,6 +325,63 @@ func TestPushLogs(t *testing.T) {
 	}
 	if app.gotRows != 2 {
 		t.Fatalf("appended %d rows, want 2", app.gotRows)
+	}
+}
+
+// Log records whose times do not fit the table's INT64 columns are dropped
+// and counted before the append. Like limit breaches they are permanent, so
+// they are never handed back for retry, and the records around them must
+// still be delivered.
+func TestPushLogsDropsRecordsViolatingTheContract(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+
+	e, app := newTestLogsExporter(t, bqi.AppendOutcome{AcknowledgedRows: 2})
+	tel, err := metadata.NewTelemetry(provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.tel = tel
+
+	ld := plog.NewLogs()
+	records := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords()
+	for _, body := range []string{"a", "b", "c", "d"} {
+		lr := records.AppendEmpty()
+		lr.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+		lr.Body().SetStr(body)
+	}
+	records.At(1).SetTimestamp(math.MaxInt64 + 1)
+	records.At(2).SetObservedTimestamp(math.MaxUint64)
+
+	if err := e.pushLogData(context.Background(), ld); err != nil {
+		t.Fatalf("surviving records should still be delivered, got %v", err)
+	}
+	if app.gotRows != 2 {
+		t.Fatalf("appended %d rows, want the 2 records that satisfy the contract", app.gotRows)
+	}
+	if got := metricInt64Sum(t, reader, "otelcol_exporter_bigquery_rejected_rows"); got != 2 {
+		t.Fatalf("rejected metric = %d, want the 2 contract violations", got)
+	}
+}
+
+// The log identity attributes are configured on the exporter and must reach
+// the row builder, or log_name and insert_id would silently ignore them.
+func TestNewSignalExporterWiresLogIdentityOptions(t *testing.T) {
+	cfg := validConfig()
+	cfg.Logs.LogNameAttribute = "log.file.name"
+	cfg.Logs.InsertIDAttribute = "log.record.uid"
+
+	e, err := newLogsExporter(component.TelemetrySettings{
+		Logger:        zap.NewNop(),
+		MeterProvider: noop.NewMeterProvider(),
+	}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.opts.LogNameAttribute != "log.file.name" || e.opts.InsertIDAttribute != "log.record.uid" {
+		t.Fatalf("log_name attribute = %q, insert_id attribute = %q, want the configured ones",
+			e.opts.LogNameAttribute, e.opts.InsertIDAttribute)
 	}
 }
 

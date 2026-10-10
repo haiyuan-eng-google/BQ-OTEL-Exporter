@@ -135,8 +135,29 @@ func TestEncodeLogRow(t *testing.T) {
 	if err := proto.Unmarshal(b, msg); err != nil {
 		t.Fatal(err)
 	}
-	if got := stringField(t, msg, "body"); got != `{"string_value":"disk full"}` {
+	if got := stringField(t, msg, "body"); got != `"disk full"` {
 		t.Errorf("body = %q", got)
+	}
+
+	// The singular STRUCT columns, identity columns and INT64 nanos must
+	// reach the service intact, so check them through the descriptor the
+	// write stream gets.
+	norm := decodeNormalized(t, enc, b)
+	for path, want := range map[string]string{
+		"resource.attributes":        `{"service.name":"checkout"}`,
+		"resource.attributes_schema": `{"service.name":"string"}`,
+		"log_name":                   "checkout",
+		"schema_version":             schema.Version,
+	} {
+		if got := get(t, norm, path).String(); got != want {
+			t.Errorf("%s = %q, want %q", path, got, want)
+		}
+	}
+	if got := get(t, norm, "time_unix_nano").Int(); got != 1_700_000_000_000_000_000 {
+		t.Errorf("time_unix_nano = %d, want the exact nanos", got)
+	}
+	if got := get(t, norm, "insert_id").String(); got != rows[0]["record_fingerprint"] {
+		t.Errorf("insert_id = %q, want the record fingerprint %q", got, rows[0]["record_fingerprint"])
 	}
 }
 

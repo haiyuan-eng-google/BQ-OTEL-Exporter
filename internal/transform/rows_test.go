@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
-	"strings"
+	"regexp"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -431,37 +431,159 @@ func TestSpansDoNotShareNestedRows(t *testing.T) {
 	}
 }
 
+// fingerprintPattern is the record_fingerprint form the contract specifies.
+var fingerprintPattern = regexp.MustCompile(`^fp1:[0-9a-f]{64}$`)
+
 func newLogs() (plog.Logs, plog.LogRecord) {
 	ld := plog.NewLogs()
 	rl := ld.ResourceLogs().AppendEmpty()
 	rl.Resource().Attributes().PutStr("service.name", "checkout")
+	rl.SetSchemaUrl("https://example.test/resource")
 	sl := rl.ScopeLogs().AppendEmpty()
+	sl.Scope().SetName("scope")
+	sl.Scope().SetVersion("1.2.3")
+	sl.SetSchemaUrl("https://example.test/scope")
+
 	lr := sl.LogRecords().AppendEmpty()
-	lr.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
-	lr.SetObservedTimestamp(pcommon.Timestamp(1_700_000_000_500_000_000))
+	lr.SetTimestamp(pcommon.Timestamp(1_700_000_000_123_456_789))
+	lr.SetObservedTimestamp(pcommon.Timestamp(1_700_000_000_500_000_789))
+	lr.SetTraceID(pcommon.TraceID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
+	lr.SetSpanID(pcommon.SpanID{1, 2, 3, 4, 5, 6, 7, 8})
+	lr.SetFlags(plog.DefaultLogRecordFlags.WithIsSampled(true))
+	lr.SetEventName("disk.alert")
 	lr.SetSeverityNumber(plog.SeverityNumberError)
 	lr.SetSeverityText("ERROR")
 	lr.Body().SetStr("disk full")
+	lr.Attributes().PutInt("disk.used_pct", 97)
 	return ld, lr
 }
 
+// TestLogRow pins the complete row for a representative log record: every
+// column, every nested STRUCT field, and the Go type the encoder expects for
+// each.
 func TestLogRow(t *testing.T) {
 	ld, _ := newLogs()
 	rows, rejects := LogRows(ld, testOpts())
+	if len(rejects) != 0 {
+		t.Fatalf("unexpected rejections: %+v", rejects)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	got := rows[0]
+
+	// The fingerprint is a hash, so the tests below pin its properties rather
+	// than its value; here it must have the contract's form. With no upstream
+	// record ID, insert_id is the fingerprint itself.
+	fp, _ := got["record_fingerprint"].(string)
+	if !fingerprintPattern.MatchString(fp) {
+		t.Errorf("record_fingerprint = %q, want fp1: plus 64 lowercase hex chars", fp)
+	}
+	if got["insert_id"] != fp {
+		t.Errorf("insert_id = %#v, want the record fingerprint %q", got["insert_id"], fp)
+	}
+
+	want := Row{
+		// TIMESTAMP columns truncate to microseconds; the exact nanos live in
+		// the paired INT64 column.
+		"timestamp":               int64(1_700_000_000_123_456),
+		"timestamp_source":        "event",
+		"time_unix_nano":          int64(1_700_000_000_123_456_789),
+		"observed_timestamp":      int64(1_700_000_000_500_000),
+		"observed_time_unix_nano": int64(1_700_000_000_500_000_789),
+		"receive_time":            fixedNow.UnixMicro(),
+		"receive_time_unix_nano":  fixedNow.UnixNano(),
+
+		"trace_id": "0102030405060708090a0b0c0d0e0f10",
+		"span_id":  "0102030405060708",
+		"flags":    int64(1),
+
+		"event_name":      "disk.alert",
+		"severity_number": int64(plog.SeverityNumberError),
+		"severity_text":   "ERROR",
+		// The body is plain JSON too: a string body is a JSON string.
+		"body":                     `"disk full"`,
+		"attributes":               `{"disk.used_pct":"97"}`,
+		"attributes_schema":        `{"disk.used_pct":"int64"}`,
+		"dropped_attributes_count": int64(0),
+
+		"service_name": "checkout",
+		"resource": Row{
+			"attributes":               `{"service.name":"checkout"}`,
+			"attributes_schema":        `{"service.name":"string"}`,
+			"dropped_attributes_count": int64(0),
+		},
+		"resource_schema_url": "https://example.test/resource",
+		"instrumentation_scope": Row{
+			"name":                     "scope",
+			"version":                  "1.2.3",
+			"attributes":               "{}",
+			"attributes_schema":        "{}",
+			"dropped_attributes_count": int64(0),
+		},
+		"scope_schema_url": "https://example.test/scope",
+
+		// No log name attribute is set, so log_name is the service name.
+		"log_name":           "checkout",
+		"insert_id":          fp,
+		"record_fingerprint": fp,
+		"schema_version":     schema.Version,
+	}
+	for col, w := range want {
+		if g, ok := got[col]; !ok || !reflect.DeepEqual(g, w) {
+			t.Errorf("%s = %#v, want %#v", col, g, w)
+		}
+	}
+	for col, g := range got {
+		if _, ok := want[col]; !ok {
+			t.Errorf("unexpected column %s = %#v", col, g)
+		}
+	}
+}
+
+// An absent optional value must leave the column NULL, which means omitting
+// the key. The raw time columns are NOT NULL and keep the zeros as sent, and
+// the NOT NULL identity columns still get a value.
+func TestAbsentOptionalLogColumnsAreOmitted(t *testing.T) {
+	// A record with no times, body or IDs, under no resource attributes,
+	// scope or schema URLs.
+	bare := plog.NewLogs()
+	bare.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+	rows, rejects := LogRows(bare, testOpts())
 	if len(rejects) != 0 || len(rows) != 1 {
-		t.Fatalf("rows=%d rejects=%+v", len(rows), rejects)
+		t.Fatalf("rows=%d rejects=%+v, want the bare record kept", len(rows), rejects)
 	}
 	r := rows[0]
 
-	if r["timestamp_source"] != "event" {
-		t.Errorf("timestamp_source = %v, want event", r["timestamp_source"])
+	for _, col := range []string{
+		"observed_timestamp", "trace_id", "span_id", "event_name", "severity_text", "body",
+		"service_name", "resource_schema_url", "scope_schema_url", "payload_refs",
+	} {
+		if _, present := r[col]; present {
+			t.Errorf("%s should be omitted when unset, so the column stays NULL", col)
+		}
 	}
-	if r["body"] != `{"string_value":"disk full"}` {
-		t.Errorf("body = %v", r["body"])
+	for _, fld := range []string{"name", "version"} {
+		if _, present := r["instrumentation_scope"].(Row)[fld]; present {
+			t.Errorf("instrumentation_scope.%s should be omitted when unset", fld)
+		}
 	}
-	fp, _ := r["record_fingerprint"].(string)
-	if !strings.HasPrefix(fp, "v1:") || len(fp) != len("v1:")+64 {
-		t.Errorf("record_fingerprint = %q, want v1: plus 64 hex chars", fp)
+
+	for col, want := range map[string]any{
+		"time_unix_nano":          int64(0),
+		"observed_time_unix_nano": int64(0),
+		"timestamp":               fixedNow.UnixMicro(),
+		"timestamp_source":        "exporter",
+		"log_name":                "default",
+		"schema_version":          schema.Version,
+	} {
+		if got := r[col]; got != want {
+			t.Errorf("%s = %#v, want %#v", col, got, want)
+		}
+	}
+	if fp, _ := r["record_fingerprint"].(string); !fingerprintPattern.MatchString(fp) || r["insert_id"] != fp {
+		t.Errorf("insert_id = %#v, record_fingerprint = %#v, want both the record fingerprint",
+			r["insert_id"], r["record_fingerprint"])
 	}
 }
 
@@ -472,10 +594,11 @@ func TestLogTimestampFallback(t *testing.T) {
 		name       string
 		ts, obs    pcommon.Timestamp
 		wantSource string
+		wantMicros int64
 	}{
-		{"event time wins", 1_000_000_000, 2_000_000_000, "event"},
-		{"observed when event is zero", 0, 2_000_000_000, "observed"},
-		{"exporter when both are zero", 0, 0, "exporter"},
+		{"event time wins", 1_000_000_000, 2_000_000_000, "event", 1_000_000},
+		{"observed when event is zero", 0, 2_000_000_000, "observed", 2_000_000},
+		{"exporter when both are zero", 0, 0, "exporter", fixedNow.UnixMicro()},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -489,38 +612,404 @@ func TestLogTimestampFallback(t *testing.T) {
 			if rows[0]["timestamp"] == nil {
 				t.Error("timestamp must never be NULL: it is the partition key")
 			}
+			if got := rows[0]["timestamp"]; got != tc.wantMicros {
+				t.Errorf("timestamp = %#v, want %d", got, tc.wantMicros)
+			}
 		})
 	}
 }
 
-// Exact identity requires both halves. An ID without a trusted namespace is
-// not an identity, because two producers could mint the same ID.
-func TestSourceRecordIdentity(t *testing.T) {
-	t.Run("both halves present", func(t *testing.T) {
-		ld, lr := newLogs()
-		lr.Attributes().PutStr("log.record.uid", "abc-123")
-		opts := testOpts()
-		opts.SourceRecordNamespace = "prod-fleet"
-		opts.SourceRecordIDAttribute = "log.record.uid"
+// Before OTLP gave log records a top-level event name, producers carried it
+// in an event.name attribute. The field wins when both are set, and the
+// attribute stays among the record's attributes either way.
+func TestEventNameFallsBackToAttribute(t *testing.T) {
+	tests := map[string]struct {
+		field     string
+		attrs     map[string]any
+		want      string // empty means NULL
+		wantAttrs string
+	}{
+		"attribute only": {
+			"", map[string]any{"event.name": "legacy.alert"},
+			"legacy.alert", `{"event.name":"legacy.alert"}`,
+		},
+		"field wins": {
+			"disk.alert", map[string]any{"event.name": "legacy.alert"},
+			"disk.alert", `{"event.name":"legacy.alert"}`,
+		},
+		"non-string attribute": {
+			"", map[string]any{"event.name": int64(7)},
+			"", `{"event.name":"7"}`,
+		},
+		"neither": {"", nil, "", "{}"},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			ld, lr := newLogs()
+			lr.SetEventName(tc.field)
+			if err := lr.Attributes().FromRaw(tc.attrs); err != nil {
+				t.Fatal(err)
+			}
 
-		rows, _ := LogRows(ld, opts)
-		if rows[0]["source_record_namespace"] != "prod-fleet" || rows[0]["source_record_id"] != "abc-123" {
-			t.Errorf("identity tuple not populated: %v / %v",
-				rows[0]["source_record_namespace"], rows[0]["source_record_id"])
+			rows, _ := LogRows(ld, testOpts())
+			got, present := rows[0]["event_name"]
+			if (tc.want == "" && present) || (tc.want != "" && got != tc.want) {
+				t.Errorf("event_name = %#v, want %q (empty means NULL)", got, tc.want)
+			}
+			if got := rows[0]["attributes"]; got != tc.wantAttrs {
+				t.Errorf("attributes = %#v, want %s", got, tc.wantAttrs)
+			}
+		})
+	}
+}
+
+// log_name comes from the configured attribute, then the well-known log name
+// attributes in order, then the service name, then "default". Only non-empty
+// strings count: a value of another type, or an empty one, is passed over.
+func TestLogNameResolution(t *testing.T) {
+	tests := map[string]struct {
+		configured string
+		service    string
+		attrs      map[string]any
+		want       string
+	}{
+		"configured attribute wins": {
+			"log.file.name", "checkout",
+			map[string]any{"log.file.name": "app.log", "gcp.log_name": "gcp"},
+			"app.log",
+		},
+		"first well-known attribute": {
+			"log.file.name", "checkout",
+			map[string]any{"gcp.log_name": "gcp", "logging.googleapis.com/logName": "lg", "log.iostream": "stdout"},
+			"gcp",
+		},
+		"second well-known attribute": {
+			"", "checkout",
+			map[string]any{"logging.googleapis.com/logName": "lg", "log.iostream": "stdout"},
+			"lg",
+		},
+		"third well-known attribute": {
+			"", "checkout",
+			map[string]any{"log.iostream": "stdout"},
+			"stdout",
+		},
+		"service name": {"", "checkout", nil, "checkout"},
+		"default":      {"", "", nil, "default"},
+		"unconfigured attribute is not consulted": {
+			"", "checkout",
+			map[string]any{"log.file.name": "app.log"},
+			"checkout",
+		},
+		"non-string values are passed over": {
+			"log.file.name", "checkout",
+			map[string]any{"log.file.name": int64(7), "gcp.log_name": true, "log.iostream": "stderr"},
+			"stderr",
+		},
+		"empty values are passed over": {
+			"log.file.name", "",
+			map[string]any{"log.file.name": "", "gcp.log_name": ""},
+			"default",
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			ld, lr := newLogs()
+			res := map[string]any{}
+			if tc.service != "" {
+				res["service.name"] = tc.service
+			}
+			if err := ld.ResourceLogs().At(0).Resource().Attributes().FromRaw(res); err != nil {
+				t.Fatal(err)
+			}
+			if err := lr.Attributes().FromRaw(tc.attrs); err != nil {
+				t.Fatal(err)
+			}
+			opts := testOpts()
+			opts.LogNameAttribute = tc.configured
+
+			rows, _ := LogRows(ld, opts)
+			if got := rows[0]["log_name"]; got != tc.want {
+				t.Errorf("log_name = %#v, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// insert_id comes from the configured attribute, then the well-known insert
+// ID attributes in order, then the record fingerprint. As for log_name, only
+// non-empty strings count.
+func TestInsertIDResolution(t *testing.T) {
+	tests := map[string]struct {
+		configured string
+		attrs      map[string]any
+		want       string // empty means the record's own fingerprint
+	}{
+		"configured attribute wins": {
+			"my.id",
+			map[string]any{"my.id": "abc", "logging.googleapis.com/insertId": "lg"},
+			"abc",
+		},
+		"first well-known attribute": {
+			"my.id",
+			map[string]any{
+				"logging.googleapis.com/insertId": "lg", "gcp.insert.id": "g1",
+				"gcp.insert_id": "g2", "log.record.uid": "uid",
+			},
+			"lg",
+		},
+		"second well-known attribute": {
+			"",
+			map[string]any{"gcp.insert.id": "g1", "gcp.insert_id": "g2", "log.record.uid": "uid"},
+			"g1",
+		},
+		"third well-known attribute": {
+			"",
+			map[string]any{"gcp.insert_id": "g2", "log.record.uid": "uid"},
+			"g2",
+		},
+		"fourth well-known attribute": {"", map[string]any{"log.record.uid": "uid"}, "uid"},
+		"record fingerprint":          {"", nil, ""},
+		"unconfigured attribute is not consulted": {
+			"",
+			map[string]any{"my.id": "abc"},
+			"",
+		},
+		"non-string values are passed over": {
+			"my.id",
+			map[string]any{"my.id": int64(5), "logging.googleapis.com/insertId": []any{"lg"}, "log.record.uid": "uid"},
+			"uid",
+		},
+		"empty values are passed over": {
+			"my.id",
+			map[string]any{"my.id": "", "gcp.insert.id": ""},
+			"",
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			ld, lr := newLogs()
+			if err := lr.Attributes().FromRaw(tc.attrs); err != nil {
+				t.Fatal(err)
+			}
+			opts := testOpts()
+			opts.InsertIDAttribute = tc.configured
+
+			rows, _ := LogRows(ld, opts)
+			fp, _ := rows[0]["record_fingerprint"].(string)
+			if !fingerprintPattern.MatchString(fp) {
+				t.Errorf("record_fingerprint = %q: it must be written whatever insert_id holds", fp)
+			}
+			want := tc.want
+			if want == "" {
+				want = fp
+			}
+			if got := rows[0]["insert_id"]; got != want {
+				t.Errorf("insert_id = %#v, want %q", got, want)
+			}
+		})
+	}
+}
+
+// Identical records in one batch are distinct log entries, so they must not
+// share an identity, or the dedup view would collapse them into one. The
+// intra_batch_ordinal keeps them apart, and since a retry repeats the batch
+// in the same order, it reproduces every fingerprint.
+func TestIdenticalRecordsInABatchGetDistinctFingerprints(t *testing.T) {
+	fingerprints := func(ld plog.Logs) []string {
+		t.Helper()
+		rows, rejects := LogRows(ld, testOpts())
+		if len(rejects) != 0 {
+			t.Fatalf("unexpected rejections: %+v", rejects)
 		}
-	})
-
-	t.Run("no namespace configured", func(t *testing.T) {
-		ld, lr := newLogs()
-		lr.Attributes().PutStr("log.record.uid", "abc-123")
-		opts := testOpts()
-		opts.SourceRecordIDAttribute = "log.record.uid"
-
-		rows, _ := LogRows(ld, opts)
-		if _, ok := rows[0]["source_record_id"]; ok {
-			t.Error("source_record_id must stay NULL without a trusted namespace")
+		fps := make([]string, len(rows))
+		for i, r := range rows {
+			fps[i], _ = r["record_fingerprint"].(string)
+			if r["insert_id"] != fps[i] {
+				t.Errorf("row %d: insert_id = %#v, want its fingerprint", i, r["insert_id"])
+			}
 		}
-	})
+		return fps
+	}
+
+	// The batch is [A, A, B, A], where B differs from A only in its body.
+	ld, a := newLogs()
+	records := ld.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords()
+	a.CopyTo(records.AppendEmpty())
+	b := records.AppendEmpty()
+	a.CopyTo(b)
+	b.Body().SetStr("disk ok")
+	a.CopyTo(records.AppendEmpty())
+
+	fps := fingerprints(ld)
+	if len(fps) != 4 {
+		t.Fatalf("got %d rows, want 4", len(fps))
+	}
+	if fps[0] == fps[1] || fps[0] == fps[3] || fps[1] == fps[3] {
+		t.Errorf("identical records share a fingerprint: %q", []string{fps[0], fps[1], fps[3]})
+	}
+	if again := fingerprints(ld); !reflect.DeepEqual(again, fps) {
+		t.Errorf("a retry of the batch changed its fingerprints:\n got %q\nwant %q", again, fps)
+	}
+
+	// The first of the identical records has ordinal 0, as the record sent on
+	// its own does, and B is unaffected by the A's around it.
+	aloneA, _ := newLogs()
+	aloneB, lr := newLogs()
+	lr.Body().SetStr("disk ok")
+	if want := fingerprints(aloneA)[0]; fps[0] != want {
+		t.Errorf("first A = %q, want %q, the fingerprint of A sent alone", fps[0], want)
+	}
+	if want := fingerprints(aloneB)[0]; fps[2] != want {
+		t.Errorf("B = %q, want %q, the fingerprint of B sent alone", fps[2], want)
+	}
+}
+
+// The row stores values as plain JSON, in which an int64 and its decimal
+// string look the same. The fingerprint must still tell them apart, or two
+// distinct records would share an identity.
+func TestFingerprintDistinguishesTypes(t *testing.T) {
+	row := func(mutate func(plog.LogRecord)) Row {
+		ld, lr := newLogs()
+		mutate(lr)
+		rows, _ := LogRows(ld, testOpts())
+		return rows[0]
+	}
+	for _, tc := range []struct {
+		name            string
+		col             string
+		asInt, asString func(plog.LogRecord)
+	}{
+		{
+			"attribute", "attributes",
+			func(lr plog.LogRecord) { lr.Attributes().PutInt("n", 42) },
+			func(lr plog.LogRecord) { lr.Attributes().PutStr("n", "42") },
+		},
+		{
+			"body", "body",
+			func(lr plog.LogRecord) { lr.Body().SetInt(42) },
+			func(lr plog.LogRecord) { lr.Body().SetStr("42") },
+		},
+	} {
+		i, s := row(tc.asInt), row(tc.asString)
+		if i[tc.col] != s[tc.col] {
+			t.Fatalf("%s: plain JSON differs (%v vs %v), so this case proves nothing", tc.name, i[tc.col], s[tc.col])
+		}
+		if i["record_fingerprint"] == s["record_fingerprint"] {
+			t.Errorf("%s: an int64 and its decimal string share a fingerprint", tc.name)
+		}
+	}
+}
+
+// Every NOT NULL log column must be fillable with a value that means what
+// the column says. A record whose times do not fit INT64 is rejected before a
+// row is built, and only that record: the records around it are still
+// written.
+func TestLogContractViolationsAreRejected(t *testing.T) {
+	tests := map[string]struct {
+		mutate    func(plog.LogRecord)
+		fieldPath string
+	}{
+		"time beyond int64": {
+			func(lr plog.LogRecord) { lr.SetTimestamp(math.MaxInt64 + 1) },
+			"time_unix_nano",
+		},
+		"observed time beyond int64": {
+			func(lr plog.LogRecord) { lr.SetObservedTimestamp(math.MaxUint64) },
+			"observed_time_unix_nano",
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			ld, bad := newLogs()
+			tc.mutate(bad)
+			ld.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().AppendEmpty()
+
+			rows, rejects := LogRows(ld, testOpts())
+			if len(rows) != 1 {
+				t.Fatalf("kept %d rows, want only the valid neighbor", len(rows))
+			}
+			want := Rejection{Index: 0, Reason: ReasonTimestampOverflow, FieldPath: tc.fieldPath}
+			if len(rejects) != 1 || rejects[0] != want {
+				t.Fatalf("rejections = %+v, want [%+v]", rejects, want)
+			}
+		})
+	}
+}
+
+// INT64 holds every OTLP timestamp up to math.MaxInt64 nanoseconds, in the
+// year 2262. Only values beyond that are rejected.
+func TestLogTimestampsAtTheInt64LimitAreKept(t *testing.T) {
+	ld, lr := newLogs()
+	lr.SetTimestamp(math.MaxInt64)
+	lr.SetObservedTimestamp(math.MaxInt64)
+
+	rows, rejects := LogRows(ld, testOpts())
+	if len(rejects) != 0 || len(rows) != 1 {
+		t.Fatalf("rows=%d rejects=%+v, want the record kept", len(rows), rejects)
+	}
+	for col, want := range map[string]int64{
+		"time_unix_nano":          math.MaxInt64,
+		"observed_time_unix_nano": math.MaxInt64,
+		"timestamp":               math.MaxInt64 / 1000,
+		"observed_timestamp":      math.MaxInt64 / 1000,
+	} {
+		if got := rows[0][col]; got != want {
+			t.Errorf("%s = %#v, want %d", col, got, want)
+		}
+	}
+}
+
+// BigQuery STRING columns must hold valid UTF-8, and nothing on the OTLP wire
+// guarantees it. Invalid sequences become U+FFFD instead of failing the row.
+func TestLogStringsAreValidUTF8(t *testing.T) {
+	const bad = "a\xffb"
+	ld, lr := newLogs()
+	rl := ld.ResourceLogs().At(0)
+	rl.SetSchemaUrl(bad)
+	rl.Resource().Attributes().PutStr("service.name", bad)
+	sl := rl.ScopeLogs().At(0)
+	sl.SetSchemaUrl(bad)
+	sl.Scope().SetName(bad)
+	sl.Scope().SetVersion(bad)
+	lr.SetEventName(bad)
+	lr.SetSeverityText(bad)
+	lr.Body().SetStr(bad)
+	lr.Attributes().PutStr(bad, bad)
+	lr.Attributes().PutStr("gcp.log_name", bad)
+	lr.Attributes().PutStr("log.record.uid", bad)
+
+	rows, rejects := LogRows(ld, testOpts())
+	if len(rejects) != 0 {
+		t.Fatalf("invalid UTF-8 must be repaired, not rejected: %+v", rejects)
+	}
+	for _, col := range []string{"event_name", "severity_text", "service_name", "log_name", "insert_id"} {
+		if got, want := rows[0][col], "a\uFFFDb"; got != want {
+			t.Errorf("%s = %q, want %q", col, got, want)
+		}
+	}
+	assertValidUTF8(t, "row", rows[0])
+}
+
+// Records under one resource reuse its encoded attributes, but each row must
+// get its own STRUCT values, or a change to one row would leak into another.
+func TestLogsDoNotShareNestedRows(t *testing.T) {
+	ld, _ := newLogs()
+	ld.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().AppendEmpty()
+
+	rows, _ := LogRows(ld, testOpts())
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(rows))
+	}
+	for _, col := range []string{"resource", "instrumentation_scope"} {
+		first, second := rows[0][col].(Row), rows[1][col].(Row)
+		if !reflect.DeepEqual(first, second) {
+			t.Errorf("%s differs between two records of one resource and scope", col)
+		}
+		first["attributes"] = "changed"
+		if second["attributes"] == "changed" {
+			t.Errorf("%s is a single map shared by two rows", col)
+		}
+	}
 }
 
 // The fingerprint is what dedup partitions on, so identical content must hash
@@ -547,9 +1036,9 @@ func TestFingerprintStability(t *testing.T) {
 	}
 }
 
-// export_received_timestamp is ingestion-local. If it fed the fingerprint,
-// every retry of the same record would hash differently and deduplication
-// would never match anything.
+// receive_time is ingestion-local. If it fed the fingerprint, every retry of
+// the same record would hash differently and deduplication would never match
+// anything.
 func TestFingerprintIgnoresIngestionTime(t *testing.T) {
 	fp := func(now time.Time) string {
 		ld, _ := newLogs()
@@ -559,7 +1048,7 @@ func TestFingerprintIgnoresIngestionTime(t *testing.T) {
 		return rows[0]["record_fingerprint"].(string)
 	}
 	if fp(fixedNow) != fp(fixedNow.Add(72*time.Hour)) {
-		t.Fatal("fingerprint must not depend on export_received_timestamp")
+		t.Fatal("fingerprint must not depend on receive_time")
 	}
 }
 

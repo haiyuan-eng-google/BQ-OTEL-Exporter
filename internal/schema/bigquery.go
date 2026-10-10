@@ -30,7 +30,8 @@ func DestinationMetadata(
 		md.Clustering = &bq.Clustering{Fields: []string{"service_name", "trace_id", "name"}}
 		queryTemplate = SpansDedupViewQuery
 	case proto.Equal(in, LogsTableSchema()):
-		md.TimePartitioning = &bq.TimePartitioning{Field: "timestamp"}
+		md.TimePartitioning = &bq.TimePartitioning{Type: bq.DayPartitioningType, Field: "timestamp"}
+		md.Clustering = &bq.Clustering{Fields: []string{"service_name", "trace_id", "severity_number"}}
 		queryTemplate = LogsDedupViewQuery
 	default:
 		return nil, "", fmt.Errorf("schema is not a canonical trace or log contract")

@@ -6,6 +6,10 @@ package diag
 import (
 	"strings"
 	"testing"
+
+	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
+
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 )
 
 // The core FR13 property: nothing derived from telemetry content reaches a
@@ -13,12 +17,12 @@ import (
 // exactly the ones that must never appear.
 func TestSanitizeDropsTelemetryContent(t *testing.T) {
 	secrets := []string{
-		"4bf92f3577b34da6a3ce929d0e0e4736",    // a trace ID
-		"00f067aa0ba902b7",                    // a span ID
-		"v1:9f86d081884c7d659a2feaa0c55ad015", // a record fingerprint
-		"user@example.com",                    // an attribute value
-		"Bearer sk-abc123",                    // a credential in a body
-		"customer-order-99182",                // a source record ID
+		"4bf92f3577b34da6a3ce929d0e0e4736",     // a trace ID
+		"00f067aa0ba902b7",                     // a span ID
+		"fp1:9f86d081884c7d659a2feaa0c55ad015", // a record fingerprint
+		"user@example.com",                     // an attribute value
+		"Bearer sk-abc123",                     // a credential in a body
+		"customer-order-99182",                 // an upstream insert ID
 	}
 
 	for _, secret := range secrets {
@@ -32,9 +36,35 @@ func TestSanitizeDropsTelemetryContent(t *testing.T) {
 
 // Sanitizing must still leave something useful: the column names involved.
 func TestSanitizeKeepsColumnNames(t *testing.T) {
-	got := SanitizeFieldPath("Invalid value for field log_attributes in row")
-	if got != "log_attributes" {
-		t.Fatalf("got %q, want log_attributes", got)
+	got := SanitizeFieldPath("Invalid value for field attributes_schema in row")
+	if got != "attributes_schema" {
+		t.Fatalf("got %q, want attributes_schema", got)
+	}
+}
+
+// The allowlist must track the table contracts exactly: a missing name would
+// drop a location an operator needs, and an extra one is a name no column has.
+func TestKnownFieldTokensMatchTheContract(t *testing.T) {
+	want := map[string]bool{}
+	var walk func([]*storagepb.TableFieldSchema)
+	walk = func(fields []*storagepb.TableFieldSchema) {
+		for _, f := range fields {
+			want[f.GetName()] = true
+			walk(f.GetFields())
+		}
+	}
+	walk(schema.SpansTableSchema().GetFields())
+	walk(schema.LogsTableSchema().GetFields())
+
+	for name := range want {
+		if !knownFieldTokens[name] {
+			t.Errorf("contract field %q is missing from knownFieldTokens", name)
+		}
+	}
+	for name := range knownFieldTokens {
+		if !want[name] {
+			t.Errorf("knownFieldTokens has %q, which names no contract field", name)
+		}
 	}
 }
 

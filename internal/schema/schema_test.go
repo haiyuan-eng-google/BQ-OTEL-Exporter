@@ -12,11 +12,12 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// The contract is v0alpha1 until at least two independent design partners
-// complete representative workflows. Bumping this to v1 is a milestone gate,
-// not a code change, so make it fail loudly.
+// The contract stays in alpha, now at its first documented correction, until
+// at least two independent design partners complete representative
+// workflows. Bumping this to v1 is a milestone gate, not a code change, so
+// make it fail loudly.
 func TestVersionIsAlphaBaseline(t *testing.T) {
-	if Version != "v0alpha1" {
+	if Version != "v0alpha2" {
 		t.Fatalf("schema Version = %q; v1 freezes only at M4", Version)
 	}
 }
@@ -29,8 +30,9 @@ func TestRequiredColumns(t *testing.T) {
 		"trace_id", "span_id", "name", "kind", "schema_version",
 	}
 	logs := []string{
-		"timestamp", "time_unix_nano", "observed_time_unix_nano",
-		"export_received_timestamp", "schema_version", "record_fingerprint",
+		"timestamp", "timestamp_source", "time_unix_nano", "observed_time_unix_nano",
+		"receive_time", "receive_time_unix_nano",
+		"log_name", "insert_id", "schema_version",
 	}
 
 	for _, tc := range []struct {
@@ -71,15 +73,16 @@ func TestPartitioning(t *testing.T) {
 	}
 }
 
-// Logs get no default clustering, and that decision is final rather than
-// pending. Spans cluster on (service_name, trace_id, name), so per-service
-// scans and whole-trace lookups both prune.
+// Spans cluster on (service_name, trace_id, name), so per-service scans and
+// whole-trace lookups both prune. Logs cluster on (service_name, trace_id,
+// severity_number), so per-service scans, trace correlation and severity
+// filters prune.
 func TestClustering(t *testing.T) {
 	if !strings.Contains(SpansDDL, "CLUSTER BY service_name, trace_id, name;") {
 		t.Error("spans must cluster on service_name, trace_id, name")
 	}
-	if strings.Contains(LogsDDL, "CLUSTER BY") {
-		t.Error("logs must have no default clustering")
+	if !strings.Contains(LogsDDL, "CLUSTER BY service_name, trace_id, severity_number;") {
+		t.Error("logs must cluster on service_name, trace_id, severity_number")
 	}
 }
 
@@ -107,22 +110,21 @@ func TestSpanDedupWindow(t *testing.T) {
 	}
 }
 
-// The log dedup partition must keep the two identity kinds in disjoint
-// partitions and must never flatten the tuple into one string. A
-// CONCAT(namespace, '/', id) form would collide ('a/b','c') with ('a','b/c')
-// and mix source IDs with fingerprints in a single domain.
-func TestLogDedupPartitionIsNotFlattened(t *testing.T) {
+// The log dedup window must partition on the full record identity as
+// separate columns, led by the partitioning and clustering columns so a
+// filter on them still prunes when pushed below the window function. It must
+// never flatten the identity into one string: CONCAT(log_name, '/', id) would
+// collide ('a/b', 'c') with ('a', 'b/c').
+func TestLogDedupWindow(t *testing.T) {
 	if strings.Contains(LogsDedupViewDDL, "CONCAT(") {
-		t.Fatal("log dedup must not concatenate namespace and ID into one partition key")
+		t.Fatal("log dedup must not concatenate identity columns into one partition key")
 	}
-	for _, want := range []string{
-		"(source_record_namespace IS NOT NULL AND source_record_id IS NOT NULL)",
-		`IFNULL(source_record_namespace, '')`,
-		"record_fingerprint",
-	} {
-		if !strings.Contains(LogsDedupViewDDL, want) {
-			t.Errorf("log dedup partition is missing %q", want)
-		}
+	query := strings.Join(strings.Fields(LogsDedupViewQuery), " ")
+	want := "QUALIFY ROW_NUMBER() OVER ( " +
+		"PARTITION BY timestamp, time_unix_nano, service_name, log_name, insert_id " +
+		"ORDER BY receive_time_unix_nano DESC ) = 1"
+	if !strings.Contains(query, want) {
+		t.Errorf("log dedup window = %q, want it to contain %q", query, want)
 	}
 }
 

@@ -12,11 +12,11 @@ package schema // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/interna
 
 // Version is the per-row schema_version value.
 //
-// The contract is published as v0alpha1 at M2, during which documented
-// breaking corrections are allowed. It freezes as v1 only at M4, after at
-// least two independent design partners complete representative workflows.
-// Do not bump this to v1 without that gate.
-const Version = "v0alpha1"
+// The contract was published as v0alpha1 at M2, during which documented
+// breaking corrections are allowed; v0alpha2 is the first such correction. It
+// freezes as v1 only at M4, after at least two independent design partners
+// complete representative workflows. Do not bump this to v1 without that gate.
+const Version = "v0alpha2"
 
 // SpansDDL creates the v0alpha2 span table.
 //
@@ -113,49 +113,78 @@ PARTITION BY TIMESTAMP_TRUNC(start_time, HOUR)
 CLUSTER BY service_name, trace_id, name;
 `
 
-// LogsDDL creates the log table per §7.2.
+// LogsDDL creates the v0alpha2 log table.
 //
-// Logs get no default clustering in v1. This is final rather than pending:
-// log query patterns vary too widely for a default to be useful.
+// As with spans, every timestamp is stored twice: a microsecond-precision
+// TIMESTAMP and the exact OTLP nanoseconds as INT64. A record whose
+// nanoseconds do not fit INT64 is rejected before a row is built. timestamp
+// is never NULL: it falls back from the event time to the observed time to
+// the exporter receive time, and timestamp_source records which one won.
+//
+// Partitioning is daily on timestamp, and clustering on (service_name,
+// trace_id, severity_number) keeps per-service scans, trace correlation and
+// severity filters pruned.
 const LogsDDL = `
 CREATE TABLE IF NOT EXISTS ` + "`%[1]s.%[2]s.%[3]s`" + ` (
+  -- Time family
   timestamp                          TIMESTAMP NOT NULL,
-  timestamp_source                   STRING,
-  time_unix_nano                     STRING    NOT NULL,
+  timestamp_source                   STRING    NOT NULL,
+  time_unix_nano                     INT64     NOT NULL,
   observed_timestamp                 TIMESTAMP,
-  observed_time_unix_nano            STRING    NOT NULL,
-  export_received_timestamp          TIMESTAMP NOT NULL,
-
+  observed_time_unix_nano            INT64     NOT NULL,
+  receive_time                       TIMESTAMP NOT NULL,
+  receive_time_unix_nano             INT64     NOT NULL,
+  -- Identity & Correlation family
   trace_id                           STRING,
   span_id                            STRING,
   flags                              INT64,
-
+  -- Log payload family (Plain JSON body & attributes + sidecar)
   event_name                         STRING,
   severity_number                    INT64,
   severity_text                      STRING,
   body                               JSON,
-
-  service_name                       STRING,
-  resource_attributes                JSON,
-  resource_schema_url                STRING,
-  resource_dropped_attributes_count  INT64,
-
-  scope_name                         STRING,
-  scope_version                      STRING,
-  scope_attributes                   JSON,
-  scope_schema_url                   STRING,
-  scope_dropped_attributes_count     INT64,
-
-  log_attributes                     JSON,
+  attributes                         JSON,
+  attributes_schema                  JSON,
   dropped_attributes_count           INT64,
-
-  schema_version                     STRING    NOT NULL,
-
-  source_record_namespace            STRING,
-  source_record_id                   STRING,
-  record_fingerprint                 STRING    NOT NULL
+  -- Resource & Instrumentation Scope family
+  service_name                       STRING,
+  resource STRUCT<
+    attributes                       JSON,
+    attributes_schema                JSON,
+    dropped_attributes_count         INT64
+  >,
+  resource_schema_url                STRING,
+  instrumentation_scope STRUCT<
+    name                             STRING,
+    version                          STRING,
+    attributes                       JSON,
+    attributes_schema                JSON,
+    dropped_attributes_count         INT64
+  >,
+  scope_schema_url                   STRING,
+  -- Multimodal & Oversized Payload Offloading via BigQuery ObjectRef
+  payload_refs ARRAY<STRUCT<
+    attribute_path                   STRING,
+    part_index                       INT64,
+    mime_type                        STRING,
+    storage_mode                     STRING,
+    byte_size                        INT64,
+    sha256                           STRING,
+    object_ref STRUCT<
+      uri                            STRING,
+      version                        STRING,
+      authorizer                     STRING,
+      details                        JSON
+    >
+  >>,
+  -- Dedup Identity & Contract family (with intra_batch_ordinal in record_fingerprint)
+  log_name                           STRING    NOT NULL,
+  insert_id                          STRING    NOT NULL,
+  record_fingerprint                 STRING,
+  schema_version                     STRING    NOT NULL
 )
-PARTITION BY DATE(timestamp);
+PARTITION BY DATE(timestamp)
+CLUSTER BY service_name, trace_id, severity_number;
 `
 
 // SpansDedupViewDDL is the canonical span deduplication view (§7.4).
@@ -196,20 +225,21 @@ QUALIFY ROW_NUMBER() OVER (
 
 // LogsDedupViewDDL is the canonical log deduplication view (§7.4).
 //
-// Two-tier identity. Exact identity is the typed tuple
-// (source_record_namespace, source_record_id) when instrumentation supplies
-// one; otherwise identity falls back to record_fingerprint.
+// Identity is (timestamp, time_unix_nano, service_name, log_name, insert_id),
+// aligned with the Cloud Logging (log_name, insert_id) identity. insert_id is
+// the upstream record ID when instrumentation supplies one and the record
+// fingerprint otherwise. The partitioning column and the leading clustering
+// column come first, so a filter on either can be pushed below the window
+// function and a query over the view still prunes partitions and clusters;
+// time_unix_nano keeps apart records that share a microsecond timestamp. The
+// most recently received copy wins.
 //
-// The PARTITION BY deliberately uses three separate expressions and never
-// string concatenation. Flattening to CONCAT(namespace, '/', id) would collide
-// ('a/b','c') with ('a','b/c') and would mix source IDs and fingerprints into
-// a single string domain. The leading boolean keeps the two identity kinds in
-// disjoint partitions.
-//
-// Scope of the promise, deliberately narrow: this removes content-equivalent
-// retry duplicates. A fingerprint cannot separate two legitimately emitted log
-// records whose complete contents are identical — exact record identity is
-// available only through the trusted namespace/ID tuple.
+// Scope of the promise, deliberately narrow: this removes retry duplicates.
+// The fingerprint separates identical records only within one export batch,
+// through its intra-batch ordinal, so identical records delivered in separate
+// batches collapse to one row. A record with neither an event nor an observed
+// time is stamped with the exporter receive time, which differs on every
+// retry, so retries of such a record are not collapsed.
 const LogsDedupViewDDL = `
 CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s.%[3]s_dedup`" + ` AS
 ` + LogsDedupViewQuery + `;
@@ -218,23 +248,28 @@ CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s.%[3]s_dedup`" + ` AS
 // LogsDedupViewQuery is shared by operator-run DDL and metadata-API view
 // creation so their deduplication behavior cannot drift.
 const LogsDedupViewQuery = `
-SELECT * FROM ` + "`%[1]s.%[2]s.%[3]s`" + `
+SELECT *
+FROM ` + "`%[1]s.%[2]s.%[3]s`" + `
 QUALIFY ROW_NUMBER() OVER (
   PARTITION BY
-    (source_record_namespace IS NOT NULL AND source_record_id IS NOT NULL),
-    IFNULL(source_record_namespace, ''),
-    IF(source_record_namespace IS NOT NULL AND source_record_id IS NOT NULL,
-       source_record_id, record_fingerprint)
-  ORDER BY export_received_timestamp DESC
+    timestamp,
+    time_unix_nano,
+    service_name,
+    log_name,
+    insert_id
+  ORDER BY
+    receive_time_unix_nano DESC
 ) = 1
 `
 
 // FingerprintPrefix is the version tag on record_fingerprint values, which are
-// formatted as "v1:" + lowercase_hex(SHA256(canonical_log_record)).
+// formatted as "fp1:" + lowercase_hex(SHA-256(canonical_log_record)).
 //
-// The canonical form covers all non-derived OTLP source fields with object
-// keys sorted by UTF-8 byte order and array order preserved.
-// export_received_timestamp is ingestion-local and derived, so it is excluded:
-// including it would give every retry a distinct fingerprint and defeat the
-// whole mechanism.
-const FingerprintPrefix = "v1:"
+// The canonical form covers every non-derived OTLP field of the record, its
+// resource and its scope, encodes values as plain JSON together with their
+// type sidecars, and ends with the record's intra_batch_ordinal: the 0-based
+// count of identical canonical records before it in the same export batch.
+// Receive time is ingestion-local and derived, so it is excluded: including
+// it would give every retry a distinct fingerprint and defeat the whole
+// mechanism.
+const FingerprintPrefix = "fp1:"
