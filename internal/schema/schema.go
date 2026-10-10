@@ -262,6 +262,31 @@ QUALIFY ROW_NUMBER() OVER (
 ) = 1
 `
 
+// SpansSearchIndexDDL creates the trace lookup search index on the span
+// table. NO_OP_ANALYZER indexes every trace_id and span_id value whole,
+// without tokenizing it, which suits exact-match lookups of one trace or one
+// span.
+//
+// The exporter never runs this statement. Auto-create goes through the table
+// metadata API only, while a search index is created by a SQL query job,
+// which needs bigquery.jobs.create; operators run it themselves or manage it
+// with their infrastructure-as-code tooling. The index name is derived from
+// the table name, so the default otel_spans table gets
+// otel_spans_trace_lookup_idx.
+const SpansSearchIndexDDL = `
+CREATE SEARCH INDEX IF NOT EXISTS ` + "`%[3]s_trace_lookup_idx`" + `
+ON ` + "`%[1]s.%[2]s.%[3]s`" + ` (trace_id, span_id) OPTIONS (analyzer = 'NO_OP_ANALYZER');
+`
+
+// LogsSearchIndexDDL creates the trace lookup search index on the log table,
+// so looking up the records correlated with one trace or one span can use the
+// index. As with SpansSearchIndexDDL, the exporter never runs it, and the
+// default otel_logs table gets otel_logs_trace_lookup_idx.
+const LogsSearchIndexDDL = `
+CREATE SEARCH INDEX IF NOT EXISTS ` + "`%[3]s_trace_lookup_idx`" + `
+ON ` + "`%[1]s.%[2]s.%[3]s`" + ` (trace_id, span_id) OPTIONS (analyzer = 'NO_OP_ANALYZER');
+`
+
 // FingerprintPrefix is the version tag on record_fingerprint values, which are
 // formatted as "fp1:" + lowercase_hex(SHA-256(canonical_log_record)).
 //

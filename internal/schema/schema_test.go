@@ -132,10 +132,12 @@ func TestLogDedupWindow(t *testing.T) {
 // index count silently produces %!s(MISSING) rather than failing.
 func TestDDLTemplatesFormatCleanly(t *testing.T) {
 	for name, tmpl := range map[string]string{
-		"spans":      SpansDDL,
-		"logs":       LogsDDL,
-		"spans_view": SpansDedupViewDDL,
-		"logs_view":  LogsDedupViewDDL,
+		"spans":              SpansDDL,
+		"logs":               LogsDDL,
+		"spans_view":         SpansDedupViewDDL,
+		"logs_view":          LogsDedupViewDDL,
+		"spans_search_index": SpansSearchIndexDDL,
+		"logs_search_index":  LogsSearchIndexDDL,
 	} {
 		got := fmt.Sprintf(tmpl, "proj", "ds", "tbl")
 		if strings.Contains(got, "%!") || strings.Contains(got, "MISSING") {
@@ -168,6 +170,86 @@ func TestDedupQueriesAreBodiesAndDDLsAreStatements(t *testing.T) {
 			}
 			if !strings.Contains(ddl, query) {
 				t.Fatal("operator-run DDL does not contain the metadata API query body")
+			}
+		})
+	}
+}
+
+// The window tests above pin the identity and ordering; this pins the whole
+// view, so a filter, a projection or a source change cannot slip in either.
+// The views are formatted for the default table names.
+func TestDedupViewsMatchPublishedContract(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		query     string
+		ddl       string
+		table     string
+		wantQuery string
+	}{
+		{
+			name:  "spans",
+			query: SpansDedupViewQuery,
+			ddl:   SpansDedupViewDDL,
+			table: "otel_spans",
+			wantQuery: "SELECT * FROM `proj.ds.otel_spans` QUALIFY ROW_NUMBER() OVER ( " +
+				"PARTITION BY start_time, service_name, trace_id, span_id " +
+				"ORDER BY end_time_unix_nano DESC, receive_time_unix_nano DESC ) = 1",
+		},
+		{
+			name:  "logs",
+			query: LogsDedupViewQuery,
+			ddl:   LogsDedupViewDDL,
+			table: "otel_logs",
+			wantQuery: "SELECT * FROM `proj.ds.otel_logs` QUALIFY ROW_NUMBER() OVER ( " +
+				"PARTITION BY timestamp, time_unix_nano, service_name, log_name, insert_id " +
+				"ORDER BY receive_time_unix_nano DESC ) = 1",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			query := strings.Join(strings.Fields(fmt.Sprintf(tc.query, "proj", "ds", tc.table)), " ")
+			if query != tc.wantQuery {
+				t.Errorf("dedup view query =\n%s\nwant\n%s", query, tc.wantQuery)
+			}
+			ddl := strings.Join(strings.Fields(fmt.Sprintf(tc.ddl, "proj", "ds", tc.table)), " ")
+			if want := "CREATE OR REPLACE VIEW `proj.ds." + tc.table + "_dedup` AS "; !strings.HasPrefix(ddl, want) {
+				t.Errorf("dedup view DDL = %q, want it to start with %q", ddl, want)
+			}
+		})
+	}
+}
+
+// The trace lookup indexes are operator-run statements, so their text is the
+// contract: formatted for the default tables they must read exactly as
+// published, and the index name must follow a custom table name.
+func TestSearchIndexDDLs(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		tmpl  string
+		table string
+		want  string
+	}{
+		{
+			name:  "spans",
+			tmpl:  SpansSearchIndexDDL,
+			table: "otel_spans",
+			want: "CREATE SEARCH INDEX IF NOT EXISTS `otel_spans_trace_lookup_idx`\n" +
+				"ON `proj.ds.otel_spans` (trace_id, span_id) OPTIONS (analyzer = 'NO_OP_ANALYZER');",
+		},
+		{
+			name:  "logs",
+			tmpl:  LogsSearchIndexDDL,
+			table: "otel_logs",
+			want: "CREATE SEARCH INDEX IF NOT EXISTS `otel_logs_trace_lookup_idx`\n" +
+				"ON `proj.ds.otel_logs` (trace_id, span_id) OPTIONS (analyzer = 'NO_OP_ANALYZER');",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := strings.TrimSpace(fmt.Sprintf(tc.tmpl, "proj", "ds", tc.table)); got != tc.want {
+				t.Errorf("search index DDL =\n%s\nwant\n%s", got, tc.want)
+			}
+			custom := fmt.Sprintf(tc.tmpl, "proj", "ds", "custom")
+			if !strings.Contains(custom, "`custom_trace_lookup_idx`") {
+				t.Errorf("index name must follow the table name, got\n%s", custom)
 			}
 		})
 	}
