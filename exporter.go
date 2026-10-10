@@ -11,6 +11,7 @@ import (
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.uber.org/zap"
 	bigqueryapi "google.golang.org/api/bigquery/v2"
 	"google.golang.org/api/impersonate"
@@ -22,6 +23,7 @@ import (
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/diag"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/metadata"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/protoenc"
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
 )
 
@@ -64,6 +66,11 @@ type signalExporter struct {
 	writer rowAppender
 	enc    rowEncoder
 
+	// quarantine and quarantineEnc write the opt-in quarantine table on a
+	// stream of its own. Both stay nil unless quarantine is enabled.
+	quarantine    rowAppender
+	quarantineEnc rowEncoder
+
 	schema *storagepb.TableSchema
 	opts   transform.Options
 }
@@ -83,8 +90,22 @@ func newSignalExporter(
 			Limits:            cfg.Limits.toTransform(),
 			LogNameAttribute:  cfg.Logs.LogNameAttribute,
 			InsertIDAttribute: cfg.Logs.InsertIDAttribute,
+			ExporterInstance:  exporterInstance(set.Resource),
+			MaxRowBytes:       cfg.Write.MaxRowBytes,
 		},
 	}
+}
+
+// exporterInstance labels quarantine rows with the service.instance.id of the
+// collector's own telemetry resource, or nothing when the host sets none.
+func exporterInstance(res pcommon.Resource) string {
+	if res == (pcommon.Resource{}) {
+		return ""
+	}
+	if v, ok := res.Attributes().Get("service.instance.id"); ok {
+		return v.AsString()
+	}
+	return ""
 }
 
 // authenticationOptions renders the configured identity for either BigQuery
@@ -224,16 +245,43 @@ func (e *signalExporter) start(ctx context.Context, _ component.Host) (err error
 		Observer:            e.tel,
 	})
 
-	e.logger.Info("BigQuery exporter started",
+	startedFields := []zap.Field{
 		zap.String("destination", e.tableID()),
 		zap.String("delivery", "at-least-once (default stream) — appends may duplicate data"),
 		zap.String("schema_version", schemaVersion),
-	)
+	}
+	if e.cfg.Quarantine.Enabled {
+		qenc, qerr := protoenc.New(schema.QuarantineTableSchema())
+		if qerr != nil {
+			return qerr
+		}
+		e.quarantineEnc = qenc
+		// The quarantine table gets a stream of its own, so a quarantine
+		// append that fails or stalls can never fail a signal append.
+		e.quarantine = bqi.NewWriter(lifetimeCtx, client, bqi.WriterOptions{
+			Project:             e.cfg.Project,
+			Dataset:             e.cfg.Dataset,
+			Table:               e.cfg.Quarantine.Table,
+			Descriptor:          qenc.Descriptor(),
+			MaxRequestBytes:     e.cfg.Write.MaxRequestBytes,
+			MaxInflightRequests: e.cfg.Write.MaxInflightRequests,
+			MaxInflightBytes:    e.cfg.Write.MaxInflightBytes,
+			TraceID:             writeAPITraceID,
+			Observer:            e.tel,
+		})
+		startedFields = append(startedFields, zap.String("quarantine", e.quarantineTableID()))
+	}
+
+	e.logger.Info("BigQuery exporter started", startedFields...)
 	return nil
 }
 
 func (e *signalExporter) tableID() string {
 	return fmt.Sprintf("%s.%s.%s", e.cfg.Project, e.cfg.Dataset, e.table)
+}
+
+func (e *signalExporter) quarantineTableID() string {
+	return fmt.Sprintf("%s.%s.%s", e.cfg.Project, e.cfg.Dataset, e.cfg.Quarantine.Table)
 }
 
 func (e *signalExporter) shutdown(_ context.Context) error {
@@ -246,6 +294,12 @@ func (e *signalExporter) shutdown(_ context.Context) error {
 			errs = append(errs, err)
 		}
 		e.writer = nil
+	}
+	if e.quarantine != nil {
+		if err := e.quarantine.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		e.quarantine = nil
 	}
 	if e.client != nil {
 		if err := e.client.Close(); err != nil {
@@ -265,10 +319,12 @@ func (e *signalExporter) shutdown(_ context.Context) error {
 //
 // Both are permanent, row-scoped failures: retrying them produces the same
 // result. They are counted and dropped rather than failing the batch, because
-// one pathological row must not block the telemetry around it.
+// one pathological row must not block the telemetry around it. drops
+// describes each dropped row for the quarantine table, indexed by row
+// position.
 func (e *signalExporter) encodeRows(
 	ctx context.Context, rows []transform.Row, opID string,
-) (encoded [][]byte, keptIndex []int, dropped int) {
+) (encoded [][]byte, keptIndex []int, drops []transform.QuarantineEntry) {
 	encoded = make([][]byte, 0, len(rows))
 	keptIndex = make([]int, 0, len(rows))
 
@@ -278,7 +334,10 @@ func (e *signalExporter) encodeRows(
 			e.tel.RecordRejected(ctx, string(transform.ReasonSerialization), 1)
 			e.logger.Debug("dropping row that failed serialization",
 				diag.Rejection(e.tableID(), opID, i, string(transform.ReasonSerialization), "unknown", 0, 0)...)
-			dropped++
+			drops = append(drops, transform.QuarantineEntry{
+				Rejection: transform.Rejection{Index: i, Reason: transform.ReasonSerialization},
+				Detail:    err.Error(),
+			})
 			continue
 		}
 		if len(b) > e.cfg.Write.MaxRowBytes {
@@ -286,13 +345,18 @@ func (e *signalExporter) encodeRows(
 			e.logger.Debug("dropping oversized row",
 				diag.Rejection(e.tableID(), opID, i, string(transform.ReasonRowBytes), "unknown",
 					e.cfg.Write.MaxRowBytes, len(b))...)
-			dropped++
+			drops = append(drops, transform.QuarantineEntry{
+				Rejection: transform.Rejection{
+					Index: i, Reason: transform.ReasonRowBytes,
+					Limit: e.cfg.Write.MaxRowBytes, Actual: len(b),
+				},
+			})
 			continue
 		}
 		encoded = append(encoded, b)
 		keptIndex = append(keptIndex, i)
 	}
-	return encoded, keptIndex, dropped
+	return encoded, keptIndex, drops
 }
 
 // recordRejections counts and logs records the transform stage dropped for
@@ -314,6 +378,9 @@ type appendDecision struct {
 	err error
 	// permanent reports whether err is permanent.
 	permanent bool
+	// rowErrors describes each record the service rejected, once per record
+	// and indexed like retryableIndices, for the quarantine table.
+	rowErrors []transform.QuarantineEntry
 }
 
 // appendEncoded sends encoded rows and interprets the outcome.
@@ -332,10 +399,17 @@ func (e *signalExporter) appendEncoded(
 	e.tel.RecordAcknowledged(ctx, out.AcknowledgedRows)
 
 	invalid := make(map[int]bool, len(out.RowErrors))
+	var rowErrors []transform.QuarantineEntry
 	for _, re := range out.RowErrors {
 		pos := int(re.Index)
 		if pos < 0 || pos >= len(keptIndex) {
 			continue
+		}
+		if !invalid[pos] {
+			rowErrors = append(rowErrors, transform.QuarantineEntry{
+				Rejection: transform.Rejection{Index: keptIndex[pos], Reason: transform.ReasonRowError},
+				Detail:    rowErrorDetail(re),
+			})
 		}
 		invalid[pos] = true
 		e.tel.RecordRejected(ctx, string(transform.ReasonRowError), 1)
@@ -386,7 +460,7 @@ func (e *signalExporter) appendEncoded(
 		// AcknowledgedRows is a count rather than an index set. Conservatively
 		// retry every row not permanently rejected; this may replay confirmed
 		// rows, which the at-least-once contract permits.
-		return appendDecision{retryableIndices: retryable, err: out.Err}
+		return appendDecision{retryableIndices: retryable, err: out.Err, rowErrors: rowErrors}
 	}
 
 	if len(out.RowErrors) > 0 {
@@ -396,8 +470,91 @@ func (e *signalExporter) appendEncoded(
 		return appendDecision{
 			retryableIndices: retryable,
 			err:              fmt.Errorf("%d row(s) rejected by the service; re-sending the valid subset", len(invalid)),
+			rowErrors:        rowErrors,
 		}
 	}
 
 	return appendDecision{}
+}
+
+// rowErrorDetail renders a service row error for the quarantine table.
+func rowErrorDetail(re bqi.RowError) string {
+	if re.Message == "" {
+		return re.Code
+	}
+	return re.Code + ": " + re.Message
+}
+
+// quarantineEntries lists every record a push drops permanently, indexed by
+// record position: the transform stage's rejections, the rows encodeRows
+// dropped, mapped from row positions through rowToRecord, and the rows the
+// service rejected.
+func quarantineEntries(
+	rejects []transform.Rejection,
+	drops []transform.QuarantineEntry,
+	rowToRecord []int,
+	rowErrors []transform.QuarantineEntry,
+) []transform.QuarantineEntry {
+	entries := make([]transform.QuarantineEntry, 0, len(rejects)+len(drops)+len(rowErrors))
+	for _, r := range rejects {
+		entries = append(entries, transform.QuarantineEntry{Rejection: r})
+	}
+	for _, d := range drops {
+		d.Index = rowToRecord[d.Index]
+		entries = append(entries, d)
+	}
+	return append(entries, rowErrors...)
+}
+
+// quarantineRows appends rows to the quarantine table on its dedicated stream.
+//
+// Quarantine is best effort and never changes the outcome of the push that
+// produced the rows. They are appended once and never retried; when the
+// append fails, the failure is logged without any row content and the rows
+// are dropped, exactly as they would be with quarantine disabled.
+func (e *signalExporter) quarantineRows(ctx context.Context, rows []transform.Row, opID string) {
+	if len(rows) == 0 {
+		return
+	}
+	qid := e.quarantineTableID()
+	encoded := make([][]byte, 0, len(rows))
+	for i, row := range rows {
+		b, err := e.quarantineEnc.Encode(row)
+		if err != nil {
+			e.logger.Debug("dropping quarantine row that failed serialization",
+				diag.Rejection(qid, opID, i, string(transform.ReasonSerialization), "unknown", 0, 0)...)
+			continue
+		}
+		if len(b) > e.cfg.Write.MaxRowBytes {
+			e.logger.Debug("dropping oversized quarantine row",
+				diag.Rejection(qid, opID, i, string(transform.ReasonRowBytes), "unknown",
+					e.cfg.Write.MaxRowBytes, len(b))...)
+			continue
+		}
+		encoded = append(encoded, b)
+	}
+	if len(encoded) == 0 {
+		return
+	}
+
+	out := e.quarantine.Append(ctx, encoded)
+	if out.Err == nil && len(out.RowErrors) == 0 {
+		return
+	}
+	for _, re := range out.RowErrors {
+		e.logger.Debug("service rejected a quarantine row",
+			diag.RowError(qid, opID, re.Index, re.Code, re.Message)...)
+	}
+	fields := append(diag.Fields(qid, opID),
+		zap.Int("rows", len(encoded)),
+		zap.Int("acknowledged", out.AcknowledgedRows),
+		zap.Int("row_errors", len(out.RowErrors)),
+	)
+	if out.Err != nil {
+		fields = append(fields,
+			zap.String("error_code", out.Verdict.Label),
+			zap.String("class", out.Verdict.Class.String()),
+		)
+	}
+	e.logger.Warn("quarantine append failed; unacknowledged quarantine rows are dropped", fields...)
 }

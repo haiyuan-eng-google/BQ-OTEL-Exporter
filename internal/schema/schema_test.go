@@ -35,6 +35,9 @@ func TestRequiredColumns(t *testing.T) {
 		"receive_time", "receive_time_unix_nano",
 		"log_name", "insert_id", "schema_version",
 	}
+	quarantine := []string{
+		"ingest_time", "signal", "error_code", "error_message", "schema_version",
+	}
 
 	for _, tc := range []struct {
 		name string
@@ -43,6 +46,7 @@ func TestRequiredColumns(t *testing.T) {
 	}{
 		{"spans", SpansDDL, spans},
 		{"logs", LogsDDL, logs},
+		{"quarantine", QuarantineDDL, quarantine},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, col := range tc.cols {
@@ -65,6 +69,7 @@ func columnIsNotNull(ddl, col string) bool {
 }
 
 // Partitioning is what makes ordinary queries affordable on these tables.
+// The quarantine table is a triage queue, so its partitions also expire.
 func TestPartitioning(t *testing.T) {
 	if !strings.Contains(SpansDDL, "PARTITION BY TIMESTAMP_TRUNC(start_time, HOUR)") {
 		t.Error("spans must be hour-partitioned on start_time")
@@ -72,18 +77,33 @@ func TestPartitioning(t *testing.T) {
 	if !strings.Contains(LogsDDL, "PARTITION BY DATE(timestamp)") {
 		t.Error("logs must be day-partitioned on timestamp")
 	}
+	if !strings.Contains(QuarantineDDL, "PARTITION BY DATE(ingest_time)") {
+		t.Error("quarantine must be day-partitioned on ingest_time")
+	}
+	if !strings.Contains(QuarantineDDL, "OPTIONS (\n  partition_expiration_days = 30\n);") {
+		t.Error("quarantine partitions must expire after 30 days")
+	}
+	for name, ddl := range map[string]string{"spans": SpansDDL, "logs": LogsDDL} {
+		if strings.Contains(ddl, "partition_expiration_days") {
+			t.Errorf("%s must not expire partitions; retention is the operator's call", name)
+		}
+	}
 }
 
 // Spans cluster on (service_name, trace_id, name), so per-service scans and
 // whole-trace lookups both prune. Logs cluster on (service_name, trace_id,
 // severity_number), so per-service scans, trace correlation and severity
-// filters prune.
+// filters prune. Quarantine clusters on (signal, error_code, service_name),
+// so "what is failing, and where" queries prune.
 func TestClustering(t *testing.T) {
 	if !strings.Contains(SpansDDL, "CLUSTER BY service_name, trace_id, name;") {
 		t.Error("spans must cluster on service_name, trace_id, name")
 	}
 	if !strings.Contains(LogsDDL, "CLUSTER BY service_name, trace_id, severity_number;") {
 		t.Error("logs must cluster on service_name, trace_id, severity_number")
+	}
+	if !strings.Contains(QuarantineDDL, "\nCLUSTER BY signal, error_code, service_name\nOPTIONS (") {
+		t.Error("quarantine must cluster on signal, error_code, service_name")
 	}
 }
 
@@ -135,13 +155,16 @@ func TestDDLTemplatesFormatCleanly(t *testing.T) {
 	for name, tmpl := range map[string]string{
 		"spans":              SpansDDL,
 		"logs":               LogsDDL,
+		"quarantine":         QuarantineDDL,
 		"spans_view":         SpansDedupViewDDL,
 		"logs_view":          LogsDedupViewDDL,
 		"spans_search_index": SpansSearchIndexDDL,
 		"logs_search_index":  LogsSearchIndexDDL,
 	} {
 		got := fmt.Sprintf(tmpl, "proj", "ds", "tbl")
-		if strings.Contains(got, "%!") || strings.Contains(got, "MISSING") {
+		// fmt marks a missing operand as %!s(MISSING). Match "(MISSING)", not
+		// the bare word: QuarantineDDL names the MISSING_END_TIME error code.
+		if strings.Contains(got, "%!") || strings.Contains(got, "(MISSING)") {
 			t.Errorf("%s: template did not format cleanly:\n%s", name, got)
 		}
 		if !strings.Contains(got, "`proj.ds.tbl`") {
@@ -521,6 +544,7 @@ func TestDDLAndTableSchemaAgree(t *testing.T) {
 	}{
 		{"spans", SpansDDL, FieldNames(SpansTableSchema())},
 		{"logs", LogsDDL, FieldNames(LogsTableSchema())},
+		{"quarantine", QuarantineDDL, FieldNames(QuarantineTableSchema())},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			inDDL := ddlColumns(tc.ddl)
@@ -550,6 +574,7 @@ func TestDDLMatchesTableSchema(t *testing.T) {
 	}{
 		{"spans", SpansDDL, SpansTableSchema()},
 		{"logs", LogsDDL, LogsTableSchema()},
+		{"quarantine", QuarantineDDL, QuarantineTableSchema()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := parseDDL(tc.ddl)
@@ -593,11 +618,97 @@ func TestDDLMatchesTableSchemaDetectsDrift(t *testing.T) {
 	}
 }
 
+// QuarantineDDL carries trailing -- comments on some column lines, and one of
+// them contains a ">". The parsers must read past those comments, never skip
+// the commented lines, so drift on exactly those lines must still be caught.
+func TestQuarantineDDLDriftOnCommentedLinesIsDetected(t *testing.T) {
+	for name, mutate := range map[string]func(string) string{
+		"mode before a comment": func(ddl string) string {
+			return strings.Replace(ddl, "error_code                         STRING    NOT NULL, --", "error_code                         STRING, --", 1)
+		},
+		"type before a comment": func(ddl string) string {
+			return strings.Replace(ddl, "raw_payload                        STRING,", "raw_payload                        JSON,", 1)
+		},
+		"field after a commented closer": func(ddl string) string {
+			return strings.Replace(ddl, "  exporter_instance                  STRING,\n", "", 1)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ddl := mutate(QuarantineDDL)
+			if ddl == QuarantineDDL {
+				t.Fatal("mutation did not apply; update it to match QuarantineDDL")
+			}
+			got, err := parseDDL(ddl)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if schemaDiff(got, QuarantineTableSchema()) == "" {
+				t.Fatal("drift went undetected")
+			}
+		})
+	}
+	cols := ddlColumns(QuarantineDDL)
+	for _, want := range []string{"payload_ref", "exporter_instance", "schema_version"} {
+		if !cols[want] {
+			t.Errorf("ddlColumns lost %q after the commented payload_ref closer", want)
+		}
+	}
+	if cols["partition_expiration_days"] {
+		t.Error("ddlColumns read a table option as a column")
+	}
+}
+
+// The quarantine payload_ref column and payload_refs.object_ref on the signal
+// tables both hold a BigQuery ObjectRef value, so they must have one shape.
+func TestQuarantinePayloadRefMatchesObjectRef(t *testing.T) {
+	var objectRef, payloadRef *storagepb.TableFieldSchema
+	for _, fld := range SpansTableSchema().GetFields() {
+		if fld.GetName() == "payload_refs" {
+			for _, nested := range fld.GetFields() {
+				if nested.GetName() == "object_ref" {
+					objectRef = nested
+				}
+			}
+		}
+	}
+	for _, fld := range QuarantineTableSchema().GetFields() {
+		if fld.GetName() == "payload_ref" {
+			payloadRef = fld
+		}
+	}
+	if objectRef == nil || payloadRef == nil {
+		t.Fatalf("object_ref = %v, payload_ref = %v; both must exist", objectRef, payloadRef)
+	}
+	renamed := proto.Clone(payloadRef).(*storagepb.TableFieldSchema)
+	renamed.Name = objectRef.GetName()
+	if !proto.Equal(renamed, objectRef) {
+		t.Fatalf("payload_ref = %v, want the object_ref shape %v", payloadRef, objectRef)
+	}
+	if payloadRef.GetMode() != storagepb.TableFieldSchema_NULLABLE {
+		t.Fatalf("payload_ref mode = %s, want NULLABLE", payloadRef.GetMode())
+	}
+}
+
+// The quarantine contract is 12 columns in a fixed order.
+func TestQuarantineTableSchemaColumns(t *testing.T) {
+	want := []string{
+		"ingest_time", "signal", "error_code", "error_message", "service_name",
+		"trace_id", "span_id", "raw_payload", "raw_attributes", "payload_ref",
+		"exporter_instance", "schema_version",
+	}
+	if got := FieldNames(QuarantineTableSchema()); !slices.Equal(got, want) {
+		t.Fatalf("quarantine columns = %v, want %v", got, want)
+	}
+	if SignalSpans != "spans" || SignalLogs != "logs" {
+		t.Fatalf("signal values = %q, %q; the DDL documents 'spans' | 'logs'", SignalSpans, SignalLogs)
+	}
+}
+
 // parseDDL reads the column list of a CREATE TABLE statement laid out one
-// field per line, as SpansDDL and LogsDDL are. It accepts exactly the shapes
-// those DDLs use: "name TYPE" with an optional NOT NULL, "name STRUCT<" and
-// "name ARRAY<STRUCT<" openers, and lines that start with the matching ">"
-// closers.
+// field per line, as SpansDDL, LogsDDL and QuarantineDDL are. It accepts
+// exactly the shapes those DDLs use: "name TYPE" with an optional NOT NULL,
+// "name STRUCT<" and "name ARRAY<STRUCT<" openers, and lines that start with
+// the matching ">" closers. A -- comment, whole-line or trailing, is ignored.
 func parseDDL(ddl string) (*storagepb.TableSchema, error) {
 	types := map[string]storagepb.TableFieldSchema_Type{
 		"STRING":    storagepb.TableFieldSchema_STRING,
@@ -613,12 +724,13 @@ func parseDDL(ddl string) (*storagepb.TableSchema, error) {
 	inColumns := false
 
 	for _, line := range strings.Split(ddl, "\n") {
+		line, _, _ = strings.Cut(line, "--")
 		line = strings.TrimSpace(line)
 		switch {
 		case strings.HasPrefix(line, "CREATE TABLE"):
 			inColumns = true
 			continue
-		case !inColumns || line == "" || strings.HasPrefix(line, "--"):
+		case !inColumns || line == "":
 			continue
 		case line == ")":
 			if len(stack) != 1 {
@@ -703,13 +815,20 @@ func flattenSchema(fields []*storagepb.TableFieldSchema, prefix string) []string
 	return out
 }
 
-// ddlColumns extracts top-level column names, skipping the nested STRUCT
-// fields of the events and links arrays.
+// ddlColumns extracts the top-level column names of a CREATE TABLE column
+// list, skipping the nested STRUCT fields of the events and links arrays.
+// Comments are ignored, so a ">" inside one cannot unbalance the depth count,
+// and reading stops at the closing ")", so table options are never taken for
+// columns.
 func ddlColumns(ddl string) map[string]bool {
 	out := map[string]bool{}
 	depth := 0
 	for _, line := range strings.Split(ddl, "\n") {
+		line, _, _ = strings.Cut(line, "--")
 		trimmed := strings.TrimSpace(line)
+		if trimmed == ")" {
+			break
+		}
 		if depth == 0 {
 			if f := strings.Fields(trimmed); len(f) >= 2 {
 				if name := f[0]; isColumnName(name) && !isDDLKeyword(name) {

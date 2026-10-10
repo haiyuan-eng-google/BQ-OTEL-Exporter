@@ -6,6 +6,7 @@ package schema
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	bq "cloud.google.com/go/bigquery"
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
@@ -37,6 +38,29 @@ func DestinationMetadata(
 		return nil, "", fmt.Errorf("schema is not a canonical trace or log contract")
 	}
 	return md, fmt.Sprintf(queryTemplate, project, dataset, table), nil
+}
+
+// quarantinePartitionExpiration matches partition_expiration_days in
+// QuarantineDDL.
+const quarantinePartitionExpiration = 30 * 24 * time.Hour
+
+// QuarantineDestinationMetadata builds the physical table metadata of the
+// opt-in quarantine table, matching QuarantineDDL. Unlike the signal tables,
+// it has no deduplication view.
+func QuarantineDestinationMetadata() (*bq.TableMetadata, error) {
+	bqs, err := ToBigQuery(QuarantineTableSchema())
+	if err != nil {
+		return nil, err
+	}
+	return &bq.TableMetadata{
+		Schema: bqs,
+		TimePartitioning: &bq.TimePartitioning{
+			Type:       bq.DayPartitioningType,
+			Field:      "ingest_time",
+			Expiration: quarantinePartitionExpiration,
+		},
+		Clustering: &bq.Clustering{Fields: []string{"signal", "error_code", "service_name"}},
+	}, nil
 }
 
 // CompanionViewsMetadata builds the optional companion views of one signal,

@@ -4,9 +4,11 @@
 package transform // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
 
 import (
+	"fmt"
 	"math"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -50,6 +52,13 @@ type Options struct {
 	// one row per (timestamp, time_unix_nano, service_name, log_name,
 	// insert_id), so records that share all five collapse into one.
 	InsertIDAttribute string
+	// ExporterInstance identifies this exporter instance in the quarantine
+	// exporter_instance column. Empty leaves the column NULL.
+	ExporterInstance string
+	// MaxRowBytes is the encoded size a row must not exceed. Only quarantine
+	// rows are fitted to it, by truncating raw_payload; a signal row over it
+	// is rejected by the caller. Zero or less means no cap.
+	MaxRowBytes int
 	// Now supplies the exporter receive time stamped on every row.
 	// Injectable so tests are deterministic.
 	Now func() time.Time
@@ -585,4 +594,247 @@ func stringAttr(m pcommon.Map, key string) string {
 		return v.Str()
 	}
 	return ""
+}
+
+// QuarantineEntry is one record bound for the opt-in quarantine table instead
+// of its signal table.
+//
+// The embedded Rejection is the content-free reason, and its Index locates
+// the record in the batch exactly as a Rejection from SpanRows or LogRows
+// does. Detail optionally adds the encoder's error or the service's row error
+// message. Unlike the rest of the entry, Detail can echo telemetry content,
+// so it is written to the quarantine table only and never logged.
+type QuarantineEntry struct {
+	Rejection
+	Detail string
+}
+
+// Size bounds on a quarantine row. Every column except raw_payload and
+// raw_attributes has a fixed cap, so the row size budget only ever has to
+// trim those two.
+const (
+	quarantineMessageBytes = 4 << 10
+	quarantineLabelBytes   = 1 << 10
+	// quarantineRowOverhead reserves room for the wire framing of every
+	// column and for the truncation note appended to error_message.
+	quarantineRowOverhead = 1 << 10
+)
+
+// SpanQuarantineRows builds the quarantine rows for spans that will not reach
+// the span table: one row per entry, in batch order. An entry whose Index
+// matches no span is ignored.
+func SpanQuarantineRows(td ptrace.Traces, entries []QuarantineEntry, opts Options) []Row {
+	if len(entries) == 0 {
+		return nil
+	}
+	byIndex := entriesByIndex(entries)
+	ingest := opts.now().UnixMicro()
+	marshaler := &ptrace.JSONMarshaler{}
+	var rows []Row
+	idx := -1
+
+	for _, rs := range td.ResourceSpans().All() {
+		svc := stringAttr(rs.Resource().Attributes(), serviceNameAttr)
+		for _, ss := range rs.ScopeSpans().All() {
+			for _, span := range ss.Spans().All() {
+				idx++
+				group := byIndex[idx]
+				if len(group) == 0 {
+					continue
+				}
+				// The span is serialized alone with its own resource and
+				// scope, so an untruncated raw_payload is a complete OTLP/JSON
+				// export request for just this record.
+				one := ptrace.NewTraces()
+				ors := one.ResourceSpans().AppendEmpty()
+				rs.Resource().CopyTo(ors.Resource())
+				ors.SetSchemaUrl(rs.SchemaUrl())
+				oss := ors.ScopeSpans().AppendEmpty()
+				ss.Scope().CopyTo(oss.Scope())
+				oss.SetSchemaUrl(ss.SchemaUrl())
+				span.CopyTo(oss.Spans().AppendEmpty())
+				payload, err := marshaler.MarshalTraces(one)
+				if err != nil {
+					payload = nil
+				}
+				rec := quarantinedRecord{
+					signal:  schema.SignalSpans,
+					service: svc,
+					traceID: traceIDString(span.TraceID()),
+					spanID:  spanIDString(span.SpanID()),
+					payload: payload,
+					attrs:   span.Attributes(),
+				}
+				for _, e := range group {
+					rows = append(rows, rec.row(e, ingest, opts))
+				}
+			}
+		}
+	}
+	return rows
+}
+
+// LogQuarantineRows builds the quarantine rows for log records that will not
+// reach the log table: one row per entry, in batch order. An entry whose
+// Index matches no record is ignored.
+func LogQuarantineRows(ld plog.Logs, entries []QuarantineEntry, opts Options) []Row {
+	if len(entries) == 0 {
+		return nil
+	}
+	byIndex := entriesByIndex(entries)
+	ingest := opts.now().UnixMicro()
+	marshaler := &plog.JSONMarshaler{}
+	var rows []Row
+	idx := -1
+
+	for _, rl := range ld.ResourceLogs().All() {
+		svc := stringAttr(rl.Resource().Attributes(), serviceNameAttr)
+		for _, sl := range rl.ScopeLogs().All() {
+			for _, lr := range sl.LogRecords().All() {
+				idx++
+				group := byIndex[idx]
+				if len(group) == 0 {
+					continue
+				}
+				one := plog.NewLogs()
+				orl := one.ResourceLogs().AppendEmpty()
+				rl.Resource().CopyTo(orl.Resource())
+				orl.SetSchemaUrl(rl.SchemaUrl())
+				osl := orl.ScopeLogs().AppendEmpty()
+				sl.Scope().CopyTo(osl.Scope())
+				osl.SetSchemaUrl(sl.SchemaUrl())
+				lr.CopyTo(osl.LogRecords().AppendEmpty())
+				payload, err := marshaler.MarshalLogs(one)
+				if err != nil {
+					payload = nil
+				}
+				rec := quarantinedRecord{
+					signal:  schema.SignalLogs,
+					service: svc,
+					traceID: traceIDString(lr.TraceID()),
+					spanID:  spanIDString(lr.SpanID()),
+					payload: payload,
+					attrs:   lr.Attributes(),
+				}
+				for _, e := range group {
+					rows = append(rows, rec.row(e, ingest, opts))
+				}
+			}
+		}
+	}
+	return rows
+}
+
+func entriesByIndex(entries []QuarantineEntry) map[int][]QuarantineEntry {
+	out := make(map[int][]QuarantineEntry, len(entries))
+	for _, e := range entries {
+		out[e.Index] = append(out[e.Index], e)
+	}
+	return out
+}
+
+// quarantinedRecord is what a quarantine row takes from the rejected record.
+type quarantinedRecord struct {
+	signal          string
+	service         string
+	traceID, spanID string
+	// payload is the record alone as OTLP JSON, or nil if it could not be
+	// serialized.
+	payload []byte
+	attrs   pcommon.Map
+}
+
+func (q quarantinedRecord) row(e QuarantineEntry, ingest int64, opts Options) Row {
+	r := Row{
+		"ingest_time":    ingest,
+		"signal":         q.signal,
+		"error_code":     quarantineErrorCode(e.Rejection),
+		"schema_version": schema.Version,
+	}
+	putStrIfSet(r, "service_name", truncateUTF8(sanitize(q.service), quarantineLabelBytes))
+	putStrIfSet(r, "trace_id", q.traceID)
+	putStrIfSet(r, "span_id", q.spanID)
+	putStrIfSet(r, "exporter_instance", truncateUTF8(sanitize(opts.ExporterInstance), quarantineLabelBytes))
+	message := quarantineMessage(e)
+
+	// raw_payload is the record itself, so it gets the row size budget
+	// first. raw_attributes repeats part of it in queryable form and is
+	// written only when the complete payload fits beside it.
+	budget := math.MaxInt
+	if opts.MaxRowBytes > 0 {
+		budget = opts.MaxRowBytes - quarantineRowOverhead - len(message)
+		for _, v := range r {
+			if s, ok := v.(string); ok {
+				budget -= len(s)
+			}
+		}
+	}
+	if q.payload != nil {
+		payload := sanitize(string(q.payload))
+		if len(payload) > budget {
+			kept := truncateUTF8(payload, max(budget, 0))
+			message += fmt.Sprintf(" (raw_payload truncated to %d of %d bytes)", len(kept), len(payload))
+			payload = kept
+			budget = 0
+		} else {
+			budget -= len(payload)
+		}
+		putStrIfSet(r, "raw_payload", payload)
+	}
+	// Attributes that breach a structural limit are left to raw_payload: the
+	// limits exist because such values make unqueryable JSON.
+	if opts.Limits.checkMap(q.attrs, "attributes") == nil {
+		if attrs := otlpjson.EncodePlainMap(q.attrs); len(attrs) <= budget {
+			r["raw_attributes"] = attrs
+		}
+	}
+	r["error_message"] = message
+	return r
+}
+
+// quarantineErrorCode maps a rejection to error_code: the specific code the
+// published contract names where the rejection pins one down, and otherwise
+// the upper-cased reason. Like Reason, the resulting set is bounded.
+func quarantineErrorCode(r Rejection) string {
+	switch {
+	case r.Reason == ReasonInvalidID && r.FieldPath == "trace_id":
+		return "INVALID_TRACE_ID"
+	case r.Reason == ReasonInvalidID && r.FieldPath == "span_id":
+		return "INVALID_SPAN_ID"
+	case r.Reason == ReasonMissingTimestamp && r.FieldPath == "start_time":
+		return "MISSING_START_TIME"
+	case r.Reason == ReasonMissingTimestamp && r.FieldPath == "end_time":
+		return "MISSING_END_TIME"
+	case r.Reason == ReasonRowBytes:
+		return "OVERSIZE_ROW"
+	}
+	return strings.ToUpper(string(r.Reason))
+}
+
+// quarantineMessage renders error_message: the reason, the field path and
+// any breached limit, then the detail, as valid UTF-8 within a fixed cap.
+func quarantineMessage(e QuarantineEntry) string {
+	msg := string(e.Reason)
+	if e.FieldPath != "" {
+		msg += ": " + e.FieldPath
+	}
+	if e.Limit != 0 || e.Actual != 0 {
+		msg += fmt.Sprintf(" exceeds limit (%d > %d)", e.Actual, e.Limit)
+	}
+	if e.Detail != "" {
+		msg += ": " + e.Detail
+	}
+	return truncateUTF8(sanitize(msg), quarantineMessageBytes)
+}
+
+// truncateUTF8 shortens valid UTF-8 to at most n bytes without splitting a
+// rune, so the result is still valid UTF-8.
+func truncateUTF8(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }

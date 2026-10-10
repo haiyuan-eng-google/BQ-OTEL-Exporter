@@ -11,11 +11,13 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	bq "cloud.google.com/go/bigquery"
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"go.opentelemetry.io/collector/component"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 	bigqueryapi "google.golang.org/api/bigquery/v2"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/grpc/codes"
@@ -529,6 +531,315 @@ func TestPrepareDestinationCompanionViewCreationResults(t *testing.T) {
 				t.Errorf("error %q must name the companion view", err)
 			}
 		})
+	}
+}
+
+func quarantineDestinationConfig() *Config {
+	cfg := validConfig()
+	cfg.Quarantine.Enabled = true
+	return cfg
+}
+
+// existingSignalTable answers reads of the signal table with a valid table,
+// so a test reaches the quarantine table without the signal table's own
+// creation path.
+func existingSignalTable(
+	t *testing.T, table string, tableSchema *storagepb.TableSchema,
+) map[string]fakeTableMetadataResponse {
+	t.Helper()
+	return map[string]fakeTableMetadataResponse{
+		table: {metadata: &bq.TableMetadata{Schema: mustBigQuerySchema(t, tableSchema)}},
+	}
+}
+
+const quarantineTableID = "my-project.otel.otel_quarantine"
+
+// Without quarantine.enabled, startup neither probes nor creates the
+// quarantine table, even when it may create tables.
+func TestPrepareDestinationQuarantineTableIsOptIn(t *testing.T) {
+	cfg := validConfig()
+	cfg.AutoCreate.Tables = true
+	admin := &fakeDestinationAdmin{datasetMetadata: &bq.DatasetMetadata{}, tableMetadataErr: notFound()}
+	e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+
+	if err := e.prepareDestination(context.Background(), admin); err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(admin.tableReadIDs, defaultQuarantineTable) {
+		t.Errorf("table reads = %v, want no quarantine table probe", admin.tableReadIDs)
+	}
+	if _, ok := admin.createdTables[defaultQuarantineTable]; ok {
+		t.Error("the quarantine table was created with quarantine disabled")
+	}
+}
+
+// An existing quarantine table is validated like a signal table and never
+// replaced: one that cannot take quarantine rows fails startup by name.
+func TestPrepareDestinationValidatesExistingQuarantineTable(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		mutate  func(bq.Schema)
+		nilMD   bool
+		wantErr string
+	}{
+		{name: "matches"},
+		{
+			name:    "type drift",
+			mutate:  mutateField("error_code", func(f *bq.FieldSchema) { f.Type = bq.IntegerFieldType }),
+			wantErr: "quarantine table " + quarantineTableID + " does not match schema",
+		},
+		{
+			name:    "nested drift",
+			mutate:  mutateField("payload_ref", func(f *bq.FieldSchema) { f.Schema[0].Type = bq.IntegerFieldType }),
+			wantErr: "quarantine table " + quarantineTableID + " does not match schema",
+		},
+		{name: "nil metadata", nilMD: true, wantErr: "quarantine table " + quarantineTableID + " returned nil metadata"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := quarantineDestinationConfig()
+			byID := existingSignalTable(t, cfg.Traces.Table, schema.SpansTableSchema())
+			var md *bq.TableMetadata
+			if !tc.nilMD {
+				actual := mustBigQuerySchema(t, schema.QuarantineTableSchema())
+				if tc.mutate != nil {
+					tc.mutate(actual)
+				}
+				md = &bq.TableMetadata{Schema: actual}
+			}
+			byID[defaultQuarantineTable] = fakeTableMetadataResponse{metadata: md}
+			admin := &fakeDestinationAdmin{datasetMetadata: &bq.DatasetMetadata{}, tableMetadataByID: byID}
+			e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+
+			err := e.prepareDestination(context.Background(), admin)
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("valid quarantine table rejected: %v", err)
+			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Fatalf("error = %v, want it to contain %q", err, tc.wantErr)
+			}
+			if len(admin.createdTables) != 0 {
+				t.Errorf("created %v, want nothing created", slices.Sorted(maps.Keys(admin.createdTables)))
+			}
+			if !equalStrings(admin.tableReadIDs, []string{cfg.Traces.Table, defaultQuarantineTable}) {
+				t.Errorf("table reads = %v, want the signal table then the quarantine table", admin.tableReadIDs)
+			}
+		})
+	}
+}
+
+func TestPrepareDestinationMissingQuarantineTableRequiresAutoCreate(t *testing.T) {
+	cfg := quarantineDestinationConfig()
+	admin := &fakeDestinationAdmin{
+		datasetMetadata:   &bq.DatasetMetadata{},
+		tableMetadataByID: existingSignalTable(t, cfg.Logs.Table, schema.LogsTableSchema()),
+		tableMetadataErr:  notFound(),
+	}
+	e := newTestSignalExporter(cfg, cfg.Logs.Table, schema.LogsTableSchema())
+
+	err := e.prepareDestination(context.Background(), admin)
+	want := "quarantine table " + quarantineTableID + " does not exist; create it or enable auto_create.tables"
+	if err == nil || err.Error() != want {
+		t.Fatalf("error = %v, want %q", err, want)
+	}
+	if len(admin.createdTables) != 0 {
+		t.Errorf("created %v with table creation disabled", slices.Sorted(maps.Keys(admin.createdTables)))
+	}
+}
+
+// Either exporter may create the shared quarantine table: day partitions on
+// ingest_time that expire after 30 days, clustered for triage, with no dedup
+// view of its own.
+func TestPrepareDestinationCreatesQuarantineTable(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		table           string
+		tableSchema     *storagepb.TableSchema
+		quarantineTable string
+	}{
+		{"traces", defaultSpansTable, schema.SpansTableSchema(), defaultQuarantineTable},
+		{"logs", defaultLogsTable, schema.LogsTableSchema(), defaultQuarantineTable},
+		{"custom table", defaultSpansTable, schema.SpansTableSchema(), "dead_letters"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := quarantineDestinationConfig()
+			cfg.AutoCreate.Tables = true
+			cfg.Quarantine.Table = tc.quarantineTable
+			admin := &fakeDestinationAdmin{datasetMetadata: &bq.DatasetMetadata{}, tableMetadataErr: notFound()}
+			e := newTestSignalExporter(cfg, tc.table, tc.tableSchema)
+
+			if err := e.prepareDestination(context.Background(), admin); err != nil {
+				t.Fatal(err)
+			}
+			md := admin.createdTables[tc.quarantineTable]
+			if md == nil {
+				t.Fatalf("created %v, want the quarantine table %q", slices.Sorted(maps.Keys(admin.createdTables)), tc.quarantineTable)
+			}
+			if tp := md.TimePartitioning; tp == nil || tp.Type != bq.DayPartitioningType ||
+				tp.Field != "ingest_time" || tp.Expiration != 30*24*time.Hour {
+				t.Errorf("partitioning = %#v, want daily on ingest_time expiring after 30 days", tp)
+			}
+			if got := clusteringFields(md); !equalStrings(got, []string{"signal", "error_code", "service_name"}) {
+				t.Errorf("clustering = %v, want [signal error_code service_name]", got)
+			}
+			if err := validateSchemaOf(md, schema.QuarantineTableSchema(), "created table"); err != nil {
+				t.Errorf("created quarantine table fails startup validation: %v", err)
+			}
+			want := []string{tc.table, tc.table + "_dedup", tc.quarantineTable}
+			if got := slices.Sorted(maps.Keys(admin.createdTables)); !equalStrings(got, slices.Sorted(slices.Values(want))) {
+				t.Errorf("created %v, want %v and no quarantine dedup view", got, want)
+			}
+		})
+	}
+}
+
+// The traces and logs exporters share the quarantine table, so the other one
+// can win a creation race. The winner is validated like any existing table.
+func TestPrepareDestinationValidatesConcurrentQuarantineCreateWinner(t *testing.T) {
+	wrong := mustBigQuerySchema(t, schema.QuarantineTableSchema())
+	mutateField("signal", func(f *bq.FieldSchema) { f.Type = bq.IntegerFieldType })(wrong)
+	for _, tc := range []struct {
+		name    string
+		winner  fakeTableMetadataResponse
+		wantErr string
+		wrapped error
+	}{
+		{name: "matches", winner: fakeTableMetadataResponse{
+			metadata: &bq.TableMetadata{Schema: mustBigQuerySchema(t, schema.QuarantineTableSchema())},
+		}},
+		{
+			name:    "drifted",
+			winner:  fakeTableMetadataResponse{metadata: &bq.TableMetadata{Schema: wrong}},
+			wantErr: "quarantine table " + quarantineTableID + " does not match schema",
+		},
+		{
+			name:    "unreadable",
+			winner:  fakeTableMetadataResponse{err: forbidden()},
+			wantErr: "validating concurrently created quarantine table " + quarantineTableID,
+			wrapped: forbidden(),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := quarantineDestinationConfig()
+			cfg.AutoCreate.Tables = true
+			admin := &fakeDestinationAdmin{
+				datasetMetadata:   &bq.DatasetMetadata{},
+				tableMetadataByID: existingSignalTable(t, cfg.Traces.Table, schema.SpansTableSchema()),
+				tableResponses:    []fakeTableMetadataResponse{{err: notFound()}, tc.winner},
+				createErrByID:     map[string]error{defaultQuarantineTable: alreadyExists()},
+			}
+			e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+
+			err := e.prepareDestination(context.Background(), admin)
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("valid concurrent winner rejected: %v", err)
+			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Fatalf("error = %v, want it to contain %q", err, tc.wantErr)
+			}
+			if tc.wrapped != nil && !strings.Contains(err.Error(), tc.wrapped.Error()) {
+				t.Errorf("error = %v, want it to carry the read failure %v", err, tc.wrapped)
+			}
+			if admin.tableReads != 2 {
+				t.Errorf("quarantine table reads = %d, want the initial probe and the winner validation", admin.tableReads)
+			}
+		})
+	}
+}
+
+// Unreadable quarantine metadata defers to the first quarantine append when
+// creation is disabled, and otherwise attempts the idempotent creation.
+func TestPrepareDestinationUnreadableQuarantineTable(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		autoCreate bool
+		wantLog    string
+	}{
+		{
+			name:    "creation disabled",
+			wantLog: "quarantine table metadata is unreadable; deferring authorization to the first quarantine append",
+		},
+		{
+			name:       "creation enabled",
+			autoCreate: true,
+			wantLog:    "quarantine table metadata is unreadable; attempting idempotent creation because auto_create.tables is enabled",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := quarantineDestinationConfig()
+			cfg.AutoCreate.Tables = tc.autoCreate
+			byID := existingSignalTable(t, cfg.Traces.Table, schema.SpansTableSchema())
+			byID[defaultQuarantineTable] = fakeTableMetadataResponse{err: forbidden()}
+			admin := &fakeDestinationAdmin{datasetMetadata: &bq.DatasetMetadata{}, tableMetadataByID: byID}
+			core, logs := observer.New(zap.WarnLevel)
+			e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+			e.logger = zap.New(core)
+
+			if err := e.prepareDestination(context.Background(), admin); err != nil {
+				t.Fatalf("unreadable quarantine metadata must not fail startup: %v", err)
+			}
+			if _, created := admin.createdTables[defaultQuarantineTable]; created != tc.autoCreate {
+				t.Errorf("quarantine table created = %v, want %v", created, tc.autoCreate)
+			}
+			if got := logs.FilterMessage(tc.wantLog).Len(); got != 1 {
+				t.Errorf("warnings %q = %d, want 1", tc.wantLog, got)
+			}
+		})
+	}
+}
+
+func TestPrepareDestinationQuarantineMetadataDeadlineFailsStartup(t *testing.T) {
+	cfg := quarantineDestinationConfig()
+	cfg.AutoCreate.Tables = true
+	byID := existingSignalTable(t, cfg.Traces.Table, schema.SpansTableSchema())
+	byID[defaultQuarantineTable] = fakeTableMetadataResponse{err: context.DeadlineExceeded}
+	admin := &fakeDestinationAdmin{datasetMetadata: &bq.DatasetMetadata{}, tableMetadataByID: byID}
+	e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+
+	err := e.prepareDestination(context.Background(), admin)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want %v", err, context.DeadlineExceeded)
+	}
+	if !strings.Contains(err.Error(), "reading quarantine table "+quarantineTableID+" metadata") {
+		t.Errorf("error %q must name the quarantine table", err)
+	}
+	if _, ok := admin.createdTables[defaultQuarantineTable]; ok {
+		t.Error("creation was attempted after the metadata read ran out of time")
+	}
+}
+
+func TestPrepareDestinationReturnsQuarantineCreationFailure(t *testing.T) {
+	cfg := quarantineDestinationConfig()
+	cfg.AutoCreate.Tables = true
+	createErr := status.Error(codes.Unavailable, "control plane unavailable")
+	admin := &fakeDestinationAdmin{
+		datasetMetadata:  &bq.DatasetMetadata{},
+		tableMetadataErr: notFound(),
+		createErrByID:    map[string]error{defaultQuarantineTable: createErr},
+	}
+	e := newTestSignalExporter(cfg, cfg.Logs.Table, schema.LogsTableSchema())
+
+	err := e.prepareDestination(context.Background(), admin)
+	if !errors.Is(err, createErr) {
+		t.Fatalf("error = %v, want %v", err, createErr)
+	}
+	if !strings.Contains(err.Error(), "creating quarantine table "+quarantineTableID) {
+		t.Errorf("error %q must name the quarantine table", err)
+	}
+}
+
+// The signal destination is prepared first: when it fails, the quarantine
+// table is not touched.
+func TestPrepareDestinationSignalFailureSkipsQuarantine(t *testing.T) {
+	cfg := quarantineDestinationConfig()
+	admin := &fakeDestinationAdmin{datasetMetadata: &bq.DatasetMetadata{}, tableMetadataErr: notFound()}
+	e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+
+	err := e.prepareDestination(context.Background(), admin)
+	if err == nil || !strings.Contains(err.Error(), "destination table my-project.otel.otel_spans does not exist") {
+		t.Fatalf("error = %v, want the missing signal table", err)
+	}
+	if !equalStrings(admin.tableReadIDs, []string{cfg.Traces.Table}) {
+		t.Errorf("table reads = %v, want only the signal table", admin.tableReadIDs)
 	}
 }
 

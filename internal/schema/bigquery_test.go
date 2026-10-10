@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	bq "cloud.google.com/go/bigquery"
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
@@ -53,6 +54,7 @@ func TestBigQuerySchemaRoundTripPreservesCanonicalContracts(t *testing.T) {
 	}{
 		{name: "spans", in: SpansTableSchema()},
 		{name: "logs", in: LogsTableSchema()},
+		{name: "quarantine", in: QuarantineTableSchema()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			bqs, err := ToBigQuery(tc.in)
@@ -132,6 +134,46 @@ func TestDestinationMetadata(t *testing.T) {
 		f("not_a_contract", str, opt),
 	}}, "proj", "ds", "tbl"); err == nil {
 		t.Error("a schema that is not a canonical contract must be rejected")
+	}
+	if _, _, err := DestinationMetadata(QuarantineTableSchema(), "proj", "ds", "tbl"); err == nil {
+		t.Error("the quarantine contract has no dedup view and must go through QuarantineDestinationMetadata")
+	}
+}
+
+// QuarantineDestinationMetadata is what auto-create applies for the opt-in
+// quarantine table, so it must carry the layout QuarantineDDL declares: daily
+// partitions on ingest_time that expire after 30 days, clustering on
+// (signal, error_code, service_name), and no view.
+func TestQuarantineDestinationMetadata(t *testing.T) {
+	md, err := QuarantineDestinationMetadata()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tp := md.TimePartitioning
+	if tp == nil || tp.Type != bq.DayPartitioningType || tp.Field != "ingest_time" {
+		t.Fatalf("partitioning = %+v, want daily on ingest_time", tp)
+	}
+	if tp.Expiration != 30*24*time.Hour {
+		t.Errorf("partition expiration = %v, want 30 days", tp.Expiration)
+	}
+	days := int(tp.Expiration / (24 * time.Hour))
+	if !strings.Contains(QuarantineDDL, fmt.Sprintf("partition_expiration_days = %d\n", days)) {
+		t.Errorf("metadata expires partitions after %d days, but QuarantineDDL disagrees", days)
+	}
+	var cluster []string
+	if md.Clustering != nil {
+		cluster = md.Clustering.Fields
+	}
+	if want := []string{"signal", "error_code", "service_name"}; !slices.Equal(cluster, want) {
+		t.Errorf("clustering = %v, want %v", cluster, want)
+	}
+	wantSchema, err := ToBigQuery(QuarantineTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertBigQuerySchemaEqual(t, md.Schema, wantSchema)
+	if md.ViewQuery != "" {
+		t.Errorf("quarantine table metadata must not define a view, got %q", md.ViewQuery)
 	}
 }
 

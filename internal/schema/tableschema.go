@@ -130,12 +130,19 @@ func payloadRefsRecord() *storagepb.TableFieldSchema {
 		f("storage_mode", str, opt),
 		f("byte_size", i64, opt),
 		f("sha256", str, opt),
-		record("object_ref", opt,
-			f("uri", str, opt),
-			f("version", str, opt),
-			f("authorizer", str, opt),
-			f("details", jsn, opt),
-		),
+		objectRefRecord("object_ref"),
+	)
+}
+
+// objectRefRecord is a nullable STRUCT with the shape of a BigQuery ObjectRef
+// value. payload_refs.object_ref and the quarantine payload_ref column share
+// it, so an offloaded payload is referenced the same way everywhere.
+func objectRefRecord(name string) *storagepb.TableFieldSchema {
+	return record(name, opt,
+		f("uri", str, opt),
+		f("version", str, opt),
+		f("authorizer", str, opt),
+		f("details", jsn, opt),
 	)
 }
 
@@ -190,6 +197,34 @@ const (
 	TimestampSourceEvent    = "event"
 	TimestampSourceObserved = "observed"
 	TimestampSourceExporter = "exporter"
+)
+
+// QuarantineTableSchema is the opt-in dead-letter contract: 12 columns, in the
+// same order as QuarantineDDL. A quarantined row records why a span or log
+// record was rejected, enough identity to find it again, and the record
+// itself serialized as OTLP JSON.
+func QuarantineTableSchema() *storagepb.TableSchema {
+	return &storagepb.TableSchema{Fields: []*storagepb.TableFieldSchema{
+		f("ingest_time", ts, req),
+		f("signal", str, req),
+		f("error_code", str, req),
+		f("error_message", str, req),
+		f("service_name", str, opt),
+		f("trace_id", str, opt),
+		f("span_id", str, opt),
+		f("raw_payload", str, opt),
+		f("raw_attributes", jsn, opt),
+		objectRefRecord("payload_ref"),
+		f("exporter_instance", str, opt),
+		f("schema_version", str, req),
+	}}
+}
+
+// Signal values for the quarantine signal column, naming the table the
+// rejected record was bound for.
+const (
+	SignalSpans = "spans"
+	SignalLogs  = "logs"
 )
 
 // FieldNames lists the top-level column names of a schema, in order.

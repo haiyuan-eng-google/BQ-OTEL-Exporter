@@ -43,14 +43,16 @@ func (e *tracesExporter) shutdown(ctx context.Context) error {
 //
 // Permanently invalid spans are counted and dropped here. They are never
 // routed back through consumererror, because exporterhelper treats a returned
-// payload as retryable and would replay them forever.
+// payload as retryable and would replay them forever. With quarantine
+// enabled, each one is also written to the quarantine table, which never
+// changes what this returns.
 func (e *tracesExporter) pushTraceData(ctx context.Context, td ptrace.Traces) error {
 	opID := diag.OperationID()
 
 	rows, rejects := transform.SpanRows(td, e.opts)
 	e.recordRejections(ctx, rejects, opID)
 
-	encoded, keptIndex, _ := e.encodeRows(ctx, rows, opID)
+	encoded, keptIndex, drops := e.encodeRows(ctx, rows, opID)
 
 	// keptIndex is expressed in row positions; map it back to span positions
 	// so a retry payload can be rebuilt from the original batch.
@@ -61,6 +63,10 @@ func (e *tracesExporter) pushTraceData(ctx context.Context, td ptrace.Traces) er
 	}
 
 	decision := e.appendEncoded(ctx, encoded, spanIndex, opID)
+	if e.quarantine != nil {
+		entries := quarantineEntries(rejects, drops, rowToSpan, decision.rowErrors)
+		e.quarantineRows(ctx, transform.SpanQuarantineRows(td, entries, e.opts), opID)
+	}
 	if decision.err == nil {
 		return nil
 	}

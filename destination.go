@@ -12,6 +12,7 @@ import (
 	"slices"
 
 	bq "cloud.google.com/go/bigquery"
+	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"github.com/googleapis/gax-go/v2/apierror"
 	"go.uber.org/zap"
 	"google.golang.org/api/googleapi"
@@ -96,7 +97,20 @@ var newDestinationAdmin = func(
 	}, nil
 }
 
+// prepareDestination checks, and where enabled creates, everything this
+// exporter writes to: the dataset, the signal table and its views, and the
+// quarantine table when quarantine is enabled.
 func (e *signalExporter) prepareDestination(ctx context.Context, admin destinationAdmin) error {
+	if err := e.prepareSignalDestination(ctx, admin); err != nil {
+		return err
+	}
+	if !e.cfg.Quarantine.Enabled {
+		return nil
+	}
+	return e.prepareQuarantineTable(ctx, admin)
+}
+
+func (e *signalExporter) prepareSignalDestination(ctx context.Context, admin destinationAdmin) error {
 	if err := e.ensureDataset(ctx, admin); err != nil {
 		return err
 	}
@@ -256,18 +270,72 @@ func (e *signalExporter) createCompanionViews(ctx context.Context, admin destina
 	return nil
 }
 
+// prepareQuarantineTable checks the quarantine table, and creates it when
+// auto_create.tables is enabled. The rules match the signal table's: a
+// missing table needs auto_create.tables, a table that cannot take quarantine
+// rows fails startup, and unreadable metadata defers to the first quarantine
+// append unless creation is enabled. Both exporters share the table, so a
+// concurrent creation by the other one is validated like any existing table.
+func (e *signalExporter) prepareQuarantineTable(ctx context.Context, admin destinationAdmin) error {
+	table := e.cfg.Quarantine.Table
+	subject := "quarantine table " + e.quarantineTableID()
+	want := schema.QuarantineTableSchema()
+
+	md, err := admin.TableMetadata(ctx, table)
+	switch {
+	case err == nil:
+		return validateSchemaOf(md, want, subject)
+	case isContextError(err):
+		return fmt.Errorf("reading %s metadata: %w", subject, err)
+	case isNotFound(err):
+		if !e.cfg.AutoCreate.Tables {
+			return fmt.Errorf("%s does not exist; create it or enable auto_create.tables", subject)
+		}
+	default:
+		if !e.cfg.AutoCreate.Tables {
+			e.logger.Warn("quarantine table metadata is unreadable; deferring authorization to the first quarantine append",
+				zap.String("destination", e.quarantineTableID()), zap.Error(err))
+			return nil
+		}
+		e.logger.Warn("quarantine table metadata is unreadable; attempting idempotent creation because auto_create.tables is enabled",
+			zap.String("destination", e.quarantineTableID()), zap.Error(err))
+	}
+
+	createMD, err := schema.QuarantineDestinationMetadata()
+	if err != nil {
+		return fmt.Errorf("deriving quarantine table metadata: %w", err)
+	}
+	if err := admin.CreateTable(ctx, table, createMD); err != nil {
+		if !isAlreadyExists(err) {
+			return fmt.Errorf("creating %s: %w", subject, err)
+		}
+		winner, readErr := admin.TableMetadata(ctx, table)
+		if readErr != nil {
+			return fmt.Errorf("validating concurrently created %s: %w", subject, readErr)
+		}
+		return validateSchemaOf(winner, want, subject)
+	}
+	return nil
+}
+
 func (e *signalExporter) validateTableMetadata(md *bq.TableMetadata) error {
+	return validateSchemaOf(md, e.schema, "destination table "+e.tableID())
+}
+
+// validateSchemaOf checks that a table described by md can take rows of the
+// want schema. subject names the table in errors.
+func validateSchemaOf(md *bq.TableMetadata, want *storagepb.TableSchema, subject string) error {
 	if md == nil {
-		return errors.New("destination table returned nil metadata")
+		return fmt.Errorf("%s returned nil metadata", subject)
 	}
 	have, err := schema.FromBigQuery(md.Schema)
 	if err != nil {
-		return fmt.Errorf("destination table %s has an unreadable schema: %w", e.tableID(), err)
+		return fmt.Errorf("%s has an unreadable schema: %w", subject, err)
 	}
-	if differences := schema.CompatibilityDifferences(e.schema, have); len(differences) > 0 {
+	if differences := schema.CompatibilityDifferences(want, have); len(differences) > 0 {
 		return fmt.Errorf(
-			"destination table %s does not match schema %s: %v — create or migrate the table before starting",
-			e.tableID(), schemaVersion, differences)
+			"%s does not match schema %s: %v — create or migrate the table before starting",
+			subject, schemaVersion, differences)
 	}
 	return nil
 }

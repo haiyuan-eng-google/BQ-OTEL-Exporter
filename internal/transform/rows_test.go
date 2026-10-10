@@ -8,6 +8,7 @@ import (
 	"math"
 	"reflect"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -1064,5 +1065,488 @@ func TestFingerprintFieldBoundaries(t *testing.T) {
 	}
 	if fp("ab", "c") == fp("a", "bc") {
 		t.Fatal("adjacent fields collide: the canonical form is ambiguous")
+	}
+}
+
+// quarantineOpts are testOpts with the options only quarantine rows read.
+func quarantineOpts() Options {
+	opts := testOpts()
+	opts.ExporterInstance = "collector-7"
+	opts.MaxRowBytes = 1 << 20
+	return opts
+}
+
+// entriesFor quarantines every rejection as reported, without a detail.
+func entriesFor(rejects []Rejection) []QuarantineEntry {
+	entries := make([]QuarantineEntry, len(rejects))
+	for i, r := range rejects {
+		entries[i] = QuarantineEntry{Rejection: r}
+	}
+	return entries
+}
+
+// spanPayload decodes a quarantine row's raw_payload, which must be a
+// complete OTLP/JSON traces request holding only the quarantined span, under
+// its own resource and scope.
+func spanPayload(t *testing.T, row Row) ptrace.ResourceSpans {
+	t.Helper()
+	raw, ok := row["raw_payload"].(string)
+	if !ok {
+		t.Fatalf("raw_payload = %#v, want a string", row["raw_payload"])
+	}
+	td, err := (&ptrace.JSONUnmarshaler{}).UnmarshalTraces([]byte(raw))
+	if err != nil {
+		t.Fatalf("raw_payload is not an OTLP/JSON traces request: %v", err)
+	}
+	if td.ResourceSpans().Len() != 1 || td.ResourceSpans().At(0).ScopeSpans().Len() != 1 || td.SpanCount() != 1 {
+		t.Fatalf("raw_payload holds %d resources and %d spans, want one span under one resource and scope",
+			td.ResourceSpans().Len(), td.SpanCount())
+	}
+	return td.ResourceSpans().At(0)
+}
+
+// logPayload is spanPayload for a quarantined log record.
+func logPayload(t *testing.T, row Row) plog.ResourceLogs {
+	t.Helper()
+	raw, ok := row["raw_payload"].(string)
+	if !ok {
+		t.Fatalf("raw_payload = %#v, want a string", row["raw_payload"])
+	}
+	ld, err := (&plog.JSONUnmarshaler{}).UnmarshalLogs([]byte(raw))
+	if err != nil {
+		t.Fatalf("raw_payload is not an OTLP/JSON logs request: %v", err)
+	}
+	if ld.ResourceLogs().Len() != 1 || ld.ResourceLogs().At(0).ScopeLogs().Len() != 1 || ld.LogRecordCount() != 1 {
+		t.Fatalf("raw_payload holds %d resources and %d records, want one record under one resource and scope",
+			ld.ResourceLogs().Len(), ld.LogRecordCount())
+	}
+	return ld.ResourceLogs().At(0)
+}
+
+// TestSpanQuarantineRows pins the complete quarantine row for a rejected
+// span: every column, and a raw_payload that replays as the span alone with
+// its resource and scope.
+func TestSpanQuarantineRows(t *testing.T) {
+	td, noTrace := newTraces()
+	noTrace.SetTraceID(pcommon.NewTraceIDEmpty())
+	noTrace.Attributes().PutStr("k", "v")
+	spans := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+	validSpan(spans.AppendEmpty()).SetName("kept")
+	noEnd := validSpan(spans.AppendEmpty())
+	noEnd.SetName("no end")
+	noEnd.SetEndTimestamp(0)
+
+	opts := quarantineOpts()
+	kept, rejects := SpanRows(td, opts)
+	if len(kept) != 1 || len(rejects) != 2 {
+		t.Fatalf("kept %d rows and rejected %+v, want one kept and two rejected", len(kept), rejects)
+	}
+	rows := SpanQuarantineRows(td, entriesFor(rejects), opts)
+	if len(rows) != 2 {
+		t.Fatalf("got %d quarantine rows, want one per rejection", len(rows))
+	}
+
+	want := Row{
+		"ingest_time":       fixedNow.UnixMicro(),
+		"signal":            "spans",
+		"error_code":        "INVALID_TRACE_ID",
+		"error_message":     "invalid_id: trace_id",
+		"service_name":      "checkout",
+		"span_id":           "0102030405060708",
+		"raw_payload":       rows[0]["raw_payload"],
+		"raw_attributes":    `{"http.status_code":"200","k":"v"}`,
+		"schema_version":    schema.Version,
+		"exporter_instance": "collector-7",
+	}
+	if !reflect.DeepEqual(rows[0], want) {
+		t.Errorf("quarantine row mismatch:\n got %#v\nwant %#v", rows[0], want)
+	}
+
+	rs := spanPayload(t, rows[0])
+	if got := stringAttr(rs.Resource().Attributes(), "service.name"); got != "checkout" {
+		t.Errorf("payload service.name = %q, want checkout", got)
+	}
+	if got := rs.SchemaUrl(); got != "https://example.test/resource" {
+		t.Errorf("payload resource schema URL = %q", got)
+	}
+	ss := rs.ScopeSpans().At(0)
+	if ss.Scope().Name() != "scope" || ss.Scope().Version() != "1.2.3" || ss.SchemaUrl() != "https://example.test/scope" {
+		t.Errorf("payload scope = %q %q %q, want the span's own scope",
+			ss.Scope().Name(), ss.Scope().Version(), ss.SchemaUrl())
+	}
+	span := ss.Spans().At(0)
+	if span.Name() != "GET /cart" || !span.TraceID().IsEmpty() || span.SpanID() != (pcommon.SpanID{1, 2, 3, 4, 5, 6, 7, 8}) {
+		t.Errorf("payload span = %q trace=%s span=%s, want the rejected span as sent",
+			span.Name(), span.TraceID(), span.SpanID())
+	}
+	if v, ok := span.Attributes().Get("k"); !ok || v.Str() != "v" {
+		t.Errorf("payload span attribute k = %v, want v", v)
+	}
+
+	if got := rows[1]["error_code"]; got != "MISSING_END_TIME" {
+		t.Errorf("second row error_code = %v, want MISSING_END_TIME", got)
+	}
+	if got := rows[1]["trace_id"]; got != "0102030405060708090a0b0c0d0e0f10" {
+		t.Errorf("second row trace_id = %v", got)
+	}
+	if got := spanPayload(t, rows[1]).ScopeSpans().At(0).Spans().At(0).Name(); got != "no end" {
+		t.Errorf("second row payload span = %q, want the span without an end time", got)
+	}
+}
+
+// TestLogQuarantineRows pins the complete quarantine row for a rejected log
+// record, and the row for a record with no service name and no IDs, whose
+// optional columns stay NULL.
+func TestLogQuarantineRows(t *testing.T) {
+	ld, overflow := newLogs()
+	overflow.SetTimestamp(math.MaxInt64 + 1)
+	ld.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().AppendEmpty().Body().SetStr("kept")
+	orphan := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+	orphan.SetObservedTimestamp(math.MaxUint64)
+	orphan.Body().SetStr("orphan")
+
+	opts := quarantineOpts()
+	kept, rejects := LogRows(ld, opts)
+	if len(kept) != 1 || len(rejects) != 2 {
+		t.Fatalf("kept %d rows and rejected %+v, want one kept and two rejected", len(kept), rejects)
+	}
+	rows := LogQuarantineRows(ld, entriesFor(rejects), opts)
+	if len(rows) != 2 {
+		t.Fatalf("got %d quarantine rows, want one per rejection", len(rows))
+	}
+
+	want := Row{
+		"ingest_time":       fixedNow.UnixMicro(),
+		"signal":            "logs",
+		"error_code":        "TIMESTAMP_OVERFLOW",
+		"error_message":     "timestamp_overflow: time_unix_nano",
+		"service_name":      "checkout",
+		"trace_id":          "0102030405060708090a0b0c0d0e0f10",
+		"span_id":           "0102030405060708",
+		"raw_payload":       rows[0]["raw_payload"],
+		"raw_attributes":    `{"disk.used_pct":"97"}`,
+		"schema_version":    schema.Version,
+		"exporter_instance": "collector-7",
+	}
+	if !reflect.DeepEqual(rows[0], want) {
+		t.Errorf("quarantine row mismatch:\n got %#v\nwant %#v", rows[0], want)
+	}
+	rl := logPayload(t, rows[0])
+	if got := stringAttr(rl.Resource().Attributes(), "service.name"); got != "checkout" {
+		t.Errorf("payload service.name = %q, want checkout", got)
+	}
+	lr := rl.ScopeLogs().At(0).LogRecords().At(0)
+	if lr.Body().Str() != "disk full" || uint64(lr.Timestamp()) != math.MaxInt64+1 {
+		t.Errorf("payload record = %q at %d, want the rejected record as sent", lr.Body().Str(), lr.Timestamp())
+	}
+
+	orphanWant := Row{
+		"ingest_time":       fixedNow.UnixMicro(),
+		"signal":            "logs",
+		"error_code":        "TIMESTAMP_OVERFLOW",
+		"error_message":     "timestamp_overflow: observed_time_unix_nano",
+		"raw_payload":       rows[1]["raw_payload"],
+		"raw_attributes":    "{}",
+		"schema_version":    schema.Version,
+		"exporter_instance": "collector-7",
+	}
+	if !reflect.DeepEqual(rows[1], orphanWant) {
+		t.Errorf("quarantine row mismatch:\n got %#v\nwant %#v", rows[1], orphanWant)
+	}
+	if got := logPayload(t, rows[1]).ScopeLogs().At(0).LogRecords().At(0).Body().Str(); got != "orphan" {
+		t.Errorf("second row payload body = %q, want orphan", got)
+	}
+
+	beyond := []QuarantineEntry{{Rejection: Rejection{Index: 3, Reason: ReasonRowError}}}
+	if got := LogQuarantineRows(ld, beyond, opts); got != nil {
+		t.Errorf("an entry past the last record produced rows: %v", got)
+	}
+	if got := LogQuarantineRows(ld, nil, opts); got != nil {
+		t.Errorf("no entries produced rows: %v", got)
+	}
+}
+
+// error_code takes the specific code the published contract names wherever
+// the rejection pins one down. Every other rejection keeps its reason.
+func TestQuarantineErrorCodes(t *testing.T) {
+	tests := []struct {
+		reason    Reason
+		fieldPath string
+		want      string
+	}{
+		{ReasonInvalidID, "trace_id", "INVALID_TRACE_ID"},
+		{ReasonInvalidID, "span_id", "INVALID_SPAN_ID"},
+		{ReasonInvalidID, "end_time", "INVALID_ID"},
+		{ReasonMissingTimestamp, "start_time", "MISSING_START_TIME"},
+		{ReasonMissingTimestamp, "end_time", "MISSING_END_TIME"},
+		{ReasonMissingTimestamp, "span_id", "MISSING_TIMESTAMP"},
+		{ReasonRowBytes, "", "OVERSIZE_ROW"},
+		{ReasonTimestampOverflow, "start_time_unix_nano", "TIMESTAMP_OVERFLOW"},
+		{ReasonAttributeCount, "attributes", "ATTRIBUTE_COUNT"},
+		{ReasonSerialization, "", "SERIALIZATION"},
+		{ReasonRowError, "", "ROW_ERROR"},
+	}
+	for _, tc := range tests {
+		r := Rejection{Reason: tc.reason, FieldPath: tc.fieldPath}
+		if got := quarantineErrorCode(r); got != tc.want {
+			t.Errorf("error code for %s at %q = %q, want %q", tc.reason, tc.fieldPath, got, tc.want)
+		}
+	}
+}
+
+func TestQuarantineMessage(t *testing.T) {
+	tests := map[string]struct {
+		entry QuarantineEntry
+		want  string
+	}{
+		"contract violation": {
+			QuarantineEntry{Rejection: Rejection{Reason: ReasonInvalidID, FieldPath: "span_id"}},
+			"invalid_id: span_id",
+		},
+		"limit breach": {
+			QuarantineEntry{Rejection: Rejection{Reason: ReasonAttributeCount, FieldPath: "attributes", Limit: 2, Actual: 3}},
+			"attribute_count: attributes exceeds limit (3 > 2)",
+		},
+		"oversize row": {
+			QuarantineEntry{Rejection: Rejection{Reason: ReasonRowBytes, Limit: 100, Actual: 150}},
+			"row_bytes exceeds limit (150 > 100)",
+		},
+		"service row error": {
+			QuarantineEntry{Rejection: Rejection{Reason: ReasonRowError}, Detail: "FIELDS_ERROR: bad value"},
+			"row_error: FIELDS_ERROR: bad value",
+		},
+		"invalid UTF-8 detail": {
+			QuarantineEntry{Rejection: Rejection{Reason: ReasonSerialization}, Detail: "a\xffb"},
+			"serialization: a\uFFFDb",
+		},
+	}
+	for name, tc := range tests {
+		if got := quarantineMessage(tc.entry); got != tc.want {
+			t.Errorf("%s: message = %q, want %q", name, got, tc.want)
+		}
+	}
+
+	// "row_error: " is 11 bytes, so the cap falls inside a two-byte rune and
+	// the message stops one byte short of it.
+	long := QuarantineEntry{Rejection: Rejection{Reason: ReasonRowError}, Detail: strings.Repeat("é", quarantineMessageBytes)}
+	got := quarantineMessage(long)
+	if len(got) != quarantineMessageBytes-1 || !utf8.ValidString(got) || !strings.HasPrefix(got, "row_error: é") {
+		t.Errorf("long message is %d bytes (valid UTF-8: %v), want %d bytes of valid UTF-8",
+			len(got), utf8.ValidString(got), quarantineMessageBytes-1)
+	}
+}
+
+func TestTruncateUTF8(t *testing.T) {
+	tests := []struct {
+		in   string
+		n    int
+		want string
+	}{
+		{"héllo", 2, "h"},
+		{"héllo", 3, "hé"},
+		{"abc", 5, "abc"},
+		{"abc", 3, "abc"},
+		{"abc", 0, ""},
+		{"€", 2, ""},
+		{"a€", 3, "a"},
+	}
+	for _, tc := range tests {
+		if got := truncateUTF8(tc.in, tc.n); got != tc.want {
+			t.Errorf("truncateUTF8(%q, %d) = %q, want %q", tc.in, tc.n, got, tc.want)
+		}
+	}
+}
+
+// A record too large for one row still gets a quarantine row: raw_payload is
+// cut on a rune boundary to fit, and error_message says by how much.
+func TestQuarantinePayloadFitsTheRowBudget(t *testing.T) {
+	td, span := newTraces()
+	span.SetTraceID(pcommon.NewTraceIDEmpty())
+	span.Attributes().PutStr("big", strings.Repeat("é", 8<<10))
+	entries := []QuarantineEntry{{Rejection: Rejection{Index: 0, Reason: ReasonInvalidID, FieldPath: "trace_id"}}}
+
+	uncapped := quarantineOpts()
+	uncapped.MaxRowBytes = 0
+	whole := SpanQuarantineRows(td, entries, uncapped)[0]
+	full := whole["raw_payload"].(string)
+	if _, ok := whole["raw_attributes"]; !ok || whole["error_message"] != "invalid_id: trace_id" {
+		t.Fatalf("an uncapped row must keep the whole record: raw_attributes present=%v, error_message=%q",
+			ok, whole["error_message"])
+	}
+
+	capped := quarantineOpts()
+	capped.MaxRowBytes = 8 << 10
+	r := SpanQuarantineRows(td, entries, capped)[0]
+	payload, _ := r["raw_payload"].(string)
+	if len(payload) == 0 || len(payload) >= len(full) || !strings.HasPrefix(full, payload) {
+		t.Fatalf("raw_payload is %d bytes, want a non-empty prefix of the %d byte payload", len(payload), len(full))
+	}
+	if !utf8.ValidString(payload) {
+		t.Error("truncated raw_payload is not valid UTF-8")
+	}
+	if _, ok := r["raw_attributes"]; ok {
+		t.Error("raw_attributes was written although the payload alone overflows the row")
+	}
+	wantMessage := fmt.Sprintf("invalid_id: trace_id (raw_payload truncated to %d of %d bytes)", len(payload), len(full))
+	if got := r["error_message"]; got != wantMessage {
+		t.Errorf("error_message = %q, want %q", got, wantMessage)
+	}
+	total := 0
+	for _, v := range r {
+		if s, ok := v.(string); ok {
+			total += len(s)
+		}
+	}
+	if total > capped.MaxRowBytes {
+		t.Errorf("row strings total %d bytes, over the %d byte row cap", total, capped.MaxRowBytes)
+	}
+}
+
+// The budget is exact: raw_attributes is written only when it fits beside the
+// whole payload, and the payload is cut only when it alone does not fit.
+func TestQuarantineRowBudgetIsExact(t *testing.T) {
+	td, span := newTraces()
+	span.SetTraceID(pcommon.NewTraceIDEmpty())
+	entries := []QuarantineEntry{{Rejection: Rejection{Index: 0, Reason: ReasonInvalidID, FieldPath: "trace_id"}}}
+
+	opts := quarantineOpts()
+	opts.MaxRowBytes = 0
+	whole := SpanQuarantineRows(td, entries, opts)[0]
+	payload, attrs := whole["raw_payload"].(string), whole["raw_attributes"].(string)
+	if !utf8.ValidString(payload) || len(payload) != len([]rune(payload)) {
+		t.Fatal("the payload must be ASCII for an exact one-byte truncation")
+	}
+	fixed := quarantineRowOverhead
+	for k, v := range whole {
+		if s, ok := v.(string); ok && k != "raw_payload" && k != "raw_attributes" {
+			fixed += len(s)
+		}
+	}
+
+	tests := []struct {
+		name        string
+		maxRowBytes int
+		wantPayload string
+		wantAttrs   bool
+	}{
+		{"both fit", fixed + len(payload) + len(attrs), payload, true},
+		{"attributes one byte over", fixed + len(payload) + len(attrs) - 1, payload, false},
+		{"payload fits exactly", fixed + len(payload), payload, false},
+		{"payload one byte over", fixed + len(payload) - 1, payload[:len(payload)-1], false},
+		{"no room at all", 1, "", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts.MaxRowBytes = tc.maxRowBytes
+			r := SpanQuarantineRows(td, entries, opts)[0]
+			got, present := r["raw_payload"].(string)
+			if got != tc.wantPayload || present != (tc.wantPayload != "") {
+				t.Errorf("raw_payload is %d bytes (present=%v), want %d bytes", len(got), present, len(tc.wantPayload))
+			}
+			if _, ok := r["raw_attributes"]; ok != tc.wantAttrs {
+				t.Errorf("raw_attributes present = %v, want %v", ok, tc.wantAttrs)
+			}
+			wantMessage := "invalid_id: trace_id"
+			if tc.wantPayload != payload {
+				wantMessage += fmt.Sprintf(" (raw_payload truncated to %d of %d bytes)", len(tc.wantPayload), len(payload))
+			}
+			if r["error_message"] != wantMessage {
+				t.Errorf("error_message = %q, want %q", r["error_message"], wantMessage)
+			}
+		})
+	}
+}
+
+// Attributes that breach a structural limit stay out of raw_attributes, since
+// the limits exist to keep unqueryable JSON out of the tables. raw_payload
+// still carries them.
+func TestQuarantineRawAttributesRespectLimits(t *testing.T) {
+	td, span := newTraces()
+	span.Attributes().PutStr("second", "x")
+	opts := quarantineOpts()
+	opts.Limits.MaxAttributeCount = 1
+
+	_, rejects := SpanRows(td, opts)
+	rows := SpanQuarantineRows(td, entriesFor(rejects), opts)
+	if len(rows) != 1 {
+		t.Fatalf("got %d quarantine rows for rejections %+v, want 1", len(rows), rejects)
+	}
+	if got, ok := rows[0]["raw_attributes"]; ok {
+		t.Errorf("raw_attributes = %v, want NULL for attributes over the limit", got)
+	}
+	if !strings.Contains(rows[0]["raw_payload"].(string), `"second"`) {
+		t.Error("raw_payload lost the attributes that breached the limit")
+	}
+	if got, want := rows[0]["error_message"], "attribute_count: attributes exceeds limit (2 > 1)"; got != want {
+		t.Errorf("error_message = %q, want %q", got, want)
+	}
+	if got := rows[0]["error_code"]; got != "ATTRIBUTE_COUNT" {
+		t.Errorf("error_code = %v, want ATTRIBUTE_COUNT", got)
+	}
+}
+
+// Entry indices are positions in the flattened batch walk, across resources
+// and scopes. Rows come out in batch order, and an index that matches no
+// record is ignored.
+func TestQuarantineRowsFollowBatchPositions(t *testing.T) {
+	td, _ := newTraces()
+	payments := td.ResourceSpans().AppendEmpty()
+	payments.Resource().Attributes().PutStr("service.name", "payments")
+	validSpan(payments.ScopeSpans().AppendEmpty().Spans().AppendEmpty()).SetName("first payments span")
+	validSpan(payments.ScopeSpans().AppendEmpty().Spans().AppendEmpty()).SetName("second payments span")
+
+	entry := func(i int, detail string) QuarantineEntry {
+		return QuarantineEntry{Rejection: Rejection{Index: i, Reason: ReasonRowError}, Detail: detail}
+	}
+	entries := []QuarantineEntry{entry(99, ""), entry(2, "first"), entry(-1, ""), entry(2, "second"), entry(0, "")}
+	rows := SpanQuarantineRows(td, entries, quarantineOpts())
+	if len(rows) != 3 {
+		t.Fatalf("got %d quarantine rows, want 3", len(rows))
+	}
+	want := []struct{ service, span, message string }{
+		{"checkout", "GET /cart", "row_error"},
+		{"payments", "second payments span", "row_error: first"},
+		{"payments", "second payments span", "row_error: second"},
+	}
+	for i, w := range want {
+		if got := rows[i]["service_name"]; got != w.service {
+			t.Errorf("row %d service_name = %v, want %s", i, got, w.service)
+		}
+		if got := rows[i]["error_message"]; got != w.message {
+			t.Errorf("row %d error_message = %v, want %s", i, got, w.message)
+		}
+		if got := spanPayload(t, rows[i]).ScopeSpans().At(0).Spans().At(0).Name(); got != w.span {
+			t.Errorf("row %d payload span = %q, want %q", i, got, w.span)
+		}
+	}
+
+	if got := SpanQuarantineRows(td, nil, quarantineOpts()); got != nil {
+		t.Errorf("no entries produced rows: %v", got)
+	}
+}
+
+func TestQuarantineRowsAreValidUTF8(t *testing.T) {
+	const bad = "a\xffb"
+	td, span := newTraces()
+	td.ResourceSpans().At(0).Resource().Attributes().PutStr("service.name", bad+strings.Repeat("x", 2<<10))
+	span.SetName(bad)
+	span.Attributes().PutStr(bad, bad)
+	opts := quarantineOpts()
+	opts.ExporterInstance = bad
+
+	entries := []QuarantineEntry{{Rejection: Rejection{Index: 0, Reason: ReasonRowError}, Detail: bad}}
+	rows := SpanQuarantineRows(td, entries, opts)
+	if len(rows) != 1 {
+		t.Fatalf("got %d quarantine rows, want 1", len(rows))
+	}
+	assertValidUTF8(t, "row", rows[0])
+	if got := rows[0]["service_name"].(string); len(got) != quarantineLabelBytes || !strings.HasPrefix(got, "a\uFFFDb") {
+		t.Errorf("service_name is %d bytes, want the repaired name capped at %d", len(got), quarantineLabelBytes)
+	}
+	if got := rows[0]["exporter_instance"]; got != "a\uFFFDb" {
+		t.Errorf("exporter_instance = %q, want a\\uFFFDb", got)
+	}
+	if got := rows[0]["error_message"]; got != "row_error: a\uFFFDb" {
+		t.Errorf("error_message = %q", got)
 	}
 }

@@ -187,6 +187,46 @@ PARTITION BY DATE(timestamp)
 CLUSTER BY service_name, trace_id, severity_number;
 `
 
+// QuarantineDDL creates the opt-in quarantine (dead-letter) table, which the
+// exporter writes only when quarantine.enabled is set. A span or log record
+// that cannot be written to its signal table, because of an invalid ID, a
+// missing or overflowing timestamp, a value over a configured limit, a row
+// over the row size limit, or a row BigQuery itself rejects, lands here
+// instead of being dropped, with the reason in error_code and error_message
+// and the record serialized as OTLP JSON in raw_payload.
+//
+// Partitioning is daily on ingest_time and partitions expire after 30 days,
+// because the table is a triage queue rather than an archive; clustering on
+// (signal, error_code, service_name) keeps "what is failing, and where"
+// queries pruned. There is no dedup view: a record whose whole batch is
+// retried can be quarantined more than once.
+const QuarantineDDL = `
+CREATE TABLE IF NOT EXISTS ` + "`%[1]s.%[2]s.%[3]s`" + ` (
+  ingest_time                        TIMESTAMP NOT NULL,
+  signal                             STRING    NOT NULL, -- 'spans' | 'logs'
+  error_code                         STRING    NOT NULL, -- e.g. 'INVALID_SPAN_ID', 'MISSING_END_TIME', 'OVERSIZE_ROW'
+  error_message                      STRING    NOT NULL,
+  service_name                       STRING,
+  trace_id                           STRING,
+  span_id                            STRING,
+  raw_payload                        STRING,             -- serialized OTLP JSON/proto up to 8 MiB
+  raw_attributes                     JSON,
+  payload_ref STRUCT<
+    uri                              STRING,
+    version                          STRING,
+    authorizer                       STRING,
+    details                          JSON
+  >,                                                     -- populated when raw_payload > 8 MiB is offloaded to GCS
+  exporter_instance                  STRING,
+  schema_version                     STRING    NOT NULL
+)
+PARTITION BY DATE(ingest_time)
+CLUSTER BY signal, error_code, service_name
+OPTIONS (
+  partition_expiration_days = 30
+);
+`
+
 // SpansDedupViewDDL is the canonical span deduplication view (§7.4).
 //
 // Identity is (start_time, service_name, trace_id, span_id). Every retry of a

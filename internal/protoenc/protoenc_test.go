@@ -626,3 +626,103 @@ func has(t *testing.T, msg protoreflect.Message, name string) bool {
 	}
 	return msg.Has(fd)
 }
+
+// Quarantine rows must encode against the published quarantine schema, with
+// every absent optional column left NULL rather than empty.
+func TestEncodeQuarantineRow(t *testing.T) {
+	enc, err := New(schema.QuarantineTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := opts()
+	o.ExporterInstance = "collector-7"
+	o.MaxRowBytes = 1 << 20
+
+	td := ptrace.NewTraces()
+	rs := td.ResourceSpans().AppendEmpty()
+	rs.Resource().Attributes().PutStr("service.name", "checkout")
+	span := rs.ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	span.SetName("GET /cart")
+	span.SetSpanID(pcommon.SpanID{1, 2, 3, 4, 5, 6, 7, 8})
+	span.SetStartTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+	span.SetEndTimestamp(pcommon.Timestamp(1_700_000_001_000_000_000))
+	span.Attributes().PutInt("http.status_code", 200)
+
+	_, rejects := transform.SpanRows(td, o)
+	if len(rejects) != 1 {
+		t.Fatalf("rejections = %+v, want the span without a trace ID", rejects)
+	}
+	rows := transform.SpanQuarantineRows(td, []transform.QuarantineEntry{{Rejection: rejects[0]}}, o)
+	if len(rows) != 1 {
+		t.Fatalf("got %d quarantine rows, want 1", len(rows))
+	}
+	b, err := enc.Encode(rows[0])
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	norm := decodeNormalized(t, enc, b)
+	for path, want := range map[string]string{
+		"signal":            "spans",
+		"error_code":        "INVALID_TRACE_ID",
+		"error_message":     "invalid_id: trace_id",
+		"service_name":      "checkout",
+		"span_id":           "0102030405060708",
+		"raw_attributes":    `{"http.status_code":"200"}`,
+		"exporter_instance": "collector-7",
+		"schema_version":    schema.Version,
+	} {
+		if got := get(t, norm, path).String(); got != want {
+			t.Errorf("%s = %q, want %q", path, got, want)
+		}
+	}
+	wantIngest := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC).UnixMicro()
+	if got := get(t, norm, "ingest_time").Int(); got != wantIngest {
+		t.Errorf("ingest_time = %d, want %d", got, wantIngest)
+	}
+	if got := get(t, norm, "raw_payload").String(); !strings.Contains(got, `"spanId":"0102030405060708"`) {
+		t.Errorf("raw_payload = %q, want the span as OTLP/JSON", got)
+	}
+	for _, name := range []string{"trace_id", "payload_ref"} {
+		if has(t, norm, name) {
+			t.Errorf("%s is set, want NULL", name)
+		}
+	}
+
+	ld := plog.NewLogs()
+	lr := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+	lr.SetTimestamp(pcommon.Timestamp(1 << 63))
+	lr.Body().SetStr("disk full")
+	_, logRejects := transform.LogRows(ld, o)
+	if len(logRejects) != 1 {
+		t.Fatalf("rejections = %+v, want the record with an overflowing time", logRejects)
+	}
+	entries := []transform.QuarantineEntry{{Rejection: logRejects[0], Detail: "seen twice"}}
+	logRows := transform.LogQuarantineRows(ld, entries, o)
+	if len(logRows) != 1 {
+		t.Fatalf("got %d quarantine rows, want 1", len(logRows))
+	}
+	lb, err := enc.Encode(logRows[0])
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	logNorm := decodeNormalized(t, enc, lb)
+	for path, want := range map[string]string{
+		"signal":         "logs",
+		"error_code":     "TIMESTAMP_OVERFLOW",
+		"error_message":  "timestamp_overflow: time_unix_nano: seen twice",
+		"raw_attributes": "{}",
+		"schema_version": schema.Version,
+	} {
+		if got := get(t, logNorm, path).String(); got != want {
+			t.Errorf("log %s = %q, want %q", path, got, want)
+		}
+	}
+	if got := get(t, logNorm, "raw_payload").String(); !strings.Contains(got, `"disk full"`) {
+		t.Errorf("log raw_payload = %q, want the record as OTLP/JSON", got)
+	}
+	for _, name := range []string{"service_name", "trace_id", "span_id", "payload_ref"} {
+		if has(t, logNorm, name) {
+			t.Errorf("log %s is set, want NULL", name)
+		}
+	}
+}

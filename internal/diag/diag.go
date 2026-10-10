@@ -75,7 +75,7 @@ func Rejection(table, operationID string, index int, reason, fieldPath string, l
 // appear in a diagnostic path. Anything outside this set is dropped rather
 // than passed through, because the only way to be sure a token is not
 // telemetry content is to recognize it. The set is exactly the column and
-// nested STRUCT field names of the span and log contracts.
+// nested STRUCT field names of the span, log and quarantine contracts.
 var knownFieldTokens = map[string]bool{
 	"start_time_unix_nano": true, "end_time_unix_nano": true,
 	"trace_id": true, "span_id": true, "parent_span_id": true,
@@ -101,6 +101,12 @@ var knownFieldTokens = map[string]bool{
 	"mime_type": true, "storage_mode": true, "byte_size": true,
 	"sha256": true, "object_ref": true, "uri": true, "authorizer": true,
 	"details": true, "log_name": true, "insert_id": true,
+
+	// Columns of the opt-in quarantine table that the signal contracts do
+	// not already name.
+	"ingest_time": true, "signal": true, "error_code": true,
+	"error_message": true, "raw_payload": true, "raw_attributes": true,
+	"payload_ref": true, "exporter_instance": true,
 }
 
 // SanitizeFieldPath reduces a service message to the recognized column names

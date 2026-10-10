@@ -66,6 +66,10 @@ type Config struct {
 
 	// Limits are the structural bounds applied before serialization.
 	Limits LimitsConfig `mapstructure:"limits"`
+
+	// Quarantine routes records the signal tables cannot take to an opt-in
+	// dead-letter table instead of only counting them.
+	Quarantine QuarantineConfig `mapstructure:"quarantine"`
 }
 
 // SignalConfig is the per-signal destination.
@@ -167,6 +171,20 @@ func (l LimitsConfig) toTransform() transform.Limits {
 	}
 }
 
+// QuarantineConfig controls the opt-in dead-letter table.
+//
+// When enabled, a record that is permanently rejected, whether by the record
+// contract, a structural limit, serialization, the row size limit or the
+// service's own row validation, is also written to Table with its error code
+// and its original content, so it can be inspected and replayed. Quarantine
+// writes are best effort: they are never retried, and they never change the
+// outcome of the signal write that rejected the record.
+type QuarantineConfig struct {
+	Enabled bool `mapstructure:"enabled"`
+	// Table is the quarantine table ID in the destination dataset.
+	Table string `mapstructure:"table"`
+}
+
 // Validate checks the configuration and fails fast at startup.
 func (cfg *Config) Validate() error {
 	var errs []error
@@ -200,6 +218,7 @@ func (cfg *Config) Validate() error {
 	errs = append(errs, cfg.validateWrite()...)
 	errs = append(errs, cfg.validateCredentials()...)
 	errs = append(errs, cfg.validateEndpoint()...)
+	errs = append(errs, cfg.validateQuarantine()...)
 
 	if err := cfg.Limits.toTransform().Validate(); err != nil {
 		errs = append(errs, err)
@@ -304,6 +323,28 @@ func (cfg *Config) validateEndpoint() []error {
 	if e.WithoutAuthentication && !isLoopback(e.URL) {
 		errs = append(errs, fmt.Errorf(
 			"endpoint.without_authentication is only allowed for a loopback endpoint, got %q", e.URL))
+	}
+	return errs
+}
+
+func (cfg *Config) validateQuarantine() []error {
+	var errs []error
+	q := cfg.Quarantine
+
+	if q.Table != "" && !idPattern.MatchString(q.Table) {
+		errs = append(errs, fmt.Errorf(
+			"quarantine.table %q must contain only letters, numbers and underscores", q.Table))
+	}
+	if !q.Enabled {
+		return errs
+	}
+	if q.Table == "" {
+		errs = append(errs, errors.New("quarantine.table must not be empty when quarantine.enabled is set"))
+	} else if q.Table == cfg.Traces.Table || q.Table == cfg.Logs.Table {
+		// The quarantine table has its own schema, so sharing a signal
+		// table could only ever fail schema validation at startup.
+		errs = append(errs, fmt.Errorf(
+			"quarantine.table %q must differ from traces.table and logs.table", q.Table))
 	}
 	return errs
 }

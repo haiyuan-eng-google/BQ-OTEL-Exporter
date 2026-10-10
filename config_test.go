@@ -67,6 +67,22 @@ func TestValidateRejects(t *testing.T) {
 			c.TimeoutSettings.Timeout = 0
 		}, "timeout must be positive"},
 		"unbounded retry horizon": {func(c *Config) { c.BackOffConfig.MaxElapsedTime = 0 }, "must be finite"},
+		"bad quarantine table": {
+			func(c *Config) { c.Quarantine.Table = "dead-letter" },
+			`quarantine.table "dead-letter" must contain only letters, numbers and underscores`,
+		},
+		"quarantine without a table": {func(c *Config) {
+			c.Quarantine.Enabled = true
+			c.Quarantine.Table = ""
+		}, "quarantine.table must not be empty when quarantine.enabled is set"},
+		"quarantine in the traces table": {func(c *Config) {
+			c.Quarantine.Enabled = true
+			c.Quarantine.Table = c.Traces.Table
+		}, `quarantine.table "otel_spans" must differ from traces.table and logs.table`},
+		"quarantine in the logs table": {func(c *Config) {
+			c.Quarantine.Enabled = true
+			c.Quarantine.Table = c.Logs.Table
+		}, `quarantine.table "otel_logs" must differ from traces.table and logs.table`},
 	}
 
 	for name, tc := range tests {
@@ -95,6 +111,41 @@ func TestValidateAcceptsCompanionViewsWithTableCreation(t *testing.T) {
 	cfg.AutoCreate.CompanionViews = true
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() = %v, want nil", err)
+	}
+}
+
+// Quarantine is opt-in, names its own table by default, and needs no table
+// creation, so it also works against an emulator without authentication.
+func TestValidateAcceptsQuarantine(t *testing.T) {
+	cfg := validConfig()
+	if cfg.Quarantine.Enabled {
+		t.Fatal("quarantine must be off by default")
+	}
+	if cfg.Quarantine.Table != "otel_quarantine" {
+		t.Fatalf("default quarantine.table = %q, want otel_quarantine", cfg.Quarantine.Table)
+	}
+
+	tests := map[string]func(*Config){
+		"enabled with the default table": func(c *Config) { c.Quarantine.Enabled = true },
+		"enabled with a custom table": func(c *Config) {
+			c.Quarantine.Enabled = true
+			c.Quarantine.Table = "dead_letters"
+		},
+		"disabled without a table": func(c *Config) { c.Quarantine.Table = "" },
+		"enabled against an emulator": func(c *Config) {
+			c.Endpoint.URL = "localhost:9050"
+			c.Endpoint.WithoutAuthentication = true
+			c.Quarantine.Enabled = true
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			cfg := validConfig()
+			mutate(cfg)
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate() = %v, want nil", err)
+			}
+		})
 	}
 }
 
