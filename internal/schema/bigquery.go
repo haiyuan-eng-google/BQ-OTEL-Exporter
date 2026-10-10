@@ -26,8 +26,8 @@ func DestinationMetadata(
 	var queryTemplate string
 	switch {
 	case proto.Equal(in, SpansTableSchema()):
-		md.TimePartitioning = &bq.TimePartitioning{Field: "start_timestamp"}
-		md.Clustering = &bq.Clustering{Fields: []string{"service_name", "name"}}
+		md.TimePartitioning = &bq.TimePartitioning{Type: bq.HourPartitioningType, Field: "start_time"}
+		md.Clustering = &bq.Clustering{Fields: []string{"service_name", "trace_id", "name"}}
 		queryTemplate = SpansDedupViewQuery
 	case proto.Equal(in, LogsTableSchema()):
 		md.TimePartitioning = &bq.TimePartitioning{Field: "timestamp"}

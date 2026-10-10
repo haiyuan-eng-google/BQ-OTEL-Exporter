@@ -89,6 +89,24 @@ func TestEncodeSpanRow(t *testing.T) {
 	if n := msg.Get(fd).List().Len(); n != 1 {
 		t.Fatalf("events length = %d, want 1", n)
 	}
+
+	// The singular STRUCT columns and INT64 nanos must reach the service
+	// intact, so check them through the descriptor the write stream gets.
+	norm := decodeNormalized(t, enc, b)
+	for path, want := range map[string]string{
+		"kind_name":                        "SPAN_KIND_UNSPECIFIED",
+		"status.code_name":                 "STATUS_CODE_UNSET",
+		"resource.attributes":              `{"service.name":"checkout"}`,
+		"resource.attributes_schema":       `{"service.name":"string"}`,
+		"instrumentation_scope.attributes": "{}",
+	} {
+		if got := get(t, norm, path).String(); got != want {
+			t.Errorf("%s = %q, want %q", path, got, want)
+		}
+	}
+	if got := get(t, norm, "end_time_unix_nano").Int(); got != 1_700_000_001_000_000_000 {
+		t.Errorf("end_time_unix_nano = %d, want the exact nanos", got)
+	}
 }
 
 func TestEncodeLogRow(t *testing.T) {

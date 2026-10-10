@@ -185,15 +185,16 @@ func TestPrepareDestinationMissingTableRequiresAutoCreate(t *testing.T) {
 
 func TestPrepareDestinationCreatesOnlyActiveSignalTableAndView(t *testing.T) {
 	tests := []struct {
-		name        string
-		table       string
-		tableSchema *storagepb.TableSchema
-		otherTable  string
-		partition   string
-		cluster     []string
+		name          string
+		table         string
+		tableSchema   *storagepb.TableSchema
+		otherTable    string
+		partitionType bq.TimePartitioningType
+		partition     string
+		cluster       []string
 	}{
-		{"traces", defaultSpansTable, schema.SpansTableSchema(), defaultLogsTable, "start_timestamp", []string{"service_name", "name"}},
-		{"logs", defaultLogsTable, schema.LogsTableSchema(), defaultSpansTable, "timestamp", nil},
+		{"traces", defaultSpansTable, schema.SpansTableSchema(), defaultLogsTable, bq.HourPartitioningType, "start_time", []string{"service_name", "trace_id", "name"}},
+		{"logs", defaultLogsTable, schema.LogsTableSchema(), defaultSpansTable, "", "timestamp", nil},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -212,8 +213,8 @@ func TestPrepareDestinationCreatesOnlyActiveSignalTableAndView(t *testing.T) {
 			if _, exists := admin.createdTables[tc.otherTable]; exists {
 				t.Fatalf("inactive table %q was created", tc.otherTable)
 			}
-			if tableMD.TimePartitioning == nil || tableMD.TimePartitioning.Field != tc.partition {
-				t.Fatalf("partitioning = %#v, want field %q", tableMD.TimePartitioning, tc.partition)
+			if tp := tableMD.TimePartitioning; tp == nil || tp.Field != tc.partition || tp.Type != tc.partitionType {
+				t.Fatalf("partitioning = %#v, want type %q on field %q", tp, tc.partitionType, tc.partition)
 			}
 			if got := clusteringFields(tableMD); !equalStrings(got, tc.cluster) {
 				t.Fatalf("clustering = %v, want %v", got, tc.cluster)
@@ -251,7 +252,8 @@ func TestPrepareDestinationRejectsTypeModeAndNestedSchemaDrift(t *testing.T) {
 	}{
 		{"type", func(s bq.Schema) { s[0].Type = bq.StringFieldType }},
 		{"mode", func(s bq.Schema) { s[0].Required = false }},
-		{"nested", func(s bq.Schema) { s[len(s)-1].Schema[0].Type = bq.IntegerFieldType }},
+		{"nested", mutateField("events", func(f *bq.FieldSchema) { f.Schema[0].Type = bq.IntegerFieldType })},
+		{"nested struct", mutateField("status", func(f *bq.FieldSchema) { f.Schema[1].Type = bq.IntegerFieldType })},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -433,6 +435,19 @@ func clusteringFields(md *bq.TableMetadata) []string {
 		return nil
 	}
 	return md.Clustering.Fields
+}
+
+// mutateField returns a schema mutation that applies fn to the top-level
+// field called name. If no field has that name the schema is left unchanged,
+// so a drift test using it fails rather than passing vacuously.
+func mutateField(name string, fn func(*bq.FieldSchema)) func(bq.Schema) {
+	return func(s bq.Schema) {
+		for _, f := range s {
+			if f.Name == name {
+				fn(f)
+			}
+		}
+	}
 }
 
 func equalStrings(a, b []string) bool {

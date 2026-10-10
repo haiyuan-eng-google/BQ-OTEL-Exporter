@@ -18,72 +18,99 @@ package schema // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/interna
 // Do not bump this to v1 without that gate.
 const Version = "v0alpha1"
 
-// SpansDDL creates the span table per §7.1.
+// SpansDDL creates the v0alpha2 span table.
 //
-// Timestamps are stored twice on purpose: a microsecond-precision TIMESTAMP
-// for querying and partitioning, and the raw OTLP value as a decimal STRING,
-// because BigQuery TIMESTAMP cannot hold nanoseconds and the unsigned fixed64
-// domain does not fit INT64.
+// Every timestamp is stored twice on purpose: a microsecond-precision
+// TIMESTAMP for querying and partitioning, and the exact OTLP nanoseconds as
+// INT64, because BigQuery TIMESTAMP cannot hold nanoseconds. A span whose
+// nanoseconds do not fit INT64 is rejected before a row is built.
 //
-// Clustering on (service_name, name) is the M3 benchmark candidate, not a
-// frozen default.
+// Partitioning is hourly on start_time, and clustering on (service_name,
+// trace_id, name) keeps per-service scans and trace lookups pruned.
 const SpansDDL = `
 CREATE TABLE IF NOT EXISTS ` + "`%[1]s.%[2]s.%[3]s`" + ` (
-  start_timestamp                    TIMESTAMP NOT NULL,
-  start_time_unix_nano               STRING    NOT NULL,
-  end_timestamp                      TIMESTAMP,
-  end_time_unix_nano                 STRING,
-  export_received_timestamp          TIMESTAMP NOT NULL,
-  duration_ns                        INT64,
-
+  -- Time family
+  start_time                         TIMESTAMP NOT NULL,
+  start_time_unix_nano               INT64     NOT NULL,
+  end_time                           TIMESTAMP NOT NULL,
+  end_time_unix_nano                 INT64     NOT NULL,
+  receive_time                       TIMESTAMP NOT NULL,
+  receive_time_unix_nano             INT64     NOT NULL,
+  duration_nano                      INT64     NOT NULL,
+  -- Identity family
   trace_id                           STRING    NOT NULL,
   span_id                            STRING    NOT NULL,
   parent_span_id                     STRING,
   trace_state                        STRING,
   flags                              INT64,
-
+  -- Span payload family (Plain JSON + attributes_schema sidecar)
   name                               STRING    NOT NULL,
-  kind                               STRING,
-  status_code                        STRING,
-  status_message                     STRING,
-
-  service_name                       STRING,
-  resource_attributes                JSON,
-  resource_schema_url                STRING,
-  resource_dropped_attributes_count  INT64,
-
-  scope_name                         STRING,
-  scope_version                      STRING,
-  scope_attributes                   JSON,
-  scope_schema_url                   STRING,
-  scope_dropped_attributes_count     INT64,
-
-  schema_version                     STRING    NOT NULL,
-
-  span_attributes                    JSON,
+  kind                               INT64     NOT NULL,
+  kind_name                          STRING,
+  status STRUCT<
+    code                             INT64,
+    code_name                        STRING,
+    message                          STRING
+  >,
+  attributes                         JSON,
+  attributes_schema                  JSON,
   dropped_attributes_count           INT64,
-  dropped_events_count               INT64,
-  dropped_links_count                INT64,
-
+  -- Resource & Instrumentation Scope family
+  service_name                       STRING,
+  resource STRUCT<
+    attributes                       JSON,
+    attributes_schema                JSON,
+    dropped_attributes_count         INT64
+  >,
+  resource_schema_url                STRING,
+  instrumentation_scope STRUCT<
+    name                             STRING,
+    version                          STRING,
+    attributes                       JSON,
+    attributes_schema                JSON,
+    dropped_attributes_count         INT64
+  >,
+  scope_schema_url                   STRING,
+  -- Signal detail: Inline Events & Links
   events ARRAY<STRUCT<
-    name                     STRING,
-    timestamp                TIMESTAMP,
-    time_unix_nano           STRING,
-    attributes               JSON,
-    dropped_attributes_count INT64
+    time                             TIMESTAMP,
+    time_unix_nano                   INT64,
+    name                             STRING,
+    attributes                       JSON,
+    attributes_schema                JSON,
+    dropped_attributes_count         INT64
   >>,
-
+  dropped_events_count               INT64,
   links ARRAY<STRUCT<
-    trace_id                 STRING,
-    span_id                  STRING,
-    trace_state              STRING,
-    flags                    INT64,
-    attributes               JSON,
-    dropped_attributes_count INT64
-  >>
+    trace_id                         STRING,
+    span_id                          STRING,
+    trace_state                      STRING,
+    flags                            INT64,
+    attributes                       JSON,
+    attributes_schema                JSON,
+    dropped_attributes_count         INT64
+  >>,
+  dropped_links_count                INT64,
+  -- Multimodal & Oversized Payload Offloading via BigQuery ObjectRef
+  payload_refs ARRAY<STRUCT<
+    attribute_path                   STRING,
+    part_index                       INT64,
+    mime_type                        STRING,
+    storage_mode                     STRING,
+    byte_size                        INT64,
+    sha256                           STRING,
+    object_ref STRUCT<
+      uri                            STRING,
+      version                        STRING,
+      authorizer                     STRING,
+      details                        JSON
+    >
+  >>,
+  -- Contract metadata
+  schema_version                     STRING    NOT NULL
 )
-PARTITION BY DATE(start_timestamp)
-CLUSTER BY service_name, name;
+PARTITION BY TIMESTAMP_TRUNC(start_time, HOUR)
+CLUSTER BY service_name, trace_id, name;
 `
 
 // LogsDDL creates the log table per §7.2.
@@ -133,14 +160,18 @@ PARTITION BY DATE(timestamp);
 
 // SpansDedupViewDDL is the canonical span deduplication view (§7.4).
 //
-// Identity is (trace_id, span_id). Ordering is on the raw nanos rather than
-// end_timestamp, because microsecond precision alone can tie across retries;
-// export_received_timestamp breaks any remaining tie.
+// Identity is (start_time, service_name, trace_id, span_id). Every retry of a
+// span carries the same start time and service, so this is the span identity
+// with the partitioning column and the leading clustering columns added: a
+// filter on any of them can be pushed below the window function, and a query
+// over the view still prunes partitions and clusters. Ordering is on the raw
+// nanos rather than end_time, because microsecond precision alone can tie
+// across retries; receive_time_unix_nano breaks any remaining tie.
 //
 // Pending amendment B.2: once truncate-and-flag lands, an is_truncated ASC
 // term goes first in the ORDER BY, so a truncated copy can never outrank the
 // full copy it duplicates. Not applied here because the column is not yet part
-// of the approved §7.1 contract.
+// of the approved span contract.
 const SpansDedupViewDDL = `
 CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s.%[3]s_dedup`" + ` AS
 ` + SpansDedupViewQuery + `;
@@ -149,11 +180,17 @@ CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s.%[3]s_dedup`" + ` AS
 // SpansDedupViewQuery is shared by operator-run DDL and metadata-API view
 // creation so their deduplication behavior cannot drift.
 const SpansDedupViewQuery = `
-SELECT * FROM ` + "`%[1]s.%[2]s.%[3]s`" + `
+SELECT *
+FROM ` + "`%[1]s.%[2]s.%[3]s`" + `
 QUALIFY ROW_NUMBER() OVER (
-  PARTITION BY trace_id, span_id
-  ORDER BY CAST(end_time_unix_nano AS BIGNUMERIC) DESC,
-           export_received_timestamp DESC
+  PARTITION BY
+    start_time,
+    service_name,
+    trace_id,
+    span_id
+  ORDER BY
+    end_time_unix_nano DESC,
+    receive_time_unix_nano DESC
 ) = 1
 `
 

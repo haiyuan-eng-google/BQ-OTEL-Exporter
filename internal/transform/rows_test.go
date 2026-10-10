@@ -4,13 +4,19 @@
 package transform
 
 import (
+	"fmt"
+	"math"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 )
 
 var fixedNow = time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
@@ -41,6 +47,18 @@ func newTraces() (ptrace.Traces, ptrace.Span) {
 	return td, span
 }
 
+// validSpan gives span the IDs and timestamps the span contract requires, so
+// a test that builds its own span exercises only the property it targets.
+func validSpan(span ptrace.Span) ptrace.Span {
+	span.SetTraceID(pcommon.TraceID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
+	span.SetSpanID(pcommon.SpanID{1, 2, 3, 4, 5, 6, 7, 8})
+	span.SetStartTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+	span.SetEndTimestamp(pcommon.Timestamp(1_700_000_001_000_000_000))
+	return span
+}
+
+// TestSpanRow pins the complete row for a representative span: every column,
+// every nested STRUCT field, and the Go type the encoder expects for each.
 func TestSpanRow(t *testing.T) {
 	td, _ := newTraces()
 	rows, rejects := SpanRows(td, testOpts())
@@ -50,36 +68,64 @@ func TestSpanRow(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("got %d rows, want 1", len(rows))
 	}
-	r := rows[0]
 
-	checks := map[string]any{
-		"trace_id":                  "0102030405060708090a0b0c0d0e0f10",
-		"span_id":                   "0102030405060708",
-		"name":                      "GET /cart",
-		"kind":                      "Server",
-		"service_name":              "checkout",
-		"status_code":               "Ok",
-		"start_time_unix_nano":      "1700000000123456789",
-		"end_time_unix_nano":        "1700000001123456789",
-		"duration_ns":               int64(1_000_000_000),
-		"resource_schema_url":       "https://example.test/resource",
-		"scope_schema_url":          "https://example.test/scope",
-		"scope_name":                "scope",
-		"export_received_timestamp": fixedNow.UnixMicro(),
+	want := Row{
+		// TIMESTAMP columns truncate to microseconds; the exact nanos live in
+		// the paired INT64 column.
+		"start_time":             int64(1_700_000_000_123_456),
+		"start_time_unix_nano":   int64(1_700_000_000_123_456_789),
+		"end_time":               int64(1_700_000_001_123_456),
+		"end_time_unix_nano":     int64(1_700_000_001_123_456_789),
+		"receive_time":           fixedNow.UnixMicro(),
+		"receive_time_unix_nano": fixedNow.UnixNano(),
+		"duration_nano":          int64(1_000_000_000),
+
+		"trace_id": "0102030405060708090a0b0c0d0e0f10",
+		"span_id":  "0102030405060708",
+		"flags":    int64(0),
+
+		"name":      "GET /cart",
+		"kind":      int64(2),
+		"kind_name": "SPAN_KIND_SERVER",
+		"status":    Row{"code": int64(1), "code_name": "STATUS_CODE_OK"},
+		// Plain JSON plus a sidecar recording the OTLP type that the plain
+		// form loses: the value is a decimal string, the schema says int64.
+		"attributes":               `{"http.status_code":"200"}`,
+		"attributes_schema":        `{"http.status_code":"int64"}`,
+		"dropped_attributes_count": int64(0),
+
+		"service_name": "checkout",
+		"resource": Row{
+			"attributes":               `{"service.name":"checkout"}`,
+			"attributes_schema":        `{"service.name":"string"}`,
+			"dropped_attributes_count": int64(0),
+		},
+		"resource_schema_url": "https://example.test/resource",
+		"instrumentation_scope": Row{
+			"name":                     "scope",
+			"version":                  "1.2.3",
+			"attributes":               "{}",
+			"attributes_schema":        "{}",
+			"dropped_attributes_count": int64(0),
+		},
+		"scope_schema_url": "https://example.test/scope",
+
+		"dropped_events_count": int64(0),
+		"dropped_links_count":  int64(0),
+
+		"schema_version": schema.Version,
 	}
-	for k, want := range checks {
-		if got := r[k]; got != want {
-			t.Errorf("%s = %v (%T), want %v (%T)", k, got, got, want, want)
+
+	got := rows[0]
+	for col, w := range want {
+		if g, ok := got[col]; !ok || !reflect.DeepEqual(g, w) {
+			t.Errorf("%s = %#v, want %#v", col, g, w)
 		}
 	}
-
-	// TIMESTAMP columns truncate to microseconds; the raw nanos live in the
-	// paired string column.
-	if got := r["start_timestamp"]; got != int64(1_700_000_000_123_456) {
-		t.Errorf("start_timestamp = %v, want microsecond truncation", got)
-	}
-	if got, want := r["span_attributes"], `{"http.status_code":{"int_value":"200"}}`; got != want {
-		t.Errorf("span_attributes = %v, want %v", got, want)
+	for col, g := range got {
+		if _, ok := want[col]; !ok {
+			t.Errorf("unexpected column %s = %#v", col, g)
+		}
 	}
 }
 
@@ -89,9 +135,27 @@ func TestSpanRow(t *testing.T) {
 func TestAbsentOptionalColumnsAreOmitted(t *testing.T) {
 	td, _ := newTraces()
 	rows, _ := SpanRows(td, testOpts())
-	for _, col := range []string{"parent_span_id", "trace_state", "status_message"} {
+	for _, col := range []string{"parent_span_id", "trace_state", "events", "links", "payload_refs"} {
 		if _, present := rows[0][col]; present {
 			t.Errorf("%s should be omitted when unset, so the column stays NULL", col)
+		}
+	}
+	if _, present := rows[0]["status"].(Row)["message"]; present {
+		t.Error("status.message should be omitted when unset, so the field stays NULL")
+	}
+
+	// A span with no resource attributes, scope or schema URLs.
+	bare := ptrace.NewTraces()
+	validSpan(bare.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty())
+	rows, _ = SpanRows(bare, testOpts())
+	for _, col := range []string{"service_name", "resource_schema_url", "scope_schema_url"} {
+		if _, present := rows[0][col]; present {
+			t.Errorf("%s should be omitted when unset, so the column stays NULL", col)
+		}
+	}
+	for _, fld := range []string{"name", "version"} {
+		if _, present := rows[0]["instrumentation_scope"].(Row)[fld]; present {
+			t.Errorf("instrumentation_scope.%s should be omitted when unset", fld)
 		}
 	}
 }
@@ -100,27 +164,270 @@ func TestSpanEventsAndLinks(t *testing.T) {
 	td, span := newTraces()
 	e := span.Events().AppendEmpty()
 	e.SetName("exception")
-	e.SetTimestamp(pcommon.Timestamp(1_700_000_000_500_000_000))
+	e.SetTimestamp(pcommon.Timestamp(1_700_000_000_500_000_123))
 	e.Attributes().PutStr("exception.type", "IOError")
+	e.SetDroppedAttributesCount(1)
 
 	l := span.Links().AppendEmpty()
 	l.SetTraceID(pcommon.TraceID{9})
 	l.SetSpanID(pcommon.SpanID{8})
+	l.SetFlags(1)
+	l.Attributes().PutBool("sampled", true)
 
 	rows, _ := SpanRows(td, testOpts())
 	events, ok := rows[0]["events"].([]Row)
 	if !ok || len(events) != 1 {
 		t.Fatalf("events = %#v, want one row", rows[0]["events"])
 	}
-	if events[0]["name"] != "exception" {
-		t.Errorf("event name = %v", events[0]["name"])
+	wantEvent := Row{
+		"time":                     int64(1_700_000_000_500_000),
+		"time_unix_nano":           int64(1_700_000_000_500_000_123),
+		"name":                     "exception",
+		"attributes":               `{"exception.type":"IOError"}`,
+		"attributes_schema":        `{"exception.type":"string"}`,
+		"dropped_attributes_count": int64(1),
 	}
-	if events[0]["time_unix_nano"] != "1700000000500000000" {
-		t.Errorf("event raw nanos = %v", events[0]["time_unix_nano"])
+	if !reflect.DeepEqual(events[0], wantEvent) {
+		t.Errorf("event = %#v, want %#v", events[0], wantEvent)
 	}
+
 	links, ok := rows[0]["links"].([]Row)
 	if !ok || len(links) != 1 {
 		t.Fatalf("links = %#v, want one row", rows[0]["links"])
+	}
+	// The unset trace_state is omitted, so the field stays NULL.
+	wantLink := Row{
+		"trace_id":                 "09000000000000000000000000000000",
+		"span_id":                  "0800000000000000",
+		"flags":                    int64(1),
+		"attributes":               `{"sampled":true}`,
+		"attributes_schema":        `{"sampled":"bool"}`,
+		"dropped_attributes_count": int64(0),
+	}
+	if !reflect.DeepEqual(links[0], wantLink) {
+		t.Errorf("link = %#v, want %#v", links[0], wantLink)
+	}
+}
+
+// OTLP lets an event omit its time. time_unix_nano keeps the zero as sent,
+// but the TIMESTAMP stays NULL rather than claiming the Unix epoch.
+func TestEventWithoutTimeHasNullTimestamp(t *testing.T) {
+	td, span := newTraces()
+	span.Events().AppendEmpty().SetName("untimed")
+	rows, rejects := SpanRows(td, testOpts())
+	if len(rejects) != 0 {
+		t.Fatalf("an untimed event must not reject its span: %+v", rejects)
+	}
+	ev := rows[0]["events"].([]Row)[0]
+	if _, present := ev["time"]; present {
+		t.Errorf("time = %v, want it omitted so the field stays NULL", ev["time"])
+	}
+	if got := ev["time_unix_nano"]; got != int64(0) {
+		t.Errorf("time_unix_nano = %#v, want the raw zero", got)
+	}
+}
+
+// kind and status.code keep the raw OTLP number. The name columns carry the
+// protobuf enum name, and stay NULL for a number outside the enum rather than
+// inventing one.
+func TestSpanKindAndStatusNames(t *testing.T) {
+	for kind, wantName := range map[ptrace.SpanKind]string{
+		ptrace.SpanKindUnspecified: "SPAN_KIND_UNSPECIFIED",
+		ptrace.SpanKindInternal:    "SPAN_KIND_INTERNAL",
+		ptrace.SpanKindServer:      "SPAN_KIND_SERVER",
+		ptrace.SpanKindClient:      "SPAN_KIND_CLIENT",
+		ptrace.SpanKindProducer:    "SPAN_KIND_PRODUCER",
+		ptrace.SpanKindConsumer:    "SPAN_KIND_CONSUMER",
+		ptrace.SpanKind(9):         "",
+	} {
+		td, span := newTraces()
+		span.SetKind(kind)
+		rows, _ := SpanRows(td, testOpts())
+		if got := rows[0]["kind"]; got != int64(kind) {
+			t.Errorf("kind %d: kind = %#v", kind, got)
+		}
+		if got := rows[0]["kind_name"]; (wantName == "" && got != nil) || (wantName != "" && got != wantName) {
+			t.Errorf("kind %d: kind_name = %#v, want %q (empty means NULL)", kind, got, wantName)
+		}
+	}
+
+	for code, wantName := range map[ptrace.StatusCode]string{
+		ptrace.StatusCodeUnset: "STATUS_CODE_UNSET",
+		ptrace.StatusCodeOk:    "STATUS_CODE_OK",
+		ptrace.StatusCodeError: "STATUS_CODE_ERROR",
+		ptrace.StatusCode(7):   "",
+	} {
+		td, span := newTraces()
+		span.Status().SetCode(code)
+		span.Status().SetMessage("upstream timed out")
+		rows, _ := SpanRows(td, testOpts())
+		status := rows[0]["status"].(Row)
+		if got := status["code"]; got != int64(code) {
+			t.Errorf("status %d: code = %#v", code, got)
+		}
+		if got := status["code_name"]; (wantName == "" && got != nil) || (wantName != "" && got != wantName) {
+			t.Errorf("status %d: code_name = %#v, want %q (empty means NULL)", code, got, wantName)
+		}
+		if got := status["message"]; got != "upstream timed out" {
+			t.Errorf("status %d: message = %#v", code, got)
+		}
+	}
+}
+
+// Every NOT NULL span column must be fillable with a value that means what
+// the column says. A span that cannot be is rejected before a row is built,
+// and only that span: the spans around it are still written.
+func TestSpanContractViolationsAreRejected(t *testing.T) {
+	tests := map[string]struct {
+		mutate    func(ptrace.Span)
+		reason    Reason
+		fieldPath string
+	}{
+		"empty trace id": {func(s ptrace.Span) { s.SetTraceID(pcommon.NewTraceIDEmpty()) }, ReasonInvalidID, "trace_id"},
+		"empty span id":  {func(s ptrace.Span) { s.SetSpanID(pcommon.NewSpanIDEmpty()) }, ReasonInvalidID, "span_id"},
+		"no start time":  {func(s ptrace.Span) { s.SetStartTimestamp(0) }, ReasonMissingTimestamp, "start_time"},
+		"no end time":    {func(s ptrace.Span) { s.SetEndTimestamp(0) }, ReasonMissingTimestamp, "end_time"},
+		"start time beyond int64": {
+			func(s ptrace.Span) { s.SetStartTimestamp(math.MaxInt64 + 1) },
+			ReasonTimestampOverflow, "start_time_unix_nano",
+		},
+		"end time beyond int64": {
+			func(s ptrace.Span) { s.SetEndTimestamp(math.MaxUint64) },
+			ReasonTimestampOverflow, "end_time_unix_nano",
+		},
+		"event time beyond int64": {
+			func(s ptrace.Span) { s.Events().AppendEmpty().SetTimestamp(math.MaxInt64 + 1) },
+			ReasonTimestampOverflow, "events.time_unix_nano",
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			td, bad := newTraces()
+			tc.mutate(bad)
+			validSpan(td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().AppendEmpty())
+
+			rows, rejects := SpanRows(td, testOpts())
+			if len(rows) != 1 {
+				t.Fatalf("kept %d rows, want only the valid neighbor", len(rows))
+			}
+			want := Rejection{Index: 0, Reason: tc.reason, FieldPath: tc.fieldPath}
+			if len(rejects) != 1 || rejects[0] != want {
+				t.Fatalf("rejections = %+v, want [%+v]", rejects, want)
+			}
+		})
+	}
+}
+
+// INT64 holds every OTLP timestamp up to math.MaxInt64 nanoseconds, in the
+// year 2262. Only values beyond that are rejected.
+func TestSpanTimestampsAtTheInt64LimitAreKept(t *testing.T) {
+	td, span := newTraces()
+	span.SetStartTimestamp(math.MaxInt64)
+	span.SetEndTimestamp(math.MaxInt64)
+	span.Events().AppendEmpty().SetTimestamp(math.MaxInt64)
+
+	rows, rejects := SpanRows(td, testOpts())
+	if len(rejects) != 0 || len(rows) != 1 {
+		t.Fatalf("rows=%d rejects=%+v, want the span kept", len(rows), rejects)
+	}
+	if got := rows[0]["end_time_unix_nano"]; got != int64(math.MaxInt64) {
+		t.Errorf("end_time_unix_nano = %#v, want math.MaxInt64", got)
+	}
+	if got := rows[0]["end_time"]; got != int64(math.MaxInt64/1000) {
+		t.Errorf("end_time = %#v, want math.MaxInt64 nanos in micros", got)
+	}
+	if got := rows[0]["events"].([]Row)[0]["time_unix_nano"]; got != int64(math.MaxInt64) {
+		t.Errorf("events.time_unix_nano = %#v, want math.MaxInt64", got)
+	}
+}
+
+// Clock skew between hosts can put a span's end before its start. The raw
+// times are kept as sent, but a negative duration means nothing, so
+// duration_nano clamps to zero.
+func TestNegativeSpanDurationClampsToZero(t *testing.T) {
+	td, span := newTraces()
+	span.SetStartTimestamp(pcommon.Timestamp(2_000_000_000))
+	span.SetEndTimestamp(pcommon.Timestamp(1_000_000_000))
+
+	rows, rejects := SpanRows(td, testOpts())
+	if len(rejects) != 0 {
+		t.Fatalf("clock skew must not reject the span: %+v", rejects)
+	}
+	if got := rows[0]["duration_nano"]; got != int64(0) {
+		t.Errorf("duration_nano = %#v, want 0", got)
+	}
+	if rows[0]["start_time_unix_nano"] != int64(2_000_000_000) || rows[0]["end_time_unix_nano"] != int64(1_000_000_000) {
+		t.Errorf("raw times were altered: start=%v end=%v",
+			rows[0]["start_time_unix_nano"], rows[0]["end_time_unix_nano"])
+	}
+}
+
+// BigQuery STRING columns must hold valid UTF-8, and nothing on the OTLP wire
+// guarantees it. Invalid sequences become U+FFFD instead of failing the row.
+func TestSpanStringsAreValidUTF8(t *testing.T) {
+	const bad = "a\xffb"
+	td, span := newTraces()
+	rs := td.ResourceSpans().At(0)
+	rs.SetSchemaUrl(bad)
+	rs.Resource().Attributes().PutStr("service.name", bad)
+	ss := rs.ScopeSpans().At(0)
+	ss.SetSchemaUrl(bad)
+	ss.Scope().SetName(bad)
+	ss.Scope().SetVersion(bad)
+	span.SetName(bad)
+	span.TraceState().FromRaw(bad)
+	span.Status().SetMessage(bad)
+	span.Attributes().PutStr(bad, bad)
+	span.Events().AppendEmpty().SetName(bad)
+	span.Links().AppendEmpty().TraceState().FromRaw(bad)
+
+	rows, rejects := SpanRows(td, testOpts())
+	if len(rejects) != 0 {
+		t.Fatalf("invalid UTF-8 must be repaired, not rejected: %+v", rejects)
+	}
+	if got, want := rows[0]["name"], "a\uFFFDb"; got != want {
+		t.Errorf("name = %q, want %q", got, want)
+	}
+	assertValidUTF8(t, "row", rows[0])
+}
+
+func assertValidUTF8(t *testing.T, path string, v any) {
+	t.Helper()
+	switch v := v.(type) {
+	case string:
+		if !utf8.ValidString(v) {
+			t.Errorf("%s = %q is not valid UTF-8", path, v)
+		}
+	case Row:
+		for k, fv := range v {
+			assertValidUTF8(t, path+"."+k, fv)
+		}
+	case []Row:
+		for i, r := range v {
+			assertValidUTF8(t, fmt.Sprintf("%s[%d]", path, i), r)
+		}
+	}
+}
+
+// Spans under one resource reuse its encoded attributes, but each row must
+// get its own STRUCT values, or a change to one row would leak into another.
+func TestSpansDoNotShareNestedRows(t *testing.T) {
+	td, _ := newTraces()
+	validSpan(td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().AppendEmpty())
+
+	rows, _ := SpanRows(td, testOpts())
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(rows))
+	}
+	for _, col := range []string{"resource", "instrumentation_scope"} {
+		first, second := rows[0][col].(Row), rows[1][col].(Row)
+		if !reflect.DeepEqual(first, second) {
+			t.Errorf("%s differs between two spans of one resource and scope", col)
+		}
+		first["attributes"] = "changed"
+		if second["attributes"] == "changed" {
+			t.Errorf("%s is a single map shared by two rows", col)
+		}
 	}
 }
 

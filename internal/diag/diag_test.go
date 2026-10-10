@@ -45,6 +45,24 @@ func TestSanitizeMultipleColumns(t *testing.T) {
 	}
 }
 
+// v0alpha2 nests fields in STRUCT columns, and a service message names one by
+// its dotted path. Each part must be recognized, or the diagnostic would lose
+// the location an operator needs.
+func TestSanitizeKeepsNestedFieldPaths(t *testing.T) {
+	for msg, want := range map[string]string{
+		"Invalid value for field status.code_name":                         "status,code_name",
+		"field resource.attributes_schema is not valid JSON":               "resource,attributes_schema",
+		"instrumentation_scope.version exceeds the maximum length":         "instrumentation_scope,version",
+		"events.time out of range in row":                                  "events,time",
+		"payload_refs.object_ref.uri is required":                          "payload_refs,object_ref,uri",
+		"bad start_time, end_time or receive_time_unix_nano duration_nano": "start_time,end_time,receive_time_unix_nano,duration_nano",
+	} {
+		if got := SanitizeFieldPath(msg); got != want {
+			t.Errorf("SanitizeFieldPath(%q) = %q, want %q", msg, got, want)
+		}
+	}
+}
+
 // An unrecognized message must degrade to "unknown" rather than passing
 // through. Allowlisting is what makes the guarantee hold by construction.
 func TestSanitizeUnknownMessage(t *testing.T) {

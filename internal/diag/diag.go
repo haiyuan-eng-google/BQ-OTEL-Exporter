@@ -95,6 +95,19 @@ var knownFieldTokens = map[string]bool{
 	"body": true, "log_attributes": true,
 	"source_record_namespace": true, "source_record_id": true,
 	"record_fingerprint": true, "attributes": true,
+
+	// v0alpha2 columns and nested STRUCT fields. A message names a nested
+	// field by its dotted path, which the separator split reduces to these
+	// parts.
+	"start_time": true, "end_time": true, "receive_time": true,
+	"receive_time_unix_nano": true, "duration_nano": true,
+	"kind_name": true, "status": true, "code": true, "code_name": true,
+	"message": true, "attributes_schema": true, "resource": true,
+	"instrumentation_scope": true, "version": true, "time": true,
+	"payload_refs": true, "attribute_path": true, "part_index": true,
+	"mime_type": true, "storage_mode": true, "byte_size": true,
+	"sha256": true, "object_ref": true, "uri": true, "authorizer": true,
+	"details": true, "log_name": true, "insert_id": true,
 }
 
 // SanitizeFieldPath reduces a service message to the recognized column names

@@ -30,61 +30,113 @@ func record(name string, m storagepb.TableFieldSchema_Mode, fields ...*storagepb
 	return &storagepb.TableFieldSchema{Name: name, Type: strc, Mode: m, Fields: fields}
 }
 
-// SpansTableSchema is the §7.1 span contract.
+// SpansTableSchema is the v0alpha2 span contract: 30 columns, grouped by
+// family in the same order as SpansDDL.
 func SpansTableSchema() *storagepb.TableSchema {
 	return &storagepb.TableSchema{Fields: []*storagepb.TableFieldSchema{
-		f("start_timestamp", ts, req),
-		f("start_time_unix_nano", str, req),
-		f("end_timestamp", ts, opt),
-		f("end_time_unix_nano", str, opt),
-		f("export_received_timestamp", ts, req),
-		f("duration_ns", i64, opt),
+		// Time family.
+		f("start_time", ts, req),
+		f("start_time_unix_nano", i64, req),
+		f("end_time", ts, req),
+		f("end_time_unix_nano", i64, req),
+		f("receive_time", ts, req),
+		f("receive_time_unix_nano", i64, req),
+		f("duration_nano", i64, req),
 
+		// Identity family.
 		f("trace_id", str, req),
 		f("span_id", str, req),
 		f("parent_span_id", str, opt),
 		f("trace_state", str, opt),
 		f("flags", i64, opt),
 
+		// Span payload family.
 		f("name", str, req),
-		f("kind", str, opt),
-		f("status_code", str, opt),
-		f("status_message", str, opt),
-
-		f("service_name", str, opt),
-		f("resource_attributes", jsn, opt),
-		f("resource_schema_url", str, opt),
-		f("resource_dropped_attributes_count", i64, opt),
-
-		f("scope_name", str, opt),
-		f("scope_version", str, opt),
-		f("scope_attributes", jsn, opt),
-		f("scope_schema_url", str, opt),
-		f("scope_dropped_attributes_count", i64, opt),
-
-		f("schema_version", str, req),
-
-		f("span_attributes", jsn, opt),
+		f("kind", i64, req),
+		f("kind_name", str, opt),
+		record("status", opt,
+			f("code", i64, opt),
+			f("code_name", str, opt),
+			f("message", str, opt),
+		),
+		f("attributes", jsn, opt),
+		f("attributes_schema", jsn, opt),
 		f("dropped_attributes_count", i64, opt),
-		f("dropped_events_count", i64, opt),
-		f("dropped_links_count", i64, opt),
 
+		// Resource and instrumentation scope family.
+		f("service_name", str, opt),
+		resourceRecord(),
+		f("resource_schema_url", str, opt),
+		scopeRecord(),
+		f("scope_schema_url", str, opt),
+
+		// Signal detail: inline events and links.
 		record("events", rep,
+			f("time", ts, opt),
+			f("time_unix_nano", i64, opt),
 			f("name", str, opt),
-			f("timestamp", ts, opt),
-			f("time_unix_nano", str, opt),
 			f("attributes", jsn, opt),
+			f("attributes_schema", jsn, opt),
 			f("dropped_attributes_count", i64, opt),
 		),
+		f("dropped_events_count", i64, opt),
 		record("links", rep,
 			f("trace_id", str, opt),
 			f("span_id", str, opt),
 			f("trace_state", str, opt),
 			f("flags", i64, opt),
 			f("attributes", jsn, opt),
+			f("attributes_schema", jsn, opt),
 			f("dropped_attributes_count", i64, opt),
 		),
+		f("dropped_links_count", i64, opt),
+
+		// Multimodal and oversized payload offloading.
+		payloadRefsRecord(),
+
+		// Contract metadata.
+		f("schema_version", str, req),
 	}}
+}
+
+// resourceRecord, scopeRecord and payloadRefsRecord build the column families
+// the span and log contracts share, so the two tables cannot drift apart on
+// them.
+func resourceRecord() *storagepb.TableFieldSchema {
+	return record("resource", opt,
+		f("attributes", jsn, opt),
+		f("attributes_schema", jsn, opt),
+		f("dropped_attributes_count", i64, opt),
+	)
+}
+
+func scopeRecord() *storagepb.TableFieldSchema {
+	return record("instrumentation_scope", opt,
+		f("name", str, opt),
+		f("version", str, opt),
+		f("attributes", jsn, opt),
+		f("attributes_schema", jsn, opt),
+		f("dropped_attributes_count", i64, opt),
+	)
+}
+
+// payloadRefsRecord describes payloads moved out of the row. object_ref has
+// the shape of a BigQuery ObjectRef value (uri, version, authorizer, details).
+func payloadRefsRecord() *storagepb.TableFieldSchema {
+	return record("payload_refs", rep,
+		f("attribute_path", str, opt),
+		f("part_index", i64, opt),
+		f("mime_type", str, opt),
+		f("storage_mode", str, opt),
+		f("byte_size", i64, opt),
+		f("sha256", str, opt),
+		record("object_ref", opt,
+			f("uri", str, opt),
+			f("version", str, opt),
+			f("authorizer", str, opt),
+			f("details", jsn, opt),
+		),
+	)
 }
 
 // LogsTableSchema is the §7.2 log contract.

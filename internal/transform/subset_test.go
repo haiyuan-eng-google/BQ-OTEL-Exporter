@@ -20,7 +20,7 @@ func multiResourceTraces() ptrace.Traces {
 		ss := rs.ScopeSpans().AppendEmpty()
 		ss.Scope().SetName([]string{"scope-a", "scope-b"}[r])
 		for s := 0; s < 2; s++ {
-			ss.Spans().AppendEmpty().SetName([]string{"s0", "s1", "s2", "s3"}[r*2+s])
+			validSpan(ss.Spans().AppendEmpty()).SetName([]string{"s0", "s1", "s2", "s3"}[r*2+s])
 		}
 	}
 	return td

@@ -81,11 +81,17 @@ const (
 	ReasonSerialization  Reason = "serialization"
 	ReasonRowBytes       Reason = "row_bytes"
 	ReasonRowError       Reason = "row_error"
+
+	// Contract violations. A record that cannot fill a NOT NULL column, or
+	// whose value does not fit the column type, has no valid row at all.
+	ReasonInvalidID         Reason = "invalid_id"
+	ReasonMissingTimestamp  Reason = "missing_timestamp"
+	ReasonTimestampOverflow Reason = "timestamp_overflow"
 )
 
-// Violation describes a structural limit breach.
+// Violation describes a structural limit breach or a contract violation.
 //
-// FieldPath is a sanitized location such as "span_attributes" or
+// FieldPath is a sanitized location such as "attributes" or
 // "events[3].attributes" — the shape of the path only. It never carries an
 // attribute key or value, because FR13 prohibits telemetry content in logs and
 // diagnostics flow into logs.
@@ -93,12 +99,16 @@ type Violation struct {
 	Reason    Reason
 	FieldPath string
 	// Limit and Actual are counts or byte sizes, which are metadata rather
-	// than content and are safe to log.
+	// than content and are safe to log. Both are zero for a contract
+	// violation, which breaches no configured limit.
 	Limit  int
 	Actual int
 }
 
 func (v Violation) Error() string {
+	if v.Limit == 0 && v.Actual == 0 {
+		return fmt.Sprintf("%s: %s", v.Reason, v.FieldPath)
+	}
 	return fmt.Sprintf("%s: %s exceeds limit (%d > %d)", v.Reason, v.FieldPath, v.Actual, v.Limit)
 }
 

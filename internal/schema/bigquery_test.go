@@ -4,6 +4,8 @@
 package schema
 
 import (
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -64,6 +66,69 @@ func TestBigQuerySchemaRoundTripPreservesCanonicalContracts(t *testing.T) {
 				t.Fatalf("schema changed across conversion\ngot:  %v\nwant: %v", got, tc.in)
 			}
 		})
+	}
+}
+
+// DestinationMetadata is what auto-create applies, so the partitioning,
+// clustering and view it returns are the physical layout of every table the
+// exporter creates.
+func TestDestinationMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		in            *storagepb.TableSchema
+		partitionType bq.TimePartitioningType
+		partition     string
+		cluster       []string
+		viewQuery     string
+	}{
+		{
+			name:          "spans",
+			in:            SpansTableSchema(),
+			partitionType: bq.HourPartitioningType,
+			partition:     "start_time",
+			cluster:       []string{"service_name", "trace_id", "name"},
+			viewQuery:     SpansDedupViewQuery,
+		},
+		{
+			name:      "logs",
+			in:        LogsTableSchema(),
+			partition: "timestamp",
+			viewQuery: LogsDedupViewQuery,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			md, view, err := DestinationMetadata(tc.in, "proj", "ds", "tbl")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tp := md.TimePartitioning; tp == nil || tp.Type != tc.partitionType || tp.Field != tc.partition {
+				t.Errorf("partitioning = %+v, want type %q on %q", tp, tc.partitionType, tc.partition)
+			}
+			var cluster []string
+			if md.Clustering != nil {
+				cluster = md.Clustering.Fields
+			}
+			if !slices.Equal(cluster, tc.cluster) {
+				t.Errorf("clustering = %v, want %v", cluster, tc.cluster)
+			}
+			wantSchema, err := ToBigQuery(tc.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertBigQuerySchemaEqual(t, md.Schema, wantSchema)
+			if want := fmt.Sprintf(tc.viewQuery, "proj", "ds", "tbl"); view != want {
+				t.Errorf("view query = %q, want %q", view, want)
+			}
+			if !strings.Contains(view, "`proj.ds.tbl`") {
+				t.Errorf("view query %q does not reference the base table", view)
+			}
+		})
+	}
+
+	if _, _, err := DestinationMetadata(&storagepb.TableSchema{Fields: []*storagepb.TableFieldSchema{
+		f("not_a_contract", str, opt),
+	}}, "proj", "ds", "tbl"); err == nil {
+		t.Error("a schema that is not a canonical contract must be rejected")
 	}
 }
 

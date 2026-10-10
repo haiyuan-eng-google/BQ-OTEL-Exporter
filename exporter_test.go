@@ -245,6 +245,38 @@ func TestPushTracesDropsStructurallyInvalidRecords(t *testing.T) {
 	}
 }
 
+// Spans that cannot fill the table's required columns (an empty trace ID, a
+// missing end time) are dropped and counted before the append. Like limit
+// breaches they are permanent, so they are never handed back for retry, and
+// the spans around them must still be delivered.
+func TestPushTracesDropsSpansViolatingTheContract(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+
+	e, app := newTestTracesExporter(t, bqi.AppendOutcome{AcknowledgedRows: 2})
+	tel, err := metadata.NewTelemetry(provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.tel = tel
+
+	td := newTestTraces(4)
+	spans := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+	spans.At(1).SetTraceID(pcommon.NewTraceIDEmpty())
+	spans.At(2).SetEndTimestamp(0)
+
+	if err := e.pushTraceData(context.Background(), td); err != nil {
+		t.Fatalf("surviving spans should still be delivered, got %v", err)
+	}
+	if app.gotRows != 2 {
+		t.Fatalf("appended %d rows, want the 2 spans that satisfy the contract", app.gotRows)
+	}
+	if got := metricInt64Sum(t, reader, "otelcol_exporter_bigquery_rejected_rows"); got != 2 {
+		t.Fatalf("rejected metric = %d, want the 2 contract violations", got)
+	}
+}
+
 // An empty batch must not reach the service at all.
 func TestPushTracesEmptyBatch(t *testing.T) {
 	e, app := newTestTracesExporter(t, bqi.AppendOutcome{})
