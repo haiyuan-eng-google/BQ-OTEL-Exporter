@@ -177,17 +177,20 @@ as log events rather than span attributes.
 | `location`                      | —                     | Dataset location. Required only when creating a dataset. |
 | `traces.table`                  | `otel_spans`          | Destination table for OTLP spans. |
 | `logs.table`                    | `otel_logs`           | Destination table for OTLP log records. |
-| `logs.source_record_namespace`  | —                     | Trusted namespace for `source_record_id`. Deployment-controlled, never taken from a payload attribute. |
-| `logs.source_record_id_attribute` | —                   | Log attribute carrying a stable source record ID. Only honored alongside a namespace. |
+| `logs.log_name_attribute`       | —                     | Optional log attribute carrying `log_name` before falling back to `gcp.log_name`, `logging.googleapis.com/logName`, `log.iostream`, `service_name`, and `"default"`. |
+| `logs.insert_id_attribute`      | —                     | Optional log attribute carrying `insert_id` before falling back to `logging.googleapis.com/insertId`, `gcp.insert.id`, `gcp.insert_id`, `log.record.uid`, and `record_fingerprint`. |
+| `quarantine.enabled`            | `false`               | Route permanently rejected spans and log records to the dead-letter table (`otel_quarantine`) instead of dropping them only in metrics. |
+| `quarantine.table`              | `otel_quarantine`     | Destination table for quarantined records when `quarantine.enabled` is `true`. |
 | `credentials.file`              | ADC                   | Path to a service account key file. |
 | `credentials.impersonate_service_account` | —           | Target principal for impersonation, using ambient credentials as the source. |
 | `endpoint.url`                  | —                     | Alternate Storage Write API endpoint. Emulator and development only. |
 | `endpoint.insecure`             | `false`               | Disables TLS. Refused unless the endpoint is loopback. |
 | `endpoint.without_authentication` | `false`             | Sends no credentials. Refused unless the endpoint is loopback. |
 | `auto_create.dataset`           | `false`               | Create the dataset if absent. Requires `location`. |
-| `auto_create.tables`            | `false`               | Create the active signal's destination table and create-only `_dedup` view if absent. Existing views are never replaced. |
+| `auto_create.tables`            | `false`               | Create the active signal's destination table (plus `quarantine.table` when enabled) and create-only `_dedup` view if absent. Existing views are never replaced. |
+| `auto_create.companion_views`   | `false`               | Create the create-only companion views (`otel_spans_as_allspans`, `v_gen_ai_spans`, `v_gen_ai_logs`) if absent. Requires `auto_create.tables`. |
 | `write.max_request_bytes`       | `8388608` (8 MiB)     | Our request-size headroom threshold, enforced after protobuf serialization and before `AppendRows`. Distinct from, and below, the API's own per-request limit. |
-| `write.max_row_bytes`           | `1048576` (1 MiB)     | Rejects individual serialized rows above this size. |
+| `write.max_row_bytes`           | `1048576` (1 MiB)     | Rejects individual serialized signal rows above this size and bounds quarantine rows by truncating `raw_payload`. |
 | `write.max_inflight_requests`   | `8`                   | Bounds asynchronous in-flight appends. |
 | `write.max_inflight_bytes`      | `67108864` (64 MiB)   | Bounds memory held by in-flight appends. |
 | `limits.*`                      | see below             | Structural bounds applied before serialization. |
@@ -198,8 +201,9 @@ as log events rather than span attributes.
 ### Structural limits
 
 Applied before serialization, these stop pathological payloads from becoming
-unqueryable rows or consuming unbounded memory. A breach drops only the
-offending record, counted under `rejected_rows{reason}`.
+unqueryable rows or consuming unbounded memory. A breach rejects only the
+offending record, counted under `rejected_rows{reason}` and optionally written
+to `otel_quarantine` when `quarantine.enabled` is `true`.
 
 | Option                      | Default  |
 | --------------------------- | -------- |
@@ -218,14 +222,58 @@ An authoritative `NotFound` fails startup with the corresponding
 `auto_create` setting named in the error; other metadata-read failures warn and
 defer the authorization verdict to the real append.
 
-### Promoted attributes — not in v1
+## Schema contract (`v0alpha2`)
 
-Lifting named attributes into their own top-level columns is a **proposed
-amendment**, not part of this contract. It is not implemented and not
-configurable here. When it lands, promoted columns will be nullable, additive,
-and excluded from the record fingerprint, so a fleet running heterogeneous
-promotion configs still produces identical fingerprints for the same logical
-record.
+The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
+[`internal/schema`](internal/schema/schema.go)) aligns with Cloud Trace
+`_AllSpans`, Cloud Logging `_AllLogs`, OpenTelemetry GenAI semantic conventions,
+and Google ADK / Vertex Agent Analytics:
+
+- **Plain JSON attributes with `attributes_schema` sidecar.** `attributes`,
+  `resource.attributes`, `instrumentation_scope.attributes`,
+  `events.attributes`, `links.attributes`, and `otel_logs.body` are stored as
+  plain JSON (`{"gen_ai.system":"gemini","http.status_code":"200"}`) so queries
+  can use direct `JSON_VALUE(attributes, '$."gen_ai.system"')` and `LAX_INT64`
+  expressions. Every attribute bag is paired with an `attributes_schema` JSON
+  column (`{"gen_ai.system":"string","http.status_code":"int64"}`) that
+  preserves original OTLP leaf types (`"string"`, `"bool"`, `"int64"`,
+  `"double"`, `"bytes"`, `"empty"`, with arrays and maps represented
+  structurally), and all 64-bit integers are serialized as decimal JSON
+  strings so values outside IEEE-754 safe range ($|n| > 2^{53}-1$) never lose
+  precision.
+- **Multimodal `payload_refs` (`ObjectRef`).** Both `otel_spans` and `otel_logs`
+  include `payload_refs ARRAY<STRUCT<attribute_path STRING, part_index INT64, mime_type STRING, storage_mode STRING, byte_size INT64, sha256 STRING, object_ref STRUCT<uri STRING, version STRING, authorizer STRING, details JSON>>>`
+  so offloaded prompts, completions, and multimodal blobs can be referenced via
+  BigQuery `ObjectRef` functions (`OBJ.FETCH_METADATA`, `OBJ.GET_ACCESS_URL`).
+- **Cloud Logging identity columns on `otel_logs`.** Each log row carries
+  `log_name STRING NOT NULL`, `insert_id STRING NOT NULL`, and
+  `record_fingerprint STRING` (`fp1:<sha256_hex>`).
+- **Companion views (`auto_create.companion_views`).**
+  - `otel_spans_as_allspans`: projects `otel_spans_dedup` into the 25-column
+    Cloud Trace `_AllSpans` layout (`status` narrowed to `STRUCT<code INT64, message STRING>`).
+  - `v_gen_ai_spans`: filters `otel_spans_dedup` to GenAI/agent spans and
+    promotes `gen_ai.*` and `gcp.vertex.agent.*` attributes (`gen_ai_operation_name`,
+    `gen_ai_system`, `gen_ai_request_model`, `gen_ai_response_model`,
+    `gen_ai_agent_name`, `gen_ai_agent_id`, `gen_ai_conversation_id`,
+    `gen_ai_usage_input_tokens`, `gen_ai_usage_output_tokens`,
+    `gen_ai_request_temperature`, `gen_ai_response_finish_reason`,
+    `gen_ai_tool_name`, `gen_ai_tool_call_id`, `adk_event_id`,
+    `adk_session_id`, `adk_invocation_id`, `adk_user_id`) into top-level columns.
+  - `v_gen_ai_logs`: filters `otel_logs_dedup` to GenAI/agent log events and
+    joins `otel_spans_dedup` on `(service_name, trace_id, span_id)` to promote
+    `gen_ai.*` and `gcp.vertex.agent.*` correlation columns.
+- **Opt-in quarantine dead-letter table (`otel_quarantine`).** When
+  `quarantine.enabled` is `true`, spans and log records that fail validation,
+  breach structural limits, exceed `write.max_row_bytes`, or are rejected per-row
+  by BigQuery are routed to `otel_quarantine` (partitioned by `DATE(ingest_time)`
+  with 30-day partition expiration and clustered by `(signal, error_code, service_name)`).
+- **Migrating from earlier pre-alpha tables.** `v0alpha2` replaces typed OTLP
+  protojson attribute wrappers with plain JSON plus `attributes_schema`,
+  replaces the earlier two-field log record identity settings with
+  `logs.log_name_attribute` and `logs.insert_id_attribute` (`log_name`,
+  `insert_id`, `record_fingerprint`), and adds `payload_refs`, companion views,
+  and `otel_quarantine`. Recreate pre-alpha tables and `_dedup` views using the
+  DDL in [`internal/schema`](internal/schema/schema.go).
 
 ## Delivery semantics
 
@@ -242,19 +290,22 @@ default quotas and materially more server-side orchestration.
 Every row carries a deterministic identity so duplicates can be collapsed at
 read time:
 
-- **Spans**: `(trace_id, span_id)`.
-- **Logs**: the typed tuple `(source_record_namespace, source_record_id)` when a
-  producer supplies one, otherwise a content fingerprint.
+- **Spans**: `(start_time, start_time_unix_nano, service_name, trace_id, span_id)`.
+- **Logs**: `(timestamp, time_unix_nano, service_name, log_name, insert_id)`,
+  where `insert_id` resolves from `logs.insert_id_attribute` or well-known
+  insert ID attributes (`logging.googleapis.com/insertId`, `gcp.insert.id`,
+  `gcp.insert_id`, `log.record.uid`) and falls back to `record_fingerprint`.
 
 The repo ships `otel_spans_dedup` and `otel_logs_dedup` **logical views** so the
 default object an analyst touches is already deduplicated. See
 [`internal/schema`](internal/schema/schema.go).
 
-> **Known limit, stated rather than hidden:** for logs without a trusted
-> `(source_record_namespace, source_record_id)` tuple, deduplication is
-> content-equivalence rather than identity. Two genuinely distinct but
-> byte-identical log records collapse into one. This is inherent to
-> fingerprinting.
+> **Known limit, stated rather than hidden:** for logs without an explicit
+> upstream `insert_id` attribute, `insert_id` falls back to `record_fingerprint`,
+> which includes an `intra_batch_ordinal` so identical records within the same
+> batch remain distinct while retries of the batch reproduce the same
+> fingerprints. Identical log records sent without an upstream `insert_id` in
+> separate batches at the exact same nanosecond timestamp collapse into one.
 
 ### Stream recovery and diagnostics
 
@@ -372,18 +423,15 @@ authorization result.
   *both* a metric and an event. Since this exporter ingests events, "no metrics
   support" does **not** mean "no token data".
 - **Exactly-once.** See delivery semantics above.
-- **Dead-letter queue.** Permanently invalid rows are counted and dropped, not
-  quarantined. There is no payload to replay and no second retention, IAM or
-  security surface.
 - **Aggregation, sampling or rollups.** Use the Collector's processors.
 
 ## Milestones
 
 | Milestone | Contents |
 | --------- | -------- |
-| **M1** | Write path on the Storage Write API default stream; `v0alpha1` schema for traces and logs; request sizing and the error matrix. **Code complete; throughput not yet validated.** |
+| **M1** | Write path on the Storage Write API default stream; `v0alpha2` schema for traces, logs, companion views, and opt-in `otel_quarantine`; request sizing and the error matrix. **Code complete; throughput not yet validated.** |
 | **M2** | Provisional performance envelope; dedup views exercised; crash-replay and in-process subset-retry tests; delivery-critical telemetry proven under fault injection. |
-| **M3** | Optional `auto_create` plus startup validation are implemented; security guide and formal performance/cost evidence remain. |
+| **M3** | Optional `auto_create` (including `companion_views` and `quarantine`) plus startup validation are implemented; security guide and formal performance/cost evidence remain. |
 
 ## Contributing
 

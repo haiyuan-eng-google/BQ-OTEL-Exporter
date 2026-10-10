@@ -59,6 +59,16 @@ type Options struct {
 	// rows are fitted to it, by truncating raw_payload; a signal row over it
 	// is rejected by the caller. Zero or less means no cap.
 	MaxRowBytes int
+	// PayloadOffloader optionally offloads large attributes, events, links,
+	// or log bodies before row construction and returns the payload_refs
+	// metadata to record on the row. When nil, payloads stay inline and
+	// payload_refs stays NULL.
+	PayloadOffloader PayloadOffloader
+	// QuarantinePayloadOffloader optionally offloads the serialized OTLP JSON
+	// of a quarantined record to object storage and returns an ObjectRef for
+	// the payload_ref column. When nil or when it returns a zero ObjectRef,
+	// raw_payload is written inline and payload_ref stays NULL.
+	QuarantinePayloadOffloader func(signal string, payload []byte) ObjectRef
 	// Now supplies the exporter receive time stamped on every row.
 	// Injectable so tests are deterministic.
 	Now func() time.Time
@@ -69,6 +79,114 @@ func (o Options) now() time.Time {
 		return o.Now()
 	}
 	return time.Now()
+}
+
+// PayloadOffloader inspects or mutates a span or log record before inline JSON
+// encoding and returns the payload_refs entries describing any values moved to
+// object storage.
+type PayloadOffloader interface {
+	OffloadSpan(span ptrace.Span, resource pcommon.Resource, scope pcommon.InstrumentationScope) []PayloadRef
+	OffloadLog(lr plog.LogRecord, resource pcommon.Resource, scope pcommon.InstrumentationScope) []PayloadRef
+}
+
+// ObjectRef is the Go representation of the BigQuery ObjectRef STRUCT
+// (`STRUCT<uri STRING, version STRING, authorizer STRING, details JSON>`),
+// compatible with BigQuery ObjectRef functions (`OBJ.FETCH_METADATA`,
+// `OBJ.GET_ACCESS_URL`).
+type ObjectRef struct {
+	// URI is the cloud storage URI (for example, "gs://bucket/path/to/object").
+	// Required for a valid ObjectRef.
+	URI string
+	// Version is the optional object generation or version identifier.
+	Version string
+	// Authorizer is the optional BigQuery connection resource name used to
+	// authorize access to the object.
+	Authorizer string
+	// Details is optional JSON metadata about the object (for example,
+	// `{"gcs_metadata":{"content_type":"application/json"}}`).
+	Details string
+}
+
+// ToRow converts r into a transform.Row matching schema.ObjectRefFields().
+// An ObjectRef with an empty URI returns nil so the enclosing column stays NULL.
+func (r ObjectRef) ToRow() Row {
+	uri := sanitize(r.URI)
+	if uri == "" {
+		return nil
+	}
+	row := Row{"uri": uri}
+	putStrIfSet(row, "version", sanitize(r.Version))
+	putStrIfSet(row, "authorizer", sanitize(r.Authorizer))
+	putStrIfSet(row, "details", sanitize(r.Details))
+	return row
+}
+
+// PayloadRef describes a single offloaded value in the REPEATED
+// `payload_refs` column of `otel_spans` and `otel_logs`.
+type PayloadRef struct {
+	// AttributePath is the path of the offloaded field within the record
+	// (for example, "attributes.gen_ai.prompt" or "body").
+	AttributePath string
+	// PartIndex is the 0-based part index within a multipart payload.
+	// Negative values are omitted.
+	PartIndex int64
+	// MIMEType is the MIME type of the offloaded payload (for example,
+	// "application/json" or "text/plain").
+	MIMEType string
+	// StorageMode describes how the offloaded payload is stored (for example,
+	// "gcs_object_ref").
+	StorageMode string
+	// ByteSize is the uncompressed byte length of the offloaded payload.
+	// Negative values are omitted.
+	ByteSize int64
+	// SHA256 is the lowercase hex SHA-256 digest of the offloaded payload.
+	SHA256 string
+	// ObjectRef points to the offloaded object in cloud storage.
+	ObjectRef ObjectRef
+}
+
+// ToRow converts p into a transform.Row matching payloadRefsRecord() in
+// internal/schema/tableschema.go. If AttributePath is empty or ObjectRef has
+// no URI, ToRow returns nil so incomplete references are never written.
+func (p PayloadRef) ToRow() Row {
+	attrPath := sanitize(p.AttributePath)
+	objRow := p.ObjectRef.ToRow()
+	if attrPath == "" || objRow == nil {
+		return nil
+	}
+	row := Row{
+		"attribute_path": attrPath,
+		"object_ref":     objRow,
+	}
+	if p.PartIndex >= 0 {
+		row["part_index"] = p.PartIndex
+	}
+	putStrIfSet(row, "mime_type", sanitize(p.MIMEType))
+	putStrIfSet(row, "storage_mode", sanitize(p.StorageMode))
+	if p.ByteSize >= 0 {
+		row["byte_size"] = p.ByteSize
+	}
+	putStrIfSet(row, "sha256", sanitize(p.SHA256))
+	return row
+}
+
+// PayloadRefsToRows converts a slice of PayloadRef values into a slice of
+// transform.Row values, skipping any entries whose ToRow() is nil. Returns nil
+// when no valid entries remain so the `payload_refs` column stays NULL.
+func PayloadRefsToRows(refs []PayloadRef) []Row {
+	if len(refs) == 0 {
+		return nil
+	}
+	out := make([]Row, 0, len(refs))
+	for _, ref := range refs {
+		if row := ref.ToRow(); row != nil {
+			out = append(out, row)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 const (
@@ -115,7 +233,11 @@ func SpanRows(td ptrace.Traces, opts Options) ([]Row, []Rejection) {
 					rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
 					continue
 				}
-				rows = append(rows, spanRow(span, rs.SchemaUrl(), ss.SchemaUrl(), res, sc, svc, received))
+				var refs []PayloadRef
+				if opts.PayloadOffloader != nil {
+					refs = opts.PayloadOffloader.OffloadSpan(span, resource, scope)
+				}
+				rows = append(rows, spanRow(span, rs.SchemaUrl(), ss.SchemaUrl(), res, sc, svc, received, refs))
 			}
 		}
 	}
@@ -230,6 +352,7 @@ func spanRow(
 	scope encodedScope,
 	svc string,
 	received time.Time,
+	refs []PayloadRef,
 ) Row {
 	// validateSpan has already guaranteed both timestamps are set and fit
 	// INT64, so these conversions are exact.
@@ -309,7 +432,9 @@ func spanRow(
 		r["links"] = links
 	}
 
-	// payload_refs stays NULL: every payload is currently written inline.
+	if refRows := PayloadRefsToRows(refs); len(refRows) > 0 {
+		r["payload_refs"] = refRows
+	}
 	return r
 }
 
@@ -405,10 +530,14 @@ func LogRows(ld plog.Logs, opts Options) ([]Row, []Rejection) {
 					rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
 					continue
 				}
+				var refs []PayloadRef
+				if opts.PayloadOffloader != nil {
+					refs = opts.PayloadOffloader.OffloadLog(lr, resource, scope)
+				}
 				// Only kept records consume an intra_batch_ordinal. A rejected
 				// record is rejected again on every retry, so the ordinals of
 				// the others still repeat.
-				rows = append(rows, logRow(lr, origin, fingerprints, received, opts))
+				rows = append(rows, logRow(lr, origin, fingerprints, received, opts, refs))
 			}
 		}
 	}
@@ -464,6 +593,7 @@ func logRow(
 	fingerprints fingerprinter,
 	received time.Time,
 	opts Options,
+	refs []PayloadRef,
 ) Row {
 	// The partition key falls back through event time, observed time, then
 	// receive time. OTLP permits both record times to be zero, and a row with
@@ -526,7 +656,9 @@ func logRow(
 	putStrIfSet(r, "resource_schema_url", sanitize(origin.resSchemaURL))
 	putStrIfSet(r, "scope_schema_url", sanitize(origin.scopeSchemaURL))
 
-	// payload_refs stays NULL: every payload is currently written inline.
+	if refRows := PayloadRefsToRows(refs); len(refRows) > 0 {
+		r["payload_refs"] = refRows
+	}
 	return r
 }
 
@@ -770,16 +902,24 @@ func (q quarantinedRecord) row(e QuarantineEntry, ingest int64, opts Options) Ro
 		}
 	}
 	if q.payload != nil {
-		payload := sanitize(string(q.payload))
-		if len(payload) > budget {
-			kept := truncateUTF8(payload, max(budget, 0))
-			message += fmt.Sprintf(" (raw_payload truncated to %d of %d bytes)", len(kept), len(payload))
-			payload = kept
-			budget = 0
-		} else {
-			budget -= len(payload)
+		var offloaded Row
+		if opts.QuarantinePayloadOffloader != nil {
+			offloaded = opts.QuarantinePayloadOffloader(q.signal, q.payload).ToRow()
 		}
-		putStrIfSet(r, "raw_payload", payload)
+		if offloaded != nil {
+			r["payload_ref"] = offloaded
+		} else {
+			payload := sanitize(string(q.payload))
+			if len(payload) > budget {
+				kept := truncateUTF8(payload, max(budget, 0))
+				message += fmt.Sprintf(" (raw_payload truncated to %d of %d bytes)", len(kept), len(payload))
+				payload = kept
+				budget = 0
+			} else {
+				budget -= len(payload)
+			}
+			putStrIfSet(r, "raw_payload", payload)
+		}
 	}
 	// Attributes that breach a structural limit are left to raw_payload: the
 	// limits exist because such values make unqueryable JSON.

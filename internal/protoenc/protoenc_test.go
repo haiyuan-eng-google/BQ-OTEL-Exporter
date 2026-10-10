@@ -726,3 +726,116 @@ func TestEncodeQuarantineRow(t *testing.T) {
 		}
 	}
 }
+
+type stubOffloader struct {
+	refs []transform.PayloadRef
+}
+
+func (s stubOffloader) OffloadSpan(_ ptrace.Span, _ pcommon.Resource, _ pcommon.InstrumentationScope) []transform.PayloadRef {
+	return s.refs
+}
+
+func (s stubOffloader) OffloadLog(_ plog.LogRecord, _ pcommon.Resource, _ pcommon.InstrumentationScope) []transform.PayloadRef {
+	return s.refs
+}
+
+func TestEncodeSpanAndLogRowsWithPayloadRefs(t *testing.T) {
+	ref := transform.PayloadRef{
+		AttributePath: "attributes.gen_ai.prompt",
+		PartIndex:     0,
+		MIMEType:      "application/json",
+		StorageMode:   "gcs_object_ref",
+		ByteSize:      16384,
+		SHA256:        strings.Repeat("c", 64),
+		ObjectRef: transform.ObjectRef{
+			URI:        "gs://bucket/offload/prompt-1.json",
+			Version:    "101",
+			Authorizer: "projects/my-proj/locations/us/connections/gcs",
+			Details:    `{"gcs_metadata":{"content_type":"application/json"}}`,
+		},
+	}
+	o := opts()
+	o.PayloadOffloader = stubOffloader{refs: []transform.PayloadRef{ref}}
+
+	td := ptrace.NewTraces()
+	span := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	span.SetTraceID(pcommon.TraceID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
+	span.SetSpanID(pcommon.SpanID{1, 2, 3, 4, 5, 6, 7, 8})
+	span.SetName("chat")
+	span.SetStartTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+	span.SetEndTimestamp(pcommon.Timestamp(1_700_000_001_000_000_000))
+
+	spanRows, rejects := transform.SpanRows(td, o)
+	if len(rejects) != 0 || len(spanRows) != 1 {
+		t.Fatalf("SpanRows = (%d, %v), want (1, nil)", len(spanRows), rejects)
+	}
+	spanEnc, err := New(schema.SpansTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, err := spanEnc.Encode(spanRows[0])
+	if err != nil {
+		t.Fatalf("spanEnc.Encode: %v", err)
+	}
+	spanNorm := decodeNormalized(t, spanEnc, sb)
+	spanRefList := spanNorm.Get(spanNorm.Descriptor().Fields().ByName("payload_refs")).List()
+	if spanRefList.Len() != 1 {
+		t.Fatalf("span payload_refs len = %d, want 1", spanRefList.Len())
+	}
+	spanRefMsg := spanRefList.Get(0).Message()
+	if got := get(t, spanRefMsg, "attribute_path").String(); got != "attributes.gen_ai.prompt" {
+		t.Errorf("span payload_refs[0].attribute_path = %q", got)
+	}
+	if got := get(t, spanRefMsg, "object_ref.uri").String(); got != "gs://bucket/offload/prompt-1.json" {
+		t.Errorf("span payload_refs[0].object_ref.uri = %q", got)
+	}
+	if got := get(t, spanRefMsg, "byte_size").Int(); got != 16384 {
+		t.Errorf("span payload_refs[0].byte_size = %d, want 16384", got)
+	}
+
+	ld := plog.NewLogs()
+	lr := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+	lr.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+	lr.Body().SetStr("ok")
+	logRows, logRejects := transform.LogRows(ld, o)
+	if len(logRejects) != 0 || len(logRows) != 1 {
+		t.Fatalf("LogRows = (%d, %v), want (1, nil)", len(logRows), logRejects)
+	}
+	logEnc, err := New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lb, err := logEnc.Encode(logRows[0])
+	if err != nil {
+		t.Fatalf("logEnc.Encode: %v", err)
+	}
+	logNorm := decodeNormalized(t, logEnc, lb)
+	logRefList := logNorm.Get(logNorm.Descriptor().Fields().ByName("payload_refs")).List()
+	if logRefList.Len() != 1 {
+		t.Fatalf("log payload_refs len = %d, want 1", logRefList.Len())
+	}
+	if got := get(t, logRefList.Get(0).Message(), "object_ref.authorizer").String(); got != "projects/my-proj/locations/us/connections/gcs" {
+		t.Errorf("log payload_refs[0].object_ref.authorizer = %q", got)
+	}
+
+	qo := opts()
+	qo.QuarantinePayloadOffloader = func(_ string, _ []byte) transform.ObjectRef {
+		return ref.ObjectRef
+	}
+	qRows := transform.SpanQuarantineRows(td, []transform.QuarantineEntry{{Rejection: transform.Rejection{Index: 0, Reason: transform.ReasonRowBytes, Limit: 10, Actual: 20}}}, qo)
+	qEnc, err := New(schema.QuarantineTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	qb, err := qEnc.Encode(qRows[0])
+	if err != nil {
+		t.Fatalf("qEnc.Encode: %v", err)
+	}
+	qNorm := decodeNormalized(t, qEnc, qb)
+	if has(t, qNorm, "raw_payload") {
+		t.Errorf("quarantine raw_payload is set when offloaded, want NULL")
+	}
+	if got := get(t, qNorm, "payload_ref.uri").String(); got != "gs://bucket/offload/prompt-1.json" {
+		t.Errorf("quarantine payload_ref.uri = %q", got)
+	}
+}

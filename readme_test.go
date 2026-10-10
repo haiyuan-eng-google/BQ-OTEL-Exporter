@@ -61,3 +61,40 @@ func TestReadmeQuotesStartupErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestReadmeReflectsV0Alpha2Contract(t *testing.T) {
+	raw, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	readme := string(raw)
+
+	for _, required := range []string{
+		"logs.log_name_attribute",
+		"logs.insert_id_attribute",
+		"auto_create.companion_views",
+		"quarantine.enabled",
+		"quarantine.table",
+		"attributes_schema",
+		"payload_refs",
+		"otel_spans_as_allspans",
+		"v_gen_ai_spans",
+		"v_gen_ai_logs",
+		"otel_quarantine",
+		"v0alpha2",
+	} {
+		if !strings.Contains(readme, required) {
+			t.Errorf("README.md is missing v0alpha2 contract token %q", required)
+		}
+	}
+
+	for _, retired := range []string{
+		"source_record_namespace",
+		"source_record_id_attribute",
+		"otlp-protojson-v1",
+	} {
+		if strings.Contains(readme, retired) {
+			t.Errorf("README.md still references retired v0alpha1 token %q", retired)
+		}
+	}
+}

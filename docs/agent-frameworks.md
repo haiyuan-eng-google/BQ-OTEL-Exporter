@@ -264,10 +264,20 @@ Official reference: [Microsoft Agent Framework observability](https://learn.micr
 
 Do not assume all producers use the same semantic-convention generation.
 Depending on the instrumentor, provider identity can be `gen_ai.system` or
-`gen_ai.provider.name`; OpenInference spans may contain only `llm.*` and
-`openinference.*`. Attribute values in this exporter are typed OTLP JSON, so a
-string value is represented as an object such as
-`{"string_value":"openai"}`, not as a bare JSON string.
+`gen_ai.provider.name`, and session identity can arrive under
+`gen_ai.conversation.id` or `gcp.vertex.agent.session_id`; OpenInference spans
+may contain only `llm.*` and `openinference.*`.
 
-Normalize these variants in a view or downstream model instead of teaching the
-transport exporter to reinterpret agent telemetry.
+In `v0alpha2`, attribute bags (`attributes`, `resource.attributes`,
+`instrumentation_scope.attributes`, `events.attributes`, `links.attributes`)
+and `otel_logs.body` are stored as plain JSON alongside an `attributes_schema`
+JSON sidecar that records the original OTLP type of each key. A string
+attribute is therefore a plain JSON string (`"openai"`), queried directly via
+`JSON_VALUE(attributes, '$."gen_ai.system"')`, while numeric attributes such as
+token counts can be read with `LAX_INT64(attributes['gen_ai.usage.input_tokens'])`.
+
+When `auto_create.companion_views` is enabled (or when you apply the companion
+view DDL in [`internal/schema`](../internal/schema/schema.go)), `v_gen_ai_spans`
+and `v_gen_ai_logs` coalesce the common `gen_ai.*` and `gcp.vertex.agent.*`
+attribute variants into typed top-level columns over `otel_spans_dedup` and
+`otel_logs_dedup` while keeping the raw transport tables schema-pure.

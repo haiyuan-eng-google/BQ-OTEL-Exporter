@@ -1550,3 +1550,201 @@ func TestQuarantineRowsAreValidUTF8(t *testing.T) {
 		t.Errorf("error_message = %q", got)
 	}
 }
+
+type fakePayloadOffloader struct {
+	spanRefs []PayloadRef
+	logRefs  []PayloadRef
+}
+
+func (f fakePayloadOffloader) OffloadSpan(span ptrace.Span, _ pcommon.Resource, _ pcommon.InstrumentationScope) []PayloadRef {
+	span.Attributes().PutStr("gen_ai.prompt", "[offloaded]")
+	return f.spanRefs
+}
+
+func (f fakePayloadOffloader) OffloadLog(lr plog.LogRecord, _ pcommon.Resource, _ pcommon.InstrumentationScope) []PayloadRef {
+	lr.Body().SetStr("[offloaded]")
+	return f.logRefs
+}
+
+func TestObjectRefToRow(t *testing.T) {
+	if got := (ObjectRef{}).ToRow(); got != nil {
+		t.Errorf("empty ObjectRef.ToRow() = %v, want nil", got)
+	}
+	full := ObjectRef{
+		URI:        "gs://bucket/spans/123.json",
+		Version:    "1712700000000000",
+		Authorizer: "projects/my-proj/locations/us/connections/gcs-conn",
+		Details:    `{"gcs_metadata":{"content_type":"application/json"}}`,
+	}.ToRow()
+	want := Row{
+		"uri":        "gs://bucket/spans/123.json",
+		"version":    "1712700000000000",
+		"authorizer": "projects/my-proj/locations/us/connections/gcs-conn",
+		"details":    `{"gcs_metadata":{"content_type":"application/json"}}`,
+	}
+	if !reflect.DeepEqual(full, want) {
+		t.Errorf("ObjectRef.ToRow() = %#v, want %#v", full, want)
+	}
+
+	minimal := ObjectRef{URI: "gs://bucket/obj\xff"}.ToRow()
+	wantMin := Row{"uri": "gs://bucket/obj\uFFFD"}
+	if !reflect.DeepEqual(minimal, wantMin) {
+		t.Errorf("minimal ObjectRef.ToRow() = %#v, want %#v", minimal, wantMin)
+	}
+}
+
+func TestPayloadRefToRowAndSlice(t *testing.T) {
+	if got := (PayloadRef{AttributePath: "body"}).ToRow(); got != nil {
+		t.Errorf("missing ObjectRef URI: ToRow() = %v, want nil", got)
+	}
+	if got := (PayloadRef{ObjectRef: ObjectRef{URI: "gs://b/k"}}).ToRow(); got != nil {
+		t.Errorf("missing AttributePath: ToRow() = %v, want nil", got)
+	}
+	if got := PayloadRefsToRows(nil); got != nil {
+		t.Errorf("PayloadRefsToRows(nil) = %v, want nil", got)
+	}
+	if got := PayloadRefsToRows([]PayloadRef{{AttributePath: "body"}}); got != nil {
+		t.Errorf("PayloadRefsToRows(invalid) = %v, want nil", got)
+	}
+
+	valid := PayloadRef{
+		AttributePath: "attributes.gen_ai.prompt",
+		PartIndex:     2,
+		MIMEType:      "application/json",
+		StorageMode:   "gcs_object_ref",
+		ByteSize:      8192,
+		SHA256:        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		ObjectRef: ObjectRef{
+			URI:        "gs://bucket/prompts/abc.json",
+			Version:    "42",
+			Authorizer: "projects/p/locations/us/connections/c",
+			Details:    `{"encoding":"utf-8"}`,
+		},
+	}
+	noSize := PayloadRef{
+		AttributePath: "body",
+		PartIndex:     -1,
+		ByteSize:      -1,
+		ObjectRef:     ObjectRef{URI: "gs://bucket/body/def.txt"},
+	}
+	rows := PayloadRefsToRows([]PayloadRef{{}, valid, noSize})
+	if len(rows) != 2 {
+		t.Fatalf("len(PayloadRefsToRows) = %d, want 2", len(rows))
+	}
+	if got := rows[0]["attribute_path"]; got != "attributes.gen_ai.prompt" {
+		t.Errorf("rows[0][attribute_path] = %v, want attributes.gen_ai.prompt", got)
+	}
+	if got := rows[0]["part_index"]; got != int64(2) {
+		t.Errorf("rows[0][part_index] = %v, want 2", got)
+	}
+	if got := rows[0]["storage_mode"]; got != "gcs_object_ref" {
+		t.Errorf("rows[0][storage_mode] = %v, want gcs_object_ref", got)
+	}
+	if got := rows[0]["byte_size"]; got != int64(8192) {
+		t.Errorf("rows[0][byte_size] = %v, want 8192", got)
+	}
+	if _, hasSize := rows[1]["byte_size"]; hasSize {
+		t.Errorf("negative ByteSize should be omitted, got %v", rows[1]["byte_size"])
+	}
+	if _, hasPart := rows[1]["part_index"]; hasPart {
+		t.Errorf("negative PartIndex should be omitted, got %v", rows[1]["part_index"])
+	}
+}
+
+func TestSpanAndLogRowsWithPayloadOffloader(t *testing.T) {
+	spanRef := PayloadRef{
+		AttributePath: "attributes.gen_ai.prompt",
+		PartIndex:     0,
+		MIMEType:      "application/json",
+		StorageMode:   "gcs_object_ref",
+		ByteSize:      2048,
+		SHA256:        strings.Repeat("a", 64),
+		ObjectRef: ObjectRef{
+			URI:        "gs://bucket/spans/prompt.json",
+			Version:    "1",
+			Authorizer: "projects/p/locations/us/connections/c",
+			Details:    `{"part":0}`,
+		},
+	}
+	logRef := PayloadRef{
+		AttributePath: "body",
+		PartIndex:     0,
+		MIMEType:      "text/plain",
+		StorageMode:   "gcs_object_ref",
+		ByteSize:      4096,
+		SHA256:        strings.Repeat("b", 64),
+		ObjectRef: ObjectRef{
+			URI: "gs://bucket/logs/body.txt",
+		},
+	}
+
+	opts := testOpts()
+	opts.PayloadOffloader = fakePayloadOffloader{
+		spanRefs: []PayloadRef{spanRef},
+		logRefs:  []PayloadRef{logRef},
+	}
+
+	td, span := newTraces()
+	span.Attributes().PutStr("gen_ai.prompt", "very large prompt")
+	spanRows, rejects := SpanRows(td, opts)
+	if len(rejects) != 0 || len(spanRows) != 1 {
+		t.Fatalf("SpanRows() = (%d rows, %v rejects), want (1, nil)", len(spanRows), rejects)
+	}
+	gotSpanRefs, ok := spanRows[0]["payload_refs"].([]Row)
+	if !ok || len(gotSpanRefs) != 1 {
+		t.Fatalf("span row payload_refs = %#v, want 1 Row", spanRows[0]["payload_refs"])
+	}
+	if got := gotSpanRefs[0]["attribute_path"]; got != "attributes.gen_ai.prompt" {
+		t.Errorf("span payload_refs[0].attribute_path = %v", got)
+	}
+
+	ld, lr := newLogs()
+	lr.Body().SetStr("very large log body")
+	logRows, logRejects := LogRows(ld, opts)
+	if len(logRejects) != 0 || len(logRows) != 1 {
+		t.Fatalf("LogRows() = (%d rows, %v rejects), want (1, nil)", len(logRows), logRejects)
+	}
+	gotLogRefs, ok := logRows[0]["payload_refs"].([]Row)
+	if !ok || len(gotLogRefs) != 1 {
+		t.Fatalf("log row payload_refs = %#v, want 1 Row", logRows[0]["payload_refs"])
+	}
+	if got := gotLogRefs[0]["attribute_path"]; got != "body" {
+		t.Errorf("log payload_refs[0].attribute_path = %v", got)
+	}
+}
+
+func TestQuarantineRowsWithPayloadOffloader(t *testing.T) {
+	td, _ := newTraces()
+	opts := quarantineOpts()
+	var gotSignal string
+	var gotBytes int
+	opts.QuarantinePayloadOffloader = func(signal string, payload []byte) ObjectRef {
+		gotSignal = signal
+		gotBytes = len(payload)
+		return ObjectRef{
+			URI:        "gs://bucket/quarantine/span-0.json",
+			Version:    "99",
+			Authorizer: "projects/p/locations/us/connections/q",
+			Details:    `{"compressed":false}`,
+		}
+	}
+
+	entries := []QuarantineEntry{{Rejection: Rejection{Index: 0, Reason: ReasonRowBytes, Limit: 100, Actual: 200}}}
+	rows := SpanQuarantineRows(td, entries, opts)
+	if len(rows) != 1 {
+		t.Fatalf("got %d quarantine rows, want 1", len(rows))
+	}
+	if gotSignal != schema.SignalSpans || gotBytes == 0 {
+		t.Errorf("offloader called with (%q, %d bytes), want (%q, >0)", gotSignal, gotBytes, schema.SignalSpans)
+	}
+	if _, hasInline := rows[0]["raw_payload"]; hasInline {
+		t.Errorf("raw_payload should be omitted when offloaded, got %v", rows[0]["raw_payload"])
+	}
+	ref, ok := rows[0]["payload_ref"].(Row)
+	if !ok {
+		t.Fatalf("payload_ref = %#v, want Row", rows[0]["payload_ref"])
+	}
+	if got := ref["uri"]; got != "gs://bucket/quarantine/span-0.json" {
+		t.Errorf("payload_ref.uri = %v, want gs://bucket/quarantine/span-0.json", got)
+	}
+}

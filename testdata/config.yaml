@@ -15,11 +15,15 @@ exporters:
       # attributes, then to the service name and the record fingerprint.
       log_name_attribute: log.file.name
       insert_id_attribute: log.record.uid
+    quarantine:
+      enabled: true
+      table: otel_quarantine
     credentials:
       impersonate_service_account: writer@my-project.iam.gserviceaccount.com
     auto_create:
       dataset: true
       tables: true
+      companion_views: true
     write:
       max_request_bytes: 8388608
       max_row_bytes: 1048576
