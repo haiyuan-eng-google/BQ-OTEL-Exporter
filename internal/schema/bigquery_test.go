@@ -5,6 +5,7 @@ package schema
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"testing"
@@ -131,6 +132,49 @@ func TestDestinationMetadata(t *testing.T) {
 		f("not_a_contract", str, opt),
 	}}, "proj", "ds", "tbl"); err == nil {
 		t.Error("a schema that is not a canonical contract must be rejected")
+	}
+}
+
+// CompanionViewsMetadata is what auto-create applies for the optional
+// companion views, so each signal must get exactly its own views, under their
+// published names, as plain standard SQL views over the configured tables.
+func TestCompanionViewsMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		isSpans bool
+		want    map[string]string
+	}{
+		{
+			name:    "spans",
+			isSpans: true,
+			want: map[string]string{
+				"otel_spans_as_allspans": fmt.Sprintf(SpansAsAllSpansViewQuery, "proj", "ds", "spans_tbl"),
+				"v_gen_ai_spans":         fmt.Sprintf(GenAISpansViewQuery, "proj", "ds", "spans_tbl"),
+			},
+		},
+		{
+			name: "logs",
+			want: map[string]string{
+				"v_gen_ai_logs": fmt.Sprintf(GenAILogsViewQuery, "proj", "ds", "logs_tbl", "spans_tbl"),
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := CompanionViewsMetadata("proj", "ds", "spans_tbl", "logs_tbl", tc.isSpans)
+			gotNames, wantNames := slices.Sorted(maps.Keys(got)), slices.Sorted(maps.Keys(tc.want))
+			if !slices.Equal(gotNames, wantNames) {
+				t.Fatalf("views = %v, want %v", gotNames, wantNames)
+			}
+			for name, query := range tc.want {
+				md := got[name]
+				if md.ViewQuery != query {
+					t.Errorf("%s query = %q, want %q", name, md.ViewQuery, query)
+				}
+				if md.UseLegacySQL || md.Schema != nil || md.TimePartitioning != nil || md.Clustering != nil {
+					t.Errorf("%s must be a plain standard SQL view, got %+v", name, md)
+				}
+			}
+		})
 	}
 }
 

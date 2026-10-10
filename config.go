@@ -125,6 +125,11 @@ type EndpointConfig struct {
 type AutoCreateConfig struct {
 	Dataset bool `mapstructure:"dataset"`
 	Tables  bool `mapstructure:"tables"`
+	// CompanionViews also creates the optional companion views over the
+	// dedup views: otel_spans_as_allspans and v_gen_ai_spans with the traces
+	// table, and v_gen_ai_logs with the logs table once the traces dedup view
+	// exists. Like the dedup views they are create-only. Requires tables.
+	CompanionViews bool `mapstructure:"companion_views"`
 }
 
 // WriteConfig holds Storage Write API tuning knobs.
@@ -202,6 +207,9 @@ func (cfg *Config) Validate() error {
 
 	if cfg.AutoCreate.Dataset && cfg.Location == "" {
 		errs = append(errs, errors.New("location is required when auto_create.dataset is enabled"))
+	}
+	if cfg.AutoCreate.CompanionViews && !cfg.AutoCreate.Tables {
+		errs = append(errs, errors.New("auto_create.companion_views requires auto_create.tables"))
 	}
 	if cfg.Endpoint.WithoutAuthentication {
 		if cfg.AutoCreate.Dataset {

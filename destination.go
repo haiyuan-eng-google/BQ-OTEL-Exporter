@@ -7,7 +7,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	stdhttp "net/http"
+	"slices"
 
 	bq "cloud.google.com/go/bigquery"
 	"github.com/googleapis/gax-go/v2/apierror"
@@ -17,6 +19,7 @@ import (
 	htransport "google.golang.org/api/transport/http"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 )
@@ -140,7 +143,13 @@ func (e *signalExporter) prepareDestination(ctx context.Context, admin destinati
 			return err
 		}
 	}
-	return e.createDedupView(ctx, admin, viewQuery)
+	if err := e.createDedupView(ctx, admin, viewQuery); err != nil {
+		return err
+	}
+	if !e.cfg.AutoCreate.CompanionViews {
+		return nil
+	}
+	return e.createCompanionViews(ctx, admin)
 }
 
 func (e *signalExporter) ensureDataset(ctx context.Context, admin destinationAdmin) error {
@@ -200,6 +209,49 @@ func (e *signalExporter) createDedupView(
 	if err := admin.CreateTable(ctx, viewID, md); err != nil && !isAlreadyExists(err) {
 		return fmt.Errorf("creating deduplication view %s.%s.%s: %w",
 			e.cfg.Project, e.cfg.Dataset, viewID, err)
+	}
+	return nil
+}
+
+// createCompanionViews creates the optional companion views of the active
+// signal. Like the dedup view they are create-only: an existing view produces
+// AlreadyExists and is left as it is.
+//
+// v_gen_ai_logs joins the span dedup view, which only a traces exporter
+// creates, so a logs exporter first checks that it exists. When it does not,
+// as in a logs-only deployment or before the traces exporter has started, the
+// view is skipped with a notice rather than failing startup, and a later start
+// creates it. An unreadable span dedup view is skipped the same way, with a
+// warning, because the companion views are a convenience and must not block
+// export.
+func (e *signalExporter) createCompanionViews(ctx context.Context, admin destinationAdmin) error {
+	isSpans := proto.Equal(e.schema, schema.SpansTableSchema())
+	spansTable, logsTable := e.table, e.cfg.Logs.Table
+	if !isSpans {
+		spansTable, logsTable = e.cfg.Traces.Table, e.table
+		spansView := e.cfg.Project + "." + e.cfg.Dataset + "." + spansTable + "_dedup"
+		logsView := e.cfg.Project + "." + e.cfg.Dataset + "." + schema.GenAILogsViewName
+		if _, err := admin.TableMetadata(ctx, spansTable+"_dedup"); err != nil {
+			switch {
+			case isContextError(err):
+				return fmt.Errorf("reading span deduplication view metadata for %s: %w", spansView, err)
+			case isNotFound(err):
+				e.logger.Info("span deduplication view does not exist; skipping companion view until a later start",
+					zap.String("view", logsView), zap.String("requires", spansView))
+			default:
+				e.logger.Warn("span deduplication view metadata is unreadable; skipping companion view",
+					zap.String("view", logsView), zap.String("requires", spansView), zap.Error(err))
+			}
+			return nil
+		}
+	}
+
+	views := schema.CompanionViewsMetadata(e.cfg.Project, e.cfg.Dataset, spansTable, logsTable, isSpans)
+	for _, id := range slices.Sorted(maps.Keys(views)) {
+		if err := admin.CreateTable(ctx, id, views[id]); err != nil && !isAlreadyExists(err) {
+			return fmt.Errorf("creating companion view %s.%s.%s: %w",
+				e.cfg.Project, e.cfg.Dataset, id, err)
+		}
 	}
 	return nil
 }

@@ -287,6 +287,184 @@ CREATE SEARCH INDEX IF NOT EXISTS ` + "`%[3]s_trace_lookup_idx`" + `
 ON ` + "`%[1]s.%[2]s.%[3]s`" + ` (trace_id, span_id) OPTIONS (analyzer = 'NO_OP_ANALYZER');
 `
 
+// Companion view names. The companion views are optional conveniences over
+// the dedup views, created only when auto_create.companion_views is enabled.
+// Their names are fixed rather than derived from the table names, so one
+// dataset holds one set of them.
+const (
+	SpansAsAllSpansViewName = "otel_spans_as_allspans"
+	GenAISpansViewName      = "v_gen_ai_spans"
+	GenAILogsViewName       = "v_gen_ai_logs"
+)
+
+// SpansAsAllSpansViewDDL creates otel_spans_as_allspans, which presents the
+// deduplicated spans in the 25-column layout of the Cloud Trace _AllSpans
+// view. Every column passes through unchanged except status, which is
+// narrowed to its code and message.
+const SpansAsAllSpansViewDDL = `
+CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + SpansAsAllSpansViewName + "`" + ` AS
+` + SpansAsAllSpansViewQuery + `;
+`
+
+// SpansAsAllSpansViewQuery is shared by operator-run DDL and metadata-API
+// view creation. It takes (project, dataset, spans table) and reads the span
+// dedup view, never the raw table.
+const SpansAsAllSpansViewQuery = `
+SELECT
+  trace_id,
+  span_id,
+  trace_state,
+  parent_span_id,
+  name,
+  kind,
+  start_time,
+  start_time_unix_nano,
+  end_time,
+  end_time_unix_nano,
+  receive_time,
+  receive_time_unix_nano,
+  duration_nano,
+  attributes,
+  attributes_schema,
+  dropped_attributes_count,
+  events,
+  dropped_events_count,
+  links,
+  dropped_links_count,
+  STRUCT(status.code AS code, status.message AS message) AS status,
+  resource,
+  resource_schema_url,
+  instrumentation_scope,
+  scope_schema_url
+FROM ` + "`%[1]s.%[2]s.%[3]s_dedup`" + `
+`
+
+// GenAISpansViewDDL creates v_gen_ai_spans: the spans that carry
+// gen_ai.operation.name, gen_ai.system or gcp.vertex.agent.invocation_id,
+// with the OpenTelemetry GenAI semantic convention attributes and the Agent
+// Development Kit gcp.vertex.agent.* attributes promoted out of the plain
+// JSON attributes into typed top-level columns. Where the same fact can arrive
+// under more than one key, such as gen_ai.system and its successor
+// gen_ai.provider.name, the keys are coalesced in a fixed order. The raw
+// attribute, resource, scope, event and link columns and payload_refs are
+// kept for anything not promoted.
+const GenAISpansViewDDL = `
+CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAISpansViewName + "`" + ` AS
+` + GenAISpansViewQuery + `;
+`
+
+// GenAISpansViewQuery is shared by operator-run DDL and metadata-API view
+// creation. It takes (project, dataset, spans table) and reads the span dedup
+// view, never the raw table.
+const GenAISpansViewQuery = `
+SELECT
+  start_time,
+  end_time,
+  duration_nano,
+  ROUND(duration_nano / 1e6, 3) AS duration_ms,
+  trace_id,
+  span_id,
+  parent_span_id,
+  service_name,
+  name AS span_name,
+  kind AS span_kind,
+  status.code AS status_code,
+  status.message AS status_message,
+  -- Promoted OTel GenAI semantic convention fields (Plain JSON)
+  JSON_VALUE(attributes, '$."gen_ai.operation.name"') AS gen_ai_operation_name,
+  COALESCE(
+    JSON_VALUE(attributes, '$."gen_ai.system"'),
+    JSON_VALUE(attributes, '$."gen_ai.provider.name"')
+  ) AS gen_ai_system,
+  JSON_VALUE(attributes, '$."gen_ai.request.model"') AS gen_ai_request_model,
+  JSON_VALUE(attributes, '$."gen_ai.response.model"') AS gen_ai_response_model,
+  COALESCE(
+    JSON_VALUE(attributes, '$."gen_ai.agent.name"'),
+    JSON_VALUE(attributes, '$."gcp.vertex.agent.name"'),
+    service_name
+  ) AS gen_ai_agent_name,
+  JSON_VALUE(attributes, '$."gen_ai.agent.id"') AS gen_ai_agent_id,
+  COALESCE(
+    JSON_VALUE(attributes, '$."gen_ai.conversation.id"'),
+    JSON_VALUE(attributes, '$."gcp.vertex.agent.session_id"')
+  ) AS gen_ai_conversation_id,
+  LAX_INT64(attributes['gen_ai.usage.input_tokens']) AS gen_ai_usage_input_tokens,
+  LAX_INT64(attributes['gen_ai.usage.output_tokens']) AS gen_ai_usage_output_tokens,
+  LAX_FLOAT64(attributes['gen_ai.request.temperature']) AS gen_ai_request_temperature,
+  JSON_VALUE(attributes, '$."gen_ai.response.finish_reasons"[0]') AS gen_ai_response_finish_reason,
+  JSON_VALUE(attributes, '$."gen_ai.tool.name"') AS gen_ai_tool_name,
+  JSON_VALUE(attributes, '$."gen_ai.tool.call.id"') AS gen_ai_tool_call_id,
+  -- ADK / Vertex Agent Analytics attributes
+  JSON_VALUE(attributes, '$."gcp.vertex.agent.event_id"') AS adk_event_id,
+  COALESCE(
+    JSON_VALUE(attributes, '$."gcp.vertex.agent.session_id"'),
+    JSON_VALUE(attributes, '$."gen_ai.conversation.id"')
+  ) AS adk_session_id,
+  JSON_VALUE(attributes, '$."gcp.vertex.agent.invocation_id"') AS adk_invocation_id,
+  COALESCE(
+    JSON_VALUE(attributes, '$."user.id"'),
+    JSON_VALUE(attributes, '$."gen_ai.user.id"')
+  ) AS adk_user_id,
+  -- Multimodal ObjectRef array and raw bags
+  payload_refs,
+  attributes,
+  resource,
+  instrumentation_scope,
+  events,
+  links
+FROM ` + "`%[1]s.%[2]s.%[3]s_dedup`" + `
+WHERE JSON_VALUE(attributes, '$."gen_ai.operation.name"') IS NOT NULL
+   OR JSON_VALUE(attributes, '$."gen_ai.system"') IS NOT NULL
+   OR JSON_VALUE(attributes, '$."gcp.vertex.agent.invocation_id"') IS NOT NULL
+`
+
+// GenAILogsViewDDL creates v_gen_ai_logs: the log records whose event name
+// starts with "gen_ai.", or that carry gen_ai.system or
+// gcp.vertex.agent.invocation_id, with the GenAI and agent fields promoted
+// from the record's own attributes and, where the record lacks one, from the
+// attributes of the span it belongs to. The event name falls back from the
+// event_name column to the event.name attribute.
+const GenAILogsViewDDL = `
+CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAILogsViewName + "`" + ` AS
+` + GenAILogsViewQuery + `;
+`
+
+// GenAILogsViewQuery is shared by operator-run DDL and metadata-API view
+// creation. It takes (project, dataset, logs table, spans table) and joins
+// the log dedup view to the span dedup view on (service_name, trace_id,
+// span_id), so the span dedup view must exist before this view can be
+// created. The LIKE pattern's percent sign is doubled because every template
+// here goes through fmt.Sprintf.
+const GenAILogsViewQuery = `
+SELECT
+  l.timestamp,
+  l.receive_time,
+  l.trace_id,
+  l.span_id,
+  l.service_name,
+  COALESCE(NULLIF(l.event_name, ''), JSON_VALUE(l.attributes, '$."event.name"')) AS event_name,
+  l.severity_number,
+  l.severity_text,
+  COALESCE(JSON_VALUE(l.attributes, '$."gen_ai.operation.name"'), JSON_VALUE(s.attributes, '$."gen_ai.operation.name"')) AS gen_ai_operation_name,
+  COALESCE(JSON_VALUE(l.attributes, '$."gen_ai.system"'), JSON_VALUE(s.attributes, '$."gen_ai.system"')) AS gen_ai_system,
+  COALESCE(JSON_VALUE(l.attributes, '$."gen_ai.agent.name"'), JSON_VALUE(s.attributes, '$."gen_ai.agent.name"')) AS gen_ai_agent_name,
+  COALESCE(JSON_VALUE(l.attributes, '$."gen_ai.conversation.id"'), JSON_VALUE(s.attributes, '$."gen_ai.conversation.id"'), JSON_VALUE(s.attributes, '$."gcp.vertex.agent.session_id"')) AS adk_session_id,
+  COALESCE(JSON_VALUE(l.attributes, '$."gcp.vertex.agent.invocation_id"'), JSON_VALUE(s.attributes, '$."gcp.vertex.agent.invocation_id"')) AS adk_invocation_id,
+  COALESCE(JSON_VALUE(l.attributes, '$."gcp.vertex.agent.event_id"'), JSON_VALUE(s.attributes, '$."gcp.vertex.agent.event_id"')) AS adk_event_id,
+  COALESCE(JSON_VALUE(l.attributes, '$."user.id"'), JSON_VALUE(s.attributes, '$."user.id"')) AS adk_user_id,
+  l.body,
+  l.payload_refs,
+  l.attributes,
+  l.resource,
+  l.instrumentation_scope
+FROM ` + "`%[1]s.%[2]s.%[3]s_dedup`" + ` l
+LEFT JOIN ` + "`%[1]s.%[2]s.%[4]s_dedup`" + ` s
+  USING (service_name, trace_id, span_id)
+WHERE COALESCE(NULLIF(l.event_name, ''), JSON_VALUE(l.attributes, '$."event.name"')) LIKE 'gen_ai.%%'
+   OR JSON_VALUE(l.attributes, '$."gen_ai.system"') IS NOT NULL
+   OR JSON_VALUE(l.attributes, '$."gcp.vertex.agent.invocation_id"') IS NOT NULL
+`
+
 // FingerprintPrefix is the version tag on record_fingerprint values, which are
 // formatted as "fp1:" + lowercase_hex(SHA-256(canonical_log_record)).
 //

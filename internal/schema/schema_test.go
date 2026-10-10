@@ -5,6 +5,7 @@ package schema
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -253,6 +254,259 @@ func TestSearchIndexDDLs(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The companion views are optional, but once created they are queried
+// directly. Their templates must format cleanly, read only the dedup views,
+// and come both as a bare body for the metadata API and as a statement for
+// operators.
+func TestCompanionViewTemplates(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		view    string
+		query   string
+		ddl     string
+		args    []any
+		sources []string
+	}{
+		{
+			name:    "allspans",
+			view:    "otel_spans_as_allspans",
+			query:   SpansAsAllSpansViewQuery,
+			ddl:     SpansAsAllSpansViewDDL,
+			args:    []any{"proj", "ds", "spans_tbl"},
+			sources: []string{"FROM `proj.ds.spans_tbl_dedup`"},
+		},
+		{
+			name:    "gen_ai_spans",
+			view:    "v_gen_ai_spans",
+			query:   GenAISpansViewQuery,
+			ddl:     GenAISpansViewDDL,
+			args:    []any{"proj", "ds", "spans_tbl"},
+			sources: []string{"FROM `proj.ds.spans_tbl_dedup`"},
+		},
+		{
+			name:  "gen_ai_logs",
+			view:  "v_gen_ai_logs",
+			query: GenAILogsViewQuery,
+			ddl:   GenAILogsViewDDL,
+			args:  []any{"proj", "ds", "logs_tbl", "spans_tbl"},
+			sources: []string{
+				"FROM `proj.ds.logs_tbl_dedup` l",
+				"LEFT JOIN `proj.ds.spans_tbl_dedup` s USING (service_name, trace_id, span_id)",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			query := strings.TrimSpace(fmt.Sprintf(tc.query, tc.args...))
+			ddl := strings.TrimSpace(fmt.Sprintf(tc.ddl, tc.args...))
+			for _, got := range []string{query, ddl} {
+				if strings.Contains(got, "%!") || strings.Contains(got, "MISSING") {
+					t.Fatalf("template did not format cleanly:\n%s", got)
+				}
+			}
+			if strings.HasSuffix(query, ";") {
+				t.Errorf("metadata API query must be a bare query body, got %q", query)
+			}
+			if !strings.HasSuffix(ddl, ";") || !strings.Contains(ddl, query) {
+				t.Errorf("operator-run DDL must be the query body as a terminated statement, got %q", ddl)
+			}
+			if want := "CREATE OR REPLACE VIEW `proj.ds." + tc.view + "` AS\n"; !strings.HasPrefix(ddl, want) {
+				t.Errorf("DDL must start with %q, got %q", want, ddl)
+			}
+			normalized := strings.Join(strings.Fields(query), " ")
+			for _, source := range tc.sources {
+				if !strings.Contains(normalized, source) {
+					t.Errorf("query must contain %q, got %q", source, normalized)
+				}
+			}
+			if strings.Contains(query, "_tbl`") {
+				t.Errorf("query must read only the dedup views, never a raw table:\n%s", query)
+			}
+		})
+	}
+}
+
+// The event name match is the only literal percent sign in the templates. It
+// is doubled in the source because the templates go through fmt.Sprintf, so
+// the formatted view must carry exactly one.
+func TestGenAILogsViewMatchesGenAIEventNamePrefix(t *testing.T) {
+	query := fmt.Sprintf(GenAILogsViewQuery, "proj", "ds", "logs_tbl", "spans_tbl")
+	if !strings.Contains(query, "LIKE 'gen_ai.%'\n") {
+		t.Errorf("v_gen_ai_logs must match event names by the gen_ai. prefix, got:\n%s", query)
+	}
+	if strings.Contains(query, "%%") {
+		t.Errorf("formatted v_gen_ai_logs still has an escaped percent sign:\n%s", query)
+	}
+}
+
+// The companion views are published layouts that queries pin against, so
+// compare every projected column, in order. A column passed through unchanged
+// must exist in the contract of the table it comes from, or BigQuery rejects
+// the view when it is created.
+func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		query     string
+		args      []any
+		contract  *storagepb.TableSchema
+		qualifier string // table alias every passed-through column must use
+		want      []string
+	}{
+		{
+			name:     "allspans",
+			query:    SpansAsAllSpansViewQuery,
+			args:     []any{"proj", "ds", "spans"},
+			contract: SpansTableSchema(),
+			// The 25 columns of the Cloud Trace _AllSpans layout.
+			want: []string{
+				"trace_id", "span_id", "trace_state", "parent_span_id", "name", "kind",
+				"start_time", "start_time_unix_nano", "end_time", "end_time_unix_nano",
+				"receive_time", "receive_time_unix_nano", "duration_nano",
+				"attributes", "attributes_schema", "dropped_attributes_count",
+				"events", "dropped_events_count", "links", "dropped_links_count",
+				"status", "resource", "resource_schema_url", "instrumentation_scope", "scope_schema_url",
+			},
+		},
+		{
+			name:     "gen_ai_spans",
+			query:    GenAISpansViewQuery,
+			args:     []any{"proj", "ds", "spans"},
+			contract: SpansTableSchema(),
+			// 29 identity, timing and promoted columns, then the six raw
+			// columns kept for anything not promoted.
+			want: []string{
+				"start_time", "end_time", "duration_nano", "duration_ms",
+				"trace_id", "span_id", "parent_span_id", "service_name",
+				"span_name", "span_kind", "status_code", "status_message",
+				"gen_ai_operation_name", "gen_ai_system", "gen_ai_request_model", "gen_ai_response_model",
+				"gen_ai_agent_name", "gen_ai_agent_id", "gen_ai_conversation_id",
+				"gen_ai_usage_input_tokens", "gen_ai_usage_output_tokens", "gen_ai_request_temperature",
+				"gen_ai_response_finish_reason", "gen_ai_tool_name", "gen_ai_tool_call_id",
+				"adk_event_id", "adk_session_id", "adk_invocation_id", "adk_user_id",
+				"payload_refs", "attributes", "resource", "instrumentation_scope", "events", "links",
+			},
+		},
+		{
+			name:      "gen_ai_logs",
+			query:     GenAILogsViewQuery,
+			args:      []any{"proj", "ds", "logs", "spans"},
+			contract:  LogsTableSchema(),
+			qualifier: "l",
+			// 20 columns: the passed-through log columns and the promoted
+			// GenAI and agent fields.
+			want: []string{
+				"timestamp", "receive_time", "trace_id", "span_id", "service_name",
+				"event_name", "severity_number", "severity_text",
+				"gen_ai_operation_name", "gen_ai_system", "gen_ai_agent_name",
+				"adk_session_id", "adk_invocation_id", "adk_event_id", "adk_user_id",
+				"body", "payload_refs", "attributes", "resource", "instrumentation_scope",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			items, err := selectList(fmt.Sprintf(tc.query, tc.args...))
+			if err != nil {
+				t.Fatal(err)
+			}
+			inContract := map[string]bool{}
+			for _, name := range FieldNames(tc.contract) {
+				inContract[name] = true
+			}
+			var got []string
+			for _, item := range items {
+				got = append(got, item.alias)
+				if !item.passthrough {
+					continue
+				}
+				if item.qualifier != tc.qualifier {
+					t.Errorf("column %q is read through %q, want %q", item.alias, item.qualifier, tc.qualifier)
+				}
+				if !inContract[item.alias] {
+					t.Errorf("column %q passes through but is not in the contract", item.alias)
+				}
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("projected %d columns:\n%v\nwant %d:\n%v", len(got), got, len(tc.want), tc.want)
+			}
+		})
+	}
+}
+
+// selectItem is one entry of a view's projection.
+type selectItem struct {
+	alias       string // output column name
+	qualifier   string // table alias of a passed-through column, if any
+	passthrough bool   // the entry is a bare, possibly qualified, column
+}
+
+// selectList parses the projection of a query laid out as the companion views
+// are: SELECT alone on a line, entries separated by top-level commas, "--"
+// comment lines, and FROM at the start of the first line after the
+// projection. An entry is a column, optionally qualified, or an expression
+// ending in "AS alias".
+func selectList(query string) ([]selectItem, error) {
+	var lines []string
+	inSelect := false
+	for _, line := range strings.Split(query, "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case trimmed == "SELECT":
+			inSelect = true
+		case !inSelect || strings.HasPrefix(trimmed, "--"):
+		case strings.HasPrefix(trimmed, "FROM "):
+			return splitSelectList(strings.Join(lines, " "))
+		default:
+			lines = append(lines, trimmed)
+		}
+	}
+	return nil, fmt.Errorf("no SELECT ... FROM projection in %q", query)
+}
+
+// splitSelectList splits a projection on the commas that are outside quotes,
+// parentheses and brackets.
+func splitSelectList(list string) ([]selectItem, error) {
+	var items []selectItem
+	depth, quoted, start := 0, false, 0
+	for i := 0; i <= len(list); i++ {
+		if i < len(list) {
+			switch c := list[i]; {
+			case c == '\'':
+				quoted = !quoted
+			case quoted:
+			case c == '(' || c == '[':
+				depth++
+			case c == ')' || c == ']':
+				depth--
+			}
+			if quoted || depth != 0 || list[i] != ',' {
+				continue
+			}
+		}
+		item, err := parseSelectItem(strings.Join(strings.Fields(list[start:i]), " "))
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+		start = i + 1
+	}
+	return items, nil
+}
+
+func parseSelectItem(entry string) (selectItem, error) {
+	if i := strings.LastIndex(entry, " AS "); i >= 0 {
+		if alias := entry[i+len(" AS "):]; isColumnName(alias) {
+			return selectItem{alias: alias}, nil
+		}
+	}
+	qualifier, column, qualified := strings.Cut(entry, ".")
+	if !qualified {
+		qualifier, column = "", entry
+	}
+	if !isColumnName(column) || (qualified && !isColumnName(qualifier)) {
+		return selectItem{}, fmt.Errorf("projection entry %q is neither a column nor an aliased expression", entry)
+	}
+	return selectItem{alias: column, qualifier: qualifier, passthrough: true}, nil
 }
 
 // The DDL and the storagepb.TableSchema describe the same contract from two

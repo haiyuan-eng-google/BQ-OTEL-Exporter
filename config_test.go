@@ -41,7 +41,11 @@ func TestValidateRejects(t *testing.T) {
 			"a single full request could never be sent",
 		},
 		"autocreate needs location": {func(c *Config) { c.AutoCreate.Dataset = true }, "location is required"},
-		"bad limits":                {func(c *Config) { c.Limits.MaxNestingDepth = 0 }, "max_nesting_depth must be positive"},
+		"companion views need table creation": {
+			func(c *Config) { c.AutoCreate.CompanionViews = true },
+			"auto_create.companion_views requires auto_create.tables",
+		},
+		"bad limits": {func(c *Config) { c.Limits.MaxNestingDepth = 0 }, "max_nesting_depth must be positive"},
 		"two credential methods": {func(c *Config) {
 			c.Credentials.File = "/k.json"
 			c.Credentials.ImpersonateServiceAccount = "sa@p.iam.gserviceaccount.com"
@@ -77,6 +81,20 @@ func TestValidateRejects(t *testing.T) {
 				t.Fatalf("expected error containing %q, got: %v", tc.want, err)
 			}
 		})
+	}
+}
+
+// Companion views are opt-in, and ride on table creation, which provides the
+// dedup views they read.
+func TestValidateAcceptsCompanionViewsWithTableCreation(t *testing.T) {
+	cfg := validConfig()
+	if cfg.AutoCreate.CompanionViews {
+		t.Fatal("auto_create.companion_views must be off by default")
+	}
+	cfg.AutoCreate.Tables = true
+	cfg.AutoCreate.CompanionViews = true
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil", err)
 	}
 }
 

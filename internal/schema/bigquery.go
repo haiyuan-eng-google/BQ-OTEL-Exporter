@@ -39,6 +39,28 @@ func DestinationMetadata(
 	return md, fmt.Sprintf(queryTemplate, project, dataset, table), nil
 }
 
+// CompanionViewsMetadata builds the optional companion views of one signal,
+// keyed by view name: otel_spans_as_allspans and v_gen_ai_spans for traces,
+// v_gen_ai_logs for logs. The views read the dedup views, never the raw
+// tables, and v_gen_ai_logs reads the span dedup view as well as the log one,
+// so it can only be created once the span dedup view exists.
+func CompanionViewsMetadata(
+	project, dataset, spansTable, logsTable string, isSpans bool,
+) map[string]*bq.TableMetadata {
+	view := func(query string) *bq.TableMetadata {
+		return &bq.TableMetadata{ViewQuery: query, UseLegacySQL: false}
+	}
+	if isSpans {
+		return map[string]*bq.TableMetadata{
+			SpansAsAllSpansViewName: view(fmt.Sprintf(SpansAsAllSpansViewQuery, project, dataset, spansTable)),
+			GenAISpansViewName:      view(fmt.Sprintf(GenAISpansViewQuery, project, dataset, spansTable)),
+		}
+	}
+	return map[string]*bq.TableMetadata{
+		GenAILogsViewName: view(fmt.Sprintf(GenAILogsViewQuery, project, dataset, logsTable, spansTable)),
+	}
+}
+
 var fieldTypePairs = []struct {
 	storage  storagepb.TableFieldSchema_Type
 	bigQuery bq.FieldType

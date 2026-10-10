@@ -6,6 +6,9 @@ package bigqueryexporter
 import (
 	"context"
 	"errors"
+	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"testing"
 
@@ -31,11 +34,17 @@ type fakeDestinationAdmin struct {
 	createViewErr      error
 	closeErr           error
 	blockDatasetRead   bool
+	// tableMetadataByID answers reads of the listed IDs ahead of, and
+	// without consuming, the shared tableResponses sequence.
+	tableMetadataByID map[string]fakeTableMetadataResponse
+	// createErrByID overrides the creation result for the listed IDs.
+	createErrByID map[string]error
 
 	createdDataset *bq.DatasetMetadata
 	createdTables  map[string]*bq.TableMetadata
 	tableResponses []fakeTableMetadataResponse
 	tableReads     int
+	tableReadIDs   []string
 }
 
 type fakeTableMetadataResponse struct {
@@ -56,7 +65,11 @@ func (f *fakeDestinationAdmin) CreateDataset(_ context.Context, md *bq.DatasetMe
 	return f.createDatasetErr
 }
 
-func (f *fakeDestinationAdmin) TableMetadata(context.Context, string) (*bq.TableMetadata, error) {
+func (f *fakeDestinationAdmin) TableMetadata(_ context.Context, id string) (*bq.TableMetadata, error) {
+	f.tableReadIDs = append(f.tableReadIDs, id)
+	if response, ok := f.tableMetadataByID[id]; ok {
+		return response.metadata, response.err
+	}
 	if f.tableReads < len(f.tableResponses) {
 		response := f.tableResponses[f.tableReads]
 		f.tableReads++
@@ -71,6 +84,9 @@ func (f *fakeDestinationAdmin) CreateTable(_ context.Context, id string, md *bq.
 		f.createdTables = make(map[string]*bq.TableMetadata)
 	}
 	f.createdTables[id] = md
+	if err, ok := f.createErrByID[id]; ok {
+		return err
+	}
 	if strings.HasSuffix(id, "_dedup") {
 		return f.createViewErr
 	}
@@ -343,6 +359,176 @@ func TestPrepareDestinationRecognizesGRPCProvisioningCodes(t *testing.T) {
 	}
 	if admin.tableReads != 2 {
 		t.Fatalf("table reads = %d, want initial gRPC NotFound and concurrent-winner validation", admin.tableReads)
+	}
+}
+
+func companionViewConfig() *Config {
+	cfg := validConfig()
+	cfg.AutoCreate.Tables = true
+	cfg.AutoCreate.CompanionViews = true
+	return cfg
+}
+
+// Without auto_create.companion_views, startup creates only the table and its
+// dedup view, and never probes the other signal's dedup view.
+func TestPrepareDestinationCompanionViewsAreOptIn(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		table       string
+		tableSchema *storagepb.TableSchema
+	}{
+		{"traces", defaultSpansTable, schema.SpansTableSchema()},
+		{"logs", defaultLogsTable, schema.LogsTableSchema()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.AutoCreate.Tables = true
+			admin := &fakeDestinationAdmin{datasetMetadata: &bq.DatasetMetadata{}, tableMetadataErr: notFound()}
+			e := newTestSignalExporter(cfg, tc.table, tc.tableSchema)
+
+			if err := e.prepareDestination(context.Background(), admin); err != nil {
+				t.Fatal(err)
+			}
+			if got := slices.Sorted(maps.Keys(admin.createdTables)); !equalStrings(got, []string{tc.table, tc.table + "_dedup"}) {
+				t.Errorf("created %v, want only the table and its dedup view", got)
+			}
+			if !equalStrings(admin.tableReadIDs, []string{tc.table}) {
+				t.Errorf("table reads = %v, want only the destination table probe", admin.tableReadIDs)
+			}
+		})
+	}
+}
+
+func TestPrepareDestinationCreatesSpanCompanionViews(t *testing.T) {
+	cfg := companionViewConfig()
+	admin := &fakeDestinationAdmin{datasetMetadata: &bq.DatasetMetadata{}, tableMetadataErr: notFound()}
+	e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+
+	if err := e.prepareDestination(context.Background(), admin); err != nil {
+		t.Fatal(err)
+	}
+	for id, tmpl := range map[string]string{
+		"otel_spans_as_allspans": schema.SpansAsAllSpansViewQuery,
+		"v_gen_ai_spans":         schema.GenAISpansViewQuery,
+	} {
+		want := fmt.Sprintf(tmpl, "my-project", "otel", cfg.Traces.Table)
+		if md := admin.createdTables[id]; md == nil || md.ViewQuery != want {
+			t.Errorf("companion view %s = %#v, want a view over the span dedup view", id, md)
+		}
+	}
+	if got := len(admin.createdTables); got != 4 {
+		t.Errorf("created %d tables and views, want the table, its dedup view and two companion views", got)
+	}
+	if !equalStrings(admin.tableReadIDs, []string{cfg.Traces.Table}) {
+		t.Errorf("table reads = %v, want only the destination table probe", admin.tableReadIDs)
+	}
+}
+
+func TestPrepareDestinationCreatesLogsCompanionViewOverSpanDedupView(t *testing.T) {
+	cfg := companionViewConfig()
+	admin := &fakeDestinationAdmin{
+		datasetMetadata:  &bq.DatasetMetadata{},
+		tableMetadataErr: notFound(),
+		tableMetadataByID: map[string]fakeTableMetadataResponse{
+			cfg.Traces.Table + "_dedup": {metadata: &bq.TableMetadata{Type: bq.ViewTable}},
+		},
+	}
+	e := newTestSignalExporter(cfg, cfg.Logs.Table, schema.LogsTableSchema())
+
+	if err := e.prepareDestination(context.Background(), admin); err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf(schema.GenAILogsViewQuery, "my-project", "otel", cfg.Logs.Table, cfg.Traces.Table)
+	if md := admin.createdTables["v_gen_ai_logs"]; md == nil || md.ViewQuery != want {
+		t.Fatalf("v_gen_ai_logs = %#v, want the join of the log and span dedup views", md)
+	}
+	if got := len(admin.createdTables); got != 3 {
+		t.Errorf("created %d tables and views, want the table, its dedup view and v_gen_ai_logs", got)
+	}
+	if !slices.Contains(admin.tableReadIDs, cfg.Traces.Table+"_dedup") {
+		t.Errorf("table reads = %v, want a probe of the span dedup view", admin.tableReadIDs)
+	}
+}
+
+// v_gen_ai_logs joins the span dedup view. A logs exporter that cannot see
+// that view skips the companion view and still starts, unless the probe ran
+// out of time, which fails startup like every other metadata read.
+func TestPrepareDestinationLogsCompanionViewNeedsSpanDedupView(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		probeErr error
+		wantErr  error
+	}{
+		{name: "absent", probeErr: notFound()},
+		{name: "unreadable", probeErr: forbidden()},
+		{name: "deadline", probeErr: context.DeadlineExceeded, wantErr: context.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := companionViewConfig()
+			admin := &fakeDestinationAdmin{
+				datasetMetadata:  &bq.DatasetMetadata{},
+				tableMetadataErr: notFound(),
+				tableMetadataByID: map[string]fakeTableMetadataResponse{
+					cfg.Traces.Table + "_dedup": {err: tc.probeErr},
+				},
+			}
+			e := newTestSignalExporter(cfg, cfg.Logs.Table, schema.LogsTableSchema())
+
+			err := e.prepareDestination(context.Background(), admin)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tc.wantErr)
+			}
+			if _, ok := admin.createdTables["v_gen_ai_logs"]; ok {
+				t.Error("v_gen_ai_logs must not be created without a readable span dedup view")
+			}
+			if admin.createdTables[cfg.Logs.Table+"_dedup"] == nil {
+				t.Error("the log dedup view must still be created")
+			}
+		})
+	}
+}
+
+// Like the dedup view, companion views are create-only: one that already
+// exists is left alone, and any other creation failure fails startup with the
+// view named.
+func TestPrepareDestinationCompanionViewCreationResults(t *testing.T) {
+	createErr := status.Error(codes.PermissionDenied, "cannot create view")
+	for _, tc := range []struct {
+		name       string
+		createErrs map[string]error
+		wantErr    error
+	}{
+		{
+			name: "already exists",
+			createErrs: map[string]error{
+				"otel_spans_as_allspans": alreadyExists(),
+				"v_gen_ai_spans":         status.Error(codes.AlreadyExists, "existing view"),
+			},
+		},
+		{
+			name:       "fails",
+			createErrs: map[string]error{"v_gen_ai_spans": createErr},
+			wantErr:    createErr,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := companionViewConfig()
+			admin := &fakeDestinationAdmin{
+				datasetMetadata: &bq.DatasetMetadata{},
+				tableMetadata:   &bq.TableMetadata{Schema: mustBigQuerySchema(t, schema.SpansTableSchema())},
+				createViewErr:   alreadyExists(),
+				createErrByID:   tc.createErrs,
+			}
+			e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+
+			err := e.prepareDestination(context.Background(), admin)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tc.wantErr)
+			}
+			if tc.wantErr != nil && !strings.Contains(err.Error(), "my-project.otel.v_gen_ai_spans") {
+				t.Errorf("error %q must name the companion view", err)
+			}
+		})
 	}
 }
 
