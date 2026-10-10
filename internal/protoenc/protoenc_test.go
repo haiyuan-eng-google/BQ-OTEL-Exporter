@@ -4,6 +4,7 @@
 package protoenc
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -12,7 +13,9 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/dynamicpb"
 
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
@@ -181,4 +184,406 @@ func stringField(t *testing.T, msg protoreflect.Message, name string) string {
 		t.Fatalf("field %q not found", name)
 	}
 	return msg.Get(fd).String()
+}
+
+// Shorthand for the table schemas in the nested STRUCT tests.
+const (
+	nullable = storagepb.TableFieldSchema_NULLABLE
+	required = storagepb.TableFieldSchema_REQUIRED
+	repeated = storagepb.TableFieldSchema_REPEATED
+
+	tString    = storagepb.TableFieldSchema_STRING
+	tInt64     = storagepb.TableFieldSchema_INT64
+	tJSON      = storagepb.TableFieldSchema_JSON
+	tTimestamp = storagepb.TableFieldSchema_TIMESTAMP
+	tStruct    = storagepb.TableFieldSchema_STRUCT
+)
+
+func col(name string, typ storagepb.TableFieldSchema_Type, mode storagepb.TableFieldSchema_Mode, fields ...*storagepb.TableFieldSchema) *storagepb.TableFieldSchema {
+	return &storagepb.TableFieldSchema{Name: name, Type: typ, Mode: mode, Fields: fields}
+}
+
+// attrCols appends the attribute columns that every STRUCT in the nested
+// schema carries, so sibling STRUCTs share these sub-field names.
+func attrCols(lead ...*storagepb.TableFieldSchema) []*storagepb.TableFieldSchema {
+	return append(lead,
+		col("attributes", tJSON, nullable),
+		col("attributes_schema", tJSON, nullable),
+		col("dropped_attributes_count", tInt64, nullable),
+	)
+}
+
+// nestedSchema has the nested shape of a span table with STRUCT columns:
+// singular STRUCTs whose sub-fields share names, repeated STRUCTs, and a
+// singular STRUCT inside a repeated one.
+func nestedSchema() *storagepb.TableSchema {
+	return &storagepb.TableSchema{Fields: []*storagepb.TableFieldSchema{
+		col("span_id", tString, required),
+		col("status", tStruct, nullable,
+			col("code", tInt64, nullable),
+			col("code_name", tString, nullable),
+			col("message", tString, nullable)),
+		col("resource", tStruct, nullable, attrCols()...),
+		col("instrumentation_scope", tStruct, nullable, attrCols(
+			col("name", tString, nullable),
+			col("version", tString, nullable))...),
+		col("events", tStruct, repeated, attrCols(
+			col("time", tTimestamp, nullable),
+			col("time_unix_nano", tInt64, nullable),
+			col("name", tString, nullable))...),
+		col("links", tStruct, repeated, attrCols(
+			col("trace_id", tString, nullable),
+			col("span_id", tString, nullable),
+			col("trace_state", tString, nullable),
+			col("flags", tInt64, nullable))...),
+		col("payload_refs", tStruct, repeated,
+			col("attribute_path", tString, nullable),
+			col("part_index", tInt64, nullable),
+			col("mime_type", tString, nullable),
+			col("storage_mode", tString, nullable),
+			col("byte_size", tInt64, nullable),
+			col("sha256", tString, nullable),
+			col("object_ref", tStruct, nullable,
+				col("uri", tString, nullable),
+				col("version", tString, nullable),
+				col("authorizer", tString, nullable),
+				col("details", tJSON, nullable))),
+	}}
+}
+
+func newNestedEncoder(t *testing.T) *Encoder {
+	t.Helper()
+	enc, err := New(nestedSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return enc
+}
+
+// Singular STRUCT columns encode as nested messages with every sub-field in
+// place, and sub-fields the row leaves out stay NULL.
+func TestEncodeSingularStruct(t *testing.T) {
+	enc := newNestedEncoder(t)
+	b, err := enc.Encode(transform.Row{
+		"span_id": "0102030405060708",
+		"status":  transform.Row{"code": int64(2), "code_name": "STATUS_CODE_ERROR", "message": "upstream timeout"},
+		"resource": transform.Row{
+			"attributes":               `{"service.name":"checkout"}`,
+			"attributes_schema":        `{"service.name":"string"}`,
+			"dropped_attributes_count": int64(0),
+		},
+		"instrumentation_scope": transform.Row{"name": "otel-go", "version": "1.2.3"},
+	})
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	msg := decode(t, enc, b)
+
+	for path, want := range map[string]any{
+		"status.code":                       int64(2),
+		"status.code_name":                  "STATUS_CODE_ERROR",
+		"status.message":                    "upstream timeout",
+		"resource.attributes":               `{"service.name":"checkout"}`,
+		"resource.attributes_schema":        `{"service.name":"string"}`,
+		"resource.dropped_attributes_count": int64(0),
+		"instrumentation_scope.name":        "otel-go",
+		"instrumentation_scope.version":     "1.2.3",
+	} {
+		if got := get(t, msg, path).Interface(); got != want {
+			t.Errorf("%s = %v (%T), want %v (%T)", path, got, got, want, want)
+		}
+	}
+	if scope := get(t, msg, "instrumentation_scope").Message(); has(t, scope, "attributes") {
+		t.Error("instrumentation_scope.attributes is set, but the row left it out")
+	}
+}
+
+// A nil STRUCT value, typed or untyped, leaves the field unset, which BigQuery
+// stores as a NULL STRUCT.
+func TestEncodeNullStruct(t *testing.T) {
+	enc := newNestedEncoder(t)
+	for name, val := range map[string]any{
+		"untyped nil":   nil,
+		"nil Row":       transform.Row(nil),
+		"nil plain map": map[string]any(nil),
+	} {
+		t.Run(name, func(t *testing.T) {
+			b, err := enc.Encode(transform.Row{"span_id": "0102030405060708", "status": val})
+			if err != nil {
+				t.Fatalf("Encode: %v", err)
+			}
+			if has(t, decode(t, enc, b), "status") {
+				t.Error("status is set, want it left NULL")
+			}
+		})
+	}
+}
+
+// An empty but non-nil row is a present STRUCT whose sub-fields are all NULL,
+// which BigQuery distinguishes from a NULL STRUCT.
+func TestEncodeEmptyStructIsPresent(t *testing.T) {
+	enc := newNestedEncoder(t)
+	b, err := enc.Encode(transform.Row{"span_id": "0102030405060708", "status": transform.Row{}})
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	status := get(t, decode(t, enc, b), "status").Message()
+	for _, name := range []string{"code", "code_name", "message"} {
+		if has(t, status, name) {
+			t.Errorf("status.%s is set, want NULL", name)
+		}
+	}
+}
+
+// A STRUCT built as a plain map is accepted just like a transform.Row.
+func TestEncodeStructAcceptsPlainMap(t *testing.T) {
+	enc := newNestedEncoder(t)
+	b, err := enc.Encode(transform.Row{
+		"span_id": "0102030405060708",
+		"status":  map[string]any{"code": int64(1)},
+	})
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if got := get(t, decode(t, enc, b), "status.code").Int(); got != 1 {
+		t.Errorf("status.code = %d, want 1", got)
+	}
+}
+
+// A STRUCT value of the wrong shape fails the row, and the error names the
+// column path down to the offending field.
+func TestEncodeStructErrors(t *testing.T) {
+	enc := newNestedEncoder(t)
+	tests := []struct {
+		name string
+		row  transform.Row
+		want []string // substrings the error must contain
+	}{
+		{"scalar for struct", transform.Row{"status": "ERROR"},
+			[]string{`column "status"`, "got string"}},
+		{"list for singular struct", transform.Row{"status": []transform.Row{{"code": int64(1)}}},
+			[]string{`column "status"`, "got []transform.Row"}},
+		{"unknown sub-column", transform.Row{"status": transform.Row{"bogus": "x"}},
+			[]string{`column "status"`, `column "bogus" is not present`}},
+		{"sub-column type mismatch", transform.Row{"status": transform.Row{"code": "two"}},
+			[]string{`column "status"`, `column "code"`, "expected int64"}},
+		{"inside repeated struct", transform.Row{"payload_refs": []transform.Row{{"object_ref": "not a struct"}}},
+			[]string{`column "payload_refs"[0]`, `column "object_ref"`, "got string"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.row["span_id"] = "0102030405060708"
+			_, err := enc.Encode(tc.row)
+			if err == nil {
+				t.Fatal("Encode succeeded, want an error")
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not contain %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+// A singular STRUCT inside a repeated STRUCT, as payload_refs[].object_ref
+// is, can be present on one element and NULL on the next.
+func TestEncodeStructInsideRepeatedStruct(t *testing.T) {
+	enc := newNestedEncoder(t)
+	b, err := enc.Encode(transform.Row{
+		"span_id": "0102030405060708",
+		"payload_refs": []transform.Row{
+			{
+				"attribute_path": "gen_ai.input.messages",
+				"part_index":     int64(0),
+				"mime_type":      "image/png",
+				"storage_mode":   "OBJECT_REF",
+				"byte_size":      int64(2048),
+				"sha256":         "9f86d081884c7d65",
+				"object_ref": transform.Row{
+					"uri":        "gs://bucket/object.png",
+					"version":    "1700000000000000",
+					"authorizer": "project.us.connection",
+					"details":    `{"content_type":"image/png"}`,
+				},
+			},
+			{"attribute_path": "gen_ai.output.messages", "part_index": int64(1), "object_ref": nil},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	refs := decode(t, enc, b).Get(enc.md.Fields().ByName("payload_refs")).List()
+	if refs.Len() != 2 {
+		t.Fatalf("payload_refs length = %d, want 2", refs.Len())
+	}
+	first, second := refs.Get(0).Message(), refs.Get(1).Message()
+	for path, want := range map[string]any{
+		"byte_size":             int64(2048),
+		"object_ref.uri":        "gs://bucket/object.png",
+		"object_ref.version":    "1700000000000000",
+		"object_ref.authorizer": "project.us.connection",
+		"object_ref.details":    `{"content_type":"image/png"}`,
+	} {
+		if got := get(t, first, path).Interface(); got != want {
+			t.Errorf("payload_refs[0].%s = %v, want %v", path, got, want)
+		}
+	}
+	if got := get(t, second, "attribute_path").String(); got != "gen_ai.output.messages" {
+		t.Errorf("payload_refs[1].attribute_path = %q", got)
+	}
+	if has(t, second, "object_ref") {
+		t.Error("payload_refs[1].object_ref is set, want NULL")
+	}
+}
+
+// Sibling STRUCTs share the sub-field names attributes, attributes_schema and
+// dropped_attributes_count. Decoded against the normalized descriptor that the
+// write stream receives, every value must land in its own STRUCT, which holds
+// only if each nested message type keeps a distinct name.
+func TestEncodeSiblingStructsThroughNormalizedDescriptor(t *testing.T) {
+	enc := newNestedEncoder(t)
+	b, err := enc.Encode(transform.Row{
+		"span_id":               "0102030405060708",
+		"resource":              transform.Row{"attributes": `{"from":"resource"}`, "dropped_attributes_count": int64(1)},
+		"instrumentation_scope": transform.Row{"name": "otel-go", "attributes": `{"from":"scope"}`, "dropped_attributes_count": int64(2)},
+		"events":                []transform.Row{{"name": "retry", "attributes": `{"from":"event"}`, "dropped_attributes_count": int64(3)}},
+		"links":                 []transform.Row{{"span_id": "1112131415161718", "attributes": `{"from":"link"}`, "dropped_attributes_count": int64(4)}},
+		"payload_refs":          []transform.Row{{"object_ref": transform.Row{"uri": "gs://bucket/o", "details": `{"from":"object_ref"}`}}},
+	})
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	msg := decodeNormalized(t, enc, b)
+	only := func(name string) protoreflect.Message {
+		t.Helper()
+		l := msg.Get(msg.Descriptor().Fields().ByName(protoreflect.Name(name))).List()
+		if l.Len() != 1 {
+			t.Fatalf("%s length = %d, want 1", name, l.Len())
+		}
+		return l.Get(0).Message()
+	}
+	for _, c := range []struct {
+		where string
+		msg   protoreflect.Message
+		path  string
+		want  any
+	}{
+		{"row", msg, "resource.attributes", `{"from":"resource"}`},
+		{"row", msg, "resource.dropped_attributes_count", int64(1)},
+		{"row", msg, "instrumentation_scope.attributes", `{"from":"scope"}`},
+		{"row", msg, "instrumentation_scope.dropped_attributes_count", int64(2)},
+		{"events[0]", only("events"), "attributes", `{"from":"event"}`},
+		{"events[0]", only("events"), "dropped_attributes_count", int64(3)},
+		{"links[0]", only("links"), "attributes", `{"from":"link"}`},
+		{"links[0]", only("links"), "dropped_attributes_count", int64(4)},
+		{"payload_refs[0]", only("payload_refs"), "object_ref.details", `{"from":"object_ref"}`},
+	} {
+		if got := get(t, c.msg, c.path).Interface(); got != c.want {
+			t.Errorf("%s: %s = %v, want %v", c.where, c.path, got, c.want)
+		}
+	}
+
+	seen := make(map[string]bool)
+	for _, nt := range enc.Descriptor().GetNestedType() {
+		if seen[nt.GetName()] {
+			t.Errorf("nested type %q is defined more than once", nt.GetName())
+		}
+		seen[nt.GetName()] = true
+	}
+}
+
+// Sibling STRUCTs that each hold a STRUCT sub-field of the same name but a
+// different shape need distinct message types. Naming nested types without
+// their parent would give both the same type and encode one with the other's
+// layout.
+func TestDescriptorScopesNestedStructNames(t *testing.T) {
+	enc, err := New(&storagepb.TableSchema{Fields: []*storagepb.TableFieldSchema{
+		col("resource", tStruct, nullable,
+			col("meta", tStruct, nullable, col("origin", tString, nullable))),
+		col("instrumentation_scope", tStruct, nullable,
+			col("meta", tStruct, nullable, col("depth", tInt64, nullable))),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := enc.Encode(transform.Row{
+		"resource":              transform.Row{"meta": transform.Row{"origin": "sdk"}},
+		"instrumentation_scope": transform.Row{"meta": transform.Row{"depth": int64(7)}},
+	})
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	msg := decodeNormalized(t, enc, b)
+	if got := get(t, msg, "resource.meta.origin").String(); got != "sdk" {
+		t.Errorf("resource.meta.origin = %q, want sdk", got)
+	}
+	if got := get(t, msg, "instrumentation_scope.meta.depth").Int(); got != 7 {
+		t.Errorf("instrumentation_scope.meta.depth = %d, want 7", got)
+	}
+	resMeta := get(t, msg, "resource.meta").Message().Descriptor().FullName()
+	scopeMeta := get(t, msg, "instrumentation_scope.meta").Message().Descriptor().FullName()
+	if resMeta == scopeMeta {
+		t.Errorf("both meta sub-fields use message type %s", resMeta)
+	}
+}
+
+// decode decodes b against the encoder's own descriptor.
+func decode(t *testing.T, enc *Encoder, b []byte) protoreflect.Message {
+	t.Helper()
+	msg := dynamicpb.NewMessage(enc.md)
+	if err := proto.Unmarshal(b, msg); err != nil {
+		t.Fatalf("round trip failed: %v", err)
+	}
+	return msg
+}
+
+// decodeNormalized decodes b against the normalized descriptor the encoder
+// hands to the write stream, which is the only view of the bytes the service
+// has.
+func decodeNormalized(t *testing.T, enc *Encoder, b []byte) protoreflect.Message {
+	t.Helper()
+	fd, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
+		Name:        proto.String("normalized.proto"),
+		Syntax:      proto.String("proto2"),
+		MessageType: []*descriptorpb.DescriptorProto{enc.Descriptor()},
+	}, nil)
+	if err != nil {
+		t.Fatalf("normalized descriptor does not form a valid file: %v", err)
+	}
+	msg := dynamicpb.NewMessage(fd.Messages().Get(0))
+	if err := proto.Unmarshal(b, msg); err != nil {
+		t.Fatalf("decoding against the normalized descriptor: %v", err)
+	}
+	return msg
+}
+
+// get returns the value at a dotted path of singular fields, failing the test
+// if a step does not exist or is unset.
+func get(t *testing.T, msg protoreflect.Message, path string) protoreflect.Value {
+	t.Helper()
+	names := strings.Split(path, ".")
+	for _, name := range names[:len(names)-1] {
+		if !has(t, msg, name) {
+			t.Fatalf("%s: %q is unset", path, name)
+		}
+		msg = msg.Get(msg.Descriptor().Fields().ByName(protoreflect.Name(name))).Message()
+	}
+	last := names[len(names)-1]
+	if !has(t, msg, last) {
+		t.Fatalf("%s: %q is unset", path, last)
+	}
+	return msg.Get(msg.Descriptor().Fields().ByName(protoreflect.Name(last)))
+}
+
+// has reports whether the named field is set on msg.
+func has(t *testing.T, msg protoreflect.Message, name string) bool {
+	t.Helper()
+	fd := msg.Descriptor().Fields().ByName(protoreflect.Name(name))
+	if fd == nil {
+		t.Fatalf("%s has no field %q", msg.Descriptor().FullName(), name)
+	}
+	return msg.Has(fd)
 }

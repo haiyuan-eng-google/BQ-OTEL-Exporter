@@ -98,6 +98,31 @@ func setFields(msg *dynamicpb.Message, md protoreflect.MessageDescriptor, row tr
 			}
 			continue
 		}
+		if fd.Kind() == protoreflect.MessageKind {
+			// A singular STRUCT. A nil row leaves the field unset, which
+			// BigQuery stores as a NULL STRUCT; an empty one is a present
+			// STRUCT whose fields are all NULL.
+			var nested transform.Row
+			switch v := val.(type) {
+			case nil:
+				// A NULL STRUCT: nested stays nil.
+			case transform.Row:
+				nested = v
+			case map[string]any:
+				nested = v
+			default:
+				return fmt.Errorf("column %q: expected a row, got %T", name, val)
+			}
+			if nested == nil {
+				continue
+			}
+			elem := dynamicpb.NewMessage(fd.Message())
+			if err := setFields(elem, fd.Message(), nested); err != nil {
+				return fmt.Errorf("column %q: %w", name, err)
+			}
+			msg.Set(fd, protoreflect.ValueOfMessage(elem))
+			continue
+		}
 		pv, err := scalar(fd, val)
 		if err != nil {
 			return fmt.Errorf("column %q: %w", name, err)
