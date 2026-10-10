@@ -231,32 +231,21 @@ func (e *signalExporter) createDedupView(
 // signal. Like the dedup view they are create-only: an existing view produces
 // AlreadyExists and is left as it is.
 //
-// v_gen_ai_logs joins the span dedup view, which only a traces exporter
-// creates, so a logs exporter first checks that it exists. When it does not,
-// as in a logs-only deployment or before the traces exporter has started, the
-// view is skipped with a notice rather than failing startup, and a later start
-// creates it. An unreadable span dedup view is skipped the same way, with a
-// warning, because the companion views are a convenience and must not block
-// export.
+// v_gen_ai_logs joins the log and span dedup views, which belong to separate
+// signal exporters, so whichever exporter starts second creates v_gen_ai_logs
+// once the peer signal's dedup view exists. When the peer dedup view does not
+// exist yet (or in a single-signal deployment), v_gen_ai_logs is skipped with
+// a notice rather than failing startup, and a later start creates it. An
+// unreadable peer dedup view is skipped with a warning because companion views
+// are a convenience and must not block export.
 func (e *signalExporter) createCompanionViews(ctx context.Context, admin destinationAdmin) error {
 	isSpans := proto.Equal(e.schema, schema.SpansTableSchema())
 	spansTable, logsTable := e.table, e.cfg.Logs.Table
 	if !isSpans {
 		spansTable, logsTable = e.cfg.Traces.Table, e.table
-		spansView := e.cfg.Project + "." + e.cfg.Dataset + "." + spansTable + "_dedup"
-		logsView := e.cfg.Project + "." + e.cfg.Dataset + "." + schema.GenAILogsViewName
-		if _, err := admin.TableMetadata(ctx, spansTable+"_dedup"); err != nil {
-			switch {
-			case isContextError(err):
-				return fmt.Errorf("reading span deduplication view metadata for %s: %w", spansView, err)
-			case isNotFound(err):
-				e.logger.Info("span deduplication view does not exist; skipping companion view until a later start",
-					zap.String("view", logsView), zap.String("requires", spansView))
-			default:
-				e.logger.Warn("span deduplication view metadata is unreadable; skipping companion view",
-					zap.String("view", logsView), zap.String("requires", spansView), zap.Error(err))
-			}
-			return nil
+		ok, err := e.probePeerDedupView(ctx, admin, "span", spansTable)
+		if err != nil || !ok {
+			return err
 		}
 	}
 
@@ -267,7 +256,42 @@ func (e *signalExporter) createCompanionViews(ctx context.Context, admin destina
 				e.cfg.Project, e.cfg.Dataset, id, err)
 		}
 	}
+
+	if isSpans {
+		ok, err := e.probePeerDedupView(ctx, admin, "log", logsTable)
+		if err != nil || !ok {
+			return err
+		}
+		logViews := schema.CompanionViewsMetadata(e.cfg.Project, e.cfg.Dataset, spansTable, logsTable, false)
+		for _, id := range slices.Sorted(maps.Keys(logViews)) {
+			if err := admin.CreateTable(ctx, id, logViews[id]); err != nil && !isAlreadyExists(err) {
+				return fmt.Errorf("creating companion view %s.%s.%s: %w",
+					e.cfg.Project, e.cfg.Dataset, id, err)
+			}
+		}
+	}
 	return nil
+}
+
+func (e *signalExporter) probePeerDedupView(
+	ctx context.Context, admin destinationAdmin, peerSignal, peerTable string,
+) (bool, error) {
+	peerView := e.cfg.Project + "." + e.cfg.Dataset + "." + peerTable + "_dedup"
+	logsView := e.cfg.Project + "." + e.cfg.Dataset + "." + schema.GenAILogsViewName
+	if _, err := admin.TableMetadata(ctx, peerTable+"_dedup"); err != nil {
+		switch {
+		case isContextError(err):
+			return false, fmt.Errorf("reading %s deduplication view metadata for %s: %w", peerSignal, peerView, err)
+		case isNotFound(err):
+			e.logger.Info(peerSignal+" deduplication view does not exist; skipping companion view until a later start",
+				zap.String("view", logsView), zap.String("requires", peerView))
+		default:
+			e.logger.Warn(peerSignal+" deduplication view metadata is unreadable; skipping companion view",
+				zap.String("view", logsView), zap.String("requires", peerView), zap.Error(err))
+		}
+		return false, nil
+	}
+	return true, nil
 }
 
 // prepareQuarantineTable checks the quarantine table, and creates it when

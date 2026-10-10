@@ -1748,3 +1748,152 @@ func TestQuarantineRowsWithPayloadOffloader(t *testing.T) {
 		t.Errorf("payload_ref.uri = %v, want gs://bucket/quarantine/span-0.json", got)
 	}
 }
+
+type thresholdOffloader struct{}
+
+func (thresholdOffloader) OffloadSpan(span ptrace.Span, res pcommon.Resource, scope pcommon.InstrumentationScope) []PayloadRef {
+	var refs []PayloadRef
+	if v, ok := span.Attributes().Get("gen_ai.prompt"); ok && len(v.Str()) > 10 {
+		span.Attributes().PutStr("gen_ai.prompt", "[offloaded]")
+		refs = append(refs, PayloadRef{
+			AttributePath: "attributes.gen_ai.prompt",
+			ObjectRef:     ObjectRef{URI: "gs://bucket/spans/prompt.txt"},
+		})
+	}
+	if v, ok := res.Attributes().Get("service.name"); ok && v.Str() != "" {
+		res.Attributes().PutStr("resource.note", "[offloaded-res]")
+	}
+	scope.Attributes().PutStr("scope.note", "[offloaded-scope]")
+	return refs
+}
+
+func (thresholdOffloader) OffloadLog(lr plog.LogRecord, res pcommon.Resource, scope pcommon.InstrumentationScope) []PayloadRef {
+	var refs []PayloadRef
+	if lr.Body().Type() == pcommon.ValueTypeStr && len(lr.Body().Str()) > 10 {
+		lr.Body().SetStr("[offloaded]")
+		refs = append(refs, PayloadRef{
+			AttributePath: "body",
+			ObjectRef:     ObjectRef{URI: "gs://bucket/logs/body.txt"},
+		})
+	}
+	for _, key := range []string{"event.name", "gcp.log_name", "logging.googleapis.com/insertId"} {
+		if v, ok := lr.Attributes().Get(key); ok && len(v.Str()) > 10 {
+			lr.Attributes().PutStr(key, "[offloaded]")
+			refs = append(refs, PayloadRef{
+				AttributePath: "attributes." + key,
+				ObjectRef:     ObjectRef{URI: "gs://bucket/logs/" + key},
+			})
+		}
+	}
+	res.Attributes().PutStr("service.name", "[offloaded-svc]")
+	scope.Attributes().PutStr("scope.note", "[offloaded-scope]")
+	return refs
+}
+
+func TestLogOffloaderPreservesOriginalIdentityAndRetryPayload(t *testing.T) {
+	ld := plog.NewLogs()
+	rl := ld.ResourceLogs().AppendEmpty()
+	rl.Resource().Attributes().PutStr("service.name", "checkout")
+	sl := rl.ScopeLogs().AppendEmpty()
+	sl.Scope().SetName("agent.logger")
+
+	lr1 := sl.LogRecords().AppendEmpty()
+	lr1.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+	lr1.Body().SetStr("first oversized body payload A")
+	lr1.Attributes().PutStr("event.name", "gen_ai.user.message.long")
+	lr1.Attributes().PutStr("gcp.log_name", "long-custom-log-stream-name")
+
+	lr2 := sl.LogRecords().AppendEmpty()
+	lr2.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+	lr2.Body().SetStr("second oversized body payload B")
+	lr2.Attributes().PutStr("event.name", "gen_ai.user.message.long")
+	lr2.Attributes().PutStr("gcp.log_name", "long-custom-log-stream-name")
+
+	// Compute baseline identity without an offloader.
+	baseLD := plog.NewLogs()
+	ld.CopyTo(baseLD)
+	baseRows, baseRejects := LogRows(baseLD, testOpts())
+	if len(baseRejects) != 0 || len(baseRows) != 2 {
+		t.Fatalf("baseline LogRows = (%d, %v), want (2, nil)", len(baseRows), baseRejects)
+	}
+
+	// Mark original batch read-only to mirror Collector fanout.
+	ld.MarkReadOnly()
+
+	opts := testOpts()
+	opts.PayloadOffloader = thresholdOffloader{}
+
+	firstRows, rejects := LogRows(ld, opts)
+	if len(rejects) != 0 || len(firstRows) != 2 {
+		t.Fatalf("first LogRows = (%d, %v), want (2, nil)", len(firstRows), rejects)
+	}
+	secondRows, rejects := LogRows(ld, opts)
+	if len(rejects) != 0 || len(secondRows) != 2 {
+		t.Fatalf("second LogRows = (%d, %v), want (2, nil)", len(secondRows), rejects)
+	}
+
+	// Original batch must remain untouched.
+	if got := lr1.Body().Str(); got != "first oversized body payload A" {
+		t.Errorf("original lr1 body mutated to %q", got)
+	}
+	if got := lr2.Body().Str(); got != "second oversized body payload B" {
+		t.Errorf("original lr2 body mutated to %q", got)
+	}
+
+	// Distinct original bodies must keep their distinct original fingerprints
+	// and insert_ids even when OffloadLog replaces both bodies with "[offloaded]".
+	for i := range 2 {
+		if got, want := firstRows[i]["record_fingerprint"], baseRows[i]["record_fingerprint"]; got != want {
+			t.Errorf("row %d record_fingerprint = %v, want original %v", i, got, want)
+		}
+		if got, want := firstRows[i]["insert_id"], baseRows[i]["insert_id"]; got != want {
+			t.Errorf("row %d insert_id = %v, want original %v", i, got, want)
+		}
+		if got, want := firstRows[i]["log_name"], "long-custom-log-stream-name"; got != want {
+			t.Errorf("row %d log_name = %v, want %q", i, got, want)
+		}
+		if got, want := firstRows[i]["event_name"], "gen_ai.user.message.long"; got != want {
+			t.Errorf("row %d event_name = %v, want %q", i, got, want)
+		}
+		if got, want := firstRows[i]["service_name"], "checkout"; got != want {
+			t.Errorf("row %d service_name = %v, want %q", i, got, want)
+		}
+		if got := firstRows[i]["body"]; got != `"[offloaded]"` {
+			t.Errorf("row %d body = %v, want \"[offloaded]\"", i, got)
+		}
+	}
+	if firstRows[0]["insert_id"] == firstRows[1]["insert_id"] {
+		t.Errorf("distinct records collapsed to same insert_id %v after offload", firstRows[0]["insert_id"])
+	}
+	if !reflect.DeepEqual(firstRows, secondRows) {
+		t.Errorf("retry of LogRows produced different rows:\nfirst:  %#v\nsecond: %#v", firstRows, secondRows)
+	}
+}
+
+func TestSpanOffloaderPreservesOriginalAndReadOnlyBatch(t *testing.T) {
+	td, span := newTraces()
+	span.Attributes().PutStr("gen_ai.prompt", "oversized span prompt payload")
+	td.MarkReadOnly()
+
+	opts := testOpts()
+	opts.PayloadOffloader = thresholdOffloader{}
+
+	firstRows, rejects := SpanRows(td, opts)
+	if len(rejects) != 0 || len(firstRows) != 1 {
+		t.Fatalf("first SpanRows = (%d, %v), want (1, nil)", len(firstRows), rejects)
+	}
+	secondRows, rejects := SpanRows(td, opts)
+	if len(rejects) != 0 || len(secondRows) != 1 {
+		t.Fatalf("second SpanRows = (%d, %v), want (1, nil)", len(secondRows), rejects)
+	}
+
+	if v, _ := span.Attributes().Get("gen_ai.prompt"); v.Str() != "oversized span prompt payload" {
+		t.Errorf("original span attribute mutated to %q", v.Str())
+	}
+	if got, want := firstRows[0]["service_name"], "checkout"; got != want {
+		t.Errorf("service_name = %v, want %q", got, want)
+	}
+	if !reflect.DeepEqual(firstRows, secondRows) {
+		t.Errorf("retry of SpanRows produced different rows:\nfirst:  %#v\nsecond: %#v", firstRows[0], secondRows[0])
+	}
+}

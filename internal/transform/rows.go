@@ -233,11 +233,25 @@ func SpanRows(td ptrace.Traces, opts Options) ([]Row, []Rejection) {
 					rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
 					continue
 				}
+				rowSpan, rowRes, rowScope := span, res, sc
 				var refs []PayloadRef
 				if opts.PayloadOffloader != nil {
-					refs = opts.PayloadOffloader.OffloadSpan(span, resource, scope)
+					workSpan := ptrace.NewSpan()
+					span.CopyTo(workSpan)
+					workRes := pcommon.NewResource()
+					resource.CopyTo(workRes)
+					workScope := pcommon.NewInstrumentationScope()
+					scope.CopyTo(workScope)
+					refs = opts.PayloadOffloader.OffloadSpan(workSpan, workRes, workScope)
+					rowSpan = workSpan
+					rowRes = encodeBag(workRes.Attributes(), workRes.DroppedAttributesCount())
+					rowScope = encodedScope{
+						name:    sanitize(workScope.Name()),
+						version: sanitize(workScope.Version()),
+						bag:     encodeBag(workScope.Attributes(), workScope.DroppedAttributesCount()),
+					}
 				}
-				rows = append(rows, spanRow(span, rs.SchemaUrl(), ss.SchemaUrl(), res, sc, svc, received, refs))
+				rows = append(rows, spanRow(rowSpan, rs.SchemaUrl(), ss.SchemaUrl(), rowRes, rowScope, svc, received, refs))
 			}
 		}
 	}
@@ -530,14 +544,10 @@ func LogRows(ld plog.Logs, opts Options) ([]Row, []Rejection) {
 					rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
 					continue
 				}
-				var refs []PayloadRef
-				if opts.PayloadOffloader != nil {
-					refs = opts.PayloadOffloader.OffloadLog(lr, resource, scope)
-				}
 				// Only kept records consume an intra_batch_ordinal. A rejected
 				// record is rejected again on every retry, so the ordinals of
 				// the others still repeat.
-				rows = append(rows, logRow(lr, origin, fingerprints, received, opts, refs))
+				rows = append(rows, logRow(lr, resource, scope, origin, fingerprints, received, opts))
 			}
 		}
 	}
@@ -589,12 +599,47 @@ type logOrigin struct {
 
 func logRow(
 	lr plog.LogRecord,
+	resource pcommon.Resource,
+	scope pcommon.InstrumentationScope,
 	origin logOrigin,
 	fingerprints fingerprinter,
 	received time.Time,
 	opts Options,
-	refs []PayloadRef,
 ) Row {
+	// Record identity (record_fingerprint, intra_batch_ordinal, log_name,
+	// insert_id, event_name) is always computed from the original un-offloaded
+	// OTLP record so offloading large values never collapses distinct records
+	// or strips identity attributes.
+	attrs := encodeBag(lr.Attributes(), lr.DroppedAttributesCount())
+	body, bodySchema := otlpjson.EncodePlainValueWithSchema(lr.Body())
+	fingerprint := fingerprints.next(canonicalLogRecord(lr, attrs, body, bodySchema, origin.canonical))
+	resolvedLogName := logName(lr.Attributes(), origin.svc, opts.LogNameAttribute)
+	resolvedInsertID := insertID(lr.Attributes(), fingerprint, opts.InsertIDAttribute)
+	resolvedEventName := eventName(lr)
+
+	rowLR := lr
+	rowRes := origin.res
+	rowScope := origin.scope
+	var refs []PayloadRef
+	if opts.PayloadOffloader != nil {
+		workLR := plog.NewLogRecord()
+		lr.CopyTo(workLR)
+		workRes := pcommon.NewResource()
+		resource.CopyTo(workRes)
+		workScope := pcommon.NewInstrumentationScope()
+		scope.CopyTo(workScope)
+		refs = opts.PayloadOffloader.OffloadLog(workLR, workRes, workScope)
+		rowLR = workLR
+		attrs = encodeBag(workLR.Attributes(), workLR.DroppedAttributesCount())
+		body, _ = otlpjson.EncodePlainValueWithSchema(workLR.Body())
+		rowRes = encodeBag(workRes.Attributes(), workRes.DroppedAttributesCount())
+		rowScope = encodedScope{
+			name:    sanitize(workScope.Name()),
+			version: sanitize(workScope.Version()),
+			bag:     encodeBag(workScope.Attributes(), workScope.DroppedAttributesCount()),
+		}
+	}
+
 	// The partition key falls back through event time, observed time, then
 	// receive time. OTLP permits both record times to be zero, and a row with
 	// no partition key cannot be written at all. validateLog has already
@@ -602,38 +647,34 @@ func logRow(
 	partitionMicros := received.UnixMicro()
 	source := schema.TimestampSourceExporter
 	switch {
-	case lr.Timestamp() != 0:
-		partitionMicros = micros(lr.Timestamp())
+	case rowLR.Timestamp() != 0:
+		partitionMicros = micros(rowLR.Timestamp())
 		source = schema.TimestampSourceEvent
-	case lr.ObservedTimestamp() != 0:
-		partitionMicros = micros(lr.ObservedTimestamp())
+	case rowLR.ObservedTimestamp() != 0:
+		partitionMicros = micros(rowLR.ObservedTimestamp())
 		source = schema.TimestampSourceObserved
 	}
-
-	attrs := encodeBag(lr.Attributes(), lr.DroppedAttributesCount())
-	body, bodySchema := otlpjson.EncodePlainValueWithSchema(lr.Body())
-	fingerprint := fingerprints.next(canonicalLogRecord(lr, attrs, body, bodySchema, origin.canonical))
 
 	r := Row{
 		"timestamp":               partitionMicros,
 		"timestamp_source":        source,
-		"time_unix_nano":          int64(lr.Timestamp()),
-		"observed_time_unix_nano": int64(lr.ObservedTimestamp()),
+		"time_unix_nano":          int64(rowLR.Timestamp()),
+		"observed_time_unix_nano": int64(rowLR.ObservedTimestamp()),
 		"receive_time":            received.UnixMicro(),
 		"receive_time_unix_nano":  received.UnixNano(),
 
-		"flags": int64(lr.Flags()),
+		"flags": int64(rowLR.Flags()),
 
-		"severity_number":          int64(lr.SeverityNumber()),
+		"severity_number":          int64(rowLR.SeverityNumber()),
 		"attributes":               attrs.attributes,
 		"attributes_schema":        attrs.schema,
 		"dropped_attributes_count": attrs.dropped,
 
-		"resource":              origin.res.row(),
-		"instrumentation_scope": origin.scope.row(),
+		"resource":              rowRes.row(),
+		"instrumentation_scope": rowScope.row(),
 
-		"log_name":           logName(lr.Attributes(), origin.svc, opts.LogNameAttribute),
-		"insert_id":          insertID(lr.Attributes(), fingerprint, opts.InsertIDAttribute),
+		"log_name":           resolvedLogName,
+		"insert_id":          resolvedInsertID,
 		"record_fingerprint": fingerprint,
 		"schema_version":     schema.Version,
 	}
@@ -642,16 +683,16 @@ func logRow(
 	// a record omit its observed time: the raw column keeps the zero as sent,
 	// but the TIMESTAMP stays NULL rather than claiming the Unix epoch. An
 	// empty body is likewise absent rather than JSON null.
-	if lr.ObservedTimestamp() != 0 {
-		r["observed_timestamp"] = micros(lr.ObservedTimestamp())
+	if rowLR.ObservedTimestamp() != 0 {
+		r["observed_timestamp"] = micros(rowLR.ObservedTimestamp())
 	}
-	if lr.Body().Type() != pcommon.ValueTypeEmpty {
+	if rowLR.Body().Type() != pcommon.ValueTypeEmpty {
 		r["body"] = body
 	}
-	putStrIfSet(r, "trace_id", traceIDString(lr.TraceID()))
-	putStrIfSet(r, "span_id", spanIDString(lr.SpanID()))
-	putStrIfSet(r, "event_name", eventName(lr))
-	putStrIfSet(r, "severity_text", sanitize(lr.SeverityText()))
+	putStrIfSet(r, "trace_id", traceIDString(rowLR.TraceID()))
+	putStrIfSet(r, "span_id", spanIDString(rowLR.SpanID()))
+	putStrIfSet(r, "event_name", resolvedEventName)
+	putStrIfSet(r, "severity_text", sanitize(rowLR.SeverityText()))
 	putStrIfSet(r, "service_name", origin.svc)
 	putStrIfSet(r, "resource_schema_url", sanitize(origin.resSchemaURL))
 	putStrIfSet(r, "scope_schema_url", sanitize(origin.scopeSchemaURL))
