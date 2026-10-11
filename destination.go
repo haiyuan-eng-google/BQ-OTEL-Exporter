@@ -364,12 +364,24 @@ func (e *signalExporter) createCompanionViews(ctx context.Context, admin destina
 	if isSpans {
 		order = schema.SpanCompanionViewOrder
 	}
+	var companionViewsPreserved bool
 	for _, id := range order {
 		md, ok := views[id]
 		if !ok {
 			continue
 		}
-		if err := admin.CreateTable(ctx, id, md); err != nil && !isAlreadyExists(err) {
+		err := admin.CreateTable(ctx, id, md)
+		if isAlreadyExists(err) {
+			companionViewsPreserved = true
+			continue
+		}
+		if err != nil {
+			if isRollupView(id) && companionViewsPreserved {
+				e.logger.Warn("skipping rollup view creation over preserved companion view",
+					zap.String("view", e.cfg.Project+"."+e.cfg.Dataset+"."+id),
+					zap.Error(err))
+				continue
+			}
 			return fmt.Errorf("creating companion view %s.%s.%s: %w",
 				e.cfg.Project, e.cfg.Dataset, id, err)
 		}
@@ -389,6 +401,17 @@ func (e *signalExporter) createCompanionViews(ctx context.Context, admin destina
 		}
 	}
 	return nil
+}
+
+func isRollupView(id string) bool {
+	switch id {
+	case schema.GenAIModelCostsViewName,
+		schema.GenAISessionsViewName,
+		schema.GenAIToolUsageViewName:
+		return true
+	default:
+		return false
+	}
 }
 
 func (e *signalExporter) probePeerDedupView(

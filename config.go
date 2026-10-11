@@ -6,6 +6,7 @@ package bigqueryexporter // import "github.com/haiyuan-eng-google/BQ-OTEL-Export
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"regexp"
 	"strings"
@@ -453,7 +454,7 @@ func (cfg *Config) validateEndpoint() []error {
 		case err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http"):
 			errs = append(errs, fmt.Errorf(
 				"endpoint.admin_url must be an absolute http(s):// URL, got %q", e.AdminURL))
-		case u.Scheme == "http" && !isLoopback(e.AdminURL):
+		case u.Scheme == "http" && !isLoopbackHost(u.Hostname()):
 			errs = append(errs, fmt.Errorf(
 				"endpoint.admin_url must use https:// unless it is a loopback address, got %q", e.AdminURL))
 		}
@@ -566,14 +567,22 @@ func isLoopback(endpoint string) bool {
 	if i := indexByte(host, '/'); i >= 0 {
 		host = host[:i]
 	}
-	if i := lastIndexByte(host, ':'); i >= 0 {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	} else if i := lastIndexByte(host, ':'); i >= 0 && !strings.Contains(host, "]") {
 		host = host[:i]
 	}
-	switch host {
-	case "localhost", "127.0.0.1", "::1", "[::1]":
+	return isLoopbackHost(host)
+}
+
+func isLoopbackHost(host string) bool {
+	h := strings.Trim(host, "[]")
+	switch h {
+	case "localhost", "127.0.0.1", "::1":
 		return true
 	}
-	return false
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
 }
 
 func trimPrefix(s, prefix string) string {

@@ -326,6 +326,8 @@ func TestEndpointAdminURLRequiresTLSUnlessLoopback(t *testing.T) {
 	for adminURL, want := range map[string]string{
 		"http://private.example.test/bigquery/v2/": "must use https:// unless it is a loopback address",
 		"http://10.0.0.5:9050":                     "must use https:// unless it is a loopback address",
+		"http://localhost:80@attacker.com":         "must use https:// unless it is a loopback address",
+		"http://attacker.com#localhost":            "must use https:// unless it is a loopback address",
 		"private.example.test/bigquery/v2/":        "must be an absolute http(s):// URL",
 		"ftp://private.example.test":               "must be an absolute http(s):// URL",
 		"https://":                                 "must be an absolute http(s):// URL",

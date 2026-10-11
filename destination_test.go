@@ -596,7 +596,7 @@ func TestPrepareDestinationCompanionViewCreationResults(t *testing.T) {
 		wantView   string
 	}{
 		{
-			name: "already exists updates in place",
+			name: "already exists preserved",
 			createErrs: map[string]error{
 				"otel_spans_as_allspans": alreadyExists(),
 				"v_gen_ai_spans":         status.Error(codes.AlreadyExists, "existing view"),
@@ -604,6 +604,13 @@ func TestPrepareDestinationCompanionViewCreationResults(t *testing.T) {
 				"v_gen_ai_sessions":      alreadyExists(),
 				"v_gen_ai_tool_usage":    alreadyExists(),
 				"v_gen_ai_logs":          alreadyExists(),
+			},
+		},
+		{
+			name: "preserved companion view allows rollup view failure",
+			createErrs: map[string]error{
+				"v_gen_ai_spans":       alreadyExists(),
+				"v_gen_ai_model_costs": status.Error(codes.InvalidArgument, "column not found in underlying view"),
 			},
 		},
 		{
@@ -637,10 +644,8 @@ func TestPrepareDestinationCompanionViewCreationResults(t *testing.T) {
 				t.Errorf("error %q must name the companion view %q", err, tc.wantView)
 			}
 			if tc.wantErr == nil {
-				for viewID := range tc.createErrs {
-					if upd := admin.updatedTables[viewID]; upd.ViewQuery == "" {
-						t.Errorf("existing companion view %s was not updated in place", viewID)
-					}
+				if len(admin.updatedTables) > 0 {
+					t.Errorf("existing companion views must not be modified in place, updated = %#v", admin.updatedTables)
 				}
 			}
 		})

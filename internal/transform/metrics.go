@@ -369,13 +369,7 @@ func baseMetricRow(
 	return r
 }
 
-func numberPointRow(
-	dp pmetric.NumberDataPoint,
-	desc metricDescriptor,
-	origin metricOrigin,
-	fingerprints fingerprinter,
-	received time.Time,
-) Row {
+func canonicalNumberValue(dp pmetric.NumberDataPoint) string {
 	var valBuilder strings.Builder
 	writeField(&valBuilder, "value_type", dp.ValueType().String())
 	if !hasNoRecordedValue(dp.Flags()) {
@@ -386,7 +380,23 @@ func numberPointRow(
 			writeField(&valBuilder, "value_int64", strconv.FormatInt(dp.IntValue(), 10))
 		}
 	}
-	r := baseMetricRow(dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), dp.Attributes(), dp.Exemplars(), desc, origin, received, valBuilder.String(), fingerprints)
+	return valBuilder.String()
+}
+
+func canonicalForNumberPoint(dp pmetric.NumberDataPoint, desc metricDescriptor, origin metricOrigin) string {
+	attrStr, attrSchema := otlpjson.EncodeMapWithSchema(dp.Attributes())
+	_, exCanonical := encodeExemplars(dp.Exemplars())
+	return canonicalMetricPoint(dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), attrStr, attrSchema, desc, origin, canonicalNumberValue(dp), exCanonical)
+}
+
+func numberPointRow(
+	dp pmetric.NumberDataPoint,
+	desc metricDescriptor,
+	origin metricOrigin,
+	fingerprints fingerprinter,
+	received time.Time,
+) Row {
+	r := baseMetricRow(dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), dp.Attributes(), dp.Exemplars(), desc, origin, received, canonicalNumberValue(dp), fingerprints)
 	if !hasNoRecordedValue(dp.Flags()) {
 		switch dp.ValueType() {
 		case pmetric.NumberDataPointValueTypeDouble:
@@ -400,13 +410,7 @@ func numberPointRow(
 	return r
 }
 
-func histogramPointRow(
-	dp pmetric.HistogramDataPoint,
-	desc metricDescriptor,
-	origin metricOrigin,
-	fingerprints fingerprinter,
-	received time.Time,
-) Row {
+func canonicalHistogramValue(dp pmetric.HistogramDataPoint) string {
 	var valBuilder strings.Builder
 	if !hasNoRecordedValue(dp.Flags()) {
 		writeField(&valBuilder, "count", strconv.FormatUint(dp.Count(), 10))
@@ -428,7 +432,23 @@ func histogramPointRow(
 			writeField(&valBuilder, "bucket_count", strconv.FormatUint(c, 10))
 		}
 	}
-	r := baseMetricRow(dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), dp.Attributes(), dp.Exemplars(), desc, origin, received, valBuilder.String(), fingerprints)
+	return valBuilder.String()
+}
+
+func canonicalForHistogramPoint(dp pmetric.HistogramDataPoint, desc metricDescriptor, origin metricOrigin) string {
+	attrStr, attrSchema := otlpjson.EncodeMapWithSchema(dp.Attributes())
+	_, exCanonical := encodeExemplars(dp.Exemplars())
+	return canonicalMetricPoint(dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), attrStr, attrSchema, desc, origin, canonicalHistogramValue(dp), exCanonical)
+}
+
+func histogramPointRow(
+	dp pmetric.HistogramDataPoint,
+	desc metricDescriptor,
+	origin metricOrigin,
+	fingerprints fingerprinter,
+	received time.Time,
+) Row {
+	r := baseMetricRow(dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), dp.Attributes(), dp.Exemplars(), desc, origin, received, canonicalHistogramValue(dp), fingerprints)
 	if !hasNoRecordedValue(dp.Flags()) {
 		r["count"] = int64(dp.Count())
 		if dp.HasSum() {
@@ -447,56 +467,6 @@ func histogramPointRow(
 		}
 		if dp.BucketCounts().Len() > 0 {
 			r["bucket_counts"] = uint64SliceToInt64(dp.BucketCounts().AsRaw())
-		}
-	}
-	return r
-}
-
-func expHistogramPointRow(
-	dp pmetric.ExponentialHistogramDataPoint,
-	desc metricDescriptor,
-	origin metricOrigin,
-	fingerprints fingerprinter,
-	received time.Time,
-) Row {
-	var valBuilder strings.Builder
-	if !hasNoRecordedValue(dp.Flags()) {
-		writeField(&valBuilder, "count", strconv.FormatUint(dp.Count(), 10))
-		writeField(&valBuilder, "exp_scale", strconv.FormatInt(int64(dp.Scale()), 10))
-		writeField(&valBuilder, "exp_zero_count", strconv.FormatUint(dp.ZeroCount(), 10))
-		writeField(&valBuilder, "exp_zero_threshold", strconv.FormatFloat(dp.ZeroThreshold(), 'g', -1, 64))
-		if dp.HasSum() {
-			writeField(&valBuilder, "sum", strconv.FormatFloat(dp.Sum(), 'g', -1, 64))
-		}
-		if dp.HasMin() {
-			writeField(&valBuilder, "min", strconv.FormatFloat(dp.Min(), 'g', -1, 64))
-		}
-		if dp.HasMax() {
-			writeField(&valBuilder, "max", strconv.FormatFloat(dp.Max(), 'g', -1, 64))
-		}
-		writeExpBucketsCanonical(&valBuilder, "exp_positive", dp.Positive())
-		writeExpBucketsCanonical(&valBuilder, "exp_negative", dp.Negative())
-	}
-	r := baseMetricRow(dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), dp.Attributes(), dp.Exemplars(), desc, origin, received, valBuilder.String(), fingerprints)
-	if !hasNoRecordedValue(dp.Flags()) {
-		r["count"] = int64(dp.Count())
-		if dp.HasSum() {
-			r["sum"] = dp.Sum()
-		}
-		if dp.HasMin() {
-			r["min"] = dp.Min()
-		}
-		if dp.HasMax() {
-			r["max"] = dp.Max()
-		}
-		r["exp_scale"] = int64(dp.Scale())
-		r["exp_zero_count"] = int64(dp.ZeroCount())
-		r["exp_zero_threshold"] = dp.ZeroThreshold()
-		if pos := expBucketsRow(dp.Positive()); pos != nil {
-			r["exp_positive"] = pos
-		}
-		if neg := expBucketsRow(dp.Negative()); neg != nil {
-			r["exp_negative"] = neg
 		}
 	}
 	return r
@@ -521,13 +491,67 @@ func expBucketsRow(b pmetric.ExponentialHistogramDataPointBuckets) Row {
 	return r
 }
 
-func summaryPointRow(
-	dp pmetric.SummaryDataPoint,
+func canonicalExpHistogramValue(dp pmetric.ExponentialHistogramDataPoint) string {
+	var valBuilder strings.Builder
+	if !hasNoRecordedValue(dp.Flags()) {
+		writeField(&valBuilder, "count", strconv.FormatUint(dp.Count(), 10))
+		writeField(&valBuilder, "exp_scale", strconv.FormatInt(int64(dp.Scale()), 10))
+		writeField(&valBuilder, "exp_zero_count", strconv.FormatUint(dp.ZeroCount(), 10))
+		writeField(&valBuilder, "exp_zero_threshold", strconv.FormatFloat(dp.ZeroThreshold(), 'g', -1, 64))
+		if dp.HasSum() {
+			writeField(&valBuilder, "sum", strconv.FormatFloat(dp.Sum(), 'g', -1, 64))
+		}
+		if dp.HasMin() {
+			writeField(&valBuilder, "min", strconv.FormatFloat(dp.Min(), 'g', -1, 64))
+		}
+		if dp.HasMax() {
+			writeField(&valBuilder, "max", strconv.FormatFloat(dp.Max(), 'g', -1, 64))
+		}
+		writeExpBucketsCanonical(&valBuilder, "exp_positive", dp.Positive())
+		writeExpBucketsCanonical(&valBuilder, "exp_negative", dp.Negative())
+	}
+	return valBuilder.String()
+}
+
+func canonicalForExpHistogramPoint(dp pmetric.ExponentialHistogramDataPoint, desc metricDescriptor, origin metricOrigin) string {
+	attrStr, attrSchema := otlpjson.EncodeMapWithSchema(dp.Attributes())
+	_, exCanonical := encodeExemplars(dp.Exemplars())
+	return canonicalMetricPoint(dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), attrStr, attrSchema, desc, origin, canonicalExpHistogramValue(dp), exCanonical)
+}
+
+func expHistogramPointRow(
+	dp pmetric.ExponentialHistogramDataPoint,
 	desc metricDescriptor,
 	origin metricOrigin,
 	fingerprints fingerprinter,
 	received time.Time,
 ) Row {
+	r := baseMetricRow(dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), dp.Attributes(), dp.Exemplars(), desc, origin, received, canonicalExpHistogramValue(dp), fingerprints)
+	if !hasNoRecordedValue(dp.Flags()) {
+		r["count"] = int64(dp.Count())
+		if dp.HasSum() {
+			r["sum"] = dp.Sum()
+		}
+		if dp.HasMin() {
+			r["min"] = dp.Min()
+		}
+		if dp.HasMax() {
+			r["max"] = dp.Max()
+		}
+		r["exp_scale"] = int64(dp.Scale())
+		r["exp_zero_count"] = int64(dp.ZeroCount())
+		r["exp_zero_threshold"] = dp.ZeroThreshold()
+		if pos := expBucketsRow(dp.Positive()); pos != nil {
+			r["exp_positive"] = pos
+		}
+		if neg := expBucketsRow(dp.Negative()); neg != nil {
+			r["exp_negative"] = neg
+		}
+	}
+	return r
+}
+
+func canonicalSummaryValue(dp pmetric.SummaryDataPoint) string {
 	var valBuilder strings.Builder
 	if !hasNoRecordedValue(dp.Flags()) {
 		writeField(&valBuilder, "count", strconv.FormatUint(dp.Count(), 10))
@@ -538,7 +562,22 @@ func summaryPointRow(
 			writeField(&valBuilder, "value", strconv.FormatFloat(qv.Value(), 'g', -1, 64))
 		}
 	}
-	r := baseMetricRow(dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), dp.Attributes(), pmetric.NewExemplarSlice(), desc, origin, received, valBuilder.String(), fingerprints)
+	return valBuilder.String()
+}
+
+func canonicalForSummaryPoint(dp pmetric.SummaryDataPoint, desc metricDescriptor, origin metricOrigin) string {
+	attrStr, attrSchema := otlpjson.EncodeMapWithSchema(dp.Attributes())
+	return canonicalMetricPoint(dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), attrStr, attrSchema, desc, origin, canonicalSummaryValue(dp), "")
+}
+
+func summaryPointRow(
+	dp pmetric.SummaryDataPoint,
+	desc metricDescriptor,
+	origin metricOrigin,
+	fingerprints fingerprinter,
+	received time.Time,
+) Row {
+	r := baseMetricRow(dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), dp.Attributes(), pmetric.NewExemplarSlice(), desc, origin, received, canonicalSummaryValue(dp), fingerprints)
 	if !hasNoRecordedValue(dp.Flags()) {
 		r["count"] = int64(dp.Count())
 		r["sum"] = dp.Sum()
@@ -554,6 +593,166 @@ func summaryPointRow(
 		}
 	}
 	return r
+}
+
+// PreserveMetricOrdinalPeers widens the metric data points to retry so that
+// retrying them reproduces the point_fingerprints they had in the original batch.
+//
+// A data point's fingerprint encodes its intra_batch_ordinal: how many data
+// points of the same canonical form precede it in the batch. MetricRows
+// fingerprints a retry payload from scratch, so leaving out an acknowledged
+// data point that is identical to a retried one shifts the retried point's
+// ordinal down onto the acknowledged copy's.
+func PreserveMetricOrdinalPeers(md pmetric.Metrics, candidateIndices, retryableIndices []int) []int {
+	if len(retryableIndices) == 0 {
+		return nil
+	}
+	if len(candidateIndices) == 0 {
+		return retryableIndices
+	}
+	candidate := indexSet(candidateIndices)
+	retryable := indexSet(retryableIndices)
+
+	allCandidatesRetried := true
+	for _, c := range candidateIndices {
+		if !retryable[c] {
+			allCandidatesRetried = false
+			break
+		}
+	}
+	if allCandidatesRetried {
+		return retryableIndices
+	}
+
+	type member struct {
+		idx   int
+		group string
+	}
+	members := make([]member, 0, len(candidateIndices))
+	retried := make(map[string]bool)
+
+	idx := -1
+	for _, rm := range md.ResourceMetrics().All() {
+		resource := rm.Resource()
+		res := encodeBag(resource.Attributes(), resource.DroppedAttributesCount())
+		svc := sanitize(stringAttr(resource.Attributes(), serviceNameAttr))
+
+		for _, sm := range rm.ScopeMetrics().All() {
+			scope := sm.Scope()
+			sc := encodedScope{
+				name:    sanitize(scope.Name()),
+				version: sanitize(scope.Version()),
+				bag:     encodeBag(scope.Attributes(), scope.DroppedAttributesCount()),
+			}
+			origin := metricOrigin{
+				res:            res,
+				resSchemaURL:   rm.SchemaUrl(),
+				scope:          sc,
+				scopeSchemaURL: sm.SchemaUrl(),
+				svc:            svc,
+				canonical:      canonicalOrigin(res, rm.SchemaUrl(), scope, sc.bag, sm.SchemaUrl()),
+			}
+
+			for _, m := range sm.Metrics().All() {
+				meta, metaSchema := otlpjson.EncodeMapWithSchema(m.Metadata())
+				desc := metricDescriptor{
+					name:       sanitize(m.Name()),
+					rawName:    m.Name(),
+					desc:       sanitize(m.Description()),
+					unit:       sanitize(m.Unit()),
+					meta:       meta,
+					metaSchema: metaSchema,
+					hasMeta:    m.Metadata().Len() > 0,
+					rawMeta:    m.Metadata(),
+				}
+
+				switch m.Type() {
+				case pmetric.MetricTypeGauge:
+					desc.metricType = MetricTypeGauge
+					for _, dp := range m.Gauge().DataPoints().All() {
+						idx++
+						if !candidate[idx] && !retryable[idx] {
+							continue
+						}
+						group := LogFingerprint(canonicalForNumberPoint(dp, desc, origin), 0)
+						members = append(members, member{idx: idx, group: group})
+						if retryable[idx] {
+							retried[group] = true
+						}
+					}
+
+				case pmetric.MetricTypeSum:
+					desc.metricType = MetricTypeSum
+					desc.temporality = temporalityName(m.Sum().AggregationTemporality())
+					monotonic := m.Sum().IsMonotonic()
+					desc.monotonic = &monotonic
+					for _, dp := range m.Sum().DataPoints().All() {
+						idx++
+						if !candidate[idx] && !retryable[idx] {
+							continue
+						}
+						group := LogFingerprint(canonicalForNumberPoint(dp, desc, origin), 0)
+						members = append(members, member{idx: idx, group: group})
+						if retryable[idx] {
+							retried[group] = true
+						}
+					}
+
+				case pmetric.MetricTypeHistogram:
+					desc.metricType = MetricTypeHistogram
+					desc.temporality = temporalityName(m.Histogram().AggregationTemporality())
+					for _, dp := range m.Histogram().DataPoints().All() {
+						idx++
+						if !candidate[idx] && !retryable[idx] {
+							continue
+						}
+						group := LogFingerprint(canonicalForHistogramPoint(dp, desc, origin), 0)
+						members = append(members, member{idx: idx, group: group})
+						if retryable[idx] {
+							retried[group] = true
+						}
+					}
+
+				case pmetric.MetricTypeExponentialHistogram:
+					desc.metricType = MetricTypeExponentialHistogram
+					desc.temporality = temporalityName(m.ExponentialHistogram().AggregationTemporality())
+					for _, dp := range m.ExponentialHistogram().DataPoints().All() {
+						idx++
+						if !candidate[idx] && !retryable[idx] {
+							continue
+						}
+						group := LogFingerprint(canonicalForExpHistogramPoint(dp, desc, origin), 0)
+						members = append(members, member{idx: idx, group: group})
+						if retryable[idx] {
+							retried[group] = true
+						}
+					}
+
+				case pmetric.MetricTypeSummary:
+					desc.metricType = MetricTypeSummary
+					for _, dp := range m.Summary().DataPoints().All() {
+						idx++
+						if !candidate[idx] && !retryable[idx] {
+							continue
+						}
+						group := LogFingerprint(canonicalForSummaryPoint(dp, desc, origin), 0)
+						members = append(members, member{idx: idx, group: group})
+						if retryable[idx] {
+							retried[group] = true
+						}
+					}
+				}
+			}
+		}
+	}
+
+	out := make([]int, 0, len(members))
+	for _, m := range members {
+		if retryable[m.idx] || retried[m.group] {
+			out = append(out, m.idx)
+		}
+	}
+	return out
 }
 
 func encodeExemplars(exemplars pmetric.ExemplarSlice) ([]Row, string) {
