@@ -258,3 +258,67 @@ func TestRuntimeImagesDeclareExecFormHealthcheck(t *testing.T) {
 		}
 	}
 }
+
+// Cloud Run cannot pull from GHCR, and the service account Terraform creates
+// may only read metadata and append rows, so the service must name a
+// supported registry and switch off the image's default auto_create.
+func TestCloudRunServiceUsesSupportedRegistryAndPreProvisionedTables(t *testing.T) {
+	raw, err := os.ReadFile("deploy/cloudrun/service.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var svc struct {
+		Spec struct {
+			Template struct {
+				Spec struct {
+					Containers []struct {
+						Image string   `yaml:"image"`
+						Args  []string `yaml:"args"`
+					} `yaml:"containers"`
+				} `yaml:"spec"`
+			} `yaml:"template"`
+		} `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(raw, &svc); err != nil {
+		t.Fatal(err)
+	}
+	containers := svc.Spec.Template.Spec.Containers
+	if len(containers) != 1 {
+		t.Fatalf("containers = %d, want 1", len(containers))
+	}
+	c := containers[0]
+	if !regexp.MustCompile(`^([a-z0-9-]+-docker\.pkg\.dev|(?:[a-z]+\.)?gcr\.io|docker\.io)/`).MatchString(c.Image) ||
+		strings.HasPrefix(c.Image, "ghcr.io/") {
+		t.Errorf("image %q is not on Artifact Registry, Container Registry, or Docker Hub", c.Image)
+	}
+	for _, want := range []string{
+		"--set=exporters.bigquery.auto_create.dataset=false",
+		"--set=exporters.bigquery.auto_create.tables=false",
+	} {
+		found := false
+		for _, a := range c.Args {
+			found = found || a == want
+		}
+		if !found {
+			t.Errorf("args %v missing %q", c.Args, want)
+		}
+	}
+}
+
+// filestorage compacts in compaction.directory, which defaults to its own
+// /var/lib/otelcol/file_storage rather than the configured directory, and
+// Validate refuses a compaction directory that does not exist. The image has
+// no such directory and a read-only root, so every on_start compaction must
+// point at the persistent queue mount.
+func TestHelmPersistentQueueCompactsOnTheQueueVolume(t *testing.T) {
+	raw, err := os.ReadFile("deploy/helm/bigquery-otel-collector/templates/configmap.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	starts := strings.Count(text, "on_start: true")
+	dirs := strings.Count(text, "          directory: {{ .Values.persistentQueue.mountPath }}")
+	if starts == 0 || dirs != starts {
+		t.Errorf("configmap has %d on_start compactions and %d compaction directories on the queue mount, want them equal and non-zero", starts, dirs)
+	}
+}

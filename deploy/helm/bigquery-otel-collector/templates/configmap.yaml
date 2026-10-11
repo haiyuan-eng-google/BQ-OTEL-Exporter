@@ -54,6 +54,9 @@ data:
         timeout: 1s
         compaction:
           on_start: true
+          # filestorage otherwise compacts in its default directory,
+          # /var/lib/otelcol/file_storage, which the read-only image lacks.
+          directory: {{ .Values.persistentQueue.mountPath }}
       {{- end }}
       health_check:
         endpoint: 0.0.0.0:{{ .Values.healthCheck.port }}
@@ -64,6 +67,9 @@ data:
         timeout: 1s
         compaction:
           on_start: true
+          # filestorage otherwise compacts in its default directory,
+          # /var/lib/otelcol/file_storage, which the read-only image lacks.
+          directory: {{ .Values.persistentQueue.mountPath }}
     {{- end }}
 
     service:

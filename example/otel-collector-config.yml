@@ -70,13 +70,17 @@ exporters:
 # on collector shutdown or crash. Requires a file_storage extension
 # (uncomment below and the storage entry in the bigquery exporter).
 #
+# Mount a writable volume at /var/lib/otel/queue first. Compaction runs in
+# the same directory: a separate compaction directory would have to exist
+# on the volume before the collector starts.
+#
 # extensions:
 #   file_storage:
 #     directory: /var/lib/otel/queue
 #     timeout: 1s
 #     compaction:
 #       on_start: true
-#       directory: /var/lib/otel/queue/compaction
+#       directory: /var/lib/otel/queue
 
 extensions:
   health_check:

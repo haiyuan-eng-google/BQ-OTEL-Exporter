@@ -8,10 +8,15 @@
 # BQ_LOCATION environment variables.
 #
 # Prerequisites:
-# - The container image must be pushed to GHCR or Artifact Registry.
-# - A service account with the custom IAM role from deploy/terraform/main.tf
-#   must exist.
-# - The BigQuery dataset and tables must be provisioned (use deploy/terraform/).
+# - Cloud Run pulls images only from Artifact Registry, Container Registry, or
+#   Docker Hub, not from GHCR. Copy the release image into an Artifact Registry
+#   repository (for example `gcrane cp ghcr.io/haiyuan-eng-google/bq-otel-collector:0.1.0
+#   us-central1-docker.pkg.dev/my-project/otel/bq-otel-collector:0.1.0`), or
+#   point an Artifact Registry remote repository at ghcr.io, and set `image`.
+# - The service account from deploy/terraform/ must exist. By default it may
+#   only read metadata and append rows, so the dataset, tables, and views must
+#   already be provisioned by deploy/terraform/. The `--set` arguments below
+#   therefore turn off the image's default auto_create.
 
 apiVersion: serving.knative.dev/v1
 kind: Service
@@ -33,9 +38,11 @@ spec:
       serviceAccountName: otel-collector@my-project.iam.gserviceaccount.com
       containers:
         - name: otelcollector
-          image: ghcr.io/haiyuan-eng-google/bq-otel-collector:0.1.0
+          image: us-central1-docker.pkg.dev/my-project/otel/bq-otel-collector:0.1.0
           args:
             - "--config=/etc/otel/config.yml"
+            - "--set=exporters.bigquery.auto_create.dataset=false"
+            - "--set=exporters.bigquery.auto_create.tables=false"
           ports:
             - name: http1
               containerPort: 4318
