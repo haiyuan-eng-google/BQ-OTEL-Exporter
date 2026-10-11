@@ -281,3 +281,58 @@ jobs:
       - name: Compose down
         if: always()
         run: docker compose -f example/docker-compose.yml -f .github/compose-smoke.yml down --remove-orphans || true
+
+  # The release workflow runs only for tags, so this job replays its version
+  # stamping step on every change. GoReleaser refuses to release from a
+  # checkout with modified tracked files, so stamping must leave the checkout
+  # clean; GoReleaser then validates it against a throwaway local tag and
+  # generates the distribution from the stamped manifest, as a release would.
+  release-stamping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Install GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: v2
+          install-only: true
+
+      # Installed the way release.yml installs it.
+      - name: Install OpenTelemetry Collector Builder (ocb)
+        run: |
+          bin="${RUNNER_TEMP}/bin"
+          mkdir -p "${bin}"
+          GOBIN="${bin}" GOTOOLCHAIN=local go install go.opentelemetry.io/collector/cmd/builder@v0.158.0
+          ln -sf "${bin}/builder" "${bin}/ocb"
+          echo "${bin}" >> "${GITHUB_PATH}"
+
+      - name: Replay the release workflow's stamping step
+        env:
+          RELEASE_TAG: v0.0.0-ci
+        run: |
+          yq -e '.jobs.release.steps[] | select(.id == "stamp") | .run' .github/workflows/release.yml > "${RUNNER_TEMP}/stamp.sh"
+          cat "${RUNNER_TEMP}/stamp.sh"
+          bash -e "${RUNNER_TEMP}/stamp.sh"
+
+      - name: Stamping leaves the checkout clean
+        run: |
+          changes="$(git status --porcelain)"
+          if [ -n "${changes}" ]; then
+            printf '%s\n' "${changes}"
+            echo "::error::the release stamping step modified the checkout, which GoReleaser refuses to release from"
+            exit 1
+          fi
+          echo "no tracked file changed"
+
+      - name: GoReleaser builds from the stamped manifest
+        run: |
+          git tag v0.0.0-ci
+          goreleaser build --clean --single-target --id healthcheck
+          grep -E 'Version: +"0\.0\.0-ci"' otelcol-bq-dist/main.go
+          grep -F 'github.com/haiyuan-eng-google/BQ-OTEL-Exporter v0.0.0-ci' otelcol-bq-dist/go.mod

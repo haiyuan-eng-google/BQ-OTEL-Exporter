@@ -11,7 +11,11 @@ before:
   hooks:
     # Generate the custom Collector distribution source tree from the OCB
     # release manifest so GoReleaser compiles it across target platforms.
-    - ocb --config=example/otelcol-builder-release.yaml --skip-compilation=true
+    # OCB_RELEASE_MANIFEST names the copy the release workflow stamps with the
+    # tag outside the checkout: stamping the tracked manifest in place would
+    # leave the checkout dirty, and GoReleaser refuses to release from it. For
+    # a local snapshot, point it at example/otelcol-builder-release.yaml.
+    - ocb --config={{ .Env.OCB_RELEASE_MANIFEST }} --skip-compilation=true
 
 builds:
   - id: otelcol-bq

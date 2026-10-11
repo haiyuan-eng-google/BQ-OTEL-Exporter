@@ -1,9 +1,11 @@
 # OCB builder manifest for release builds.
 #
-# During release builds, .github/workflows/release.yml stamps the release tag
-# into dist.version and the exporter gomod entry, while the local replace
-# directive ensures OCB builds the exact checked-out release commit without
-# requiring the module proxy to have indexed the tag beforehand.
+# During release builds, .github/workflows/release.yml writes a copy of this
+# file outside the checkout with the release tag stamped into dist.version and
+# the exporter gomod entry, and GoReleaser generates the distribution from that
+# copy. The local replace directive ensures OCB builds the exact checked-out
+# release commit without requiring the module proxy to have indexed the tag
+# beforehand.
 dist:
   module: github.com/haiyuan-eng-google/BQ-OTEL-Exporter/cmd/otelcol-bq
   name: otelcol-bq
