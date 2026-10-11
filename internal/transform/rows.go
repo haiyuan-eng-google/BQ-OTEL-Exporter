@@ -236,12 +236,9 @@ func SpanRows(td ptrace.Traces, opts Options) ([]Row, []Rejection) {
 				rowSpan, rowRes, rowScope := span, res, sc
 				var refs []PayloadRef
 				if opts.PayloadOffloader != nil {
-					workSpan := ptrace.NewSpan()
-					span.CopyTo(workSpan)
-					workRes := pcommon.NewResource()
-					resource.CopyTo(workRes)
-					workScope := pcommon.NewInstrumentationScope()
-					scope.CopyTo(workScope)
+					workSpan := cloneSpanForOffload(span)
+					workRes := cloneResourceForOffload(resource)
+					workScope := cloneScopeForOffload(scope)
 					refs = opts.PayloadOffloader.OffloadSpan(workSpan, workRes, workScope)
 					rowSpan = workSpan
 					rowRes = encodeBag(workRes.Attributes(), workRes.DroppedAttributesCount())
@@ -622,12 +619,9 @@ func logRow(
 	rowScope := origin.scope
 	var refs []PayloadRef
 	if opts.PayloadOffloader != nil {
-		workLR := plog.NewLogRecord()
-		lr.CopyTo(workLR)
-		workRes := pcommon.NewResource()
-		resource.CopyTo(workRes)
-		workScope := pcommon.NewInstrumentationScope()
-		scope.CopyTo(workScope)
+		workLR := cloneLogRecordForOffload(lr)
+		workRes := cloneResourceForOffload(resource)
+		workScope := cloneScopeForOffload(scope)
 		refs = opts.PayloadOffloader.OffloadLog(workLR, workRes, workScope)
 		rowLR = workLR
 		attrs = encodeBag(workLR.Attributes(), workLR.DroppedAttributesCount())
@@ -701,6 +695,66 @@ func logRow(
 		r["payload_refs"] = refRows
 	}
 	return r
+}
+
+// pdata's CopyTo shallow-copies the underlying []byte backing array for
+// ValueTypeBytes. Detaching byte values after CopyTo gives offload hooks
+// independent storage across the working record, resource, and scope trees.
+func cloneSpanForOffload(span ptrace.Span) ptrace.Span {
+	work := ptrace.NewSpan()
+	span.CopyTo(work)
+	detachMapBytes(work.Attributes())
+	for i := 0; i < work.Events().Len(); i++ {
+		detachMapBytes(work.Events().At(i).Attributes())
+	}
+	for i := 0; i < work.Links().Len(); i++ {
+		detachMapBytes(work.Links().At(i).Attributes())
+	}
+	return work
+}
+
+func cloneLogRecordForOffload(lr plog.LogRecord) plog.LogRecord {
+	work := plog.NewLogRecord()
+	lr.CopyTo(work)
+	detachValueBytes(work.Body())
+	detachMapBytes(work.Attributes())
+	return work
+}
+
+func cloneResourceForOffload(res pcommon.Resource) pcommon.Resource {
+	work := pcommon.NewResource()
+	res.CopyTo(work)
+	detachMapBytes(work.Attributes())
+	return work
+}
+
+func cloneScopeForOffload(scope pcommon.InstrumentationScope) pcommon.InstrumentationScope {
+	work := pcommon.NewInstrumentationScope()
+	scope.CopyTo(work)
+	detachMapBytes(work.Attributes())
+	return work
+}
+
+func detachMapBytes(m pcommon.Map) {
+	m.Range(func(_ string, v pcommon.Value) bool {
+		detachValueBytes(v)
+		return true
+	})
+}
+
+func detachValueBytes(v pcommon.Value) {
+	switch v.Type() {
+	case pcommon.ValueTypeBytes:
+		raw := append([]byte(nil), v.Bytes().AsRaw()...)
+		v.SetEmptyBytes().FromRaw(raw)
+	case pcommon.ValueTypeMap:
+		detachMapBytes(v.Map())
+	case pcommon.ValueTypeSlice:
+		s := v.Slice()
+		for i := 0; i < s.Len(); i++ {
+			detachValueBytes(s.At(i))
+		}
+	}
 }
 
 // eventName returns the record's event name, falling back to a string

@@ -4,6 +4,7 @@
 package transform
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"reflect"
@@ -1895,5 +1896,194 @@ func TestSpanOffloaderPreservesOriginalAndReadOnlyBatch(t *testing.T) {
 	}
 	if !reflect.DeepEqual(firstRows, secondRows) {
 		t.Errorf("retry of SpanRows produced different rows:\nfirst:  %#v\nsecond: %#v", firstRows[0], secondRows[0])
+	}
+}
+
+func populateByteTree(m pcommon.Map) {
+	m.PutEmptyBytes("raw").FromRaw([]byte{1, 2, 3})
+	nestedMap := m.PutEmptyMap("nested_map")
+	nestedMap.PutEmptyBytes("inner_bytes").FromRaw([]byte{1, 2, 3})
+	nestedSlice := m.PutEmptySlice("nested_slice")
+	nestedSlice.AppendEmpty().SetEmptyBytes().FromRaw([]byte{1, 2, 3})
+}
+
+func mutateByteValueInPlace(v pcommon.Value) {
+	switch v.Type() {
+	case pcommon.ValueTypeBytes:
+		if v.Bytes().Len() > 0 {
+			v.Bytes().SetAt(0, 9)
+		}
+	case pcommon.ValueTypeMap:
+		mutateByteMapInPlace(v.Map())
+	case pcommon.ValueTypeSlice:
+		s := v.Slice()
+		for i := 0; i < s.Len(); i++ {
+			mutateByteValueInPlace(s.At(i))
+		}
+	}
+}
+
+func mutateByteMapInPlace(m pcommon.Map) {
+	m.Range(func(_ string, v pcommon.Value) bool {
+		mutateByteValueInPlace(v)
+		return true
+	})
+}
+
+func assertByteTreeUnmodified(t *testing.T, label string, m pcommon.Map) {
+	t.Helper()
+	want := []byte{1, 2, 3}
+	raw, ok := m.Get("raw")
+	if !ok || !bytes.Equal(raw.Bytes().AsRaw(), want) {
+		t.Errorf("%s raw bytes = %v, want %v", label, raw.Bytes().AsRaw(), want)
+	}
+	nestedMap, ok := m.Get("nested_map")
+	if !ok {
+		t.Fatalf("%s missing nested_map", label)
+	}
+	inner, ok := nestedMap.Map().Get("inner_bytes")
+	if !ok || !bytes.Equal(inner.Bytes().AsRaw(), want) {
+		t.Errorf("%s nested_map.inner_bytes = %v, want %v", label, inner.Bytes().AsRaw(), want)
+	}
+	nestedSlice, ok := m.Get("nested_slice")
+	if !ok || nestedSlice.Slice().Len() != 1 {
+		t.Fatalf("%s missing nested_slice", label)
+	}
+	elem := nestedSlice.Slice().At(0)
+	if !bytes.Equal(elem.Bytes().AsRaw(), want) {
+		t.Errorf("%s nested_slice[0] = %v, want %v", label, elem.Bytes().AsRaw(), want)
+	}
+}
+
+type byteMutatingOffloader struct{}
+
+func (byteMutatingOffloader) OffloadSpan(span ptrace.Span, res pcommon.Resource, scope pcommon.InstrumentationScope) []PayloadRef {
+	mutateByteMapInPlace(span.Attributes())
+	for i := 0; i < span.Events().Len(); i++ {
+		mutateByteMapInPlace(span.Events().At(i).Attributes())
+	}
+	for i := 0; i < span.Links().Len(); i++ {
+		mutateByteMapInPlace(span.Links().At(i).Attributes())
+	}
+	mutateByteMapInPlace(res.Attributes())
+	mutateByteMapInPlace(scope.Attributes())
+	return nil
+}
+
+func (byteMutatingOffloader) OffloadLog(lr plog.LogRecord, res pcommon.Resource, scope pcommon.InstrumentationScope) []PayloadRef {
+	mutateByteValueInPlace(lr.Body())
+	mutateByteMapInPlace(lr.Attributes())
+	mutateByteMapInPlace(res.Attributes())
+	mutateByteMapInPlace(scope.Attributes())
+	return nil
+}
+
+func TestLogBytePayloadCopyIsIsolated(t *testing.T) {
+	ld := plog.NewLogs()
+	rl := ld.ResourceLogs().AppendEmpty()
+	rl.Resource().Attributes().PutStr("service.name", "checkout")
+	populateByteTree(rl.Resource().Attributes())
+	sl := rl.ScopeLogs().AppendEmpty()
+	sl.Scope().SetName("agent.logger")
+	populateByteTree(sl.Scope().Attributes())
+
+	lr := sl.LogRecords().AppendEmpty()
+	lr.SetTimestamp(pcommon.Timestamp(1700000000123456789))
+	lr.Body().SetEmptyBytes().FromRaw([]byte{1, 2, 3})
+	populateByteTree(lr.Attributes())
+
+	lrNestedBody := sl.LogRecords().AppendEmpty()
+	lrNestedBody.SetTimestamp(pcommon.Timestamp(1700000000123456789))
+	populateByteTree(lrNestedBody.Body().SetEmptyMap())
+	populateByteTree(lrNestedBody.Attributes())
+
+	baseLD := plog.NewLogs()
+	ld.CopyTo(baseLD)
+	baseRows, baseRejects := LogRows(baseLD, testOpts())
+	if len(baseRejects) != 0 || len(baseRows) != 2 {
+		t.Fatalf("baseline LogRows = (%d, %v), want (2, nil)", len(baseRows), baseRejects)
+	}
+
+	ld.MarkReadOnly()
+
+	opts := testOpts()
+	opts.PayloadOffloader = byteMutatingOffloader{}
+
+	firstRows, rejects := LogRows(ld, opts)
+	if len(rejects) != 0 || len(firstRows) != 2 {
+		t.Fatalf("first LogRows = (%d, %v), want (2, nil)", len(firstRows), rejects)
+	}
+	secondRows, rejects := LogRows(ld, opts)
+	if len(rejects) != 0 || len(secondRows) != 2 {
+		t.Fatalf("second LogRows = (%d, %v), want (2, nil)", len(secondRows), rejects)
+	}
+
+	if got := lr.Body().Bytes().AsRaw(); !bytes.Equal(got, []byte{1, 2, 3}) {
+		t.Errorf("original lr.Body().Bytes() = %v, want [1 2 3]", got)
+	}
+	assertByteTreeUnmodified(t, "lrNestedBody.Body()", lrNestedBody.Body().Map())
+	assertByteTreeUnmodified(t, "lr.Attributes()", lr.Attributes())
+	assertByteTreeUnmodified(t, "lrNestedBody.Attributes()", lrNestedBody.Attributes())
+	assertByteTreeUnmodified(t, "resource.Attributes()", rl.Resource().Attributes())
+	assertByteTreeUnmodified(t, "scope.Attributes()", sl.Scope().Attributes())
+
+	for i := range 2 {
+		if got, want := firstRows[i]["record_fingerprint"], baseRows[i]["record_fingerprint"]; got != want {
+			t.Errorf("row %d record_fingerprint = %v, want baseline %v", i, got, want)
+		}
+		if got, want := firstRows[i]["insert_id"], baseRows[i]["insert_id"]; got != want {
+			t.Errorf("row %d insert_id = %v, want baseline %v", i, got, want)
+		}
+	}
+	if got := firstRows[0]["body"]; got != `"CQID"` {
+		t.Errorf("offloaded row 0 body = %v, want base64 of [9,2,3] (\"CQID\")", got)
+	}
+	if !reflect.DeepEqual(firstRows, secondRows) {
+		t.Errorf("retry of LogRows changed output:\nfirst:  %#v\nsecond: %#v", firstRows, secondRows)
+	}
+}
+
+func TestSpanBytePayloadCopiesAreIsolated(t *testing.T) {
+	td, span := newTraces()
+	res := td.ResourceSpans().At(0).Resource()
+	scope := td.ResourceSpans().At(0).ScopeSpans().At(0).Scope()
+
+	populateByteTree(res.Attributes())
+	populateByteTree(scope.Attributes())
+	populateByteTree(span.Attributes())
+
+	ev := span.Events().AppendEmpty()
+	ev.SetName("ev")
+	ev.SetTimestamp(span.StartTimestamp())
+	populateByteTree(ev.Attributes())
+
+	lk := span.Links().AppendEmpty()
+	populateByteTree(lk.Attributes())
+
+	td.MarkReadOnly()
+
+	opts := testOpts()
+	opts.PayloadOffloader = byteMutatingOffloader{}
+
+	firstRows, rejects := SpanRows(td, opts)
+	if len(rejects) != 0 || len(firstRows) != 1 {
+		t.Fatalf("first SpanRows = (%d, %v), want (1, nil)", len(firstRows), rejects)
+	}
+	secondRows, rejects := SpanRows(td, opts)
+	if len(rejects) != 0 || len(secondRows) != 1 {
+		t.Fatalf("second SpanRows = (%d, %v), want (1, nil)", len(secondRows), rejects)
+	}
+
+	assertByteTreeUnmodified(t, "span.Attributes()", span.Attributes())
+	assertByteTreeUnmodified(t, "span.Events[0].Attributes()", span.Events().At(0).Attributes())
+	assertByteTreeUnmodified(t, "span.Links[0].Attributes()", span.Links().At(0).Attributes())
+	assertByteTreeUnmodified(t, "resource.Attributes()", res.Attributes())
+	assertByteTreeUnmodified(t, "scope.Attributes()", scope.Attributes())
+
+	if !strings.Contains(firstRows[0]["attributes"].(string), `"CQID"`) {
+		t.Errorf("offloaded span attributes = %s, want base64 of [9,2,3] (\"CQID\")", firstRows[0]["attributes"])
+	}
+	if !reflect.DeepEqual(firstRows, secondRows) {
+		t.Errorf("retry of SpanRows changed output:\nfirst:  %#v\nsecond: %#v", firstRows[0], secondRows[0])
 	}
 }
