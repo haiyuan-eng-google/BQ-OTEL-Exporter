@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"maps"
 	stdhttp "net/http"
+	"reflect"
 	"slices"
 
 	bq "cloud.google.com/go/bigquery"
@@ -108,7 +109,16 @@ var newDestinationAdmin = func(
 	if err != nil {
 		return nil, err
 	}
-	client, err := bq.NewClient(ctx, project, option.WithHTTPClient(httpClient))
+	bqOpts := []option.ClientOption{option.WithHTTPClient(httpClient)}
+	for _, opt := range opts {
+		if rt := reflect.TypeOf(opt); rt != nil {
+			name := rt.Name()
+			if name == "withEndpoint" || name == "withUniverseDomain" {
+				bqOpts = append(bqOpts, opt)
+			}
+		}
+	}
+	client, err := bq.NewClient(ctx, project, bqOpts...)
 	if err != nil {
 		httpBase.CloseIdleConnections()
 		return nil, err
@@ -317,25 +327,16 @@ func (e *signalExporter) createDedupView(
 	viewID := e.table + "_dedup"
 	md := &bq.TableMetadata{ViewQuery: query, UseLegacySQL: false}
 	err := admin.CreateTable(ctx, viewID, md)
-	if err == nil {
+	if err == nil || isAlreadyExists(err) {
 		return nil
 	}
-	if !isAlreadyExists(err) {
-		return fmt.Errorf("creating deduplication view %s.%s.%s: %w",
-			e.cfg.Project, e.cfg.Dataset, viewID, err)
-	}
-	if updateErr := admin.UpdateTable(ctx, viewID, bq.TableMetadataToUpdate{
-		ViewQuery:    query,
-		UseLegacySQL: false,
-	}, ""); updateErr != nil {
-		return fmt.Errorf("updating deduplication view %s.%s.%s: %w",
-			e.cfg.Project, e.cfg.Dataset, viewID, updateErr)
-	}
-	return nil
+	return fmt.Errorf("creating deduplication view %s.%s.%s: %w",
+		e.cfg.Project, e.cfg.Dataset, viewID, err)
 }
 
-// createCompanionViews creates or updates the optional companion views of the
-// active signal.
+// createCompanionViews creates the optional companion views of the active
+// signal when enabled. Like the dedup view they are create-only: an existing
+// view produces AlreadyExists and is left as it is.
 //
 // v_gen_ai_logs joins the log and span dedup views, which belong to separate
 // signal exporters, so whichever exporter starts second creates v_gen_ai_logs
@@ -368,8 +369,9 @@ func (e *signalExporter) createCompanionViews(ctx context.Context, admin destina
 		if !ok {
 			continue
 		}
-		if err := e.createOrUpdateCompanionView(ctx, admin, id, md); err != nil {
-			return err
+		if err := admin.CreateTable(ctx, id, md); err != nil && !isAlreadyExists(err) {
+			return fmt.Errorf("creating companion view %s.%s.%s: %w",
+				e.cfg.Project, e.cfg.Dataset, id, err)
 		}
 	}
 
@@ -380,31 +382,11 @@ func (e *signalExporter) createCompanionViews(ctx context.Context, admin destina
 		}
 		logViews := schema.CompanionViewsMetadata(e.cfg.Project, e.cfg.Dataset, spansTable, logsTable, false)
 		for _, id := range slices.Sorted(maps.Keys(logViews)) {
-			if err := e.createOrUpdateCompanionView(ctx, admin, id, logViews[id]); err != nil {
-				return err
+			if err := admin.CreateTable(ctx, id, logViews[id]); err != nil && !isAlreadyExists(err) {
+				return fmt.Errorf("creating companion view %s.%s.%s: %w",
+					e.cfg.Project, e.cfg.Dataset, id, err)
 			}
 		}
-	}
-	return nil
-}
-
-func (e *signalExporter) createOrUpdateCompanionView(
-	ctx context.Context, admin destinationAdmin, id string, md *bq.TableMetadata,
-) error {
-	err := admin.CreateTable(ctx, id, md)
-	if err == nil {
-		return nil
-	}
-	if !isAlreadyExists(err) {
-		return fmt.Errorf("creating companion view %s.%s.%s: %w",
-			e.cfg.Project, e.cfg.Dataset, id, err)
-	}
-	if updateErr := admin.UpdateTable(ctx, id, bq.TableMetadataToUpdate{
-		ViewQuery:    md.ViewQuery,
-		UseLegacySQL: false,
-	}, ""); updateErr != nil {
-		return fmt.Errorf("updating companion view %s.%s.%s: %w",
-			e.cfg.Project, e.cfg.Dataset, id, updateErr)
 	}
 	return nil
 }

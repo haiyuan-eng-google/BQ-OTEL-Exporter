@@ -7,7 +7,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
+	stdhttp "net/http"
 	"slices"
 	"strings"
 	"testing"
@@ -21,6 +23,7 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 	bigqueryapi "google.golang.org/api/bigquery/v2"
 	"google.golang.org/api/googleapi"
+	"google.golang.org/api/option"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -292,8 +295,8 @@ func TestPrepareDestinationDoesNotReplaceExistingView(t *testing.T) {
 	if _, ok := admin.createdTables[cfg.Traces.Table]; ok {
 		t.Fatal("existing table must not be replaced")
 	}
-	if upd, ok := admin.updatedTables[cfg.Traces.Table+"_dedup"]; !ok || upd.ViewQuery == "" {
-		t.Fatalf("existing dedup view update = %#v, want in-place ViewQuery update", upd)
+	if len(admin.updatedTables) > 0 {
+		t.Fatalf("existing views must not be modified, updated = %#v", admin.updatedTables)
 	}
 }
 
@@ -1214,12 +1217,12 @@ func TestAuthenticationAndEndpointOptionsSupportEnterpriseCredentials(t *testing
 		if err != nil {
 			t.Fatalf("writerClientOptions failed: %v", err)
 		}
-		// auth: TokenSource + Scopes + QuotaProject + UniverseDomain = 4; metadata adds AdminURL = 5; writer adds URL + transport + multiplexing + pool = 8.
+		// auth: TokenSource + Scopes + QuotaProject + UniverseDomain = 4; metadata adds AdminURL = 5; writer adds URL + transport + multiplexing + inflight requests + inflight bytes + pool = 10.
 		if len(metaOpts) != 5 {
 			t.Errorf("len(metaOpts) = %d, want 5", len(metaOpts))
 		}
-		if len(writerOpts) != 8 {
-			t.Errorf("len(writerOpts) = %d, want 8", len(writerOpts))
+		if len(writerOpts) != 10 {
+			t.Errorf("len(writerOpts) = %d, want 10", len(writerOpts))
 		}
 	})
 
@@ -1235,8 +1238,8 @@ func TestAuthenticationAndEndpointOptionsSupportEnterpriseCredentials(t *testing
 			if err != nil {
 				t.Fatalf("writerClientOptions failed: %v", err)
 			}
-			if len(opts) != 4 {
-				t.Errorf("len(opts) = %d, want 4 (TokenSource + Scopes + multiplexing + pool)", len(opts))
+			if len(opts) != 6 {
+				t.Errorf("len(opts) = %d, want 6 (TokenSource + Scopes + multiplexing + inflight requests + inflight bytes + pool)", len(opts))
 			}
 		}
 	})
@@ -1290,4 +1293,86 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+type roundTripFunc func(*stdhttp.Request) (*stdhttp.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *stdhttp.Request) (*stdhttp.Response, error) {
+	return f(req)
+}
+
+func TestNewDestinationAdminAppliesAdminURL(t *testing.T) {
+	var gotURL string
+	origHTTP := newBigQueryHTTPClient
+	t.Cleanup(func() { newBigQueryHTTPClient = origHTTP })
+	newBigQueryHTTPClient = func(context.Context, ...option.ClientOption) (*stdhttp.Client, *stdhttp.Transport, error) {
+		client := &stdhttp.Client{
+			Transport: roundTripFunc(func(req *stdhttp.Request) (*stdhttp.Response, error) {
+				gotURL = req.URL.String()
+				return &stdhttp.Response{
+					StatusCode: stdhttp.StatusOK,
+					Header:     stdhttp.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{}`)),
+				}, nil
+			}),
+		}
+		return client, &stdhttp.Transport{}, nil
+	}
+
+	cfg := validConfig()
+	cfg.Endpoint.AdminURL = "https://private.example.test/bigquery/v2/"
+	e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+	metaOpts, err := e.metadataClientOptions(context.Background())
+	if err != nil {
+		t.Fatalf("metadataClientOptions() error = %v", err)
+	}
+
+	admin, err := newDestinationAdmin(context.Background(), cfg.Project, cfg.Dataset, metaOpts...)
+	if err != nil {
+		t.Fatalf("newDestinationAdmin() error = %v", err)
+	}
+	defer func() { _ = admin.Close() }()
+
+	if _, err := admin.DatasetMetadata(context.Background()); err != nil {
+		t.Fatalf("DatasetMetadata() error = %v", err)
+	}
+	wantPrefix := "https://private.example.test/bigquery/v2/projects/my-project/datasets/otel"
+	if !strings.HasPrefix(gotURL, wantPrefix) {
+		t.Fatalf("DatasetMetadata request URL = %q, want prefix %q", gotURL, wantPrefix)
+	}
+}
+
+func TestNewDestinationAdminAppliesUniverseDomain(t *testing.T) {
+	origHTTP := newBigQueryHTTPClient
+	t.Cleanup(func() { newBigQueryHTTPClient = origHTTP })
+	newBigQueryHTTPClient = func(context.Context, ...option.ClientOption) (*stdhttp.Client, *stdhttp.Transport, error) {
+		client := &stdhttp.Client{
+			Transport: roundTripFunc(func(_ *stdhttp.Request) (*stdhttp.Response, error) {
+				return &stdhttp.Response{
+					StatusCode: stdhttp.StatusOK,
+					Header:     stdhttp.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{}`)),
+				}, nil
+			}),
+		}
+		return client, &stdhttp.Transport{}, nil
+	}
+
+	cfg := validConfig()
+	cfg.Credentials.UniverseDomain = "my-universe.goog"
+	e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+	metaOpts, err := e.metadataClientOptions(context.Background())
+	if err != nil {
+		t.Fatalf("metadataClientOptions() error = %v", err)
+	}
+
+	admin, err := newDestinationAdmin(context.Background(), cfg.Project, cfg.Dataset, metaOpts...)
+	if err != nil {
+		t.Fatalf("newDestinationAdmin() error = %v", err)
+	}
+	defer func() { _ = admin.Close() }()
+
+	if _, err := admin.DatasetMetadata(context.Background()); err != nil {
+		t.Fatalf("DatasetMetadata() error = %v", err)
+	}
 }

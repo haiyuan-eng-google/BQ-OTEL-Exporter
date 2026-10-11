@@ -13,6 +13,7 @@ import (
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
@@ -1108,5 +1109,56 @@ func TestEncodeMetricRow(t *testing.T) {
 	}
 	if buckets := norm.Get(norm.Descriptor().Fields().ByName("bucket_counts")).List(); buckets.Len() != 4 {
 		t.Errorf("bucket_counts len = %d, want 4", buckets.Len())
+	}
+}
+
+func TestEncodeMetricNonFiniteFloats(t *testing.T) {
+	enc, err := New(schema.MetricsTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const ts = pcommon.Timestamp(1_700_000_000_000_000_000)
+	md := pmetric.NewMetrics()
+	sm := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
+
+	gm := sm.Metrics().AppendEmpty()
+	gm.SetName("m.gauge.nonfinite")
+	g := gm.SetEmptyGauge()
+	for _, v := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		dp := g.DataPoints().AppendEmpty()
+		dp.SetTimestamp(ts)
+		dp.SetDoubleValue(v)
+		ex := dp.Exemplars().AppendEmpty()
+		ex.SetTimestamp(ts)
+		ex.SetDoubleValue(v)
+	}
+
+	rows, rejects := transform.MetricRows(md, opts())
+	if len(rejects) != 0 || len(rows) != 3 {
+		t.Fatalf("MetricRows() rows=%d rejects=%+v", len(rows), rejects)
+	}
+
+	checks := []func(float64) bool{
+		math.IsNaN,
+		func(v float64) bool { return math.IsInf(v, 1) },
+		func(v float64) bool { return math.IsInf(v, -1) },
+	}
+	for i, check := range checks {
+		b, err := enc.Encode(rows[i])
+		if err != nil {
+			t.Fatalf("Encode(rows[%d]) error = %v", i, err)
+		}
+		norm := decodeNormalized(t, enc, b)
+		if got := get(t, norm, "value_double").Float(); !check(got) {
+			t.Errorf("rows[%d] decoded value_double = %v", i, got)
+		}
+		exList := norm.Get(norm.Descriptor().Fields().ByName("exemplars")).List()
+		if exList.Len() != 1 {
+			t.Fatalf("rows[%d] exemplars len = %d, want 1", i, exList.Len())
+		}
+		if got := get(t, exList.Get(0).Message(), "value_double").Float(); !check(got) {
+			t.Errorf("rows[%d] decoded exemplars[0].value_double = %v", i, got)
+		}
 	}
 }

@@ -167,12 +167,12 @@ func exporterInstance(res pcommon.Resource) string {
 
 func loadCredentialsJSON(
 	ctx context.Context, rawJSON []byte, scopes []string, universeDomain string,
-) (*google.Credentials, error) {
+) (google.CredentialsType, error) {
 	var header struct {
 		Type string `json:"type"`
 	}
 	if err := json.Unmarshal(rawJSON, &header); err != nil {
-		return nil, fmt.Errorf("parsing credentials JSON: %w", err)
+		return "", fmt.Errorf("parsing credentials JSON: %w", err)
 	}
 	credType := google.CredentialsType(header.Type)
 	switch credType {
@@ -183,14 +183,17 @@ func loadCredentialsJSON(
 		google.ImpersonatedServiceAccount,
 		google.GDCHServiceAccount:
 	case "":
-		return nil, errors.New("google: missing 'type' field in credentials")
+		return "", errors.New("google: missing 'type' field in credentials")
 	default:
-		return nil, fmt.Errorf("unsupported credentials type %q", header.Type)
+		return "", fmt.Errorf("unsupported credentials type %q", header.Type)
 	}
-	return google.CredentialsFromJSONWithTypeAndParams(ctx, rawJSON, credType, google.CredentialsParams{
+	if _, err := google.CredentialsFromJSONWithTypeAndParams(ctx, rawJSON, credType, google.CredentialsParams{
 		Scopes:         scopes,
 		UniverseDomain: universeDomain,
-	})
+	}); err != nil {
+		return "", err
+	}
+	return credType, nil
 }
 
 // authenticationOptions renders the configured identity for either BigQuery
@@ -202,13 +205,14 @@ func (e *signalExporter) authenticationOptions(
 
 	switch {
 	case e.cfg.Credentials.JSON != "":
-		creds, err := loadCredentialsJSON(
-			ctx, []byte(e.cfg.Credentials.JSON), scopes, e.cfg.Credentials.UniverseDomain)
+		rawJSON := []byte(e.cfg.Credentials.JSON)
+		credType, err := loadCredentialsJSON(
+			ctx, rawJSON, scopes, e.cfg.Credentials.UniverseDomain)
 		if err != nil {
 			return nil, fmt.Errorf("loading credentials.json: %w", err)
 		}
 		opts = append(opts,
-			option.WithCredentials(creds),
+			option.WithAuthCredentialsJSON(option.CredentialsType(credType), rawJSON),
 			option.WithScopes(scopes...),
 		)
 
@@ -918,14 +922,11 @@ func (e *signalExporter) quarantineRows(ctx context.Context, rows []transform.Ro
 			invalid[pos] = true
 		}
 	}
-	remainingAcked := out.AcknowledgedRows
 	for pos, reason := range encodedReasons {
-		if !invalid[pos] && (out.IsAcked(pos) || remainingAcked > 0) {
-			if !out.IsAcked(pos) {
-				remainingAcked--
-			}
+		acked := !invalid[pos] && (out.IsAcked(pos) || (len(out.AckedRanges) == 0 && out.Err == nil && len(out.RowErrors) == 0 && out.AcknowledgedRows == len(encodedReasons)))
+		if acked {
 			e.tel.RecordQuarantined(ctx, reason, 1)
-		} else if out.Err != nil || len(out.RowErrors) > 0 {
+		} else {
 			e.tel.RecordQuarantineFailed(ctx, reason, 1)
 		}
 	}

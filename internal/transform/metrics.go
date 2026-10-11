@@ -182,10 +182,6 @@ func temporalityName(t pmetric.AggregationTemporality) string {
 	return TemporalityUnspecified
 }
 
-func isFinite(v float64) bool {
-	return !math.IsNaN(v) && !math.IsInf(v, 0)
-}
-
 func hasNoRecordedValue(flags pmetric.DataPointFlags) bool {
 	return flags.NoRecordedValue()
 }
@@ -228,9 +224,6 @@ func checkCommonPoint(
 		if overflowsInt64(ex.Timestamp()) {
 			return &Violation{Reason: ReasonTimestampOverflow, FieldPath: "exemplars.time_unix_nano"}
 		}
-		if ex.ValueType() == pmetric.ExemplarValueTypeDouble && !isFinite(ex.DoubleValue()) {
-			return &Violation{Reason: ReasonSerialization, FieldPath: "exemplars.value_double"}
-		}
 		if bad := l.checkMap(ex.FilteredAttributes(), "exemplars.filtered_attributes"); bad != nil {
 			return bad
 		}
@@ -245,13 +238,7 @@ func checkNumberPoint(
 	scope pcommon.InstrumentationScope,
 	l Limits,
 ) *Violation {
-	if bad := checkCommonPoint(dp.Timestamp(), dp.StartTimestamp(), dp.Attributes(), dp.Exemplars(), desc, resource, scope, l); bad != nil {
-		return bad
-	}
-	if !hasNoRecordedValue(dp.Flags()) && dp.ValueType() == pmetric.NumberDataPointValueTypeDouble && !isFinite(dp.DoubleValue()) {
-		return &Violation{Reason: ReasonSerialization, FieldPath: "value_double"}
-	}
-	return nil
+	return checkCommonPoint(dp.Timestamp(), dp.StartTimestamp(), dp.Attributes(), dp.Exemplars(), desc, resource, scope, l)
 }
 
 func checkHistogramPoint(
@@ -269,20 +256,6 @@ func checkHistogramPoint(
 	}
 	if dp.Count() > math.MaxInt64 {
 		return &Violation{Reason: ReasonSerialization, FieldPath: "count"}
-	}
-	if dp.HasSum() && !isFinite(dp.Sum()) {
-		return &Violation{Reason: ReasonSerialization, FieldPath: "sum"}
-	}
-	if dp.HasMin() && !isFinite(dp.Min()) {
-		return &Violation{Reason: ReasonSerialization, FieldPath: "min"}
-	}
-	if dp.HasMax() && !isFinite(dp.Max()) {
-		return &Violation{Reason: ReasonSerialization, FieldPath: "max"}
-	}
-	for _, b := range dp.ExplicitBounds().All() {
-		if !isFinite(b) {
-			return &Violation{Reason: ReasonSerialization, FieldPath: "explicit_bounds"}
-		}
 	}
 	for _, c := range dp.BucketCounts().All() {
 		if c > math.MaxInt64 {
@@ -310,18 +283,6 @@ func checkExpHistogramPoint(
 	}
 	if dp.ZeroCount() > math.MaxInt64 {
 		return &Violation{Reason: ReasonSerialization, FieldPath: "exp_zero_count"}
-	}
-	if dp.HasSum() && !isFinite(dp.Sum()) {
-		return &Violation{Reason: ReasonSerialization, FieldPath: "sum"}
-	}
-	if dp.HasMin() && !isFinite(dp.Min()) {
-		return &Violation{Reason: ReasonSerialization, FieldPath: "min"}
-	}
-	if dp.HasMax() && !isFinite(dp.Max()) {
-		return &Violation{Reason: ReasonSerialization, FieldPath: "max"}
-	}
-	if !isFinite(dp.ZeroThreshold()) {
-		return &Violation{Reason: ReasonSerialization, FieldPath: "exp_zero_threshold"}
 	}
 	for _, c := range dp.Positive().BucketCounts().All() {
 		if c > math.MaxInt64 {
@@ -352,17 +313,6 @@ func checkSummaryPoint(
 	if dp.Count() > math.MaxInt64 {
 		return &Violation{Reason: ReasonSerialization, FieldPath: "count"}
 	}
-	if !isFinite(dp.Sum()) {
-		return &Violation{Reason: ReasonSerialization, FieldPath: "sum"}
-	}
-	for _, qv := range dp.QuantileValues().All() {
-		if !isFinite(qv.Quantile()) {
-			return &Violation{Reason: ReasonSerialization, FieldPath: "summary_quantiles"}
-		}
-		if !isFinite(qv.Value()) {
-			return &Violation{Reason: ReasonSerialization, FieldPath: "summary_quantiles"}
-		}
-	}
 	return nil
 }
 
@@ -378,7 +328,8 @@ func baseMetricRow(
 	fingerprints fingerprinter,
 ) Row {
 	attrStr, attrSchema := otlpjson.EncodeMapWithSchema(attrs)
-	fp := fingerprints.next(canonicalMetricPoint(ts, startTS, flags, attrStr, attrSchema, desc, origin, valueCanonical))
+	exRows, exCanonical := encodeExemplars(exemplars)
+	fp := fingerprints.next(canonicalMetricPoint(ts, startTS, flags, attrStr, attrSchema, desc, origin, valueCanonical, exCanonical))
 
 	r := Row{
 		"timestamp":              micros(ts),
@@ -412,7 +363,7 @@ func baseMetricRow(
 	}
 	putStrIfSet(r, "resource_schema_url", sanitize(origin.resSchemaURL))
 	putStrIfSet(r, "scope_schema_url", sanitize(origin.scopeSchemaURL))
-	if exRows := encodeExemplars(exemplars); len(exRows) > 0 {
+	if len(exRows) > 0 {
 		r["exemplars"] = exRows
 	}
 	return r
@@ -468,6 +419,14 @@ func histogramPointRow(
 		if dp.HasMax() {
 			writeField(&valBuilder, "max", strconv.FormatFloat(dp.Max(), 'g', -1, 64))
 		}
+		writeField(&valBuilder, "explicit_bounds_count", strconv.Itoa(dp.ExplicitBounds().Len()))
+		for _, b := range dp.ExplicitBounds().All() {
+			writeField(&valBuilder, "bound", strconv.FormatFloat(b, 'g', -1, 64))
+		}
+		writeField(&valBuilder, "bucket_counts_count", strconv.Itoa(dp.BucketCounts().Len()))
+		for _, c := range dp.BucketCounts().All() {
+			writeField(&valBuilder, "bucket_count", strconv.FormatUint(c, 10))
+		}
 	}
 	r := baseMetricRow(dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), dp.Attributes(), dp.Exemplars(), desc, origin, received, valBuilder.String(), fingerprints)
 	if !hasNoRecordedValue(dp.Flags()) {
@@ -505,9 +464,18 @@ func expHistogramPointRow(
 		writeField(&valBuilder, "count", strconv.FormatUint(dp.Count(), 10))
 		writeField(&valBuilder, "exp_scale", strconv.FormatInt(int64(dp.Scale()), 10))
 		writeField(&valBuilder, "exp_zero_count", strconv.FormatUint(dp.ZeroCount(), 10))
+		writeField(&valBuilder, "exp_zero_threshold", strconv.FormatFloat(dp.ZeroThreshold(), 'g', -1, 64))
 		if dp.HasSum() {
 			writeField(&valBuilder, "sum", strconv.FormatFloat(dp.Sum(), 'g', -1, 64))
 		}
+		if dp.HasMin() {
+			writeField(&valBuilder, "min", strconv.FormatFloat(dp.Min(), 'g', -1, 64))
+		}
+		if dp.HasMax() {
+			writeField(&valBuilder, "max", strconv.FormatFloat(dp.Max(), 'g', -1, 64))
+		}
+		writeExpBucketsCanonical(&valBuilder, "exp_positive", dp.Positive())
+		writeExpBucketsCanonical(&valBuilder, "exp_negative", dp.Negative())
 	}
 	r := baseMetricRow(dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), dp.Attributes(), dp.Exemplars(), desc, origin, received, valBuilder.String(), fingerprints)
 	if !hasNoRecordedValue(dp.Flags()) {
@@ -534,6 +502,14 @@ func expHistogramPointRow(
 	return r
 }
 
+func writeExpBucketsCanonical(b *strings.Builder, prefix string, buckets pmetric.ExponentialHistogramDataPointBuckets) {
+	writeField(b, prefix+".offset", strconv.FormatInt(int64(buckets.Offset()), 10))
+	writeField(b, prefix+".count", strconv.Itoa(buckets.BucketCounts().Len()))
+	for _, c := range buckets.BucketCounts().All() {
+		writeField(b, prefix+".bucket", strconv.FormatUint(c, 10))
+	}
+}
+
 func expBucketsRow(b pmetric.ExponentialHistogramDataPointBuckets) Row {
 	if b.BucketCounts().Len() == 0 && b.Offset() == 0 {
 		return nil
@@ -556,6 +532,11 @@ func summaryPointRow(
 	if !hasNoRecordedValue(dp.Flags()) {
 		writeField(&valBuilder, "count", strconv.FormatUint(dp.Count(), 10))
 		writeField(&valBuilder, "sum", strconv.FormatFloat(dp.Sum(), 'g', -1, 64))
+		writeField(&valBuilder, "summary_quantiles_count", strconv.Itoa(dp.QuantileValues().Len()))
+		for _, qv := range dp.QuantileValues().All() {
+			writeField(&valBuilder, "quantile", strconv.FormatFloat(qv.Quantile(), 'g', -1, 64))
+			writeField(&valBuilder, "value", strconv.FormatFloat(qv.Value(), 'g', -1, 64))
+		}
 	}
 	r := baseMetricRow(dp.Timestamp(), dp.StartTimestamp(), dp.Flags(), dp.Attributes(), pmetric.NewExemplarSlice(), desc, origin, received, valBuilder.String(), fingerprints)
 	if !hasNoRecordedValue(dp.Flags()) {
@@ -575,13 +556,30 @@ func summaryPointRow(
 	return r
 }
 
-func encodeExemplars(exemplars pmetric.ExemplarSlice) []Row {
+func encodeExemplars(exemplars pmetric.ExemplarSlice) ([]Row, string) {
 	if exemplars.Len() == 0 {
-		return nil
+		return nil, ""
 	}
+	var b strings.Builder
+	writeField(&b, "exemplars_count", strconv.Itoa(exemplars.Len()))
 	out := make([]Row, 0, exemplars.Len())
 	for _, ex := range exemplars.All() {
 		fAttrs, fSchema := otlpjson.EncodeMapWithSchema(ex.FilteredAttributes())
+		spanID := spanIDString(ex.SpanID())
+		traceID := traceIDString(ex.TraceID())
+		writeField(&b, "exemplar.time_unix_nano", strconv.FormatUint(uint64(ex.Timestamp()), 10))
+		writeField(&b, "exemplar.value_type", ex.ValueType().String())
+		switch ex.ValueType() {
+		case pmetric.ExemplarValueTypeDouble:
+			writeField(&b, "exemplar.value_double", strconv.FormatFloat(ex.DoubleValue(), 'g', -1, 64))
+		case pmetric.ExemplarValueTypeInt:
+			writeField(&b, "exemplar.value_int64", strconv.FormatInt(ex.IntValue(), 10))
+		}
+		writeField(&b, "exemplar.span_id", spanID)
+		writeField(&b, "exemplar.trace_id", traceID)
+		writeField(&b, "exemplar.filtered_attributes", fAttrs)
+		writeField(&b, "exemplar.filtered_attributes_schema", fSchema)
+
 		er := Row{
 			"time_unix_nano":             int64(ex.Timestamp()),
 			"filtered_attributes":        fAttrs,
@@ -596,11 +594,11 @@ func encodeExemplars(exemplars pmetric.ExemplarSlice) []Row {
 		case pmetric.ExemplarValueTypeInt:
 			er["value_int64"] = ex.IntValue()
 		}
-		putStrIfSet(er, "span_id", spanIDString(ex.SpanID()))
-		putStrIfSet(er, "trace_id", traceIDString(ex.TraceID()))
+		putStrIfSet(er, "span_id", spanID)
+		putStrIfSet(er, "trace_id", traceID)
 		out = append(out, er)
 	}
-	return out
+	return out, b.String()
 }
 
 func uint64SliceToInt64(in []uint64) []int64 {
@@ -618,6 +616,7 @@ func canonicalMetricPoint(
 	desc metricDescriptor,
 	origin metricOrigin,
 	valueCanonical string,
+	exemplarsCanonical string,
 ) string {
 	var b strings.Builder
 	writeField(&b, "version", schema.FingerprintPrefix)
@@ -637,6 +636,7 @@ func canonicalMetricPoint(
 	writeField(&b, "metric_metadata", desc.meta)
 	writeField(&b, "metric_metadata_schema", desc.metaSchema)
 	b.WriteString(valueCanonical)
+	b.WriteString(exemplarsCanonical)
 	b.WriteString(origin.canonical)
 	return b.String()
 }
