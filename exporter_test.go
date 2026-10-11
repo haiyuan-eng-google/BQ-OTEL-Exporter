@@ -205,6 +205,25 @@ func TestPushTracesMixedOutcomeRetriesOnlyNonRejectedRows(t *testing.T) {
 	}
 }
 
+func TestPushTracesSplitBatchExcludesAckedSubRequestsFromRetry(t *testing.T) {
+	e, _ := newTestTracesExporter(t, bqi.AppendOutcome{
+		AcknowledgedRows: 2,
+		AckedRanges:      [][2]int{{0, 2}},
+		Verdict:          bqi.Classify(status.Error(codes.Unavailable, "second sub-request failed")),
+		Err:              status.Error(codes.Unavailable, "second sub-request failed"),
+	})
+
+	err := e.pushTraceData(context.Background(), newTestTraces(4))
+	var traceErr consumererror.Traces
+	if !errors.As(err, &traceErr) {
+		t.Fatalf("expected retryable trace subset, got %T: %v", err, err)
+	}
+	spans := traceErr.Data().ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+	if got := spanNames(spans); !equalStrings(got, []string{"c", "d"}) {
+		t.Fatalf("retry subset = %v, want only unacknowledged spans [c d]", got)
+	}
+}
+
 // A request refused for row errors appended none of its rows, so its valid
 // rows still owe delivery. A permanent rejection of another request in the
 // same batch must not drop them with it.
@@ -981,8 +1000,11 @@ func TestSignalExporterStartOpensQuarantineStreamOnlyWhenEnabled(t *testing.T) {
 			if err := e.start(context.Background(), nil); err != nil {
 				t.Fatalf("start failed: %v", err)
 			}
-			if opened := e.quarantine != nil && e.quarantineEnc != nil; opened != enabled {
+			if opened := e.quarantine != nil && e.quarantineEnc != nil && e.quarantineClient != nil; opened != enabled {
 				t.Errorf("quarantine stream opened = %v, want %v", opened, enabled)
+			}
+			if enabled && e.quarantineClient == e.client {
+				t.Error("quarantine client must be distinct from the primary writer client")
 			}
 			started := logs.FilterMessage("BigQuery exporter started").All()
 			if len(started) != 1 {
@@ -998,10 +1020,214 @@ func TestSignalExporterStartOpensQuarantineStreamOnlyWhenEnabled(t *testing.T) {
 			if err := e.shutdown(context.Background()); err != nil {
 				t.Fatalf("shutdown failed: %v", err)
 			}
-			if e.quarantine != nil {
-				t.Error("shutdown kept the quarantine stream")
+			if e.quarantine != nil || e.quarantineClient != nil {
+				t.Error("shutdown kept the quarantine stream or client")
 			}
 		})
+	}
+}
+
+// When a split batch acknowledges earlier sub-requests and every remaining row
+// in a later sub-request is permanently rejected by the service, retryable is
+// empty. Both traces and logs push paths must quarantine the rejected row once
+// and return nil so exporterhelper does not replay the whole original batch.
+func TestPushSplitBatchAllRemainingRowsRejectedCompletesWithoutRetry(t *testing.T) {
+	for _, withTransportErr := range []bool{false, true} {
+		t.Run(fmt.Sprintf("withTransportErr=%v", withTransportErr), func(t *testing.T) {
+			outcome := bqi.AppendOutcome{
+				AcknowledgedRows: 2,
+				AckedRanges:      [][2]int{{0, 2}},
+				RowErrors:        []bqi.RowError{{Index: 2, Code: "FIELDS_ERROR", Message: "bad row"}},
+			}
+			if withTransportErr {
+				outcome.Verdict = bqi.Classify(status.Error(codes.InvalidArgument, "row rejected"))
+				outcome.Err = status.Error(codes.InvalidArgument, "row rejected")
+			}
+
+			te, tApp := newTestTracesExporter(t, outcome)
+			tQuarantined, tStream := withQuarantine(t, te.signalExporter, bqi.AppendOutcome{AcknowledgedRows: 1})
+			if err := te.pushTraceData(context.Background(), newTestTraces(3)); err != nil {
+				t.Fatalf("pushTraceData returned %v, want nil when all non-acked rows are permanently rejected", err)
+			}
+			if tApp.appended != 1 || tStream.appended != 1 || len(tQuarantined.rows) != 1 {
+				t.Fatalf("traces appends = %d, quarantine appends = %d (%d rows), want 1, 1, 1",
+					tApp.appended, tStream.appended, len(tQuarantined.rows))
+			}
+			if got := tQuarantined.rows[0]["span_id"]; got != (pcommon.SpanID{3}).String() {
+				t.Errorf("quarantined trace span_id = %v, want span 3", got)
+			}
+
+			le, lApp := newTestLogsExporter(t, outcome)
+			lQuarantined, lStream := withQuarantine(t, le.signalExporter, bqi.AppendOutcome{AcknowledgedRows: 1})
+			ld := plog.NewLogs()
+			records := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords()
+			for i := range 3 {
+				lr := records.AppendEmpty()
+				lr.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+				lr.SetSpanID(pcommon.SpanID{byte(i + 1)})
+			}
+			if err := le.pushLogData(context.Background(), ld); err != nil {
+				t.Fatalf("pushLogData returned %v, want nil when all non-acked rows are permanently rejected", err)
+			}
+			if lApp.appended != 1 || lStream.appended != 1 || len(lQuarantined.rows) != 1 {
+				t.Fatalf("logs appends = %d, quarantine appends = %d (%d rows), want 1, 1, 1",
+					lApp.appended, lStream.appended, len(lQuarantined.rows))
+			}
+			if got := lQuarantined.rows[0]["span_id"]; got != (pcommon.SpanID{3}).String() {
+				t.Errorf("quarantined log span_id = %v, want record 3", got)
+			}
+		})
+	}
+}
+
+// logsWithBodies builds one scope's log records, one per body, all else equal.
+// Records with the same body are identical, so the nth of them takes
+// intra_batch_ordinal n. A body of "invalid" also gets a time that does not fit
+// the table's INT64 columns, so the transform stage drops that record.
+func logsWithBodies(bodies ...string) plog.Logs {
+	ld := plog.NewLogs()
+	records := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords()
+	for _, body := range bodies {
+		lr := records.AppendEmpty()
+		lr.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+		lr.Body().SetStr(body)
+		if body == "invalid" {
+			lr.SetTimestamp(math.MaxInt64 + 1)
+		}
+	}
+	return ld
+}
+
+// A log record's insert_id encodes how many identical records precede it in
+// its batch, and a retry payload is fingerprinted from scratch. When a split
+// batch has some sub-requests acknowledged and one failed, the payload handed
+// back must still give every record it carries the identity it had in the
+// original batch. If an acknowledged record were left out ahead of an identical
+// retried one, the retried one would be sent under the acknowledged copy's
+// insert_id, and the dedup view would collapse two distinct records into one.
+func TestPushLogDataSplitBatchPreservesOrdinalForIdenticalRecordsAcrossSplit(t *testing.T) {
+	unavailable := status.Error(codes.Unavailable, "later sub-request failed")
+	// splitAfter acknowledges the given row ranges of the batch sent and fails
+	// the rest of it.
+	splitAfter := func(acked ...[2]int) bqi.AppendOutcome {
+		out := bqi.AppendOutcome{
+			AckedRanges: acked,
+			Verdict:     bqi.Classify(unavailable),
+			Err:         unavailable,
+		}
+		for _, r := range acked {
+			out.AcknowledgedRows += r[1] - r[0]
+		}
+		return out
+	}
+
+	// Row positions are positions among the rows sent, which leave out any
+	// record the transform stage dropped.
+	tests := []struct {
+		name   string
+		bodies []string
+		out    bqi.AppendOutcome
+		// retry lists, by row position, the rows the payload must carry.
+		retry []int
+	}{
+		{
+			name:   "identical records split one and one",
+			bodies: []string{"same", "same"},
+			out:    splitAfter([2]int{0, 1}),
+			retry:  []int{0, 1},
+		},
+		{
+			name:   "identical records after a distinct one",
+			bodies: []string{"other", "same", "same"},
+			out:    splitAfter([2]int{0, 2}),
+			retry:  []int{1, 2},
+		},
+		{
+			name:   "identical records over three sub-requests",
+			bodies: []string{"same", "same", "same"},
+			out:    splitAfter([2]int{0, 1}, [2]int{1, 2}),
+			retry:  []int{0, 1, 2},
+		},
+		{
+			name:   "a record the transform stage dropped between identical records",
+			bodies: []string{"same", "invalid", "same"},
+			out:    splitAfter([2]int{0, 1}),
+			retry:  []int{0, 1},
+		},
+		{
+			name:   "distinct acknowledged records stay out of the retry",
+			bodies: []string{"a", "b", "c"},
+			out:    splitAfter([2]int{0, 2}),
+			retry:  []int{2},
+		},
+		{
+			name:   "nothing acknowledged",
+			bodies: []string{"same", "same", "other"},
+			out:    splitAfter(),
+			retry:  []int{0, 1, 2},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e, _ := newTestLogsExporter(t, tc.out)
+			ld := logsWithBodies(tc.bodies...)
+
+			sent, _ := transform.LogRows(ld, e.opts)
+			seen := make(map[string]bool, len(sent))
+			for _, id := range column(sent, "insert_id") {
+				if seen[id] {
+					t.Fatalf("setup: insert_id %q is shared by two rows of the batch", id)
+				}
+				seen[id] = true
+			}
+
+			err := e.pushLogData(context.Background(), ld)
+			var logsErr consumererror.Logs
+			if !errors.As(err, &logsErr) {
+				t.Fatalf("expected a retryable consumererror.Logs, got %T: %v", err, err)
+			}
+			replay, rejects := transform.LogRows(logsErr.Data(), e.opts)
+			if len(rejects) != 0 {
+				t.Fatalf("the retry payload carries records the transform stage drops: %+v", rejects)
+			}
+			if len(replay) != len(tc.retry) {
+				t.Fatalf("retry payload holds %d records, want %d: rows %v of those sent",
+					len(replay), len(tc.retry), tc.retry)
+			}
+			for i, row := range tc.retry {
+				for _, col := range []string{"record_fingerprint", "insert_id"} {
+					if got, want := replay[i][col], sent[row][col]; got != want {
+						t.Errorf("retry record %d has %s %v, want %v, the value of row %d in the original batch",
+							i, col, got, want, row)
+					}
+				}
+			}
+		})
+	}
+}
+
+// A record the service rejected is dropped for good, even when it is identical
+// to one that must be retried: returning it would have the service reject it,
+// and exporterhelper replay it, over and over.
+func TestPushLogDataSplitBatchDoesNotReturnServiceRejectedIdenticalRecord(t *testing.T) {
+	unavailable := status.Error(codes.Unavailable, "last sub-request failed")
+	e, _ := newTestLogsExporter(t, bqi.AppendOutcome{
+		AcknowledgedRows: 1,
+		AckedRanges:      [][2]int{{0, 1}},
+		RowErrors:        []bqi.RowError{{Index: 1, Code: "FIELDS_ERROR", Message: "bad field body"}},
+		Verdict:          bqi.Classify(unavailable),
+		Err:              unavailable,
+	})
+
+	err := e.pushLogData(context.Background(), logsWithBodies("same", "same", "same"))
+	var logsErr consumererror.Logs
+	if !errors.As(err, &logsErr) {
+		t.Fatalf("expected a retryable consumererror.Logs, got %T: %v", err, err)
+	}
+	// The retried record comes back with its acknowledged predecessor, and the
+	// rejected record in between stays out.
+	if got := logsErr.Data().LogRecordCount(); got != 2 {
+		t.Fatalf("retry payload holds %d records, want 2: the rejected record must not come back", got)
 	}
 }
 

@@ -12,6 +12,8 @@ package protoenc // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/inter
 
 import (
 	"fmt"
+	"math"
+	"reflect"
 
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter/adapt"
@@ -24,10 +26,16 @@ import (
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
 )
 
+type fieldSpec struct {
+	fd     protoreflect.FieldDescriptor
+	nested map[string]fieldSpec
+}
+
 // Encoder serializes rows against one table schema.
 type Encoder struct {
 	md         protoreflect.MessageDescriptor
 	normalized *descriptorpb.DescriptorProto
+	fields     map[string]fieldSpec
 }
 
 // New builds an encoder for the given table schema.
@@ -49,7 +57,25 @@ func New(ts *storagepb.TableSchema) (*Encoder, error) {
 		return nil, fmt.Errorf("normalizing proto descriptor: %w", err)
 	}
 
-	return &Encoder{md: msgDesc, normalized: normalized}, nil
+	return &Encoder{
+		md:         msgDesc,
+		normalized: normalized,
+		fields:     indexFields(msgDesc),
+	}, nil
+}
+
+func indexFields(md protoreflect.MessageDescriptor) map[string]fieldSpec {
+	fields := md.Fields()
+	out := make(map[string]fieldSpec, fields.Len())
+	for i := 0; i < fields.Len(); i++ {
+		fd := fields.Get(i)
+		spec := fieldSpec{fd: fd}
+		if fd.Kind() == protoreflect.MessageKind && !fd.IsMap() {
+			spec.nested = indexFields(fd.Message())
+		}
+		out[string(fd.Name())] = spec
+	}
+	return out
 }
 
 // Descriptor returns the normalized descriptor to hand to the write stream.
@@ -64,7 +90,7 @@ func (e *Encoder) Descriptor() *descriptorpb.DescriptorProto {
 // failing the whole batch.
 func (e *Encoder) Encode(row transform.Row) ([]byte, error) {
 	msg := dynamicpb.NewMessage(e.md)
-	if err := setFields(msg, e.md, row); err != nil {
+	if err := setFields(msg, e.fields, row); err != nil {
 		return nil, err
 	}
 	b, err := proto.Marshal(msg)
@@ -74,24 +100,40 @@ func (e *Encoder) Encode(row transform.Row) ([]byte, error) {
 	return b, nil
 }
 
-func setFields(msg *dynamicpb.Message, md protoreflect.MessageDescriptor, row transform.Row) error {
-	fields := md.Fields()
+func setFields(msg *dynamicpb.Message, fields map[string]fieldSpec, row transform.Row) error {
 	for name, val := range row {
-		fd := fields.ByName(protoreflect.Name(name))
-		if fd == nil {
+		spec, ok := fields[name]
+		if !ok {
 			// A column the table does not have. Silently dropping it would
 			// hide a schema drift bug, so surface it.
 			return fmt.Errorf("column %q is not present in the destination table schema", name)
 		}
+		fd := spec.fd
 		if fd.IsList() {
-			nested, ok := val.([]transform.Row)
-			if !ok {
+			if fd.Kind() != protoreflect.MessageKind {
+				if err := setRepeatedScalars(msg, fd, name, val); err != nil {
+					return err
+				}
+				continue
+			}
+			var nested []transform.Row
+			switch v := val.(type) {
+			case nil:
+				continue
+			case []transform.Row:
+				nested = v
+			case []map[string]any:
+				nested = make([]transform.Row, len(v))
+				for i, item := range v {
+					nested[i] = item
+				}
+			default:
 				return fmt.Errorf("column %q: expected a list of rows, got %T", name, val)
 			}
 			list := msg.Mutable(fd).List()
 			for i, item := range nested {
 				elem := dynamicpb.NewMessage(fd.Message())
-				if err := setFields(elem, fd.Message(), item); err != nil {
+				if err := setFields(elem, spec.nested, item); err != nil {
 					return fmt.Errorf("column %q[%d]: %w", name, i, err)
 				}
 				list.Append(protoreflect.ValueOfMessage(elem))
@@ -117,7 +159,7 @@ func setFields(msg *dynamicpb.Message, md protoreflect.MessageDescriptor, row tr
 				continue
 			}
 			elem := dynamicpb.NewMessage(fd.Message())
-			if err := setFields(elem, fd.Message(), nested); err != nil {
+			if err := setFields(elem, spec.nested, nested); err != nil {
 				return fmt.Errorf("column %q: %w", name, err)
 			}
 			msg.Set(fd, protoreflect.ValueOfMessage(elem))
@@ -130,6 +172,91 @@ func setFields(msg *dynamicpb.Message, md protoreflect.MessageDescriptor, row tr
 		msg.Set(fd, pv)
 	}
 	return nil
+}
+
+func setRepeatedScalars(msg *dynamicpb.Message, fd protoreflect.FieldDescriptor, name string, val any) error {
+	if val == nil {
+		return nil
+	}
+	list := msg.Mutable(fd).List()
+	appendOne := func(i int, item any) error {
+		pv, err := scalar(fd, item)
+		if err != nil {
+			return fmt.Errorf("column %q[%d]: %w", name, i, err)
+		}
+		list.Append(pv)
+		return nil
+	}
+
+	switch s := val.(type) {
+	case []any:
+		for i, item := range s {
+			if err := appendOne(i, item); err != nil {
+				return err
+			}
+		}
+		return nil
+	case []string:
+		for i, item := range s {
+			if err := appendOne(i, item); err != nil {
+				return err
+			}
+		}
+		return nil
+	case []int64:
+		for i, item := range s {
+			if err := appendOne(i, item); err != nil {
+				return err
+			}
+		}
+		return nil
+	case []int:
+		for i, item := range s {
+			if err := appendOne(i, item); err != nil {
+				return err
+			}
+		}
+		return nil
+	case []int32:
+		for i, item := range s {
+			if err := appendOne(i, item); err != nil {
+				return err
+			}
+		}
+		return nil
+	case []float64:
+		for i, item := range s {
+			if err := appendOne(i, item); err != nil {
+				return err
+			}
+		}
+		return nil
+	case []bool:
+		for i, item := range s {
+			if err := appendOne(i, item); err != nil {
+				return err
+			}
+		}
+		return nil
+	case [][]byte:
+		for i, item := range s {
+			if err := appendOne(i, item); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		rv := reflect.ValueOf(val)
+		if rv.Kind() != reflect.Slice {
+			return fmt.Errorf("column %q: expected a slice of %s, got %T", name, fd.Kind(), val)
+		}
+		for i := 0; i < rv.Len(); i++ {
+			if err := appendOne(i, rv.Index(i).Interface()); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 }
 
 // scalar converts a Go value to the protobuf kind the descriptor declares.
@@ -162,8 +289,14 @@ func scalar(fd protoreflect.FieldDescriptor, val any) (protoreflect.Value, error
 		case int32:
 			return protoreflect.ValueOfInt32(v), nil
 		case int64:
+			if v < math.MinInt32 || v > math.MaxInt32 {
+				return protoreflect.Value{}, fmt.Errorf("int32 overflow: %d out of range [%d, %d]", v, math.MinInt32, math.MaxInt32)
+			}
 			return protoreflect.ValueOfInt32(int32(v)), nil
 		case int:
+			if int64(v) < math.MinInt32 || int64(v) > math.MaxInt32 {
+				return protoreflect.Value{}, fmt.Errorf("int32 overflow: %d out of range [%d, %d]", v, math.MinInt32, math.MaxInt32)
+			}
 			return protoreflect.ValueOfInt32(int32(v)), nil
 		default:
 			return protoreflect.Value{}, fmt.Errorf("expected int32, got %T", val)

@@ -40,6 +40,29 @@ func TestValidateRejects(t *testing.T) {
 			func(c *Config) { c.Write.MaxInflightBytes = c.Write.MaxRequestBytes - 1 },
 			"a single full request could never be sent",
 		},
+		"negative connection pool size": {
+			func(c *Config) { c.Write.ConnectionPoolSize = -1 },
+			"write.connection_pool_size must not be negative",
+		},
+		"zero connection pool size with multiplexing": {
+			func(c *Config) {
+				c.Write.EnableMultiplexing = true
+				c.Write.ConnectionPoolSize = 0
+			},
+			"write.connection_pool_size must be positive when write.enable_multiplexing is enabled",
+		},
+		"unsupported compression": {
+			func(c *Config) { c.Write.Compression = "snappy" },
+			`write.compression "snappy" must be empty or "gzip"`,
+		},
+		"negative keepalive time": {
+			func(c *Config) { c.Write.Keepalive.Time = -time.Second },
+			"write.keepalive.time must not be negative",
+		},
+		"negative keepalive timeout": {
+			func(c *Config) { c.Write.Keepalive.Timeout = -time.Second },
+			"write.keepalive.timeout must not be negative",
+		},
 		"autocreate needs location": {func(c *Config) { c.AutoCreate.Dataset = true }, "location is required"},
 		"companion views need table creation": {
 			func(c *Config) { c.AutoCreate.CompanionViews = true },

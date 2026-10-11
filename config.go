@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"time"
 
 	"go.opentelemetry.io/collector/config/configoptional"
 	"go.opentelemetry.io/collector/config/configretry"
@@ -150,6 +151,27 @@ type WriteConfig struct {
 	MaxInflightRequests int `mapstructure:"max_inflight_requests"`
 	// MaxInflightBytes bounds the memory held by in-flight appends.
 	MaxInflightBytes int `mapstructure:"max_inflight_bytes"`
+	// EnableMultiplexing enables BigQuery Storage Write API connection
+	// sharing across default write streams.
+	EnableMultiplexing bool `mapstructure:"enable_multiplexing"`
+	// ConnectionPoolSize sets the gRPC connection pool size for the
+	// Storage Write client when multiplexing is enabled.
+	ConnectionPoolSize int `mapstructure:"connection_pool_size"`
+	// Compression selects the gRPC compressor for AppendRows calls ("" or "gzip").
+	Compression string `mapstructure:"compression"`
+	// Keepalive configures gRPC client keepalive parameters for Storage
+	// Write streams.
+	Keepalive KeepaliveConfig `mapstructure:"keepalive"`
+}
+
+// KeepaliveConfig configures gRPC client keepalive parameters.
+type KeepaliveConfig struct {
+	// Time is the idle duration after which the client pings the server.
+	Time time.Duration `mapstructure:"time"`
+	// Timeout is the duration the client waits for a keepalive ping ack.
+	Timeout time.Duration `mapstructure:"timeout"`
+	// PermitWithoutStream sends keepalive pings even with no active RPCs.
+	PermitWithoutStream bool `mapstructure:"permit_without_stream"`
 }
 
 // LimitsConfig mirrors transform.Limits in configuration.
@@ -288,6 +310,20 @@ func (cfg *Config) validateWrite() []error {
 		errs = append(errs, fmt.Errorf(
 			"write.max_inflight_bytes (%d) is below write.max_request_bytes (%d): a single full request could never be sent",
 			w.MaxInflightBytes, w.MaxRequestBytes))
+	}
+	if w.ConnectionPoolSize < 0 {
+		errs = append(errs, errors.New("write.connection_pool_size must not be negative"))
+	} else if w.EnableMultiplexing && w.ConnectionPoolSize <= 0 {
+		errs = append(errs, errors.New("write.connection_pool_size must be positive when write.enable_multiplexing is enabled"))
+	}
+	if w.Compression != "" && w.Compression != "gzip" {
+		errs = append(errs, fmt.Errorf("write.compression %q must be empty or \"gzip\"", w.Compression))
+	}
+	if w.Keepalive.Time < 0 {
+		errs = append(errs, errors.New("write.keepalive.time must not be negative"))
+	}
+	if w.Keepalive.Timeout < 0 {
+		errs = append(errs, errors.New("write.keepalive.timeout must not be negative"))
 	}
 	return errs
 }

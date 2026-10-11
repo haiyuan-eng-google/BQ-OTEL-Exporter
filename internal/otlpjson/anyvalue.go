@@ -19,6 +19,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
@@ -38,6 +40,49 @@ const (
 	schemaEmpty  = "empty"
 )
 
+var builderPool = sync.Pool{
+	New: func() any { return new(strings.Builder) },
+}
+
+func acquireBuilder() *strings.Builder {
+	b := builderPool.Get().(*strings.Builder)
+	b.Reset()
+	return b
+}
+
+func releaseBuilder(b *strings.Builder) {
+	if b.Cap() <= 64*1024 {
+		b.Reset()
+		builderPool.Put(b)
+	}
+}
+
+var entriesPool = sync.Pool{
+	New: func() any {
+		s := make([]plainEntry, 0, 16)
+		return &s
+	},
+}
+
+func acquireEntries(n int) *[]plainEntry {
+	p := entriesPool.Get().(*[]plainEntry)
+	s := (*p)[:0]
+	if cap(s) < n {
+		s = make([]plainEntry, 0, n)
+	}
+	*p = s
+	return p
+}
+
+func releaseEntries(p *[]plainEntry) {
+	s := *p
+	clear(s)
+	if cap(s) <= 256 {
+		*p = s[:0]
+		entriesPool.Put(p)
+	}
+}
+
 // EncodePlainValue renders a single AnyValue as otlp-plainjson-v2 JSON.
 //
 // Strings, booleans, arrays and maps become their JSON counterparts. An int64
@@ -50,8 +95,9 @@ const (
 // Invalid UTF-8 in strings and map keys is replaced with U+FFFD, so the result
 // is always valid JSON.
 func EncodePlainValue(v pcommon.Value) string {
-	var b strings.Builder
-	plainWriter{attrs: &b}.value(v)
+	b := acquireBuilder()
+	defer releaseBuilder(b)
+	plainWriter{attrs: b}.value(v)
 	return b.String()
 }
 
@@ -63,8 +109,12 @@ func EncodePlainValue(v pcommon.Value) string {
 // replaced, are emitted once, with the value of the first in payload order:
 // the entry pcommon.Map.Get returns.
 func EncodePlainMap(m pcommon.Map) string {
-	var b strings.Builder
-	plainWriter{attrs: &b}.object(m)
+	if m.Len() == 0 {
+		return "{}"
+	}
+	b := acquireBuilder()
+	defer releaseBuilder(b)
+	plainWriter{attrs: b}.object(m)
 	return b.String()
 }
 
@@ -79,8 +129,14 @@ func EncodePlainMap(m pcommon.Map) string {
 // string, or bytes from a string that happens to look like base64. An empty
 // bag encodes as {} and {}.
 func EncodeMapWithSchema(m pcommon.Map) (attrsJSON, schemaJSON string) {
-	var attrs, schema strings.Builder
-	plainWriter{attrs: &attrs, schema: &schema}.object(m)
+	if m.Len() == 0 {
+		return "{}", "{}"
+	}
+	attrs := acquireBuilder()
+	defer releaseBuilder(attrs)
+	schema := acquireBuilder()
+	defer releaseBuilder(schema)
+	plainWriter{attrs: attrs, schema: schema}.object(m)
 	return attrs.String(), schema.String()
 }
 
@@ -92,8 +148,11 @@ func EncodeMapWithSchema(m pcommon.Map) (attrsJSON, schemaJSON string) {
 // type for a leaf, an object of the same keys for a map, and an array of the
 // elements' schemas for an array.
 func EncodePlainValueWithSchema(v pcommon.Value) (valueJSON, schemaJSON string) {
-	var value, schema strings.Builder
-	plainWriter{attrs: &value, schema: &schema}.value(v)
+	value := acquireBuilder()
+	defer releaseBuilder(value)
+	schema := acquireBuilder()
+	defer releaseBuilder(schema)
+	plainWriter{attrs: value, schema: schema}.value(v)
 	return value.String(), schema.String()
 }
 
@@ -109,7 +168,7 @@ type plainWriter struct {
 func (w plainWriter) value(v pcommon.Value) {
 	switch v.Type() {
 	case pcommon.ValueTypeStr:
-		writeJSONString(w.attrs, strings.ToValidUTF8(v.Str(), "\uFFFD"))
+		writeJSONString(w.attrs, sanitizeUTF8(v.Str()))
 		w.leaf(schemaString)
 
 	case pcommon.ValueTypeBool:
@@ -119,7 +178,9 @@ func (w plainWriter) value(v pcommon.Value) {
 	case pcommon.ValueTypeInt:
 		// A decimal string, as in ProtoJSON: a JSON number would lose
 		// precision beyond 2^53 in parsers that read numbers as doubles.
-		writeJSONString(w.attrs, strconv.FormatInt(v.Int(), 10))
+		w.attrs.WriteByte('"')
+		w.attrs.WriteString(strconv.FormatInt(v.Int(), 10))
+		w.attrs.WriteByte('"')
 		w.leaf(schemaInt)
 
 	case pcommon.ValueTypeDouble:
@@ -127,7 +188,9 @@ func (w plainWriter) value(v pcommon.Value) {
 		w.leaf(schemaDouble)
 
 	case pcommon.ValueTypeBytes:
-		writeJSONString(w.attrs, base64.StdEncoding.EncodeToString(v.Bytes().AsRaw()))
+		w.attrs.WriteByte('"')
+		w.attrs.WriteString(base64.StdEncoding.EncodeToString(v.Bytes().AsRaw()))
+		w.attrs.WriteByte('"')
 		w.leaf(schemaBytes)
 
 	case pcommon.ValueTypeSlice:
@@ -156,8 +219,20 @@ func (w plainWriter) value(v pcommon.Value) {
 
 // object writes m as a JSON object with sorted, unique keys.
 func (w plainWriter) object(m pcommon.Map) {
+	if m.Len() == 0 {
+		w.attrs.WriteString("{}")
+		if w.schema != nil {
+			w.schema.WriteString("{}")
+		}
+		return
+	}
+	ep := acquireEntries(m.Len())
+	defer releaseEntries(ep)
+	entries := plainEntriesInto(m, (*ep)[:0])
+	*ep = entries
+
 	w.punct('{')
-	for i, e := range plainEntries(m) {
+	for i, e := range entries {
 		if i > 0 {
 			w.punct(',')
 		}
@@ -188,7 +263,9 @@ func (w plainWriter) punct(c byte) {
 // leaf records the OTLP type of the leaf value just written to attrs.
 func (w plainWriter) leaf(typ string) {
 	if w.schema != nil {
-		writeJSONString(w.schema, typ)
+		w.schema.WriteByte('"')
+		w.schema.WriteString(typ)
+		w.schema.WriteByte('"')
 	}
 }
 
@@ -197,19 +274,24 @@ type plainEntry struct {
 	value pcommon.Value
 }
 
-// plainEntries returns m's entries with their keys made valid UTF-8 and sorted
-// by UTF-8 byte order, keeping only the first entry in payload order for each
-// key.
-//
-// OTLP requires unique keys, but nothing on the wire enforces it and
-// pcommon.Map keeps every entry it decodes; repairing invalid UTF-8 can also
-// turn two distinct keys into one. Keeping the first matches pcommon.Map.Get,
-// and emitting each key once avoids duplicate object names, which RFC 8259
-// leaves to each JSON reader to resolve as it sees fit.
-func plainEntries(m pcommon.Map) []plainEntry {
-	entries := make([]plainEntry, 0, m.Len())
+func sanitizeUTF8(s string) string {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			if utf8.ValidString(s[i:]) {
+				return s
+			}
+			return strings.ToValidUTF8(s, "\uFFFD")
+		}
+	}
+	return s
+}
+
+// plainEntriesInto appends m's entries into entries with their keys made valid
+// UTF-8 and sorted by UTF-8 byte order, keeping only the first entry in payload
+// order for each key.
+func plainEntriesInto(m pcommon.Map, entries []plainEntry) []plainEntry {
 	for k, v := range m.All() {
-		entries = append(entries, plainEntry{key: strings.ToValidUTF8(k, "\uFFFD"), value: v})
+		entries = append(entries, plainEntry{key: sanitizeUTF8(k), value: v})
 	}
 	// The stable sort keeps equal keys in payload order, so compacting keeps
 	// the first of each.
@@ -235,17 +317,19 @@ func writePlainDouble(b *strings.Builder, f float64) {
 	case math.IsInf(f, -1):
 		b.WriteString(`"-Infinity"`)
 	default:
+		var scratch [32]byte
 		format := byte('f')
 		if abs := math.Abs(f); abs != 0 && (abs < 1e-6 || abs >= 1e21) {
 			format = 'e'
 		}
-		s := strconv.FormatFloat(f, format, -1, 64)
+		out := strconv.AppendFloat(scratch[:0], f, format, -1, 64)
 		// Drop the padding zero of a two-digit negative exponent, e-07 to
 		// e-7, as encoding/json does.
-		if n := len(s); format == 'e' && n >= 4 && s[n-4] == 'e' && s[n-3] == '-' && s[n-2] == '0' {
-			s = s[:n-2] + s[n-1:]
+		if n := len(out); format == 'e' && n >= 4 && out[n-4] == 'e' && out[n-3] == '-' && out[n-2] == '0' {
+			out[n-2] = out[n-1]
+			out = out[:n-1]
 		}
-		b.WriteString(s)
+		b.Write(out)
 	}
 }
 
@@ -256,34 +340,52 @@ const hexDigits = "0123456789abcdef"
 // Written by hand rather than via encoding/json because that package escapes
 // <, > and & for HTML safety. Those escapes are legal JSON but they would make
 // the record fingerprint depend on an encoder policy rather than on the
-// record's content.
+// record's content. Contiguous runs of safe ASCII bytes (0x20..0x7e excluding
+// '"' and '\\') are copied in a single slice write.
 func writeJSONString(b *strings.Builder, s string) {
 	b.WriteByte('"')
-	for _, r := range s {
-		switch r {
-		case '"':
-			b.WriteString(`\"`)
-		case '\\':
-			b.WriteString(`\\`)
-		case '\n':
-			b.WriteString(`\n`)
-		case '\r':
-			b.WriteString(`\r`)
-		case '\t':
-			b.WriteString(`\t`)
-		case '\b':
-			b.WriteString(`\b`)
-		case '\f':
-			b.WriteString(`\f`)
-		default:
-			if r < 0x20 {
-				b.WriteString(`\u00`)
-				b.WriteByte(hexDigits[(r>>4)&0xF])
-				b.WriteByte(hexDigits[r&0xF])
-				continue
-			}
-			b.WriteRune(r)
+	start := 0
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c >= 0x20 && c < utf8.RuneSelf && c != '"' && c != '\\' {
+			i++
+			continue
 		}
+		if start < i {
+			b.WriteString(s[start:i])
+		}
+		if c < utf8.RuneSelf {
+			switch c {
+			case '"':
+				b.WriteString(`\"`)
+			case '\\':
+				b.WriteString(`\\`)
+			case '\n':
+				b.WriteString(`\n`)
+			case '\r':
+				b.WriteString(`\r`)
+			case '\t':
+				b.WriteString(`\t`)
+			case '\b':
+				b.WriteString(`\b`)
+			case '\f':
+				b.WriteString(`\f`)
+			default:
+				b.WriteString(`\u00`)
+				b.WriteByte(hexDigits[(c>>4)&0xF])
+				b.WriteByte(hexDigits[c&0xF])
+			}
+			i++
+			start = i
+			continue
+		}
+		_, size := utf8.DecodeRuneInString(s[i:])
+		b.WriteString(s[i : i+size])
+		i += size
+		start = i
+	}
+	if start < len(s) {
+		b.WriteString(s[start:])
 	}
 	b.WriteByte('"')
 }

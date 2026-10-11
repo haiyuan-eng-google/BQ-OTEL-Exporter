@@ -66,5 +66,12 @@ func (e *logsExporter) pushLogData(ctx context.Context, ld plog.Logs) error {
 	if len(decision.retryableIndices) == 0 {
 		return decision.err
 	}
-	return consumererror.NewLogs(decision.err, transform.SelectLogs(ld, decision.retryableIndices))
+	// Acknowledged records normally stay out of the retry payload. The
+	// exception is one identical to a retried record: the payload is
+	// fingerprinted afresh, so a retried record keeps its intra_batch_ordinal,
+	// and with it its insert_id, only if the identical records ahead of it
+	// travel along.
+	retry := transform.PreserveLogOrdinalPeers(ld,
+		validRecordIndices(recordIndex, decision.rowErrors), decision.retryableIndices)
+	return consumererror.NewLogs(decision.err, transform.SelectLogs(ld, retry))
 }
