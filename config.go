@@ -6,6 +6,7 @@ package bigqueryexporter // import "github.com/haiyuan-eng-google/BQ-OTEL-Export
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -441,6 +442,22 @@ func (cfg *Config) validateCredentials() []error {
 func (cfg *Config) validateEndpoint() []error {
 	var errs []error
 	e := cfg.Endpoint
+
+	// The metadata client always sends credentials, whatever
+	// without_authentication says about the Storage Write endpoint. Plain HTTP
+	// is therefore acceptable only to a loopback emulator; anywhere else it
+	// would put the bearer token on the wire in the clear.
+	if e.AdminURL != "" {
+		u, err := url.Parse(e.AdminURL)
+		switch {
+		case err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http"):
+			errs = append(errs, fmt.Errorf(
+				"endpoint.admin_url must be an absolute http(s):// URL, got %q", e.AdminURL))
+		case u.Scheme == "http" && !isLoopback(e.AdminURL):
+			errs = append(errs, fmt.Errorf(
+				"endpoint.admin_url must use https:// unless it is a loopback address, got %q", e.AdminURL))
+		}
+	}
 
 	if e.URL == "" {
 		if e.Insecure {

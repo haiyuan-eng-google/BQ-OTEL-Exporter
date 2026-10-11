@@ -209,7 +209,7 @@ as log events rather than span attributes.
 | `credentials.quota_project`     | —                     | Billing/quota project passed via `option.WithQuotaProject`. |
 | `credentials.universe_domain`   | —                     | Sovereign/trusted partner cloud universe domain passed via `option.WithUniverseDomain`. |
 | `endpoint.url`                  | —                     | Alternate Storage Write API gRPC endpoint (`host:port`). Emulator and development only. |
-| `endpoint.admin_url`            | —                     | Alternate BigQuery REST Admin API endpoint (`http(s)://host:port/...`) for emulators that serve REST metadata and gRPC Storage Write on separate ports. |
+| `endpoint.admin_url`            | —                     | Alternate BigQuery REST Admin API endpoint (`https://host:port/...`) for Private Service Connect, or for emulators that serve REST metadata and gRPC Storage Write on separate ports. Metadata calls always carry credentials, so `http://` is refused unless the host is loopback. |
 | `endpoint.insecure`             | `false`               | Disables TLS. Refused unless `endpoint.url` is loopback. |
 | `endpoint.without_authentication` | `false`             | Sends no credentials. Refused unless the endpoint is loopback. |
 | `auto_create.dataset`           | `false`               | Create the dataset if absent. Requires `location`. |

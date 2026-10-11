@@ -304,6 +304,41 @@ func TestEndpointOverrideIsLoopbackOnly(t *testing.T) {
 	})
 }
 
+// The metadata client authenticates every request, so endpoint.admin_url may
+// use plain HTTP only for a loopback emulator. A remote http:// URL would send
+// the bearer token in the clear, and a URL without a scheme or host cannot be
+// resolved against at all.
+func TestEndpointAdminURLRequiresTLSUnlessLoopback(t *testing.T) {
+	for _, adminURL := range []string{
+		"https://bigquery.googleapis.com",
+		"https://private.example.test/bigquery/v2/",
+		"http://localhost:9050",
+		"http://127.0.0.1:9050/bigquery/v2/",
+		"http://[::1]:9050",
+	} {
+		cfg := validConfig()
+		cfg.Endpoint.AdminURL = adminURL
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("admin_url %q should be allowed: %v", adminURL, err)
+		}
+	}
+
+	for adminURL, want := range map[string]string{
+		"http://private.example.test/bigquery/v2/": "must use https:// unless it is a loopback address",
+		"http://10.0.0.5:9050":                     "must use https:// unless it is a loopback address",
+		"private.example.test/bigquery/v2/":        "must be an absolute http(s):// URL",
+		"ftp://private.example.test":               "must be an absolute http(s):// URL",
+		"https://":                                 "must be an absolute http(s):// URL",
+	} {
+		cfg := validConfig()
+		cfg.Endpoint.AdminURL = adminURL
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("admin_url %q: Validate() = %v, want an error containing %q", adminURL, err, want)
+		}
+	}
+}
+
 // The headroom threshold must stay meaningfully below the API limit; if the
 // two converge, the distinction between our threshold and the API's has
 // quietly stopped being true.
