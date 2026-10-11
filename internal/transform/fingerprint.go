@@ -84,11 +84,25 @@ func (f fingerprinter) next(canonical string) string {
 //
 // The walk and the canonical form mirror LogRows, and must change with it.
 func PreserveLogOrdinalPeers(ld plog.Logs, candidateIndices, retryableIndices []int) []int {
-	if len(retryableIndices) == 0 || len(retryableIndices) >= len(candidateIndices) {
+	if len(retryableIndices) == 0 {
+		return nil
+	}
+	if len(candidateIndices) == 0 {
 		return retryableIndices
 	}
 	candidate := indexSet(candidateIndices)
 	retryable := indexSet(retryableIndices)
+
+	allCandidatesRetried := true
+	for _, c := range candidateIndices {
+		if !retryable[c] {
+			allCandidatesRetried = false
+			break
+		}
+	}
+	if allCandidatesRetried {
+		return retryableIndices
+	}
 
 	type member struct {
 		idx int

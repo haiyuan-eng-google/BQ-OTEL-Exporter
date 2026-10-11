@@ -28,6 +28,7 @@ import (
 	bqi "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/bigquery"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/diag"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/metadata"
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/offload"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/protoenc"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
@@ -40,10 +41,18 @@ const writeAPITraceID = "otel-bigqueryexporter"
 // not authorized to create control-plane resources.
 const scopeRead = "https://www.googleapis.com/auth/bigquery.readonly"
 
+// scopeStorageReadWrite authorizes uploading offloaded payloads to GCS.
+const scopeStorageReadWrite = "https://www.googleapis.com/auth/devstorage.read_write"
+
 // newManagedWriterClient is the external constructor seam. Keeping it narrow
 // lets lifecycle tests prove which context is retained without opening a real
 // Storage Write API connection.
 var newManagedWriterClient = managedwriter.NewClient
+
+// newBlobStore constructs the GCS blob store used when offload.enabled is set.
+var newBlobStore = func(ctx context.Context, opts ...option.ClientOption) (offload.BlobStore, error) {
+	return offload.NewGCSBlobStore(ctx, opts...)
+}
 
 // rowAppender is the append surface the push paths depend on. Narrowing it to
 // an interface is what lets the FR6 subset logic be tested without a live
@@ -80,6 +89,10 @@ type signalExporter struct {
 	quarantine       rowAppender
 	quarantineEnc    rowEncoder
 
+	// offloader offloads oversized span/log values and quarantine payloads
+	// when offload.enabled is set.
+	offloader *offload.Offloader
+
 	schema *storagepb.TableSchema
 	opts   transform.Options
 }
@@ -90,19 +103,38 @@ func newSignalExporter(
 	table string,
 	tableSchema *storagepb.TableSchema,
 ) *signalExporter {
-	return &signalExporter{
+	se := &signalExporter{
 		cfg:    cfg,
 		table:  table,
 		logger: set.Logger,
 		schema: tableSchema,
 		opts: transform.Options{
-			Limits:            cfg.Limits.toTransform(),
-			LogNameAttribute:  cfg.Logs.LogNameAttribute,
-			InsertIDAttribute: cfg.Logs.InsertIDAttribute,
-			ExporterInstance:  exporterInstance(set.Resource),
-			MaxRowBytes:       cfg.Write.MaxRowBytes,
+			Limits:                    cfg.Limits.toTransform(),
+			LogNameAttribute:          cfg.Logs.LogNameAttribute,
+			InsertIDAttribute:         cfg.Logs.InsertIDAttribute,
+			ExporterInstance:          exporterInstance(set.Resource),
+			MaxRowBytes:               cfg.Write.MaxRowBytes,
+			QuarantineMetadataOnly:    cfg.Quarantine.MetadataOnly,
+			MaxQuarantinePayloadBytes: cfg.Quarantine.MaxRawPayloadBytes,
 		},
 	}
+	if cfg.Offload.Enabled {
+		off, err := offload.New(nil, offload.Options{
+			Bucket:         cfg.Offload.Bucket,
+			Prefix:         cfg.Offload.Prefix,
+			Authorizer:     cfg.Offload.Authorizer,
+			MinBytes:       cfg.Offload.MinBytes,
+			MaxObjectBytes: cfg.Offload.MaxObjectBytes,
+			MaxConcurrency: cfg.Offload.MaxConcurrency,
+			Timeout:        cfg.Offload.Timeout,
+		})
+		if err == nil {
+			se.offloader = off
+			se.opts.PayloadOffloader = off
+			se.opts.QuarantinePayloadOffloader = off.OffloadQuarantine
+		}
+	}
+	return se
 }
 
 // exporterInstance labels quarantine rows with the service.instance.id of the
@@ -281,6 +313,13 @@ func (e *signalExporter) writerClientOptions(ctx context.Context) ([]option.Clie
 	return opts, nil
 }
 
+func (e *signalExporter) offloadClientOptions(ctx context.Context) ([]option.ClientOption, error) {
+	if e.cfg.Endpoint.WithoutAuthentication {
+		return []option.ClientOption{option.WithoutAuthentication()}, nil
+	}
+	return e.authenticationOptions(ctx, []string{scopeStorageReadWrite})
+}
+
 func (e *signalExporter) start(ctx context.Context, _ component.Host) (err error) {
 	// Start's context is scoped to component startup. managedwriter retains
 	// both its client and stream constructor contexts for background work, so
@@ -384,6 +423,20 @@ func (e *signalExporter) start(ctx context.Context, _ component.Host) (err error
 		})
 		startedFields = append(startedFields, zap.String("quarantine", e.quarantineTableID()))
 	}
+	if e.cfg.Offload.Enabled && e.offloader != nil {
+		if e.offloader.Store() == nil {
+			offloadOpts, oerr := e.offloadClientOptions(lifetimeCtx)
+			if oerr != nil {
+				return oerr
+			}
+			store, serr := newBlobStore(lifetimeCtx, offloadOpts...)
+			if serr != nil {
+				return fmt.Errorf("creating GCS payload offloader: %w", serr)
+			}
+			e.offloader.SetStore(store)
+		}
+		startedFields = append(startedFields, zap.String("offload_bucket", e.cfg.Offload.Bucket))
+	}
 
 	e.logger.Info("BigQuery exporter started", startedFields...)
 	return nil
@@ -419,6 +472,12 @@ func (e *signalExporter) shutdown(_ context.Context) error {
 			errs = append(errs, err)
 		}
 		e.quarantineClient = nil
+	}
+	if e.offloader != nil {
+		if err := e.offloader.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		e.offloader.SetStore(nil)
 	}
 	if e.client != nil {
 		if err := e.client.Close(); err != nil {
@@ -609,6 +668,35 @@ func rowErrorDetail(re bqi.RowError) string {
 	return re.Code + ": " + re.Message
 }
 
+// mergeOutcomeWithOffloadFailures merges records whose payload offload failed
+// into the retryable subset so they are returned to exporterhelper for retry
+// rather than rejected or dropped.
+func (e *signalExporter) mergeOutcomeWithOffloadFailures(
+	decision appendDecision, offloadFailedIndices []int, offloadErr error, opID string,
+) appendDecision {
+	if len(offloadFailedIndices) == 0 {
+		return decision
+	}
+	e.logger.Warn("payload offload failed; returning affected records for retry",
+		append(diag.Fields(e.tableID(), opID), zap.Int("records", len(offloadFailedIndices)))...)
+	if decision.permanent {
+		return appendDecision{
+			retryableIndices: slices.Clone(offloadFailedIndices),
+			err:              errors.Join(offloadErr, decision.err),
+			rowErrors:        decision.rowErrors,
+		}
+	}
+	combinedErr := offloadErr
+	if decision.err != nil {
+		combinedErr = errors.Join(decision.err, offloadErr)
+	}
+	return appendDecision{
+		retryableIndices: mergeSortedIndices(decision.retryableIndices, offloadFailedIndices),
+		err:              combinedErr,
+		rowErrors:        decision.rowErrors,
+	}
+}
+
 // quarantineEntries lists every record a push drops permanently, indexed by
 // record position: the transform stage's rejections, the rows encodeRows
 // dropped, mapped from row positions through rowToRecord, and the rows the
@@ -630,6 +718,16 @@ func quarantineEntries(
 	return append(entries, rowErrors...)
 }
 
+// quarantineContext derives a single bounded, detached context shared across
+// quarantine payload offloading and the BigQuery quarantine stream append.
+func (e *signalExporter) quarantineContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	timeout := e.cfg.Quarantine.Timeout
+	if timeout <= 0 {
+		timeout = defaultQuarantineTimeout
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), timeout)
+}
+
 // quarantineRows appends rows to the quarantine table on its dedicated stream.
 //
 // Quarantine is best effort and never changes the outcome of the push that
@@ -640,9 +738,15 @@ func (e *signalExporter) quarantineRows(ctx context.Context, rows []transform.Ro
 	if len(rows) == 0 {
 		return
 	}
+	if err := ctx.Err(); err != nil {
+		return
+	}
 	qid := e.quarantineTableID()
 	encoded := make([][]byte, 0, len(rows))
 	for i, row := range rows {
+		if err := ctx.Err(); err != nil {
+			break
+		}
 		b, err := e.quarantineEnc.Encode(row)
 		if err != nil {
 			e.logger.Debug("dropping quarantine row that failed serialization",
@@ -660,8 +764,18 @@ func (e *signalExporter) quarantineRows(ctx context.Context, rows []transform.Ro
 	if len(encoded) == 0 {
 		return
 	}
+	if err := ctx.Err(); err != nil {
+		return
+	}
 
-	out := e.quarantine.Append(ctx, encoded)
+	qCtx := ctx
+	if _, hasDeadline := qCtx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		qCtx, cancel = e.quarantineContext(ctx)
+		defer cancel()
+	}
+
+	out := e.quarantine.Append(qCtx, encoded)
 	if out.Err == nil && len(out.RowErrors) == 0 {
 		return
 	}

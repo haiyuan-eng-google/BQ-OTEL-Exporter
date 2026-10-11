@@ -9,7 +9,10 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,6 +34,7 @@ import (
 
 	bqi "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/bigquery"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/metadata"
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/offload"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/protoenc"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
@@ -38,15 +42,19 @@ import (
 
 type fakeAppender struct {
 	outcome  bqi.AppendOutcome
+	appendFn func(context.Context, [][]byte) bqi.AppendOutcome
 	closeErr error
 	gotRows  int
 	appended int
 	closed   int
 }
 
-func (f *fakeAppender) Append(_ context.Context, rows [][]byte) bqi.AppendOutcome {
+func (f *fakeAppender) Append(ctx context.Context, rows [][]byte) bqi.AppendOutcome {
 	f.gotRows = len(rows)
 	f.appended++
+	if f.appendFn != nil {
+		return f.appendFn(ctx, rows)
+	}
 	return f.outcome
 }
 
@@ -1298,4 +1306,788 @@ func metricInt64Sum(t *testing.T, reader *sdkmetric.ManualReader, name string) i
 	}
 	t.Fatalf("metric %s was not collected", name)
 	return 0
+}
+
+func TestNewSignalExporterWiresOffloadAndQuarantinePIIOptions(t *testing.T) {
+	cfg := validConfig()
+	cfg.Offload.Enabled = true
+	cfg.Offload.Bucket = "otel-offload-bucket"
+	cfg.Quarantine.MetadataOnly = true
+	cfg.Quarantine.MaxRawPayloadBytes = 4096
+
+	e, err := newTracesExporter(component.TelemetrySettings{
+		Logger:        zap.NewNop(),
+		MeterProvider: noop.NewMeterProvider(),
+	}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.opts.PayloadOffloader == nil || e.opts.QuarantinePayloadOffloader == nil {
+		t.Fatal("expected PayloadOffloader and QuarantinePayloadOffloader to be wired when offload.enabled is set")
+	}
+	if !e.opts.QuarantineMetadataOnly || e.opts.MaxQuarantinePayloadBytes != 4096 {
+		t.Fatalf("QuarantineMetadataOnly=%v MaxQuarantinePayloadBytes=%d, want true and 4096",
+			e.opts.QuarantineMetadataOnly, e.opts.MaxQuarantinePayloadBytes)
+	}
+}
+
+func TestPushTracesOffloadsOversizedPayloadEndToEnd(t *testing.T) {
+	cfg := validConfig()
+	cfg.Offload.Enabled = true
+	cfg.Offload.Bucket = "otel-offload-bucket"
+	cfg.Offload.MinBytes = 256 * 1024
+	cfg.Offload.MaxObjectBytes = 64 * 1024 * 1024
+
+	e, err := newTracesExporter(component.TelemetrySettings{
+		Logger:        zap.NewNop(),
+		MeterProvider: noop.NewMeterProvider(),
+	}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	memStore := offload.NewMemoryBlobStore()
+	e.offloader.SetStore(memStore)
+
+	enc, err := protoenc.New(schema.SpansTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &recordingEncoder{next: enc}
+	app := &fakeAppender{outcome: bqi.AppendOutcome{AcknowledgedRows: 1}}
+	e.enc = rec
+	e.writer = app
+
+	td := newTestTraces(1)
+	largePrompt := strings.Repeat("P", 512*1024)
+	td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Attributes().PutStr("gen_ai.prompt", largePrompt)
+
+	if err := e.pushTraceData(context.Background(), td); err != nil {
+		t.Fatalf("pushTraceData failed on 512KiB prompt with offload enabled: %v", err)
+	}
+	if app.gotRows != 1 || len(rec.rows) != 1 {
+		t.Fatalf("appended %d rows (encoded %d), want 1", app.gotRows, len(rec.rows))
+	}
+	if memStore.Count() != 1 {
+		t.Fatalf("MemoryBlobStore count = %d, want 1 offloaded object", memStore.Count())
+	}
+	refs, ok := rec.rows[0]["payload_refs"].([]transform.Row)
+	if !ok || len(refs) != 1 {
+		t.Fatalf("payload_refs = %#v, want 1 entry", rec.rows[0]["payload_refs"])
+	}
+	if refs[0]["attribute_path"] != "attributes.gen_ai.prompt" {
+		t.Errorf("payload_refs[0].attribute_path = %v, want attributes.gen_ai.prompt", refs[0]["attribute_path"])
+	}
+}
+
+func TestQuarantineAppendUsesBoundedDetachedContext(t *testing.T) {
+	e, app := newTestTracesExporter(t, bqi.AppendOutcome{AcknowledgedRows: 1})
+	e.cfg.Quarantine.Timeout = 30 * time.Millisecond
+
+	var sawDeadline bool
+	var sawParentCancelled bool
+	_, stream := withQuarantine(t, e.signalExporter, bqi.AppendOutcome{})
+	stream.appendFn = func(qCtx context.Context, _ [][]byte) bqi.AppendOutcome {
+		_, sawDeadline = qCtx.Deadline()
+		// Even if parent was already cancelled before quarantineRows, qCtx must
+		// not inherit its immediate cancellation.
+		sawParentCancelled = qCtx.Err() == context.Canceled
+		<-qCtx.Done()
+		return bqi.AppendOutcome{
+			Verdict: bqi.Classify(qCtx.Err()),
+			Err:     qCtx.Err(),
+		}
+	}
+
+	parentCtx, parentCancel := context.WithCancel(context.Background())
+	parentCancel() // Cancel caller context before quarantineRows runs; signal fakeAppender ignores ctx.
+
+	td := newTestTraces(2)
+	td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(1).SetEndTimestamp(0)
+
+	start := time.Now()
+	if err := e.pushTraceData(parentCtx, td); err != nil {
+		t.Fatalf("quarantine timeout must not fail signal push: %v", err)
+	}
+	elapsed := time.Since(start)
+	if app.gotRows != 1 {
+		t.Fatalf("signal rows = %d, want 1", app.gotRows)
+	}
+	if !sawDeadline {
+		t.Error("quarantine Append context had no deadline")
+	}
+	if sawParentCancelled {
+		t.Error("quarantine Append context inherited caller cancellation instead of detaching via context.WithoutCancel")
+	}
+	if elapsed > time.Second {
+		t.Errorf("blocking quarantine stream stalled pushTraceData for %v, want bounded ~30ms timeout", elapsed)
+	}
+}
+
+type funcBlobStore struct {
+	writeFn func(ctx context.Context, bucket, object, contentType string, data []byte) (string, error)
+}
+
+func (f funcBlobStore) WriteObject(ctx context.Context, bucket, object, contentType string, data []byte) (string, error) {
+	return f.writeFn(ctx, bucket, object, contentType, data)
+}
+
+func TestPushTracesOffloadUploadFailureReturnsRetryableSpansWithoutQuarantining(t *testing.T) {
+	t.Run("append succeeds for surviving spans", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.Offload.Enabled = true
+		cfg.Offload.Bucket = "otel-offload-bucket"
+		cfg.Offload.MinBytes = 1024
+		cfg.Offload.MaxObjectBytes = 64 * 1024 * 1024
+
+		e, err := newTracesExporter(component.TelemetrySettings{
+			Logger:        zap.NewNop(),
+			MeterProvider: noop.NewMeterProvider(),
+		}, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		uploadErr := errors.New("simulated GCS 503")
+		e.offloader.SetStore(funcBlobStore{
+			writeFn: func(_ context.Context, _, _, _ string, data []byte) (string, error) {
+				if strings.HasPrefix(string(data), "FAIL") {
+					return "", uploadErr
+				}
+				return "1", nil
+			},
+		})
+
+		enc, err := protoenc.New(schema.SpansTableSchema())
+		if err != nil {
+			t.Fatal(err)
+		}
+		app := &fakeAppender{outcome: bqi.AppendOutcome{AcknowledgedRows: 2}}
+		e.enc = enc
+		e.writer = app
+		quarantined, qStream := withQuarantine(t, e.signalExporter, bqi.AppendOutcome{AcknowledgedRows: 1})
+
+		// Span 0 ("a"): normal
+		// Span 1 ("b"): 2KiB attribute whose offload upload fails -> must be retryable, NOT quarantined
+		// Span 2 ("c"): permanently invalid (EndTimestamp=0) -> must be quarantined, NOT retried
+		// Span 3 ("d"): normal
+		td := newTestTraces(4)
+		spans := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+		spans.At(1).Attributes().PutStr("gen_ai.prompt", "FAIL"+strings.Repeat("x", 2048))
+		spans.At(2).SetEndTimestamp(0)
+
+		pushErr := e.pushTraceData(context.Background(), td)
+		if pushErr == nil {
+			t.Fatal("expected retryable error for span whose offload upload failed")
+		}
+		if consumererror.IsPermanent(pushErr) {
+			t.Fatalf("offload upload failure must be retryable, got permanent: %v", pushErr)
+		}
+		var traceErr consumererror.Traces
+		if !errors.As(pushErr, &traceErr) {
+			t.Fatalf("expected consumererror.Traces, got %T: %v", pushErr, pushErr)
+		}
+		got := traceErr.Data().ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+		if !equalStrings(spanNames(got), []string{"b"}) {
+			t.Fatalf("retryable spans = %v, want [b]", spanNames(got))
+		}
+		if app.gotRows != 2 {
+			t.Fatalf("appended signal rows = %d, want 2 (spans a and d)", app.gotRows)
+		}
+		if qStream.gotRows != 1 || len(quarantined.rows) != 1 {
+			t.Fatalf("quarantined rows = %d, want 1 (only span c)", len(quarantined.rows))
+		}
+		if quarantined.rows[0]["span_id"] != (pcommon.SpanID{3}).String() {
+			t.Errorf("quarantined span_id = %v, want span c (%s)", quarantined.rows[0]["span_id"], (pcommon.SpanID{3}).String())
+		}
+	})
+
+	t.Run("row error index mapping accounts for skipped offload failures", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.Offload.Enabled = true
+		cfg.Offload.Bucket = "otel-offload-bucket"
+		cfg.Offload.MinBytes = 1024
+		cfg.Offload.MaxObjectBytes = 64 * 1024 * 1024
+
+		e, err := newTracesExporter(component.TelemetrySettings{
+			Logger:        zap.NewNop(),
+			MeterProvider: noop.NewMeterProvider(),
+		}, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.offloader.SetStore(funcBlobStore{
+			writeFn: func(_ context.Context, _, _, _ string, _ []byte) (string, error) {
+				return "", errors.New("simulated GCS 503")
+			},
+		})
+
+		enc, err := protoenc.New(schema.SpansTableSchema())
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Encoded rows sent to BigQuery are [span "a" (idx 0), span "d" (idx 3)].
+		// RowError at Index 1 refers to encoded row 1 -> original span "d" (idx 3).
+		app := &fakeAppender{outcome: bqi.AppendOutcome{
+			RowErrors: []bqi.RowError{{Index: 1, Code: "FIELDS_ERROR", Message: "bad row"}},
+		}}
+		e.enc = enc
+		e.writer = app
+		quarantined, _ := withQuarantine(t, e.signalExporter, bqi.AppendOutcome{AcknowledgedRows: 2})
+
+		td := newTestTraces(4)
+		spans := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+		spans.At(1).Attributes().PutStr("gen_ai.prompt", strings.Repeat("x", 2048)) // idx 1: offload fails
+		spans.At(2).SetEndTimestamp(0)                                              // idx 2: pre-offload rejected
+
+		pushErr := e.pushTraceData(context.Background(), td)
+		if pushErr == nil || consumererror.IsPermanent(pushErr) {
+			t.Fatalf("expected retryable error, got %v", pushErr)
+		}
+		var traceErr consumererror.Traces
+		if !errors.As(pushErr, &traceErr) {
+			t.Fatalf("expected consumererror.Traces, got %T: %v", pushErr, pushErr)
+		}
+		// Span "a" (idx 0, valid row in failed Append) and span "b" (idx 1, offload failed) must be retried.
+		got := traceErr.Data().ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+		if !equalStrings(spanNames(got), []string{"a", "b"}) {
+			t.Fatalf("retryable spans = %v, want [a b]", spanNames(got))
+		}
+		// Span "c" (idx 2) and span "d" (idx 3) must be quarantined.
+		wantQuarantinedSpans := []string{pcommon.SpanID{3}.String(), pcommon.SpanID{4}.String()}
+		if gotSpans := column(quarantined.rows, "span_id"); !equalStrings(gotSpans, wantQuarantinedSpans) {
+			t.Fatalf("quarantined span_ids = %v, want %v", gotSpans, wantQuarantinedSpans)
+		}
+	})
+}
+
+func TestPushLogsOffloadUploadFailureReturnsRetryableLogsWithoutQuarantining(t *testing.T) {
+	cfg := validConfig()
+	cfg.Offload.Enabled = true
+	cfg.Offload.Bucket = "otel-offload-bucket"
+	cfg.Offload.MinBytes = 1024
+	cfg.Offload.MaxObjectBytes = 64 * 1024 * 1024
+
+	e, err := newLogsExporter(component.TelemetrySettings{
+		Logger:        zap.NewNop(),
+		MeterProvider: noop.NewMeterProvider(),
+	}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.offloader.SetStore(funcBlobStore{
+		writeFn: func(_ context.Context, _, _, _ string, _ []byte) (string, error) {
+			return "", errors.New("simulated GCS 503")
+		},
+	})
+
+	enc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &fakeAppender{outcome: bqi.AppendOutcome{AcknowledgedRows: 1}}
+	e.enc = enc
+	e.writer = app
+	quarantined, qStream := withQuarantine(t, e.signalExporter, bqi.AppendOutcome{})
+
+	ld := plog.NewLogs()
+	sl := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty()
+	lr0 := sl.LogRecords().AppendEmpty()
+	lr0.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+	lr0.Body().SetStr(strings.Repeat("L", 2048)) // offload upload fails
+	lr1 := sl.LogRecords().AppendEmpty()
+	lr1.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+	lr1.Body().SetStr("small-surviving-log")
+
+	pushErr := e.pushLogData(context.Background(), ld)
+	if pushErr == nil || consumererror.IsPermanent(pushErr) {
+		t.Fatalf("expected retryable consumererror.Logs, got %v", pushErr)
+	}
+	var logErr consumererror.Logs
+	if !errors.As(pushErr, &logErr) {
+		t.Fatalf("expected consumererror.Logs, got %T: %v", pushErr, pushErr)
+	}
+	if logErr.Data().LogRecordCount() != 1 {
+		t.Fatalf("retryable log count = %d, want 1", logErr.Data().LogRecordCount())
+	}
+	if app.gotRows != 1 {
+		t.Fatalf("appended log rows = %d, want 1", app.gotRows)
+	}
+	if qStream.appended != 0 || len(quarantined.rows) != 0 {
+		t.Fatalf("quarantine appends = %d (rows = %d), want 0", qStream.appended, len(quarantined.rows))
+	}
+}
+
+func TestQuarantineOffloadAndAppendShareSingleTimeoutBudget(t *testing.T) {
+	cfg := validConfig()
+	cfg.Quarantine.Enabled = true
+	cfg.Quarantine.Timeout = 60 * time.Millisecond
+	cfg.Offload.Enabled = true
+	cfg.Offload.Bucket = "otel-offload-bucket"
+	cfg.Offload.MinBytes = 512
+	cfg.Offload.MaxObjectBytes = 64 * 1024 * 1024
+	cfg.Offload.Timeout = 5 * time.Second
+
+	e, err := newTracesExporter(component.TelemetrySettings{
+		Logger:        zap.NewNop(),
+		MeterProvider: noop.NewMeterProvider(),
+	}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var uploadBudget time.Duration
+	e.offloader.SetStore(funcBlobStore{
+		writeFn: func(ctx context.Context, _, _, _ string, _ []byte) (string, error) {
+			if dl, ok := ctx.Deadline(); ok {
+				uploadBudget = time.Until(dl)
+			}
+			select {
+			case <-time.After(25 * time.Millisecond):
+				return "1", nil
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		},
+	})
+
+	enc, err := protoenc.New(schema.SpansTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.enc = enc
+	e.writer = &fakeAppender{outcome: bqi.AppendOutcome{AcknowledgedRows: 1}}
+
+	var appendBudget time.Duration
+	_, qStream := withQuarantine(t, e.signalExporter, bqi.AppendOutcome{})
+	qStream.appendFn = func(qCtx context.Context, _ [][]byte) bqi.AppendOutcome {
+		if dl, ok := qCtx.Deadline(); ok {
+			appendBudget = time.Until(dl)
+		}
+		<-qCtx.Done()
+		return bqi.AppendOutcome{Verdict: bqi.Classify(qCtx.Err()), Err: qCtx.Err()}
+	}
+
+	td := newTestTraces(2)
+	bad := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(1)
+	bad.SetEndTimestamp(0)
+	bad.Attributes().PutStr("large", strings.Repeat("Q", 1024))
+
+	start := time.Now()
+	if err := e.pushTraceData(context.Background(), td); err != nil {
+		t.Fatalf("pushTraceData failed: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	if uploadBudget <= 0 || uploadBudget > 70*time.Millisecond {
+		t.Errorf("quarantine upload context remaining budget = %v, want bounded by ~60ms quarantine.timeout (not 5s offload.timeout)", uploadBudget)
+	}
+	if appendBudget <= 0 || appendBudget >= uploadBudget {
+		t.Errorf("quarantine append remaining budget = %v, want < uploadBudget (%v) under shared deadline", appendBudget, uploadBudget)
+	}
+	if elapsed > 300*time.Millisecond {
+		t.Errorf("quarantine upload + append took %v, want bounded by single ~60ms quarantine.timeout", elapsed)
+	}
+}
+
+func TestPushTracesMetadataOnlyQuarantineStripsRowErrorMessageDetail(t *testing.T) {
+	e, _ := newTestTracesExporter(t, bqi.AppendOutcome{
+		RowErrors: []bqi.RowError{{Index: 0, Code: "FIELDS_ERROR", Message: "invalid value secret-pii-token"}},
+	})
+	e.opts.QuarantineMetadataOnly = true
+	quarantined, _ := withQuarantine(t, e.signalExporter, bqi.AppendOutcome{AcknowledgedRows: 1})
+
+	_ = e.pushTraceData(context.Background(), newTestTraces(1))
+	if len(quarantined.rows) != 1 {
+		t.Fatalf("quarantined rows = %d, want 1", len(quarantined.rows))
+	}
+	gotMsg, _ := quarantined.rows[0]["error_message"].(string)
+	if gotMsg != "row_error" {
+		t.Errorf("metadata_only error_message = %q, want %q", gotMsg, "row_error")
+	}
+	if strings.Contains(gotMsg, "secret-pii-token") {
+		t.Errorf("metadata_only error_message leaked raw service detail: %q", gotMsg)
+	}
+}
+
+func TestPushTracesDeduplicatesRepeatedContentAddressedUploadsInPush(t *testing.T) {
+	cfg := validConfig()
+	cfg.Offload.Enabled = true
+	cfg.Offload.Bucket = "otel-offload-bucket"
+	cfg.Offload.MinBytes = 256 * 1024
+	cfg.Offload.MaxObjectBytes = 64 * 1024 * 1024
+	cfg.Offload.MaxConcurrency = 8
+
+	e, err := newTracesExporter(component.TelemetrySettings{
+		Logger:        zap.NewNop(),
+		MeterProvider: noop.NewMeterProvider(),
+	}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	writesByKey := make(map[string]int)
+	e.offloader.SetStore(funcBlobStore{
+		writeFn: func(_ context.Context, bucket, object, _ string, _ []byte) (string, error) {
+			key := bucket + "/" + object
+			mu.Lock()
+			writesByKey[key]++
+			count := writesByKey[key]
+			mu.Unlock()
+			if count > 1 {
+				return "", fmt.Errorf("duplicate WriteObject call #%d for key %q within a single push", count, key)
+			}
+			return "gen-1", nil
+		},
+	})
+
+	enc, err := protoenc.New(schema.SpansTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &recordingEncoder{next: enc}
+	app := &fakeAppender{outcome: bqi.AppendOutcome{AcknowledgedRows: 3}}
+	e.enc = rec
+	e.writer = app
+
+	sharedPayload := strings.Repeat("S", 300*1024)
+	td := newTestTraces(3)
+	spans := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+	for i := 0; i < spans.Len(); i++ {
+		spans.At(i).Attributes().PutStr("gen_ai.prompt", sharedPayload)
+	}
+
+	if err := e.pushTraceData(context.Background(), td); err != nil {
+		t.Fatalf("pushTraceData failed on 3 spans sharing identical 300KiB value: %v", err)
+	}
+	if app.gotRows != 3 || len(rec.rows) != 3 {
+		t.Fatalf("appended %d rows (encoded %d), want 3", app.gotRows, len(rec.rows))
+	}
+	mu.Lock()
+	totalWrites := len(writesByKey)
+	mu.Unlock()
+	if totalWrites != 1 {
+		t.Fatalf("unique keys written = %d, want 1", totalWrites)
+	}
+}
+
+func TestPushTracesConcurrentOffloadWithinAttemptBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		spans int
+		attrs int
+	}{
+		{name: "10_spans_1_attr_each", spans: 10, attrs: 1},
+		{name: "1_span_10_attrs", spans: 1, attrs: 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.Offload.Enabled = true
+			cfg.Offload.Bucket = "otel-offload-bucket"
+			cfg.Offload.MinBytes = 1024
+			cfg.Offload.MaxObjectBytes = 64 * 1024 * 1024
+			cfg.Offload.MaxConcurrency = 8
+
+			e, err := newTracesExporter(component.TelemetrySettings{
+				Logger:        zap.NewNop(),
+				MeterProvider: noop.NewMeterProvider(),
+			}, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var inFlight atomic.Int32
+			var maxInFlight atomic.Int32
+			e.offloader.SetStore(funcBlobStore{
+				writeFn: func(ctx context.Context, _, _, _ string, _ []byte) (string, error) {
+					cur := inFlight.Add(1)
+					for {
+						prev := maxInFlight.Load()
+						if cur <= prev || maxInFlight.CompareAndSwap(prev, cur) {
+							break
+						}
+					}
+					defer inFlight.Add(-1)
+					select {
+					case <-time.After(20 * time.Millisecond):
+						return "1", nil
+					case <-ctx.Done():
+						return "", ctx.Err()
+					}
+				},
+			})
+
+			enc, err := protoenc.New(schema.SpansTableSchema())
+			if err != nil {
+				t.Fatal(err)
+			}
+			app := &fakeAppender{outcome: bqi.AppendOutcome{AcknowledgedRows: tc.spans}}
+			e.enc = enc
+			e.writer = app
+
+			td := newTestTraces(tc.spans)
+			spans := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+			for i := 0; i < tc.spans; i++ {
+				for j := 0; j < tc.attrs; j++ {
+					val := fmt.Sprintf("span-%d-attr-%d-%s", i, j, strings.Repeat("Z", 1500))
+					spans.At(i).Attributes().PutStr(fmt.Sprintf("blob_%d", j), val)
+				}
+			}
+
+			// 10 distinct 20ms uploads would take 200ms sequentially and exceed the
+			// 110ms context deadline; with MaxConcurrency=8 they finish in 2 waves (~40ms).
+			ctx, cancel := context.WithTimeout(context.Background(), 110*time.Millisecond)
+			defer cancel()
+
+			start := time.Now()
+			if err := e.pushTraceData(ctx, td); err != nil {
+				t.Fatalf("pushTraceData timed out or failed (%v); sequential uploads would take ~200ms", err)
+			}
+			elapsed := time.Since(start)
+			if elapsed >= 110*time.Millisecond {
+				t.Errorf("pushTraceData took %v, want < 110ms", elapsed)
+			}
+			if gotMax := maxInFlight.Load(); gotMax <= 1 || gotMax > 8 {
+				t.Errorf("max concurrent WriteObject calls = %d, want in (1, 8]", gotMax)
+			}
+		})
+	}
+}
+
+func TestPushLogsPreservesOrdinalPeersWhenOffloadFailsOnce(t *testing.T) {
+	cfg := validConfig()
+	cfg.Offload.Enabled = true
+	cfg.Offload.Bucket = "otel-offload-bucket"
+	cfg.Offload.MinBytes = 1024
+	cfg.Offload.MaxObjectBytes = 64 * 1024 * 1024
+	cfg.Offload.MaxConcurrency = 1
+
+	e, err := newLogsExporter(component.TelemetrySettings{
+		Logger:        zap.NewNop(),
+		MeterProvider: noop.NewMeterProvider(),
+	}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var uploadCount atomic.Int32
+	e.offloader.SetStore(funcBlobStore{
+		writeFn: func(_ context.Context, _, _, _ string, _ []byte) (string, error) {
+			if uploadCount.Add(1) == 1 {
+				return "", errors.New("simulated transient upload failure on 1st record")
+			}
+			return "1", nil
+		},
+	})
+
+	enc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &fakeAppender{outcome: bqi.AppendOutcome{AcknowledgedRows: 1}}
+	e.enc = enc
+	e.writer = app
+
+	ld := plog.NewLogs()
+	sl := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty()
+	lr0 := sl.LogRecords().AppendEmpty()
+	lr0.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+	lr0.Body().SetStr(strings.Repeat("IDENTICAL_LOG_PAYLOAD", 100))
+	lr1 := sl.LogRecords().AppendEmpty()
+	lr1.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+	lr1.Body().SetStr(strings.Repeat("IDENTICAL_LOG_PAYLOAD", 100))
+
+	pushErr := e.pushLogData(context.Background(), ld)
+	if pushErr == nil || consumererror.IsPermanent(pushErr) {
+		t.Fatalf("expected retryable consumererror.Logs, got %v", pushErr)
+	}
+	var logErr consumererror.Logs
+	if !errors.As(pushErr, &logErr) {
+		t.Fatalf("expected consumererror.Logs, got %T: %v", pushErr, pushErr)
+	}
+	// Because lr0 and lr1 are identical logs and lr1 was accepted with ordinal 0,
+	// the retry payload MUST preserve ordinal peers and include BOTH logs (not just lr0),
+	// preventing insert_id collision in BigQuery dedup view.
+	if got := logErr.Data().LogRecordCount(); got != 2 {
+		t.Fatalf("retryable log count = %d, want 2 (ordinal peers preserved)", got)
+	}
+}
+
+func TestQuarantineStopsProcessingOnceBudgetIsExhausted(t *testing.T) {
+	cfg := validConfig()
+	cfg.Quarantine.Enabled = true
+	cfg.Quarantine.Timeout = 10 * time.Millisecond
+	cfg.Offload.Enabled = true
+	cfg.Offload.Bucket = "otel-offload-bucket"
+	cfg.Offload.MinBytes = 512
+	cfg.Offload.MaxObjectBytes = 64 * 1024 * 1024
+
+	e, err := newTracesExporter(component.TelemetrySettings{
+		Logger:        zap.NewNop(),
+		MeterProvider: noop.NewMeterProvider(),
+	}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var callbackCalls atomic.Int32
+	e.offloader.SetStore(funcBlobStore{
+		writeFn: func(ctx context.Context, _, _, _ string, _ []byte) (string, error) {
+			callbackCalls.Add(1)
+			// Sleep past the 10ms quarantine timeout so the deadline expires
+			select {
+			case <-time.After(20 * time.Millisecond):
+				return "1", nil
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		},
+	})
+
+	enc, err := protoenc.New(schema.SpansTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.enc = enc
+	e.writer = &fakeAppender{outcome: bqi.AppendOutcome{AcknowledgedRows: 1}}
+	_, qStream := withQuarantine(t, e.signalExporter, bqi.AppendOutcome{})
+
+	// 32 rejected records with 512 KiB payloads
+	const count = 32
+	td := newTestTraces(count)
+	spans := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+	for i := 0; i < count; i++ {
+		spans.At(i).SetEndTimestamp(0) // rejection reason
+		spans.At(i).Attributes().PutStr("large", strings.Repeat("X", 2048))
+	}
+
+	start := time.Now()
+	_ = e.pushTraceData(context.Background(), td)
+	elapsed := time.Since(start)
+
+	// Verify that callbacks stopped once deadline expired, rather than running for all 32 records
+	if calls := callbackCalls.Load(); calls > 2 {
+		t.Errorf("quarantine payload offload callback called %d times, want <= 2 after deadline expiry", calls)
+	}
+	if elapsed > 100*time.Millisecond {
+		t.Errorf("pushTraceData delayed by %v, want <= 100ms", elapsed)
+	}
+	_ = qStream
+}
+
+// A record whose payload upload fails is withheld from the rows sent and does
+// not take an intra_batch_ordinal, so an identical record behind it is written
+// under the ordinal, and the insert_id, the withheld one would have had. The
+// retries must still leave every record with an insert_id of its own: across
+// the first attempt and its retries, the distinct insert_ids written must be
+// those a run without upload failures writes. Otherwise the dedup view
+// collapses identical records into one.
+func TestPushLogsOffloadRetryKeepsDistinctInsertIDs(t *testing.T) {
+	payload := func(s string) string { return strings.Repeat(s, 2048) }
+	tests := []struct {
+		name        string
+		bodies      []string
+		concurrency int
+		// fail reports whether the nth upload, counted from 1, fails.
+		fail func(n int) bool
+	}{
+		{
+			name:        "two identical records, the first upload fails once",
+			bodies:      []string{payload("A"), payload("A")},
+			concurrency: 1,
+			fail:        func(n int) bool { return n == 1 },
+		},
+		{
+			name:        "three identical records, the second upload fails once",
+			bodies:      []string{payload("A"), payload("A"), payload("A")},
+			concurrency: 1,
+			fail:        func(n int) bool { return n == 2 },
+		},
+		{
+			name:        "identical records among distinct ones, two uploads fail",
+			bodies:      []string{payload("B"), payload("A"), payload("A"), payload("C"), payload("A")},
+			concurrency: 1,
+			fail:        func(n int) bool { return n == 2 || n == 5 },
+		},
+		{
+			name:        "concurrent uploads, the first fails",
+			bodies:      []string{payload("A"), payload("A")},
+			concurrency: 8,
+			fail:        func(n int) bool { return n == 1 },
+		},
+		{
+			name:        "inline identical records around a failed upload",
+			bodies:      []string{"x", "x", payload("Z"), "x"},
+			concurrency: 1,
+			fail:        func(n int) bool { return n == 1 },
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			want := insertIDsWrittenUntilDelivered(t, tc.concurrency, func(int) bool { return false }, logsWithBodies(tc.bodies...))
+			if len(want) != len(tc.bodies) {
+				t.Fatalf("setup: a run without upload failures wrote %d distinct insert_ids, want %d", len(want), len(tc.bodies))
+			}
+			got := insertIDsWrittenUntilDelivered(t, tc.concurrency, tc.fail, logsWithBodies(tc.bodies...))
+			if !slices.Equal(got, want) {
+				t.Fatalf("distinct insert_ids written = %d %v, want the %d of a run without upload failures %v",
+					len(got), got, len(want), want)
+			}
+		})
+	}
+}
+
+// insertIDsWrittenUntilDelivered pushes ld through a logs exporter whose
+// payload uploads fail as fail says, pushes each retry payload it returns
+// until a push succeeds, and returns the sorted distinct insert_ids of every
+// row appended along the way. The writer acknowledges every row it is given.
+func insertIDsWrittenUntilDelivered(t *testing.T, concurrency int, fail func(n int) bool, ld plog.Logs) []string {
+	t.Helper()
+	cfg := validConfig()
+	cfg.Offload.Enabled = true
+	cfg.Offload.Bucket = "otel-offload-bucket"
+	cfg.Offload.MinBytes = 1024
+	cfg.Offload.MaxObjectBytes = 64 * 1024 * 1024
+	cfg.Offload.MaxConcurrency = concurrency
+	e, err := newLogsExporter(component.TelemetrySettings{
+		Logger:        zap.NewNop(),
+		MeterProvider: noop.NewMeterProvider(),
+	}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var uploads atomic.Int32
+	e.offloader.SetStore(funcBlobStore{
+		writeFn: func(_ context.Context, _, _, _ string, _ []byte) (string, error) {
+			if fail(int(uploads.Add(1))) {
+				return "", errors.New("simulated transient upload failure")
+			}
+			return "1", nil
+		},
+	})
+	enc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &recordingEncoder{next: enc}
+	e.enc = rec
+	e.writer = &fakeAppender{appendFn: func(_ context.Context, rows [][]byte) bqi.AppendOutcome {
+		return bqi.AppendOutcome{AcknowledgedRows: len(rows), AckedRanges: [][2]int{{0, len(rows)}}}
+	}}
+
+	payload := ld
+	for range 10 {
+		err := e.pushLogData(context.Background(), payload)
+		if err == nil {
+			ids := column(rec.rows, "insert_id")
+			slices.Sort(ids)
+			return slices.Compact(ids)
+		}
+		var logsErr consumererror.Logs
+		if !errors.As(err, &logsErr) {
+			t.Fatalf("expected a retryable consumererror.Logs, got %T: %v", err, err)
+		}
+		payload = logsErr.Data()
+	}
+	t.Fatal("the batch was not delivered within 10 pushes")
+	return nil
 }

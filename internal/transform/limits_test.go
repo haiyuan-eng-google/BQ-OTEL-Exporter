@@ -13,12 +13,13 @@ import (
 
 func tightLimits() Limits {
 	return Limits{
-		MaxAttributeCount: 2,
-		MaxEventCount:     2,
-		MaxLinkCount:      2,
-		MaxNestingDepth:   3,
-		MaxCollectionSize: 2,
-		MaxValueBytes:     16,
+		MaxAttributeCount:    2,
+		MaxEventCount:        2,
+		MaxLinkCount:         2,
+		MaxNestingDepth:      3,
+		MaxCollectionSize:    2,
+		MaxAttributeKeyBytes: 32,
+		MaxValueBytes:        16,
 	}
 }
 
@@ -30,6 +31,11 @@ func TestLimitsValidate(t *testing.T) {
 	l.MaxValueBytes = 0
 	if err := l.Validate(); err == nil {
 		t.Fatal("a zero limit can never accept a record and must be rejected")
+	}
+	lKey := DefaultLimits()
+	lKey.MaxAttributeKeyBytes = 0
+	if err := lKey.Validate(); err == nil {
+		t.Fatal("a zero max_attribute_key_bytes must be rejected")
 	}
 }
 
@@ -76,6 +82,15 @@ func TestEachLimitIsEnforced(t *testing.T) {
 				s.Attributes().PutStr(string(rune('a'+i)), "v")
 			}
 		}, ReasonAttributeCount},
+
+		"attribute key size": {func(s ptrace.Span) {
+			s.Attributes().PutStr("this.attribute.key.is.longer.than.thirty.two.bytes", "v")
+		}, ReasonAttributeKeySize},
+
+		"nested map key size": {func(s ptrace.Span) {
+			m := s.Attributes().PutEmptyMap("nested")
+			m.PutStr("this.nested.map.key.is.longer.than.thirty.two.bytes", "v")
+		}, ReasonAttributeKeySize},
 
 		"event count": {func(s ptrace.Span) {
 			for i := 0; i < 5; i++ {

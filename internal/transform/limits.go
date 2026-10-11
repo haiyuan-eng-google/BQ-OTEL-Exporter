@@ -30,8 +30,12 @@ type Limits struct {
 	MaxNestingDepth int
 	// MaxCollectionSize bounds elements in a single array or kvlist value.
 	MaxCollectionSize int
+	// MaxAttributeKeyBytes bounds one attribute or nested map key, measured in
+	// UTF-8 bytes before encoding.
+	MaxAttributeKeyBytes int
 	// MaxValueBytes bounds one string or bytes value, measured before
-	// encoding.
+	// encoding. When a PayloadOffloader is configured, this bound is enforced
+	// after eligible large values have been offloaded.
 	MaxValueBytes int
 }
 
@@ -40,24 +44,26 @@ type Limits struct {
 // during serialization, not to shape ordinary telemetry.
 func DefaultLimits() Limits {
 	return Limits{
-		MaxAttributeCount: 1024,
-		MaxEventCount:     1024,
-		MaxLinkCount:      1024,
-		MaxNestingDepth:   16,
-		MaxCollectionSize: 4096,
-		MaxValueBytes:     256 * 1024,
+		MaxAttributeCount:    1024,
+		MaxEventCount:        1024,
+		MaxLinkCount:         1024,
+		MaxNestingDepth:      16,
+		MaxCollectionSize:    4096,
+		MaxAttributeKeyBytes: 1024,
+		MaxValueBytes:        256 * 1024,
 	}
 }
 
 // Validate rejects a limits configuration that could never accept a record.
 func (l Limits) Validate() error {
 	fields := map[string]int{
-		"max_attribute_count": l.MaxAttributeCount,
-		"max_event_count":     l.MaxEventCount,
-		"max_link_count":      l.MaxLinkCount,
-		"max_nesting_depth":   l.MaxNestingDepth,
-		"max_collection_size": l.MaxCollectionSize,
-		"max_value_bytes":     l.MaxValueBytes,
+		"max_attribute_count":     l.MaxAttributeCount,
+		"max_event_count":         l.MaxEventCount,
+		"max_link_count":          l.MaxLinkCount,
+		"max_nesting_depth":       l.MaxNestingDepth,
+		"max_collection_size":     l.MaxCollectionSize,
+		"max_attribute_key_bytes": l.MaxAttributeKeyBytes,
+		"max_value_bytes":         l.MaxValueBytes,
 	}
 	for name, v := range fields {
 		if v <= 0 {
@@ -74,15 +80,16 @@ type Reason string
 
 // The rejection reasons. Each value is one label on the rejected_rows counter.
 const (
-	ReasonAttributeCount Reason = "attribute_count"
-	ReasonEventCount     Reason = "event_count"
-	ReasonLinkCount      Reason = "link_count"
-	ReasonNestingDepth   Reason = "nesting_depth"
-	ReasonCollectionSize Reason = "collection_size"
-	ReasonValueSize      Reason = "value_size"
-	ReasonSerialization  Reason = "serialization"
-	ReasonRowBytes       Reason = "row_bytes"
-	ReasonRowError       Reason = "row_error"
+	ReasonAttributeCount   Reason = "attribute_count"
+	ReasonAttributeKeySize Reason = "attribute_key_size"
+	ReasonEventCount       Reason = "event_count"
+	ReasonLinkCount        Reason = "link_count"
+	ReasonNestingDepth     Reason = "nesting_depth"
+	ReasonCollectionSize   Reason = "collection_size"
+	ReasonValueSize        Reason = "value_size"
+	ReasonSerialization    Reason = "serialization"
+	ReasonRowBytes         Reason = "row_bytes"
+	ReasonRowError         Reason = "row_error"
 
 	// Contract violations. A record that cannot fill a NOT NULL column, or
 	// whose value does not fit the column type, has no valid row at all.
@@ -114,16 +121,24 @@ func (v Violation) Error() string {
 	return fmt.Sprintf("%s: %s exceeds limit (%d > %d)", v.Reason, v.FieldPath, v.Actual, v.Limit)
 }
 
-// checkMap validates one attribute bag.
+// checkMap validates one attribute bag, including string/bytes value sizes.
 func (l Limits) checkMap(m pcommon.Map, path string) *Violation {
+	return l.checkMapMode(m, path, true)
+}
+
+func (l Limits) checkMapMode(m pcommon.Map, path string, checkValueBytes bool) *Violation {
 	if m.Len() > l.MaxAttributeCount {
 		return &Violation{ReasonAttributeCount, path, l.MaxAttributeCount, m.Len()}
 	}
 	var found *Violation
-	m.Range(func(_ string, v pcommon.Value) bool {
+	m.Range(func(k string, v pcommon.Value) bool {
 		// The key is deliberately dropped from the path: it is telemetry
 		// content. The bag name alone tells an operator where to look.
-		if found = l.checkValue(v, path, 1); found != nil {
+		if l.MaxAttributeKeyBytes > 0 && len(k) > l.MaxAttributeKeyBytes {
+			found = &Violation{ReasonAttributeKeySize, path, l.MaxAttributeKeyBytes, len(k)}
+			return false
+		}
+		if found = l.checkValueMode(v, path, 1, checkValueBytes); found != nil {
 			return false
 		}
 		return true
@@ -131,21 +146,23 @@ func (l Limits) checkMap(m pcommon.Map, path string) *Violation {
 	return found
 }
 
-// checkValue walks an AnyValue, enforcing depth, collection size and value
-// size as it goes.
-func (l Limits) checkValue(v pcommon.Value, path string, depth int) *Violation {
+func (l Limits) checkValueMode(v pcommon.Value, path string, depth int, checkValueBytes bool) *Violation {
 	if depth > l.MaxNestingDepth {
 		return &Violation{ReasonNestingDepth, path, l.MaxNestingDepth, depth}
 	}
 
 	switch v.Type() {
 	case pcommon.ValueTypeStr:
-		if n := len(v.Str()); n > l.MaxValueBytes {
-			return &Violation{ReasonValueSize, path, l.MaxValueBytes, n}
+		if checkValueBytes {
+			if n := len(v.Str()); n > l.MaxValueBytes {
+				return &Violation{ReasonValueSize, path, l.MaxValueBytes, n}
+			}
 		}
 	case pcommon.ValueTypeBytes:
-		if n := v.Bytes().Len(); n > l.MaxValueBytes {
-			return &Violation{ReasonValueSize, path, l.MaxValueBytes, n}
+		if checkValueBytes {
+			if n := v.Bytes().Len(); n > l.MaxValueBytes {
+				return &Violation{ReasonValueSize, path, l.MaxValueBytes, n}
+			}
 		}
 	case pcommon.ValueTypeSlice:
 		s := v.Slice()
@@ -153,7 +170,7 @@ func (l Limits) checkValue(v pcommon.Value, path string, depth int) *Violation {
 			return &Violation{ReasonCollectionSize, path, l.MaxCollectionSize, s.Len()}
 		}
 		for i := 0; i < s.Len(); i++ {
-			if bad := l.checkValue(s.At(i), path, depth+1); bad != nil {
+			if bad := l.checkValueMode(s.At(i), path, depth+1, checkValueBytes); bad != nil {
 				return bad
 			}
 		}
@@ -163,8 +180,12 @@ func (l Limits) checkValue(v pcommon.Value, path string, depth int) *Violation {
 			return &Violation{ReasonCollectionSize, path, l.MaxCollectionSize, inner.Len()}
 		}
 		var found *Violation
-		inner.Range(func(_ string, iv pcommon.Value) bool {
-			if found = l.checkValue(iv, path, depth+1); found != nil {
+		inner.Range(func(k string, iv pcommon.Value) bool {
+			if l.MaxAttributeKeyBytes > 0 && len(k) > l.MaxAttributeKeyBytes {
+				found = &Violation{ReasonAttributeKeySize, path, l.MaxAttributeKeyBytes, len(k)}
+				return false
+			}
+			if found = l.checkValueMode(iv, path, depth+1, checkValueBytes); found != nil {
 				return false
 			}
 			return true

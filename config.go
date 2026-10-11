@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/collector/config/configoptional"
@@ -71,6 +72,10 @@ type Config struct {
 	// Quarantine routes records the signal tables cannot take to an opt-in
 	// dead-letter table instead of only counting them.
 	Quarantine QuarantineConfig `mapstructure:"quarantine"`
+
+	// Offload routes oversized span/log values and quarantine payloads to
+	// Google Cloud Storage and records ObjectRef references in BigQuery.
+	Offload OffloadConfig `mapstructure:"offload"`
 }
 
 // SignalConfig is the per-signal destination.
@@ -176,22 +181,24 @@ type KeepaliveConfig struct {
 
 // LimitsConfig mirrors transform.Limits in configuration.
 type LimitsConfig struct {
-	MaxAttributeCount int `mapstructure:"max_attribute_count"`
-	MaxEventCount     int `mapstructure:"max_event_count"`
-	MaxLinkCount      int `mapstructure:"max_link_count"`
-	MaxNestingDepth   int `mapstructure:"max_nesting_depth"`
-	MaxCollectionSize int `mapstructure:"max_collection_size"`
-	MaxValueBytes     int `mapstructure:"max_value_bytes"`
+	MaxAttributeCount    int `mapstructure:"max_attribute_count"`
+	MaxEventCount        int `mapstructure:"max_event_count"`
+	MaxLinkCount         int `mapstructure:"max_link_count"`
+	MaxNestingDepth      int `mapstructure:"max_nesting_depth"`
+	MaxCollectionSize    int `mapstructure:"max_collection_size"`
+	MaxAttributeKeyBytes int `mapstructure:"max_attribute_key_bytes"`
+	MaxValueBytes        int `mapstructure:"max_value_bytes"`
 }
 
 func (l LimitsConfig) toTransform() transform.Limits {
 	return transform.Limits{
-		MaxAttributeCount: l.MaxAttributeCount,
-		MaxEventCount:     l.MaxEventCount,
-		MaxLinkCount:      l.MaxLinkCount,
-		MaxNestingDepth:   l.MaxNestingDepth,
-		MaxCollectionSize: l.MaxCollectionSize,
-		MaxValueBytes:     l.MaxValueBytes,
+		MaxAttributeCount:    l.MaxAttributeCount,
+		MaxEventCount:        l.MaxEventCount,
+		MaxLinkCount:         l.MaxLinkCount,
+		MaxNestingDepth:      l.MaxNestingDepth,
+		MaxCollectionSize:    l.MaxCollectionSize,
+		MaxAttributeKeyBytes: l.MaxAttributeKeyBytes,
+		MaxValueBytes:        l.MaxValueBytes,
 	}
 }
 
@@ -207,6 +214,37 @@ type QuarantineConfig struct {
 	Enabled bool `mapstructure:"enabled"`
 	// Table is the quarantine table ID in the destination dataset.
 	Table string `mapstructure:"table"`
+	// MetadataOnly omits raw_payload, raw_attributes, and payload_ref from
+	// quarantine rows when enabled, writing only metadata columns.
+	MetadataOnly bool `mapstructure:"metadata_only"`
+	// MaxRawPayloadBytes bounds the UTF-8 byte length of raw_payload in
+	// quarantine rows before any row-size cap is applied.
+	MaxRawPayloadBytes int `mapstructure:"max_raw_payload_bytes"`
+	// Timeout bounds each best-effort quarantine Append call on a context
+	// detached from the caller's export cancellation.
+	Timeout time.Duration `mapstructure:"timeout"`
+}
+
+// OffloadConfig configures optional large-payload offloading to Google Cloud
+// Storage with BigQuery ObjectRef references in payload_refs and quarantine
+// payload_ref.
+type OffloadConfig struct {
+	Enabled bool `mapstructure:"enabled"`
+	// Bucket is the destination GCS bucket name (without gs://).
+	Bucket string `mapstructure:"bucket"`
+	// Prefix is the object key prefix within Bucket.
+	Prefix string `mapstructure:"prefix"`
+	// Authorizer is the optional BigQuery connection resource name
+	// recorded in ObjectRef.authorizer.
+	Authorizer string `mapstructure:"authorizer"`
+	// MinBytes is the minimum byte length for a value to be offloaded.
+	MinBytes int `mapstructure:"min_bytes"`
+	// MaxObjectBytes is the maximum byte length eligible for offloading.
+	MaxObjectBytes int `mapstructure:"max_object_bytes"`
+	// MaxConcurrency bounds concurrent GCS uploads within an offload batch.
+	MaxConcurrency int `mapstructure:"max_concurrency"`
+	// Timeout bounds each object upload attempt.
+	Timeout time.Duration `mapstructure:"timeout"`
 }
 
 // Validate checks the configuration and fails fast at startup.
@@ -243,6 +281,7 @@ func (cfg *Config) Validate() error {
 	errs = append(errs, cfg.validateCredentials()...)
 	errs = append(errs, cfg.validateEndpoint()...)
 	errs = append(errs, cfg.validateQuarantine()...)
+	errs = append(errs, cfg.validateOffload()...)
 
 	if err := cfg.Limits.toTransform().Validate(); err != nil {
 		errs = append(errs, err)
@@ -373,6 +412,12 @@ func (cfg *Config) validateQuarantine() []error {
 		errs = append(errs, fmt.Errorf(
 			"quarantine.table %q must contain only letters, numbers and underscores", q.Table))
 	}
+	if q.MaxRawPayloadBytes < 0 {
+		errs = append(errs, errors.New("quarantine.max_raw_payload_bytes must not be negative"))
+	}
+	if q.Timeout < 0 {
+		errs = append(errs, errors.New("quarantine.timeout must not be negative"))
+	}
 	if !q.Enabled {
 		return errs
 	}
@@ -384,6 +429,51 @@ func (cfg *Config) validateQuarantine() []error {
 		// table could only ever fail schema validation at startup.
 		errs = append(errs, fmt.Errorf(
 			"quarantine.table %q must differ from traces.table and logs.table", q.Table))
+	}
+	if q.MaxRawPayloadBytes <= 0 {
+		errs = append(errs, errors.New("quarantine.max_raw_payload_bytes must be positive when quarantine.enabled is set"))
+	}
+	if q.Timeout <= 0 {
+		errs = append(errs, errors.New("quarantine.timeout must be positive when quarantine.enabled is set"))
+	}
+	return errs
+}
+
+func (cfg *Config) validateOffload() []error {
+	var errs []error
+	o := cfg.Offload
+
+	if o.MinBytes < 0 {
+		errs = append(errs, errors.New("offload.min_bytes must not be negative"))
+	}
+	if o.MaxObjectBytes < 0 {
+		errs = append(errs, errors.New("offload.max_object_bytes must not be negative"))
+	}
+	if o.Timeout < 0 {
+		errs = append(errs, errors.New("offload.timeout must not be negative"))
+	}
+	if !o.Enabled {
+		return errs
+	}
+	bucket := strings.TrimSpace(o.Bucket)
+	if bucket == "" {
+		errs = append(errs, errors.New("offload.bucket must not be empty when offload.enabled is set"))
+	} else if strings.HasPrefix(bucket, "gs://") || strings.Contains(bucket, "/") {
+		errs = append(errs, fmt.Errorf("offload.bucket %q must be a bare bucket name without gs:// or slashes", o.Bucket))
+	}
+	if o.MinBytes <= 0 {
+		errs = append(errs, errors.New("offload.min_bytes must be positive when offload.enabled is set"))
+	}
+	if o.MaxObjectBytes < o.MinBytes {
+		errs = append(errs, fmt.Errorf(
+			"offload.max_object_bytes (%d) must be at least offload.min_bytes (%d)",
+			o.MaxObjectBytes, o.MinBytes))
+	}
+	if o.MaxConcurrency <= 0 {
+		errs = append(errs, errors.New("offload.max_concurrency must be positive when offload.enabled is set"))
+	}
+	if o.Timeout <= 0 {
+		errs = append(errs, errors.New("offload.timeout must be positive when offload.enabled is set"))
 	}
 	return errs
 }
