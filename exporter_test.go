@@ -2289,3 +2289,100 @@ func TestComponentStatusReportedAcrossLifecycleAndAppend(t *testing.T) {
 		}
 	}
 }
+
+// The quarantine self-telemetry exists to expose dead-letter loss, so a
+// quarantine append that only partly succeeds must count each row by its own
+// fate: quarantined when its sub-request was acknowledged and the service did
+// not reject it, failed otherwise. A real writer reports AckedRanges alongside
+// AcknowledgedRows, and rows outside the acknowledged ranges were not written
+// even though another sub-request was.
+func TestQuarantineTelemetryCountsEachRowOfAPartiallyFailedAppend(t *testing.T) {
+	unavailable := status.Error(codes.Unavailable, "later quarantine sub-request failed")
+	rejected := status.Error(codes.InvalidArgument, "quarantine row rejected")
+	tests := []struct {
+		name                   string
+		out                    bqi.AppendOutcome
+		quarantined, failedRow int64
+	}{
+		{
+			name: "first sub-request acknowledged, the second failed",
+			out: bqi.AppendOutcome{
+				AcknowledgedRows: 2, AckedRanges: [][2]int{{0, 2}},
+				Verdict: bqi.Classify(unavailable), Err: unavailable,
+			},
+			quarantined: 2, failedRow: 1,
+		},
+		{
+			name: "a row error fails the sub-request it travelled in",
+			out: bqi.AppendOutcome{
+				AcknowledgedRows: 1, AckedRanges: [][2]int{{0, 1}},
+				RowErrors: []bqi.RowError{{Index: 2, Code: "FIELDS_ERROR", Message: "bad quarantine row"}},
+				Verdict:   bqi.Classify(rejected), Err: rejected,
+			},
+			quarantined: 1, failedRow: 2,
+		},
+		{
+			name:        "every sub-request acknowledged",
+			out:         bqi.AppendOutcome{AcknowledgedRows: 3, AckedRanges: [][2]int{{0, 2}, {2, 3}}},
+			quarantined: 3, failedRow: 0,
+		},
+		{
+			name:        "nothing acknowledged",
+			out:         bqi.AppendOutcome{Verdict: bqi.Classify(unavailable), Err: unavailable},
+			quarantined: 0, failedRow: 3,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := sdkmetric.NewManualReader()
+			mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+			t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+			tel, err := metadata.NewTelemetry(mp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			e, app := newTestTracesExporter(t, bqi.AppendOutcome{})
+			e.tel = tel
+			_, stream := withQuarantine(t, e.signalExporter, tc.out)
+
+			// Three spans without an end time: the transform stage rejects all
+			// three, so the signal table receives nothing and the quarantine
+			// append carries three rows.
+			td := newTestTraces(3)
+			spans := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+			for i := range spans.Len() {
+				spans.At(i).SetEndTimestamp(0)
+			}
+			if err := e.pushTraceData(context.Background(), td); err != nil {
+				t.Fatalf("pushTraceData returned %v, want nil: every span was rejected", err)
+			}
+			if app.appended != 0 || stream.gotRows != 3 {
+				t.Fatalf("signal appends = %d, quarantine rows = %d, want 0 and 3", app.appended, stream.gotRows)
+			}
+			if got := metricInt64SumOrZero(t, reader, "otelcol_exporter_bigquery_quarantined_rows"); got != tc.quarantined {
+				t.Errorf("quarantined_rows = %d, want %d", got, tc.quarantined)
+			}
+			if got := metricInt64SumOrZero(t, reader, "otelcol_exporter_bigquery_quarantine_failed_rows"); got != tc.failedRow {
+				t.Errorf("quarantine_failed_rows = %d, want %d", got, tc.failedRow)
+			}
+		})
+	}
+}
+
+// metricInt64SumOrZero is metricInt64Sum for a counter that may never have
+// been incremented, and so never collected.
+func metricInt64SumOrZero(t *testing.T, reader *sdkmetric.ManualReader, name string) int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name == name {
+				return metricInt64Sum(t, reader, name)
+			}
+		}
+	}
+	return 0
+}
