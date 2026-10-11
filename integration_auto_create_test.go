@@ -69,6 +69,8 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 	cfg.Location = location
 	cfg.AutoCreate.Dataset = true
 	cfg.AutoCreate.Tables = true
+	cfg.AutoCreate.CompanionViews = true
+	cfg.Quarantine.Enabled = true
 	settings := component.TelemetrySettings{
 		Logger:        zap.NewNop(),
 		MeterProvider: noop.NewMeterProvider(),
@@ -129,6 +131,14 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 		}
 		if err := waitForRows(ctx, admin, project, dataset, table+"_dedup"); err != nil {
 			t.Error(err)
+		}
+	}
+	if err := waitForRows(ctx, admin, project, dataset, "otel_spans_as_allspans"); err != nil {
+		t.Error(err)
+	}
+	for _, name := range []string{cfg.Quarantine.Table, "v_gen_ai_spans", "v_gen_ai_logs"} {
+		if _, err := admin.Dataset(dataset).Table(name).Metadata(ctx); err != nil {
+			t.Errorf("resource %s metadata: %v", name, err)
 		}
 	}
 }

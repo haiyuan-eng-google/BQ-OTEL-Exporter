@@ -4,8 +4,12 @@
 package schema
 
 import (
+	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	bq "cloud.google.com/go/bigquery"
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
@@ -50,6 +54,7 @@ func TestBigQuerySchemaRoundTripPreservesCanonicalContracts(t *testing.T) {
 	}{
 		{name: "spans", in: SpansTableSchema()},
 		{name: "logs", in: LogsTableSchema()},
+		{name: "quarantine", in: QuarantineTableSchema()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			bqs, err := ToBigQuery(tc.in)
@@ -62,6 +67,154 @@ func TestBigQuerySchemaRoundTripPreservesCanonicalContracts(t *testing.T) {
 			}
 			if !proto.Equal(got, tc.in) {
 				t.Fatalf("schema changed across conversion\ngot:  %v\nwant: %v", got, tc.in)
+			}
+		})
+	}
+}
+
+// DestinationMetadata is what auto-create applies, so the partitioning,
+// clustering and view it returns are the physical layout of every table the
+// exporter creates.
+func TestDestinationMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		in            *storagepb.TableSchema
+		partitionType bq.TimePartitioningType
+		partition     string
+		cluster       []string
+		viewQuery     string
+	}{
+		{
+			name:          "spans",
+			in:            SpansTableSchema(),
+			partitionType: bq.HourPartitioningType,
+			partition:     "start_time",
+			cluster:       []string{"service_name", "trace_id", "name"},
+			viewQuery:     SpansDedupViewQuery,
+		},
+		{
+			name:          "logs",
+			in:            LogsTableSchema(),
+			partitionType: bq.DayPartitioningType,
+			partition:     "timestamp",
+			cluster:       []string{"service_name", "trace_id", "severity_number"},
+			viewQuery:     LogsDedupViewQuery,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			md, view, err := DestinationMetadata(tc.in, "proj", "ds", "tbl")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tp := md.TimePartitioning; tp == nil || tp.Type != tc.partitionType || tp.Field != tc.partition {
+				t.Errorf("partitioning = %+v, want type %q on %q", tp, tc.partitionType, tc.partition)
+			}
+			var cluster []string
+			if md.Clustering != nil {
+				cluster = md.Clustering.Fields
+			}
+			if !slices.Equal(cluster, tc.cluster) {
+				t.Errorf("clustering = %v, want %v", cluster, tc.cluster)
+			}
+			wantSchema, err := ToBigQuery(tc.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertBigQuerySchemaEqual(t, md.Schema, wantSchema)
+			if want := fmt.Sprintf(tc.viewQuery, "proj", "ds", "tbl"); view != want {
+				t.Errorf("view query = %q, want %q", view, want)
+			}
+			if !strings.Contains(view, "`proj.ds.tbl`") {
+				t.Errorf("view query %q does not reference the base table", view)
+			}
+		})
+	}
+
+	if _, _, err := DestinationMetadata(&storagepb.TableSchema{Fields: []*storagepb.TableFieldSchema{
+		f("not_a_contract", str, opt),
+	}}, "proj", "ds", "tbl"); err == nil {
+		t.Error("a schema that is not a canonical contract must be rejected")
+	}
+	if _, _, err := DestinationMetadata(QuarantineTableSchema(), "proj", "ds", "tbl"); err == nil {
+		t.Error("the quarantine contract has no dedup view and must go through QuarantineDestinationMetadata")
+	}
+}
+
+// QuarantineDestinationMetadata is what auto-create applies for the opt-in
+// quarantine table, so it must carry the layout QuarantineDDL declares: daily
+// partitions on ingest_time that expire after 30 days, clustering on
+// (signal, error_code, service_name), and no view.
+func TestQuarantineDestinationMetadata(t *testing.T) {
+	md, err := QuarantineDestinationMetadata()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tp := md.TimePartitioning
+	if tp == nil || tp.Type != bq.DayPartitioningType || tp.Field != "ingest_time" {
+		t.Fatalf("partitioning = %+v, want daily on ingest_time", tp)
+	}
+	if tp.Expiration != 30*24*time.Hour {
+		t.Errorf("partition expiration = %v, want 30 days", tp.Expiration)
+	}
+	days := int(tp.Expiration / (24 * time.Hour))
+	if !strings.Contains(QuarantineDDL, fmt.Sprintf("partition_expiration_days = %d\n", days)) {
+		t.Errorf("metadata expires partitions after %d days, but QuarantineDDL disagrees", days)
+	}
+	var cluster []string
+	if md.Clustering != nil {
+		cluster = md.Clustering.Fields
+	}
+	if want := []string{"signal", "error_code", "service_name"}; !slices.Equal(cluster, want) {
+		t.Errorf("clustering = %v, want %v", cluster, want)
+	}
+	wantSchema, err := ToBigQuery(QuarantineTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertBigQuerySchemaEqual(t, md.Schema, wantSchema)
+	if md.ViewQuery != "" {
+		t.Errorf("quarantine table metadata must not define a view, got %q", md.ViewQuery)
+	}
+}
+
+// CompanionViewsMetadata is what auto-create applies for the optional
+// companion views, so each signal must get exactly its own views, under their
+// published names, as plain standard SQL views over the configured tables.
+func TestCompanionViewsMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		isSpans bool
+		want    map[string]string
+	}{
+		{
+			name:    "spans",
+			isSpans: true,
+			want: map[string]string{
+				"otel_spans_as_allspans": fmt.Sprintf(SpansAsAllSpansViewQuery, "proj", "ds", "spans_tbl"),
+				"v_gen_ai_spans":         fmt.Sprintf(GenAISpansViewQuery, "proj", "ds", "spans_tbl"),
+			},
+		},
+		{
+			name: "logs",
+			want: map[string]string{
+				"v_gen_ai_logs": fmt.Sprintf(GenAILogsViewQuery, "proj", "ds", "logs_tbl", "spans_tbl"),
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := CompanionViewsMetadata("proj", "ds", "spans_tbl", "logs_tbl", tc.isSpans)
+			gotNames, wantNames := slices.Sorted(maps.Keys(got)), slices.Sorted(maps.Keys(tc.want))
+			if !slices.Equal(gotNames, wantNames) {
+				t.Fatalf("views = %v, want %v", gotNames, wantNames)
+			}
+			for name, query := range tc.want {
+				md := got[name]
+				if md.ViewQuery != query {
+					t.Errorf("%s query = %q, want %q", name, md.ViewQuery, query)
+				}
+				if md.UseLegacySQL || md.Schema != nil || md.TimePartitioning != nil || md.Clustering != nil {
+					t.Errorf("%s must be a plain standard SQL view, got %+v", name, md)
+				}
 			}
 		})
 	}

@@ -38,16 +38,16 @@ func TestStructuralLimitsDropOnlyTheOffender(t *testing.T) {
 	td := ptrace.NewTraces()
 	ss := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty()
 
-	good := ss.Spans().AppendEmpty()
+	good := validSpan(ss.Spans().AppendEmpty())
 	good.SetName("fine")
 
-	bad := ss.Spans().AppendEmpty()
+	bad := validSpan(ss.Spans().AppendEmpty())
 	bad.SetName("too many attributes")
 	for i := 0; i < 10; i++ {
 		bad.Attributes().PutStr(string(rune('a'+i)), "v")
 	}
 
-	alsoGood := ss.Spans().AppendEmpty()
+	alsoGood := validSpan(ss.Spans().AppendEmpty())
 	alsoGood.SetName("also fine")
 
 	rows, rejects := SpanRows(td, Options{Limits: tightLimits()})
@@ -111,7 +111,7 @@ func TestEachLimitIsEnforced(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			td := ptrace.NewTraces()
-			span := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+			span := validSpan(td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty())
 			tc.build(span)
 
 			rows, rejects := SpanRows(td, Options{Limits: tightLimits()})
@@ -129,15 +129,66 @@ func TestEachLimitIsEnforced(t *testing.T) {
 // telemetry content and diagnostics end up in logs.
 func TestViolationPathCarriesNoAttributeKey(t *testing.T) {
 	td := ptrace.NewTraces()
-	span := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	span := validSpan(td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty())
 	span.Attributes().PutStr("customer.email.address", "this string is definitely longer than sixteen bytes")
 
 	_, rejects := SpanRows(td, Options{Limits: tightLimits()})
 	if len(rejects) != 1 {
 		t.Fatalf("expected one rejection, got %d", len(rejects))
 	}
-	if rejects[0].FieldPath != "span_attributes" {
+	if rejects[0].FieldPath != "attributes" {
 		t.Fatalf("field path = %q, want the bag name only", rejects[0].FieldPath)
+	}
+}
+
+// Each bag's path is the column, or nested field, the bag is written to, so
+// an operator can find it in the table.
+func TestViolationPathNamesTheBagColumn(t *testing.T) {
+	const long = "this string is definitely longer than sixteen bytes"
+	for want, build := range map[string]func(ptrace.ResourceSpans, ptrace.Span){
+		"resource.attributes": func(rs ptrace.ResourceSpans, _ ptrace.Span) {
+			rs.Resource().Attributes().PutStr("k", long)
+		},
+		"instrumentation_scope.attributes": func(rs ptrace.ResourceSpans, _ ptrace.Span) {
+			rs.ScopeSpans().At(0).Scope().Attributes().PutStr("k", long)
+		},
+		"attributes": func(_ ptrace.ResourceSpans, s ptrace.Span) {
+			s.Attributes().PutStr("k", long)
+		},
+		"events.attributes": func(_ ptrace.ResourceSpans, s ptrace.Span) {
+			s.Events().AppendEmpty().Attributes().PutStr("k", long)
+		},
+		"links.attributes": func(_ ptrace.ResourceSpans, s ptrace.Span) {
+			s.Links().AppendEmpty().Attributes().PutStr("k", long)
+		},
+	} {
+		t.Run(want, func(t *testing.T) {
+			td := ptrace.NewTraces()
+			rs := td.ResourceSpans().AppendEmpty()
+			span := validSpan(rs.ScopeSpans().AppendEmpty().Spans().AppendEmpty())
+			build(rs, span)
+
+			_, rejects := SpanRows(td, Options{Limits: tightLimits()})
+			if len(rejects) != 1 || rejects[0].FieldPath != want {
+				t.Fatalf("rejections = %+v, want field path %q", rejects, want)
+			}
+		})
+	}
+}
+
+// A contract violation breaches no configured limit, so its message must not
+// claim one.
+func TestViolationError(t *testing.T) {
+	for _, tc := range []struct {
+		v    Violation
+		want string
+	}{
+		{Violation{ReasonAttributeCount, "attributes", 2, 5}, "attribute_count: attributes exceeds limit (5 > 2)"},
+		{Violation{Reason: ReasonInvalidID, FieldPath: "trace_id"}, "invalid_id: trace_id"},
+	} {
+		if got := tc.v.Error(); got != tc.want {
+			t.Errorf("Error() = %q, want %q", got, tc.want)
+		}
 	}
 }
 
@@ -153,5 +204,37 @@ func TestLogBodyLimit(t *testing.T) {
 	}
 	if rejects[0].FieldPath != "body" {
 		t.Errorf("field path = %q, want body", rejects[0].FieldPath)
+	}
+}
+
+// A log record's bags and body report the column, or nested field, they are
+// written to, as span bags do.
+func TestLogViolationPathNamesTheColumn(t *testing.T) {
+	const long = "this string is definitely longer than sixteen bytes"
+	for want, build := range map[string]func(plog.ResourceLogs, plog.LogRecord){
+		"resource.attributes": func(rl plog.ResourceLogs, _ plog.LogRecord) {
+			rl.Resource().Attributes().PutStr("k", long)
+		},
+		"instrumentation_scope.attributes": func(rl plog.ResourceLogs, _ plog.LogRecord) {
+			rl.ScopeLogs().At(0).Scope().Attributes().PutStr("k", long)
+		},
+		"attributes": func(_ plog.ResourceLogs, lr plog.LogRecord) {
+			lr.Attributes().PutStr("k", long)
+		},
+		"body": func(_ plog.ResourceLogs, lr plog.LogRecord) {
+			lr.Body().SetStr(long)
+		},
+	} {
+		t.Run(want, func(t *testing.T) {
+			ld := plog.NewLogs()
+			rl := ld.ResourceLogs().AppendEmpty()
+			lr := rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+			build(rl, lr)
+
+			_, rejects := LogRows(ld, Options{Limits: tightLimits()})
+			if len(rejects) != 1 || rejects[0].FieldPath != want {
+				t.Fatalf("rejections = %+v, want field path %q", rejects, want)
+			}
+		})
 	}
 }

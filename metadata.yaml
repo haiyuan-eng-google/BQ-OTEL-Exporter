@@ -138,6 +138,9 @@ telemetry:
         - serialization
         - row_bytes
         - row_error
+        - invalid_id
+        - missing_timestamp
+        - timestamp_overflow
 
     class:
       description: >-

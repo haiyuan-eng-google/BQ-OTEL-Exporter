@@ -12,39 +12,66 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 
-	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/otlpjson"
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 )
 
-// FingerprintPrefix versions the fingerprint format, so a future change to the
-// canonical form is detectable in the data rather than silently producing
-// different hashes for the same record.
-const FingerprintPrefix = "v1:"
+// LogFingerprint computes the record_fingerprint of a log record:
+//
+//	"fp1:" + lowercase_hex(SHA-256(canonical_log_record))
+//
+// canonical is the record's canonical form from canonicalLogRecord, and
+// ordinal is its intra_batch_ordinal: the 0-based count of records with the
+// same canonical form before it in the same export batch. The canonical log
+// record that is hashed is canonical followed by the ordinal. The ordinal is
+// what keeps identical records within one batch apart, while a retry of the
+// batch, which repeats its records in the same order, reproduces every
+// fingerprint.
+func LogFingerprint(canonical string, ordinal int) string {
+	var b strings.Builder
+	b.WriteString(canonical)
+	writeField(&b, "intra_batch_ordinal", strconv.Itoa(ordinal))
+	sum := sha256.Sum256([]byte(b.String()))
+	return schema.FingerprintPrefix + hex.EncodeToString(sum[:])
+}
 
-// LogFingerprint computes the §7.4 record fingerprint:
+// fingerprinter assigns fingerprints across one export batch, counting the
+// records seen so far per canonical form to derive each intra_batch_ordinal.
+// It is keyed by the ordinal-0 fingerprint rather than the canonical form, so
+// memory stays bounded by the record count, not the payload size, and a
+// record seen for the first time costs a single hash.
+type fingerprinter map[string]int
+
+// next returns the fingerprint of the next record with the given canonical
+// form.
+func (f fingerprinter) next(canonical string) string {
+	first := LogFingerprint(canonical, 0)
+	ordinal := f[first]
+	f[first] = ordinal + 1
+	if ordinal == 0 {
+		return first
+	}
+	return LogFingerprint(canonical, ordinal)
+}
+
+// canonicalLogRecord renders the part of a log record's canonical form that
+// is specific to the record, followed by origin, the part its resource and
+// scope contribute, from canonicalOrigin.
 //
-//	"v1:" + lowercase_hex(SHA256(canonical_log_record))
+// It covers every non-derived OTLP field. Values are the plain JSON the row
+// stores together with their type schemas, since plain JSON alone would give
+// an int 42 and a string "42" the same fingerprint. Times are the raw OTLP
+// nanoseconds rather than the truncated microsecond timestamps.
 //
-// The canonical form covers every non-derived OTLP source field. Object keys
-// are sorted by UTF-8 byte order, array order is preserved, values use
-// otlp-protojson-v1, and raw *_unix_nano values are used rather than the
-// truncated microsecond timestamps.
-//
-// export_received_timestamp is deliberately excluded. It is ingestion-local
-// and derived: including it would give every retry of the same record a
-// different fingerprint, which would defeat the entire mechanism.
-func LogFingerprint(
-	lr plog.LogRecord,
-	resource pcommon.Resource,
-	resourceSchemaURL string,
-	scope pcommon.InstrumentationScope,
-	scopeSchemaURL string,
-) string {
+// The receive time is deliberately excluded. It is ingestion-local and
+// derived: including it would give every retry of the same record a different
+// fingerprint, which would defeat the entire mechanism.
+func canonicalLogRecord(lr plog.LogRecord, attrs encodedBag, body, bodySchema, origin string) string {
 	var b strings.Builder
 
 	// A field-tagged, length-free encoding would be ambiguous across field
 	// boundaries, so every component is written with an explicit name and a
 	// separator that cannot appear unescaped in the JSON-encoded parts.
-	writeField(&b, "version", FingerprintPrefix)
+	writeField(&b, "version", schema.FingerprintPrefix)
 	writeField(&b, "time_unix_nano", strconv.FormatUint(uint64(lr.Timestamp()), 10))
 	writeField(&b, "observed_time_unix_nano", strconv.FormatUint(uint64(lr.ObservedTimestamp()), 10))
 
@@ -55,23 +82,39 @@ func LogFingerprint(
 	writeField(&b, "event_name", lr.EventName())
 	writeField(&b, "severity_number", strconv.FormatInt(int64(lr.SeverityNumber()), 10))
 	writeField(&b, "severity_text", lr.SeverityText())
-	writeField(&b, "body", otlpjson.EncodeValue(lr.Body()))
+	writeField(&b, "body", body)
+	writeField(&b, "body_schema", bodySchema)
 
-	writeField(&b, "log_attributes", otlpjson.EncodeMap(lr.Attributes()))
-	writeField(&b, "dropped_attributes_count", strconv.FormatUint(uint64(lr.DroppedAttributesCount()), 10))
+	writeField(&b, "attributes", attrs.attributes)
+	writeField(&b, "attributes_schema", attrs.schema)
+	writeField(&b, "dropped_attributes_count", strconv.FormatInt(attrs.dropped, 10))
 
-	writeField(&b, "resource_attributes", otlpjson.EncodeMap(resource.Attributes()))
-	writeField(&b, "resource_schema_url", resourceSchemaURL)
-	writeField(&b, "resource_dropped_attributes_count", strconv.FormatUint(uint64(resource.DroppedAttributesCount()), 10))
+	b.WriteString(origin)
+	return b.String()
+}
 
-	writeField(&b, "scope_name", scope.Name())
-	writeField(&b, "scope_version", scope.Version())
-	writeField(&b, "scope_attributes", otlpjson.EncodeMap(scope.Attributes()))
+// canonicalOrigin renders the part of the canonical form that a resource and
+// scope contribute, once for all the log records under them.
+func canonicalOrigin(
+	res encodedBag,
+	resSchemaURL string,
+	scope pcommon.InstrumentationScope,
+	scopeBag encodedBag,
+	scopeSchemaURL string,
+) string {
+	var b strings.Builder
+	writeField(&b, "resource.attributes", res.attributes)
+	writeField(&b, "resource.attributes_schema", res.schema)
+	writeField(&b, "resource.dropped_attributes_count", strconv.FormatInt(res.dropped, 10))
+	writeField(&b, "resource_schema_url", resSchemaURL)
+
+	writeField(&b, "instrumentation_scope.name", scope.Name())
+	writeField(&b, "instrumentation_scope.version", scope.Version())
+	writeField(&b, "instrumentation_scope.attributes", scopeBag.attributes)
+	writeField(&b, "instrumentation_scope.attributes_schema", scopeBag.schema)
+	writeField(&b, "instrumentation_scope.dropped_attributes_count", strconv.FormatInt(scopeBag.dropped, 10))
 	writeField(&b, "scope_schema_url", scopeSchemaURL)
-	writeField(&b, "scope_dropped_attributes_count", strconv.FormatUint(uint64(scope.DroppedAttributesCount()), 10))
-
-	sum := sha256.Sum256([]byte(b.String()))
-	return FingerprintPrefix + hex.EncodeToString(sum[:])
+	return b.String()
 }
 
 // writeField appends one length-prefixed component. The length prefix is what

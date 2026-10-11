@@ -44,7 +44,7 @@ func (e *logsExporter) pushLogData(ctx context.Context, ld plog.Logs) error {
 	rows, rejects := transform.LogRows(ld, e.opts)
 	e.recordRejections(ctx, rejects, opID)
 
-	encoded, keptIndex, _ := e.encodeRows(ctx, rows, opID)
+	encoded, keptIndex, drops := e.encodeRows(ctx, rows, opID)
 
 	recordIndex := make([]int, len(keptIndex))
 	rowToRecord := rowPositionToRecordIndex(len(rows), rejects)
@@ -53,6 +53,10 @@ func (e *logsExporter) pushLogData(ctx context.Context, ld plog.Logs) error {
 	}
 
 	decision := e.appendEncoded(ctx, encoded, recordIndex, opID)
+	if e.quarantine != nil {
+		entries := quarantineEntries(rejects, drops, rowToRecord, decision.rowErrors)
+		e.quarantineRows(ctx, transform.LogQuarantineRows(ld, entries, e.opts), opID)
+	}
 	if decision.err == nil {
 		return nil
 	}

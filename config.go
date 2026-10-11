@@ -66,6 +66,10 @@ type Config struct {
 
 	// Limits are the structural bounds applied before serialization.
 	Limits LimitsConfig `mapstructure:"limits"`
+
+	// Quarantine routes records the signal tables cannot take to an opt-in
+	// dead-letter table instead of only counting them.
+	Quarantine QuarantineConfig `mapstructure:"quarantine"`
 }
 
 // SignalConfig is the per-signal destination.
@@ -77,17 +81,21 @@ type SignalConfig struct {
 type LogsConfig struct {
 	Table string `mapstructure:"table"`
 
-	// SourceRecordNamespace is the trusted namespace for source_record_id.
-	//
-	// It must come from deployment-controlled configuration, never from an
-	// application-supplied attribute: it participates in record identity, so
-	// letting a payload choose it would let a payload claim another
-	// producer's identity.
-	SourceRecordNamespace string `mapstructure:"source_record_namespace"`
+	// LogNameAttribute names a string log record attribute that carries the
+	// log_name column. When unset, or absent on a record, log_name falls back
+	// to well-known log name attributes, then to the service name, then to
+	// "default".
+	LogNameAttribute string `mapstructure:"log_name_attribute"`
 
-	// SourceRecordIDAttribute names the log attribute carrying a stable
-	// source record ID. Only honored when SourceRecordNamespace is also set.
-	SourceRecordIDAttribute string `mapstructure:"source_record_id_attribute"`
+	// InsertIDAttribute names a string log record attribute that carries an
+	// upstream record ID for the insert_id column. When unset, or absent on a
+	// record, insert_id falls back to well-known insert ID attributes, then to
+	// the record fingerprint.
+	//
+	// The dedup view treats insert_id as record identity within a log stream
+	// and timestamp, so only name an attribute whose values are unique per
+	// record.
+	InsertIDAttribute string `mapstructure:"insert_id_attribute"`
 }
 
 // CredentialsConfig selects an authentication method. At most one may be set;
@@ -121,6 +129,11 @@ type EndpointConfig struct {
 type AutoCreateConfig struct {
 	Dataset bool `mapstructure:"dataset"`
 	Tables  bool `mapstructure:"tables"`
+	// CompanionViews also creates the optional companion views over the
+	// dedup views: otel_spans_as_allspans and v_gen_ai_spans with the traces
+	// table, and v_gen_ai_logs with the logs table once the traces dedup view
+	// exists. Like the dedup views they are create-only. Requires tables.
+	CompanionViews bool `mapstructure:"companion_views"`
 }
 
 // WriteConfig holds Storage Write API tuning knobs.
@@ -158,6 +171,20 @@ func (l LimitsConfig) toTransform() transform.Limits {
 	}
 }
 
+// QuarantineConfig controls the opt-in dead-letter table.
+//
+// When enabled, a record that is permanently rejected, whether by the record
+// contract, a structural limit, serialization, the row size limit or the
+// service's own row validation, is also written to Table with its error code
+// and its original content, so it can be inspected and replayed. Quarantine
+// writes are best effort: they are never retried, and they never change the
+// outcome of the signal write that rejected the record.
+type QuarantineConfig struct {
+	Enabled bool `mapstructure:"enabled"`
+	// Table is the quarantine table ID in the destination dataset.
+	Table string `mapstructure:"table"`
+}
+
 // Validate checks the configuration and fails fast at startup.
 func (cfg *Config) Validate() error {
 	var errs []error
@@ -191,6 +218,7 @@ func (cfg *Config) Validate() error {
 	errs = append(errs, cfg.validateWrite()...)
 	errs = append(errs, cfg.validateCredentials()...)
 	errs = append(errs, cfg.validateEndpoint()...)
+	errs = append(errs, cfg.validateQuarantine()...)
 
 	if err := cfg.Limits.toTransform().Validate(); err != nil {
 		errs = append(errs, err)
@@ -198,6 +226,9 @@ func (cfg *Config) Validate() error {
 
 	if cfg.AutoCreate.Dataset && cfg.Location == "" {
 		errs = append(errs, errors.New("location is required when auto_create.dataset is enabled"))
+	}
+	if cfg.AutoCreate.CompanionViews && !cfg.AutoCreate.Tables {
+		errs = append(errs, errors.New("auto_create.companion_views requires auto_create.tables"))
 	}
 	if cfg.Endpoint.WithoutAuthentication {
 		if cfg.AutoCreate.Dataset {
@@ -208,14 +239,6 @@ func (cfg *Config) Validate() error {
 			errs = append(errs, errors.New(
 				"auto_create.tables cannot be enabled with endpoint.without_authentication"))
 		}
-	}
-
-	// An ID without a namespace is not an identity: two producers could mint
-	// the same ID, and the dedup view would merge unrelated records.
-	if cfg.Logs.SourceRecordIDAttribute != "" && cfg.Logs.SourceRecordNamespace == "" {
-		errs = append(errs, errors.New(
-			"logs.source_record_id_attribute requires logs.source_record_namespace: "+
-				"an ID without a trusted namespace is not a record identity"))
 	}
 
 	if !cfg.BackOffConfig.Enabled {
@@ -300,6 +323,28 @@ func (cfg *Config) validateEndpoint() []error {
 	if e.WithoutAuthentication && !isLoopback(e.URL) {
 		errs = append(errs, fmt.Errorf(
 			"endpoint.without_authentication is only allowed for a loopback endpoint, got %q", e.URL))
+	}
+	return errs
+}
+
+func (cfg *Config) validateQuarantine() []error {
+	var errs []error
+	q := cfg.Quarantine
+
+	if q.Table != "" && !idPattern.MatchString(q.Table) {
+		errs = append(errs, fmt.Errorf(
+			"quarantine.table %q must contain only letters, numbers and underscores", q.Table))
+	}
+	if !q.Enabled {
+		return errs
+	}
+	if q.Table == "" {
+		errs = append(errs, errors.New("quarantine.table must not be empty when quarantine.enabled is set"))
+	} else if q.Table == cfg.Traces.Table || q.Table == cfg.Logs.Table {
+		// The quarantine table has its own schema, so sharing a signal
+		// table could only ever fail schema validation at startup.
+		errs = append(errs, fmt.Errorf(
+			"quarantine.table %q must differ from traces.table and logs.table", q.Table))
 	}
 	return errs
 }

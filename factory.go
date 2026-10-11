@@ -26,6 +26,8 @@ const schemaVersion = schema.Version
 const (
 	defaultSpansTable = "otel_spans"
 	defaultLogsTable  = "otel_logs"
+	// defaultQuarantineTable is used only once quarantine.enabled is set.
+	defaultQuarantineTable = "otel_quarantine"
 
 	// defaultMaxRequestBytes leaves headroom under the Storage Write API
 	// per-request limit. This is our threshold, not the API's; the gap
@@ -91,6 +93,7 @@ func createDefaultConfig() component.Config {
 			MaxCollectionSize: limits.MaxCollectionSize,
 			MaxValueBytes:     limits.MaxValueBytes,
 		},
+		Quarantine: QuarantineConfig{Table: defaultQuarantineTable},
 	}
 }
 

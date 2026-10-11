@@ -6,6 +6,7 @@ package schema
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	bq "cloud.google.com/go/bigquery"
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
@@ -26,16 +27,62 @@ func DestinationMetadata(
 	var queryTemplate string
 	switch {
 	case proto.Equal(in, SpansTableSchema()):
-		md.TimePartitioning = &bq.TimePartitioning{Field: "start_timestamp"}
-		md.Clustering = &bq.Clustering{Fields: []string{"service_name", "name"}}
+		md.TimePartitioning = &bq.TimePartitioning{Type: bq.HourPartitioningType, Field: "start_time"}
+		md.Clustering = &bq.Clustering{Fields: []string{"service_name", "trace_id", "name"}}
 		queryTemplate = SpansDedupViewQuery
 	case proto.Equal(in, LogsTableSchema()):
-		md.TimePartitioning = &bq.TimePartitioning{Field: "timestamp"}
+		md.TimePartitioning = &bq.TimePartitioning{Type: bq.DayPartitioningType, Field: "timestamp"}
+		md.Clustering = &bq.Clustering{Fields: []string{"service_name", "trace_id", "severity_number"}}
 		queryTemplate = LogsDedupViewQuery
 	default:
 		return nil, "", fmt.Errorf("schema is not a canonical trace or log contract")
 	}
 	return md, fmt.Sprintf(queryTemplate, project, dataset, table), nil
+}
+
+// quarantinePartitionExpiration matches partition_expiration_days in
+// QuarantineDDL.
+const quarantinePartitionExpiration = 30 * 24 * time.Hour
+
+// QuarantineDestinationMetadata builds the physical table metadata of the
+// opt-in quarantine table, matching QuarantineDDL. Unlike the signal tables,
+// it has no deduplication view.
+func QuarantineDestinationMetadata() (*bq.TableMetadata, error) {
+	bqs, err := ToBigQuery(QuarantineTableSchema())
+	if err != nil {
+		return nil, err
+	}
+	return &bq.TableMetadata{
+		Schema: bqs,
+		TimePartitioning: &bq.TimePartitioning{
+			Type:       bq.DayPartitioningType,
+			Field:      "ingest_time",
+			Expiration: quarantinePartitionExpiration,
+		},
+		Clustering: &bq.Clustering{Fields: []string{"signal", "error_code", "service_name"}},
+	}, nil
+}
+
+// CompanionViewsMetadata builds the optional companion views of one signal,
+// keyed by view name: otel_spans_as_allspans and v_gen_ai_spans for traces,
+// v_gen_ai_logs for logs. The views read the dedup views, never the raw
+// tables, and v_gen_ai_logs reads the span dedup view as well as the log one,
+// so it can only be created once the span dedup view exists.
+func CompanionViewsMetadata(
+	project, dataset, spansTable, logsTable string, isSpans bool,
+) map[string]*bq.TableMetadata {
+	view := func(query string) *bq.TableMetadata {
+		return &bq.TableMetadata{ViewQuery: query, UseLegacySQL: false}
+	}
+	if isSpans {
+		return map[string]*bq.TableMetadata{
+			SpansAsAllSpansViewName: view(fmt.Sprintf(SpansAsAllSpansViewQuery, project, dataset, spansTable)),
+			GenAISpansViewName:      view(fmt.Sprintf(GenAISpansViewQuery, project, dataset, spansTable)),
+		}
+	}
+	return map[string]*bq.TableMetadata{
+		GenAILogsViewName: view(fmt.Sprintf(GenAILogsViewQuery, project, dataset, logsTable, spansTable)),
+	}
 }
 
 var fieldTypePairs = []struct {

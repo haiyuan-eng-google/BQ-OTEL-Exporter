@@ -5,6 +5,7 @@ package bigqueryexporter
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -58,6 +59,59 @@ func TestReadmeQuotesStartupErrors(t *testing.T) {
 	} {
 		if !strings.Contains(readme, "`"+want+"`") {
 			t.Errorf("README does not quote the %s error %q", name, want)
+		}
+	}
+}
+
+func TestReadmeReflectsV0Alpha2Contract(t *testing.T) {
+	raw, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	readme := string(raw)
+
+	spansIndexDDL := strings.TrimSpace(fmt.Sprintf(schema.SpansSearchIndexDDL, "my-project", "otel", "otel_spans"))
+	logsIndexDDL := strings.TrimSpace(fmt.Sprintf(schema.LogsSearchIndexDDL, "my-project", "otel", "otel_logs"))
+
+	for _, required := range []string{
+		"logs.log_name_attribute",
+		"logs.insert_id_attribute",
+		"auto_create.companion_views",
+		"quarantine.enabled",
+		"quarantine.table",
+		"attributes_schema",
+		"payload_refs",
+		"otel_spans_as_allspans",
+		"v_gen_ai_spans",
+		"v_gen_ai_logs",
+		"otel_quarantine",
+		"v0alpha2",
+		"Operating v0alpha2 tables",
+		"TIMESTAMP_TRUNC(start_time, HOUR)",
+		"10,000",
+		"416",
+		"partition_expiration_days",
+		"ALTER TABLE",
+		"CREATE SEARCH INDEX",
+		"otel_spans_trace_lookup_idx",
+		"otel_logs_trace_lookup_idx",
+		"NO_OP_ANALYZER",
+		"bigquery.jobs.create",
+		spansIndexDDL,
+		logsIndexDDL,
+	} {
+		if !strings.Contains(readme, required) {
+			t.Errorf("README.md is missing v0alpha2 contract token %q", required)
+		}
+	}
+
+	for _, retired := range []string{
+		"source_record_namespace",
+		"source_record_id_attribute",
+		"otlp-protojson-v1",
+	} {
+		if strings.Contains(readme, retired) {
+			t.Errorf("README.md still references retired v0alpha1 token %q", retired)
 		}
 	}
 }
