@@ -4,10 +4,10 @@
 // Package bqfake provides an in-process BigQuery Storage Write API gRPC server
 // and a BigQuery REST v2 metadata HTTP server for hermetic end-to-end tests.
 //
-// Incoming ProtoRows are decoded with dynamicpb against the destination table's
-// storagepb.TableSchema (or the stream's WriterSchema descriptor) into plain
-// Go maps so tests can assert exact column values offline without live Google
-// Cloud credentials.
+// Incoming ProtoRows are decoded with dynamicpb against the stream's
+// WriterSchema descriptor, checked against the destination table's
+// storagepb.TableSchema, and stored as plain Go maps so tests can assert exact
+// column values offline without live Google Cloud credentials.
 package bqfake // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/testfakes/bqfake"
 
 import (
@@ -506,21 +506,29 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 
 		serialized := req.GetProtoRows().GetRows().GetSerializedRows()
 		decodedBatch := make([]map[string]any, 0, len(serialized))
+		var rowErrs []*storagepb.RowError
 		for i, raw := range serialized {
-			row, derr := DecodeProtoRow(streamDesc, raw)
+			msg, derr := unmarshalRow(streamDesc, raw)
+			if derr == nil && tableDesc != nil {
+				// The writer descriptor may declare a REQUIRED destination
+				// column OPTIONAL, so decoding alone does not enforce it.
+				derr = validateRequiredValues(msg, tableDesc, "")
+			}
 			if derr != nil {
-				rowErr := &storagepb.RowError{
+				rowErrs = append(rowErrs, &storagepb.RowError{
 					Index:   int64(i),
 					Code:    storagepb.RowError_FIELDS_ERROR,
 					Message: derr.Error(),
-				}
-				_ = srv.Send(errorResponse(codes.InvalidArgument, "decode failure", []*storagepb.RowError{rowErr}))
-				decodedBatch = nil
-				break
+				})
+				continue
 			}
-			decodedBatch = append(decodedBatch, row)
+			decodedBatch = append(decodedBatch, messageToMap(msg))
 		}
-		if decodedBatch == nil && len(serialized) > 0 {
+		if len(rowErrs) > 0 {
+			// Appends are atomic: one bad row rejects every row of the request.
+			if err := srv.Send(errorResponse(codes.InvalidArgument, "row errors in append request", rowErrs)); err != nil {
+				return nil
+			}
 			continue
 		}
 
@@ -565,6 +573,41 @@ func validateWriterDescriptor(writerDesc, tableDesc protoreflect.MessageDescript
 		tf := tableDesc.Fields().Get(i)
 		if tf.Cardinality() == protoreflect.Required && writerDesc.Fields().ByName(tf.Name()) == nil {
 			return fmt.Errorf("required destination column %q is missing from writer schema", tf.Name())
+		}
+	}
+	return nil
+}
+
+// validateRequiredValues reports the first REQUIRED destination column that a
+// row decoded with the writer's descriptor leaves without a value. Records are
+// checked only where present: a NULL parent STRUCT carries no values to
+// require. prefix is the column path of msg within the row.
+func validateRequiredValues(msg protoreflect.Message, tableDesc protoreflect.MessageDescriptor, prefix string) error {
+	writerFields := msg.Descriptor().Fields()
+	for i := 0; i < tableDesc.Fields().Len(); i++ {
+		tf := tableDesc.Fields().Get(i)
+		path := prefix + string(tf.Name())
+		wf := writerFields.ByName(tf.Name())
+		if wf == nil || !msg.Has(wf) {
+			if tf.Cardinality() == protoreflect.Required {
+				return fmt.Errorf("required destination column %q has no value", path)
+			}
+			continue
+		}
+		if tf.Kind() != protoreflect.MessageKind {
+			continue
+		}
+		if tf.IsList() {
+			list := msg.Get(wf).List()
+			for j := 0; j < list.Len(); j++ {
+				if err := validateRequiredValues(list.Get(j).Message(), tf.Message(), fmt.Sprintf("%s[%d].", path, j)); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if err := validateRequiredValues(msg.Get(wf).Message(), tf.Message(), path+"."); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -647,11 +690,19 @@ func DecodeRowWithSchema(ts *storagepb.TableSchema, raw []byte) (map[string]any,
 // DecodeProtoRow unmarshals a serialized protobuf message against md into a
 // nested map[string]any keyed by field name.
 func DecodeProtoRow(md protoreflect.MessageDescriptor, raw []byte) (map[string]any, error) {
+	msg, err := unmarshalRow(md, raw)
+	if err != nil {
+		return nil, err
+	}
+	return messageToMap(msg), nil
+}
+
+func unmarshalRow(md protoreflect.MessageDescriptor, raw []byte) (protoreflect.Message, error) {
 	msg := dynamicpb.NewMessage(md)
 	if err := proto.Unmarshal(raw, msg); err != nil {
 		return nil, fmt.Errorf("unmarshaling proto row: %w", err)
 	}
-	return messageToMap(msg), nil
+	return msg, nil
 }
 
 func messageToMap(msg protoreflect.Message) map[string]any {

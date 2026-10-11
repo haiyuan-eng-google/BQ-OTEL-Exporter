@@ -5,6 +5,9 @@ package bqfake
 
 import (
 	"context"
+	"maps"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -418,6 +421,227 @@ func TestAppendRowsDecodesWithWriterDescriptorAndValidatesAgainstTableSchema(t *
 				t.Fatalf("response error = %v, want InvalidArgument", r.GetError())
 			}
 		})
+	}
+}
+
+// relaxRequired returns a copy of ts with every REQUIRED field, at any depth,
+// declared NULLABLE: the descriptor a writer built from a looser schema sends.
+func relaxRequired(ts *storagepb.TableSchema) *storagepb.TableSchema {
+	out := proto.Clone(ts).(*storagepb.TableSchema)
+	var relax func([]*storagepb.TableFieldSchema)
+	relax = func(fields []*storagepb.TableFieldSchema) {
+		for _, f := range fields {
+			if f.GetMode() == storagepb.TableFieldSchema_REQUIRED {
+				f.Mode = storagepb.TableFieldSchema_NULLABLE
+			}
+			relax(f.GetFields())
+		}
+	}
+	relax(out.GetFields())
+	return out
+}
+
+// openAppendStream opens a raw AppendRows stream, bypassing managedwriter so a
+// test controls the writer descriptor exactly.
+func openAppendStream(t *testing.T, srv *Server) storagepb.BigQueryWrite_AppendRowsClient {
+	t.Helper()
+	conn, err := grpc.NewClient(srv.Addr(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	st, err := storagepb.NewBigQueryWriteClient(conn).AppendRows(context.Background())
+	if err != nil {
+		t.Fatalf("AppendRows: %v", err)
+	}
+	return st
+}
+
+// appendProtoRows sends one request and returns its response. A nil writer
+// descriptor reuses the one the stream already carries.
+func appendProtoRows(t *testing.T, st storagepb.BigQueryWrite_AppendRowsClient, streamName string, writer *descriptorpb.DescriptorProto, rows ...[]byte) *storagepb.AppendRowsResponse {
+	t.Helper()
+	data := &storagepb.AppendRowsRequest_ProtoData{Rows: &storagepb.ProtoRows{SerializedRows: rows}}
+	if writer != nil {
+		data.WriterSchema = &storagepb.ProtoSchema{ProtoDescriptor: writer}
+	}
+	if err := st.Send(&storagepb.AppendRowsRequest{
+		WriteStream: streamName,
+		Rows:        &storagepb.AppendRowsRequest_ProtoRows{ProtoRows: data},
+	}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	resp, err := st.Recv()
+	if err != nil {
+		t.Fatalf("Recv: %v", err)
+	}
+	return resp
+}
+
+func TestAppendRowsEnforcesRequiredValuesTheWriterDeclaresOptional(t *testing.T) {
+	const (
+		required = storagepb.TableFieldSchema_REQUIRED
+		nullable = storagepb.TableFieldSchema_NULLABLE
+		repeated = storagepb.TableFieldSchema_REPEATED
+	)
+	nested := &storagepb.TableSchema{Fields: []*storagepb.TableFieldSchema{
+		{Name: "record_id", Type: storagepb.TableFieldSchema_STRING, Mode: required},
+		{Name: "parent", Type: storagepb.TableFieldSchema_STRUCT, Mode: nullable, Fields: []*storagepb.TableFieldSchema{
+			{Name: "child", Type: storagepb.TableFieldSchema_STRING, Mode: required},
+		}},
+		{Name: "items", Type: storagepb.TableFieldSchema_STRUCT, Mode: repeated, Fields: []*storagepb.TableFieldSchema{
+			{Name: "child", Type: storagepb.TableFieldSchema_STRING, Mode: required},
+		}},
+	}}
+
+	start := time.Date(2026, 8, 12, 14, 35, 10, 0, time.UTC)
+	end := start.Add(25 * time.Millisecond)
+	span := transform.Row{
+		"start_time":             start.UnixMicro(),
+		"start_time_unix_nano":   start.UnixNano(),
+		"end_time":               end.UnixMicro(),
+		"end_time_unix_nano":     end.UnixNano(),
+		"receive_time":           end.UnixMicro(),
+		"receive_time_unix_nano": end.UnixNano(),
+		"duration_nano":          int64(25 * time.Millisecond),
+		"trace_id":               "0102030405060708090a0b0c0d0e0f10",
+		"span_id":                "0102030405060708",
+		"name":                   "invoke_agent",
+		"kind":                   int64(2),
+		"schema_version":         schema.Version,
+	}
+	spanWithoutStart := maps.Clone(span)
+	delete(spanWithoutStart, "start_time")
+
+	for _, tc := range []struct {
+		name   string
+		table  string
+		schema *storagepb.TableSchema // nil: the otel_spans table New registers
+		row    transform.Row
+		// wantMissing names the column the row error must report; empty means
+		// the row is valid and must be stored.
+		wantMissing string
+	}{
+		{name: "span without start_time", table: "otel_spans", row: spanWithoutStart, wantMissing: "start_time"},
+		{name: "span with every required value", table: "otel_spans", row: span},
+		{
+			name: "top-level value absent", table: "nested", schema: nested,
+			row:         transform.Row{"parent": transform.Row{"child": "c"}},
+			wantMissing: "record_id",
+		},
+		{
+			name: "present parent without its required child", table: "nested", schema: nested,
+			row:         transform.Row{"record_id": "r", "parent": transform.Row{}},
+			wantMissing: "parent.child",
+		},
+		{
+			name: "repeated element without its required child", table: "nested", schema: nested,
+			row:         transform.Row{"record_id": "r", "items": []transform.Row{{"child": "c"}, {}}},
+			wantMissing: "items[1].child",
+		},
+		{
+			name: "absent nullable parent", table: "nested", schema: nested,
+			row: transform.Row{"record_id": "r"},
+		},
+		{
+			name: "every required value present", table: "nested", schema: nested,
+			row: transform.Row{"record_id": "r", "parent": transform.Row{"child": "c"}, "items": []transform.Row{{"child": "c"}}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := NewServer(t)
+			destination := schema.SpansTableSchema()
+			if tc.schema != nil {
+				destination = tc.schema
+				if err := srv.RegisterTableSchema(tc.table, destination); err != nil {
+					t.Fatalf("RegisterTableSchema: %v", err)
+				}
+			}
+			enc, err := protoenc.New(relaxRequired(destination))
+			if err != nil {
+				t.Fatalf("protoenc.New: %v", err)
+			}
+			raw, err := enc.Encode(tc.row)
+			if err != nil {
+				t.Fatalf("Encode: %v", err)
+			}
+
+			resp := appendProtoRows(t, openAppendStream(t, srv),
+				"projects/test-project/datasets/otel/tables/"+tc.table+"/streams/_default", enc.Descriptor(), raw)
+			_, _, acked := srv.Counts()
+
+			if tc.wantMissing == "" {
+				if resp.GetError() != nil || srv.RowCount(tc.table) != 1 || acked != 1 {
+					t.Fatalf("valid row: response error = %v, stored %d, acked %d; want no error, 1 stored, 1 acked",
+						resp.GetError(), srv.RowCount(tc.table), acked)
+				}
+				return
+			}
+			if resp.GetError() == nil || codes.Code(resp.GetError().GetCode()) != codes.InvalidArgument {
+				t.Fatalf("response error = %v, want InvalidArgument", resp.GetError())
+			}
+			rowErrs := resp.GetRowErrors()
+			if len(rowErrs) != 1 || rowErrs[0].GetIndex() != 0 || rowErrs[0].GetCode() != storagepb.RowError_FIELDS_ERROR {
+				t.Fatalf("row errors = %v, want one FIELDS_ERROR at index 0", rowErrs)
+			}
+			if msg := rowErrs[0].GetMessage(); !strings.Contains(msg, tc.wantMissing) {
+				t.Errorf("row error message %q does not name %s", msg, tc.wantMissing)
+			}
+			if srv.RowCount(tc.table) != 0 || acked != 0 {
+				t.Errorf("stored %d rows and acked %d, want neither", srv.RowCount(tc.table), acked)
+			}
+		})
+	}
+}
+
+func TestAppendRowsRejectsTheWholeRequestWhenAnyRowLacksARequiredValue(t *testing.T) {
+	srv := NewServer(t)
+	table := &storagepb.TableSchema{Fields: []*storagepb.TableFieldSchema{
+		{Name: "record_id", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_REQUIRED},
+		{Name: "note", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+	}}
+	if err := srv.RegisterTableSchema("batch_table", table); err != nil {
+		t.Fatalf("RegisterTableSchema: %v", err)
+	}
+	enc, err := protoenc.New(relaxRequired(table))
+	if err != nil {
+		t.Fatalf("protoenc.New: %v", err)
+	}
+	valid, err := enc.Encode(transform.Row{"record_id": "r"})
+	if err != nil {
+		t.Fatalf("Encode valid: %v", err)
+	}
+	missing, err := enc.Encode(transform.Row{"note": "no record_id"})
+	if err != nil {
+		t.Fatalf("Encode missing: %v", err)
+	}
+
+	const streamName = "projects/test-project/datasets/otel/tables/batch_table/streams/_default"
+	st := openAppendStream(t, srv)
+
+	resp := appendProtoRows(t, st, streamName, enc.Descriptor(), valid, missing, valid, missing)
+	if resp.GetError() == nil || codes.Code(resp.GetError().GetCode()) != codes.InvalidArgument {
+		t.Fatalf("response error = %v, want InvalidArgument", resp.GetError())
+	}
+	var indexes []int64
+	for _, re := range resp.GetRowErrors() {
+		if re.GetCode() != storagepb.RowError_FIELDS_ERROR {
+			t.Errorf("row %d error code = %v, want FIELDS_ERROR", re.GetIndex(), re.GetCode())
+		}
+		indexes = append(indexes, re.GetIndex())
+	}
+	if !slices.Equal(indexes, []int64{1, 3}) {
+		t.Fatalf("row error indexes = %v, want [1 3]", indexes)
+	}
+	if _, _, acked := srv.Counts(); srv.RowCount("batch_table") != 0 || acked != 0 {
+		t.Fatalf("stored %d rows and acked %d after a rejected request, want neither", srv.RowCount("batch_table"), acked)
+	}
+
+	// The stream stays usable: the next request reuses its writer descriptor.
+	resp = appendProtoRows(t, st, "", nil, valid)
+	if _, _, acked := srv.Counts(); resp.GetError() != nil || srv.RowCount("batch_table") != 1 || acked != 1 {
+		t.Fatalf("follow-up request: response error = %v, stored %d, acked %d; want no error, 1 stored, 1 acked",
+			resp.GetError(), srv.RowCount("batch_table"), acked)
 	}
 }
 
