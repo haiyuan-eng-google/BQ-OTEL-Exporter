@@ -1,5 +1,9 @@
 apiVersion: apps/v1
+{{- if .Values.persistentQueue.enabled }}
+kind: StatefulSet
+{{- else }}
 kind: Deployment
+{{- end }}
 metadata:
   name: {{ .Release.Name }}
   namespace: {{ .Release.Namespace }}
@@ -7,6 +11,9 @@ metadata:
     app.kubernetes.io/name: bigquery-otel-collector
     app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
+  {{- if .Values.persistentQueue.enabled }}
+  serviceName: {{ .Release.Name }}
+  {{- end }}
   replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
@@ -85,11 +92,6 @@ spec:
         - name: config
           configMap:
             name: {{ .Release.Name }}-config
-        {{- if .Values.persistentQueue.enabled }}
-        - name: file-storage
-          emptyDir:
-            sizeLimit: {{ .Values.persistentQueue.size }}
-        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -102,3 +104,17 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+  {{- if .Values.persistentQueue.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: file-storage
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        {{- if .Values.persistentQueue.storageClass }}
+        storageClassName: {{ .Values.persistentQueue.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistentQueue.size }}
+  {{- end }}

@@ -1,9 +1,11 @@
-# Cloud Run v2 service manifest for the BigQuery OTel Collector.
+# Cloud Run Knative service manifest for the BigQuery OTel Collector.
 #
-# Deploys the multi-arch container image as a Cloud Run service that
-# receives OTLP/gRPC on port 4317 and OTLP/HTTP on port 4318. Authentication
-# uses a least-privilege service account with only the BigQuery permissions
-# the exporter needs.
+# Compatible with `gcloud run services replace deploy/cloudrun/service.yaml`.
+# Cloud Run allows a single ingress containerPort per service (`http1` on 4318
+# for OTLP/HTTP by default; change to `name: h2c` and `containerPort: 4317` to
+# expose OTLP/gRPC instead). The container image bundles a default collector
+# configuration at `/etc/otel/config.yml` driven by BQ_PROJECT, BQ_DATASET, and
+# BQ_LOCATION environment variables.
 #
 # Prerequisites:
 # - The container image must be pushed to GHCR or Artifact Registry.
@@ -11,7 +13,7 @@
 #   must exist.
 # - The BigQuery dataset and tables must be provisioned (use deploy/terraform/).
 
-apiVersion: run.googleapis.com/v2
+apiVersion: serving.knative.dev/v1
 kind: Service
 metadata:
   name: bq-otel-collector
@@ -19,20 +21,24 @@ metadata:
     cloud.googleapis.com/location: us-central1
 spec:
   template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "1"
+        autoscaling.knative.dev/maxScale: "10"
+        run.googleapis.com/cpu-throttling: "false"
+        run.googleapis.com/startup-cpu-boost: "true"
     spec:
       containerConcurrency: 100
       timeoutSeconds: 300
-      serviceAccount: otel-collector@my-project.iam.gserviceaccount.com
+      serviceAccountName: otel-collector@my-project.iam.gserviceaccount.com
       containers:
         - name: otelcollector
           image: ghcr.io/haiyuan-eng-google/bq-otel-collector:0.1.0
+          args:
+            - "--config=/etc/otel/config.yml"
           ports:
-            - name: otlp-grpc
-              containerPort: 4317
-            - name: otlp-http
+            - name: http1
               containerPort: 4318
-            - name: health
-              containerPort: 13133
           env:
             - name: BQ_PROJECT
               value: my-project
@@ -53,12 +59,6 @@ spec:
               port: 13133
             initialDelaySeconds: 10
             periodSeconds: 30
-          readinessProbe:
-            httpGet:
-              path: /
-              port: 13133
-            initialDelaySeconds: 5
-            periodSeconds: 10
           startupProbe:
             httpGet:
               path: /
@@ -66,8 +66,6 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
             failureThreshold: 30
-      maxScale: 10
-      minScale: 1
   traffic:
     - percent: 100
-      type: TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST
+      latestRevision: true

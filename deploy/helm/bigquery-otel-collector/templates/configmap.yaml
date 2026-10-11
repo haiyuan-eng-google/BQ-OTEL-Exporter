@@ -54,7 +54,6 @@ data:
         timeout: 1s
         compaction:
           on_start: true
-          directory: {{ .Values.persistentQueue.mountPath }}/compaction
       {{- end }}
       health_check:
         endpoint: 0.0.0.0:{{ .Values.healthCheck.port }}
@@ -65,7 +64,6 @@ data:
         timeout: 1s
         compaction:
           on_start: true
-          directory: {{ .Values.persistentQueue.mountPath }}/compaction
     {{- end }}
 
     service:

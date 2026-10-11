@@ -1,8 +1,8 @@
 # Multi-arch builder for the BigQuery OTel Exporter custom Collector.
 #
 # Buildx sets TARGETOS and TARGETARCH automatically. The builder stage runs
-# OCB to produce the collector binary, then copies it into a distroless
-# nonroot runtime image.
+# OCB to produce the collector binary and compiles the static /healthcheck
+# probe binary, then copies both into a distroless nonroot runtime image.
 
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
@@ -15,6 +15,8 @@ RUN go mod download
 COPY . .
 RUN GOTOOLCHAIN=local go run go.opentelemetry.io/collector/cmd/builder@v0.158.0 \
     --config example/otelcol-builder.yaml
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" \
+    -o /out/healthcheck ./cmd/healthcheck
 
 FROM --platform=${TARGETOS}/${TARGETARCH} gcr.io/distroless/base-debian12:nonroot@sha256:b12529fbbd0bb15eea8905f69d83148679e0b4d7d434c8808100792029b1caae
 
@@ -25,19 +27,10 @@ LABEL org.opencontainers.image.source="https://github.com/haiyuan-eng-google/BQ-
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 
 COPY --from=builder /src/otelcol-bq-dist/otelcol-bq /otelcol-bq
+COPY --from=builder /out/healthcheck /healthcheck
+COPY example/otel-collector-config.yml /etc/otel/config.yml
 
 EXPOSE 4317 4318 13133
-
-# Health check: the health_check extension serves / on port 13133.
-# In Docker Compose, use:
-#   healthcheck:
-#     test: ["CMD", "/otelcol-bq", "--help"]
-#     interval: 30s
-#     timeout: 5s
-#     retries: 3
-# The distroless image has no shell or curl, so the health check must use
-# an external HTTP probe (e.g. docker-compose healthcheck with wget/curl
-# in a sidecar, or Kubernetes livenessProbe on :13133).
 
 ENTRYPOINT ["/otelcol-bq"]
 CMD ["--config=/etc/otel/config.yml"]

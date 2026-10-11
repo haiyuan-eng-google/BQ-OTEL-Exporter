@@ -1,8 +1,8 @@
 # GoReleaser v2 configuration for the BigQuery OTel Exporter custom Collector.
 #
-# Builds the OCB-based custom Collector binary across linux/darwin/windows
-# and amd64/arm64, then publishes GitHub release archives, checksums, SBOMs,
-# and a multi-arch container image to GHCR.
+# Builds the OCB-based custom Collector binary and distroless healthcheck probe
+# across linux/darwin/windows and amd64/arm64, then publishes GitHub release
+# archives, checksums, SBOMs, and signed multi-arch container manifests to GHCR.
 version: 2
 
 project_name: otelcol-bq
@@ -39,8 +39,26 @@ builds:
       - goos: windows
         goarch: arm64
 
+  - id: healthcheck
+    dir: ./cmd/healthcheck
+    main: .
+    binary: healthcheck
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+
 archives:
   - id: otelcol-bq
+    ids:
+      - otelcol-bq
     formats:
       - tar.gz
     name_template: >-
@@ -71,11 +89,15 @@ signs:
       - "--yes"
       - "${artifact}"
 
-docker_image_files:
-  - goos: linux
-    goarch: amd64
-  - goos: linux
-    goarch: arm64
+docker_signs:
+  - id: cosign-container-manifests
+    cmd: cosign
+    artifacts: manifests
+    output: true
+    args:
+      - "sign"
+      - "--yes"
+      - "${artifact}@${digest}"
 
 dockers:
   - id: otelcol-bq-linux-amd64
@@ -83,11 +105,14 @@ dockers:
     goarch: amd64
     ids:
       - otelcol-bq
+      - healthcheck
     image_templates:
       - "ghcr.io/haiyuan-eng-google/bq-otel-collector:{{ .Version }}-amd64"
       - "ghcr.io/haiyuan-eng-google/bq-otel-collector:latest-amd64"
     dockerfile: Dockerfile.goreleaser
     use: buildx
+    extra_files:
+      - example/otel-collector-config.yml
     build_flag_templates:
       - "--pull"
       - "--platform=linux/amd64"
@@ -103,11 +128,14 @@ dockers:
     goarch: arm64
     ids:
       - otelcol-bq
+      - healthcheck
     image_templates:
       - "ghcr.io/haiyuan-eng-google/bq-otel-collector:{{ .Version }}-arm64"
       - "ghcr.io/haiyuan-eng-google/bq-otel-collector:latest-arm64"
     dockerfile: Dockerfile.goreleaser
     use: buildx
+    extra_files:
+      - example/otel-collector-config.yml
     build_flag_templates:
       - "--pull"
       - "--platform=linux/arm64"
@@ -119,11 +147,12 @@ dockers:
       - "--label=org.opencontainers.image.licenses=Apache-2.0"
 
 docker_manifests:
-  - id: otelcol-bq-multi-arch
+  - name_template: "ghcr.io/haiyuan-eng-google/bq-otel-collector:{{ .Version }}"
     image_templates:
-      - "ghcr.io/haiyuan-eng-google/bq-otel-collector:{{ .Version }}"
-      - "ghcr.io/haiyuan-eng-google/bq-otel-collector:latest"
-    docker_manifests_templates:
+      - "ghcr.io/haiyuan-eng-google/bq-otel-collector:{{ .Version }}-amd64"
+      - "ghcr.io/haiyuan-eng-google/bq-otel-collector:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/haiyuan-eng-google/bq-otel-collector:latest"
+    image_templates:
       - "ghcr.io/haiyuan-eng-google/bq-otel-collector:{{ .Version }}-amd64"
       - "ghcr.io/haiyuan-eng-google/bq-otel-collector:{{ .Version }}-arm64"
 

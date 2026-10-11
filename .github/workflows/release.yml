@@ -20,7 +20,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     outputs:
-      digest: ${{ steps.build.outputs.digest }}
+      digest: ${{ steps.manifest_digest.outputs.digest }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -48,6 +48,25 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Install OpenTelemetry Collector Builder (ocb)
+        run: |
+          GOBIN=/usr/local/bin GOTOOLCHAIN=local go install go.opentelemetry.io/collector/cmd/builder@v0.158.0
+          sudo ln -sf /usr/local/bin/builder /usr/local/bin/ocb
+          ocb version
+          syft version
+          cosign version
+
+      - name: Stamp release version into OCB manifest
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          sed -i "s/version: 0.1.0-dev/version: ${VERSION}/g" example/otelcol-builder-release.yaml
+          sed -i "s|github.com/haiyuan-eng-google/BQ-OTEL-Exporter v0.0.0|github.com/haiyuan-eng-google/BQ-OTEL-Exporter ${RELEASE_TAG}|g" example/otelcol-builder-release.yaml
+
       - name: Run GoReleaser
         id: build
         uses: goreleaser/goreleaser-action@v6
@@ -57,10 +76,28 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Resolve published manifest digest
+        id: manifest_digest
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          DIGEST="$(docker buildx imagetools inspect "ghcr.io/haiyuan-eng-google/bq-otel-collector:${VERSION}" --format '{{ .Manifest.Digest }}')"
+          test -n "${DIGEST}"
+          echo "digest=${DIGEST}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify signed container manifest
+        env:
+          DIGEST: ${{ steps.manifest_digest.outputs.digest }}
+        run: |
+          cosign verify \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            --certificate-identity-regexp="https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter/.github/workflows/release.yml@.*" \
+            "ghcr.io/haiyuan-eng-google/bq-otel-collector@${DIGEST}"
+
       - name: Attest build provenance
-        if: steps.build.outputs.digest != ''
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: ghcr.io/haiyuan-eng-google/bq-otel-collector
-          subject-digest: ${{ steps.build.outputs.digest }}
+          subject-digest: ${{ steps.manifest_digest.outputs.digest }}
           push-to-registry: true

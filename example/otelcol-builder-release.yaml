@@ -1,9 +1,9 @@
-# OCB builder manifest for published module releases.
+# OCB builder manifest for release builds.
 #
-# Identical to example/otelcol-builder.yaml except it does NOT include the
-# local `path: .` override. Downstream users building from a tagged release
-# of this module use this manifest so `go mod download` resolves the module
-# from the Go proxy rather than the local filesystem.
+# During release builds, .github/workflows/release.yml stamps the release tag
+# into dist.version and the exporter gomod entry, while the local replace
+# directive ensures OCB builds the exact checked-out release commit without
+# requiring the module proxy to have indexed the tag beforehand.
 dist:
   module: github.com/haiyuan-eng-google/BQ-OTEL-Exporter/cmd/otelcol-bq
   name: otelcol-bq
@@ -41,3 +41,6 @@ providers:
 telemetry:
   gomod: go.opentelemetry.io/collector/service v0.158.0
   import: go.opentelemetry.io/collector/service/telemetry/otelconftelemetry
+
+replaces:
+  - github.com/haiyuan-eng-google/BQ-OTEL-Exporter => ..

@@ -631,12 +631,12 @@ resource "google_bigquery_table" "v_gen_ai_tool_usage" {
   }
 }
 
-# --- IAM: Least-Privilege Custom Role ---
+# --- IAM: Least-Privilege Custom Roles ---
 
 resource "google_project_iam_custom_role" "otel_collector" {
   role_id     = "otelCollector"
   title       = "OTel BigQuery Collector"
-  description = "Least-privilege role for the BigQuery OTel exporter"
+  description = "Least-privilege role for the BigQuery OTel exporter with auto_create"
   permissions = [
     # Read dataset/table metadata for startup validation.
     "bigquery.datasets.get",
@@ -647,8 +647,22 @@ resource "google_project_iam_custom_role" "otel_collector" {
     "bigquery.datasets.create",
     "bigquery.tables.create",
     "bigquery.tables.update",
-    # Optional: create search indexes if managed by the operator.
+    # Optional: create search indexes if auto_create.search_indexes is enabled.
+    "bigquery.tables.createIndex",
     "bigquery.jobs.create",
+  ]
+}
+
+resource "google_project_iam_custom_role" "otel_collector_writer" {
+  role_id     = "otelCollectorWriter"
+  title       = "OTel BigQuery Collector Write-Only"
+  description = "Write-only role for the BigQuery OTel exporter when resources are pre-provisioned"
+  permissions = [
+    # Read dataset/table metadata for startup validation.
+    "bigquery.datasets.get",
+    "bigquery.tables.get",
+    # Append rows via the Storage Write API.
+    "bigquery.tables.updateData",
   ]
 }
 
