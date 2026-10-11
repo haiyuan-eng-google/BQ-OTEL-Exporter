@@ -20,3 +20,22 @@ services:
     ports:
       - "127.0.0.1:4317:4317"
       - "127.0.0.1:4318:4318"
+      - "127.0.0.1:13133:13133"
+    # Container security hardening.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -qO- http://127.0.0.1:13133/ || exit 1",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

@@ -1,0 +1,144 @@
+# GoReleaser v2 configuration for the BigQuery OTel Exporter custom Collector.
+#
+# Builds the OCB-based custom Collector binary across linux/darwin/windows
+# and amd64/arm64, then publishes GitHub release archives, checksums, SBOMs,
+# and a multi-arch container image to GHCR.
+version: 2
+
+project_name: otelcol-bq
+
+before:
+  hooks:
+    # Generate the custom Collector distribution source tree from the OCB
+    # release manifest so GoReleaser compiles it across target platforms.
+    - ocb --config=example/otelcol-builder-release.yaml --skip-compilation=true
+
+builds:
+  - id: otelcol-bq
+    dir: ./otelcol-bq-dist
+    main: .
+    binary: otelcol-bq
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+    ignore:
+      # windows/arm64 is not supported by the distroless base image.
+      - goos: windows
+        goarch: arm64
+
+archives:
+  - id: otelcol-bq
+    formats:
+      - tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+sboms:
+  - id: otelcol-bq
+    artifacts: archive
+
+signs:
+  - id: cosign-keyless
+    artifacts: checksum
+    cmd: cosign
+    signature: "${artifact}.sig"
+    certificate: "${artifact}.pem"
+    args:
+      - sign-blob
+      - "--output-signature=${signature}"
+      - "--output-certificate=${certificate}"
+      - "--yes"
+      - "${artifact}"
+
+docker_image_files:
+  - goos: linux
+    goarch: amd64
+  - goos: linux
+    goarch: arm64
+
+dockers:
+  - id: otelcol-bq-linux-amd64
+    goos: linux
+    goarch: amd64
+    ids:
+      - otelcol-bq
+    image_templates:
+      - "ghcr.io/haiyuan-eng-google/bq-otel-collector:{{ .Version }}-amd64"
+      - "ghcr.io/haiyuan-eng-google/bq-otel-collector:latest-amd64"
+    dockerfile: Dockerfile.goreleaser
+    use: buildx
+    build_flag_templates:
+      - "--pull"
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.title={{.ProjectName}}"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+      - "--label=org.opencontainers.image.source={{.GitURL}}"
+      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+      - "--label=org.opencontainers.image.created={{.Date}}"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0"
+
+  - id: otelcol-bq-linux-arm64
+    goos: linux
+    goarch: arm64
+    ids:
+      - otelcol-bq
+    image_templates:
+      - "ghcr.io/haiyuan-eng-google/bq-otel-collector:{{ .Version }}-arm64"
+      - "ghcr.io/haiyuan-eng-google/bq-otel-collector:latest-arm64"
+    dockerfile: Dockerfile.goreleaser
+    use: buildx
+    build_flag_templates:
+      - "--pull"
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.title={{.ProjectName}}"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+      - "--label=org.opencontainers.image.source={{.GitURL}}"
+      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+      - "--label=org.opencontainers.image.created={{.Date}}"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0"
+
+docker_manifests:
+  - id: otelcol-bq-multi-arch
+    image_templates:
+      - "ghcr.io/haiyuan-eng-google/bq-otel-collector:{{ .Version }}"
+      - "ghcr.io/haiyuan-eng-google/bq-otel-collector:latest"
+    docker_manifests_templates:
+      - "ghcr.io/haiyuan-eng-google/bq-otel-collector:{{ .Version }}-amd64"
+      - "ghcr.io/haiyuan-eng-google/bq-otel-collector:{{ .Version }}-arm64"
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "Merge pull request"
+      - "Merge branch"
+
+release:
+  draft: true
+  prerelease: auto
+  name_template: "{{.ProjectName}} {{.Version}}"

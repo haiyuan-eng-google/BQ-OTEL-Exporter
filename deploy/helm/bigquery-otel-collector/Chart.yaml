@@ -1,0 +1,8 @@
+apiVersion: v2
+name: bigquery-otel-collector
+description: Helm chart for the BigQuery OTel Exporter custom Collector
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+maintainers:
+  - name: haiyuan-eng-google
