@@ -101,7 +101,9 @@ type LogsConfig struct {
 // CredentialsConfig selects an authentication method. At most one may be set;
 // the default is application default credentials.
 type CredentialsConfig struct {
-	// File is a path to a service account key file.
+	// File is a path to a Google credentials JSON file. The file's type must be
+	// one of service_account, authorized_user, external_account,
+	// external_account_authorized_user or impersonated_service_account.
 	File string `mapstructure:"file"`
 	// ImpersonateServiceAccount is the target principal for impersonation,
 	// using the ambient credentials as the source.
@@ -338,9 +340,10 @@ func (cfg *Config) validateQuarantine() []error {
 	if !q.Enabled {
 		return errs
 	}
-	if q.Table == "" {
+	switch q.Table {
+	case "":
 		errs = append(errs, errors.New("quarantine.table must not be empty when quarantine.enabled is set"))
-	} else if q.Table == cfg.Traces.Table || q.Table == cfg.Logs.Table {
+	case cfg.Traces.Table, cfg.Logs.Table:
 		// The quarantine table has its own schema, so sharing a signal
 		// table could only ever fail schema validation at startup.
 		errs = append(errs, fmt.Errorf(

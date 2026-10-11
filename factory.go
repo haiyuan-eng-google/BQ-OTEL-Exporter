@@ -1,8 +1,6 @@
 // Copyright 2026 Google LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//go:generate make mdatagen
-
 package bigqueryexporter // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter"
 
 import (

@@ -8,9 +8,16 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same pull request supersedes the run in flight. Runs on
+# main are never cancelled, so every commit there keeps a complete result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -23,12 +30,67 @@ jobs:
           if [ -n "$unformatted" ]; then
             echo "These files need gofmt:"; echo "$unformatted"; exit 1
           fi
+      - name: Verify go.mod and go.sum are tidy
+        run: go mod tidy -diff
       - name: Build
         run: go build ./...
       - name: Vet
         run: go vet ./...
+      - name: Vet (integration build tag)
+        run: go vet -tags=integration ./...
       - name: Test
-        run: go test -race -cover ./...
+        run: go test -race -cover -count=1 ./...
+      - name: Test with a client certificate advertised in the environment
+        # The unit-test binaries clear this setting before they build any Google
+        # client, so a workstation or runner that exports it cannot change the
+        # result. A failure here means a test started depending on the ambient
+        # credential or mTLS environment.
+        env:
+          GOOGLE_API_USE_CLIENT_CERTIFICATE: 'true'
+        run: go test -race -count=1 ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+      # Built here instead of downloaded: a prebuilt binary refuses a module
+      # that needs a newer Go release than the one it was built with. The
+      # version is pinned so a new linter release cannot change the verdict on
+      # an old commit; Dependabot does not track it, so raise it by hand.
+      - name: Install golangci-lint
+        run: |
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      # Runs the default pass and the pass with the integration build tag.
+      - name: Lint
+        run: make lint
+
+  vulncheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          # Reachable standard-library advisories are fixed by Go patch
+          # releases. Analyze against the newest 1.26 patch instead of whichever
+          # one the runner image has cached.
+          check-latest: true
+          cache: true
+      # The scanner version is pinned and raised by hand; the vulnerability
+      # database it reads is always fetched fresh.
+      - name: Install govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Check for known vulnerabilities
+        run: govulncheck ./...
 
   # Credential-free proof of the image and the Compose journey. Every step
   # prints what it checked, so the job log is the evidence. Writing to

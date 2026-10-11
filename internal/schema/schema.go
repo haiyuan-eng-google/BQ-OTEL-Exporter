@@ -1,13 +1,14 @@
 // Copyright 2026 Google LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// Package schema holds the versioned BigQuery table contract (§7 of the design
-// doc) and the canonical deduplication SQL that goes with it (§7.4).
+// Package schema holds the versioned BigQuery table contract and the canonical
+// deduplication SQL that goes with it. docs/schema-rationale.md explains the
+// reasoning behind both.
 //
 // The DDL here is the operator-facing representation of the typed TableSchema
-// contract in tableschema.go. It must track §7.1 and §7.2 column for column:
-// downstream queries and dbt models pin against this contract, so divergence
-// between either representation is a bug.
+// contract in tableschema.go. It must track that contract column for column:
+// downstream queries and dbt models pin against it, so divergence between the
+// two representations is a bug.
 package schema // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 
 // Version is the per-row schema_version value.
@@ -227,7 +228,7 @@ OPTIONS (
 );
 `
 
-// SpansDedupViewDDL is the canonical span deduplication view (§7.4).
+// SpansDedupViewDDL is the canonical span deduplication view.
 //
 // Identity is (start_time, service_name, trace_id, span_id). Every retry of a
 // span carries the same start time and service, so this is the span identity
@@ -237,10 +238,10 @@ OPTIONS (
 // nanos rather than end_time, because microsecond precision alone can tie
 // across retries; receive_time_unix_nano breaks any remaining tie.
 //
-// Pending amendment B.2: once truncate-and-flag lands, an is_truncated ASC
-// term goes first in the ORDER BY, so a truncated copy can never outrank the
-// full copy it duplicates. Not applied here because the column is not yet part
-// of the approved span contract.
+// Planned: once truncate-and-flag lands, an is_truncated ASC term goes first
+// in the ORDER BY, so a truncated copy can never outrank the full copy it
+// duplicates. Not applied here because the column is not yet part of the span
+// contract.
 const SpansDedupViewDDL = `
 CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s.%[3]s_dedup`" + ` AS
 ` + SpansDedupViewQuery + `;
@@ -263,7 +264,7 @@ QUALIFY ROW_NUMBER() OVER (
 ) = 1
 `
 
-// LogsDedupViewDDL is the canonical log deduplication view (§7.4).
+// LogsDedupViewDDL is the canonical log deduplication view.
 //
 // Identity is (timestamp, time_unix_nano, service_name, log_name, insert_id),
 // aligned with the Cloud Logging (log_name, insert_id) identity. insert_id is

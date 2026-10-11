@@ -1,0 +1,3 @@
+# Default reviewer for everything in the repository. GitHub requests a review
+# from every matching owner automatically when a pull request is opened.
+*       @haiyuan-eng-google

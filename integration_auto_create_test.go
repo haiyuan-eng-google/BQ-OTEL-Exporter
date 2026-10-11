@@ -7,6 +7,7 @@ package bigqueryexporter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -163,7 +164,7 @@ func waitForRows(ctx context.Context, client *bq.Client, project, dataset, table
 					return nil
 				}
 			}
-			if err != nil && err != iterator.Done {
+			if err != nil && !errors.Is(err, iterator.Done) {
 				return fmt.Errorf("query %s.%s.%s: %w", project, dataset, table, err)
 			}
 		}

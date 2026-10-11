@@ -903,7 +903,7 @@ func TestPrepareDestinationSignalFailureSkipsQuarantine(t *testing.T) {
 
 func TestClientOptionsSeparateMetadataFromStorageEndpoint(t *testing.T) {
 	cfg := validConfig()
-	cfg.Credentials.File = "/tmp/identity.json"
+	cfg.Credentials.File = writeCredentialsFile(t, authorizedUserFile)
 	cfg.Endpoint.URL = "localhost:9050"
 	cfg.Endpoint.Insecure = true
 	e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())

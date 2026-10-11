@@ -8,6 +8,9 @@
 
 receivers:
   otlp:
+    # Do not remove either protocol. Google ADK and LangGraph can send OTLP/HTTP
+    # only, while most other frameworks default to OTLP/gRPC. See "Transports"
+    # in the README.
     protocols:
       grpc:
         endpoint: 0.0.0.0:4317

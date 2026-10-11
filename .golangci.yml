@@ -1,0 +1,22 @@
+version: "2"
+
+run:
+  timeout: 5m
+  # Lint test files too; most of this repository's logic is covered there.
+  tests: true
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - errorlint
+    - gocritic
+    - govet
+    - misspell
+    - revive
+    - staticcheck
+    - unused
+  exclusions:
+    # Skip files carrying a "Code generated ... DO NOT EDIT." marker (mdatagen
+    # output); they are regenerated rather than hand-fixed.
+    generated: lax

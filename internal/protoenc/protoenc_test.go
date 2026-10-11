@@ -30,7 +30,7 @@ func opts() transform.Options {
 	}
 }
 
-// The full chain: pdata to rows to protobuf bytes, against the real §7.1
+// The full chain: pdata to rows to protobuf bytes, against the real span table
 // schema. If the transform emits a column the schema does not declare, or a Go
 // type the descriptor does not accept, this is where it surfaces.
 func TestEncodeSpanRow(t *testing.T) {

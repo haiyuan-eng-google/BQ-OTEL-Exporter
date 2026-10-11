@@ -255,7 +255,7 @@ const hexDigits = "0123456789abcdef"
 //
 // Written by hand rather than via encoding/json because that package escapes
 // <, > and & for HTML safety. Those escapes are legal JSON but they would make
-// the fingerprint in §7.4 depend on an encoder policy rather than on the
+// the record fingerprint depend on an encoder policy rather than on the
 // record's content.
 func writeJSONString(b *strings.Builder, s string) {
 	b.WriteByte('"')

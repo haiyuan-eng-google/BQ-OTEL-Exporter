@@ -1,6 +1,8 @@
 // Copyright 2026 Google LLC
 // SPDX-License-Identifier: Apache-2.0
 
+// Package metadata holds the exporter's self-telemetry instruments and the
+// component status generated from metadata.yaml.
 package metadata // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/metadata"
 
 import (
@@ -29,17 +31,20 @@ type Telemetry struct {
 	// compared against what the producer sent.
 	AcknowledgedRows metric.Int64Counter
 
-	// RejectedRows counts permanently rejected rows by reason. In v1 there is
-	// no dead-letter destination, so this counter is the only record that the
-	// data existed.
+	// RejectedRows counts permanently rejected rows by reason. It is counted
+	// whether or not quarantine is enabled. With quarantine disabled, the
+	// default, this counter is the only record that the data existed; with
+	// quarantine enabled the rejected record is also written to the
+	// otel_quarantine table.
 	RejectedRows metric.Int64Counter
 
 	// Retries counts retryable append failures by error class.
 	Retries metric.Int64Counter
 
 	// UncertainAckReplays counts in-loop replays triggered by an uncertain
-	// acknowledgement. This is the observable side of the §8.4 duplicate
-	// bound: N replays permit at most N+1 physical copies.
+	// acknowledgement. This is the observable side of the duplicate bound
+	// described in docs/schema-rationale.md: N replays permit at most N+1
+	// physical copies.
 	//
 	// Crash replays from the persistent queue are explicitly out of scope and
 	// are not counted here.
@@ -164,6 +169,9 @@ func (t *Telemetry) RecordUncertainAckReplay(ctx context.Context) {
 	t.UncertainAckReplays.Add(ctx, 1)
 }
 
+// RecordInflightRequests adjusts the count of dispatched append results that
+// have not reached an exporter-owned terminal state. delta is positive when a
+// result enters that state and negative when it leaves.
 func (t *Telemetry) RecordInflightRequests(ctx context.Context, delta int64) {
 	if t == nil || delta == 0 {
 		return
@@ -171,6 +179,9 @@ func (t *Telemetry) RecordInflightRequests(ctx context.Context, delta int64) {
 	t.InflightRequests.Add(ctx, delta)
 }
 
+// RecordUnresolvedResults adjusts the count of append results retained by
+// lifecycle drainers after their exporterhelper attempt ended. delta is
+// positive when a result is handed to a drainer and negative when it resolves.
 func (t *Telemetry) RecordUnresolvedResults(ctx context.Context, delta int64) {
 	if t == nil || delta == 0 {
 		return
@@ -178,6 +189,8 @@ func (t *Telemetry) RecordUnresolvedResults(ctx context.Context, delta int64) {
 	t.UnresolvedResults.Add(ctx, delta)
 }
 
+// RecordAppendResultWait records the time from append dispatch until the
+// result owner finishes.
 func (t *Telemetry) RecordAppendResultWait(ctx context.Context, elapsed time.Duration) {
 	if t == nil {
 		return
@@ -185,6 +198,8 @@ func (t *Telemetry) RecordAppendResultWait(ctx context.Context, elapsed time.Dur
 	t.AppendResultWait.Record(ctx, elapsed.Seconds())
 }
 
+// RecordTimeoutAfterDispatch records an append attempt whose context ended
+// after dispatch began.
 func (t *Telemetry) RecordTimeoutAfterDispatch(ctx context.Context) {
 	if t == nil {
 		return
@@ -192,6 +207,8 @@ func (t *Telemetry) RecordTimeoutAfterDispatch(ctx context.Context) {
 	t.TimeoutsAfterDispatch.Add(ctx, 1)
 }
 
+// RecordStreamRetirement records a managed stream generation retired after an
+// unsafe outcome.
 func (t *Telemetry) RecordStreamRetirement(ctx context.Context) {
 	if t == nil {
 		return

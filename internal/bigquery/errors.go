@@ -18,8 +18,8 @@ type Class int
 
 const (
 	// Permanent will never succeed on retry. The affected rows or batch are
-	// counted and dropped; v1 has no dead-letter destination, so "reject"
-	// means drop.
+	// dropped instead of retried. Rows the service rejects one by one are also
+	// counted and, when quarantine is enabled, written to the quarantine table.
 	Permanent Class = iota
 	// Retryable is transient and should be retried with backoff.
 	Retryable
@@ -45,8 +45,8 @@ func (c Class) String() string {
 // Owner names the component responsible for acting on a failure.
 //
 // Exactly one owner per class is the whole point: two components retrying the
-// same failure multiplies attempts and makes the duplicate bound in §8.4
-// meaningless.
+// same failure multiplies attempts and makes the duplicate bound described in
+// docs/schema-rationale.md meaningless.
 type Owner int
 
 const (
@@ -69,7 +69,7 @@ func (o Owner) String() string {
 	}
 }
 
-// Verdict is one row of the §8.3 error matrix.
+// Verdict is one row of the error matrix that Classify implements.
 type Verdict struct {
 	Class Class
 	Owner Owner
@@ -115,7 +115,8 @@ var schemaMismatchMarkers = []string{
 	"input schema has more fields than BigQuery schema",
 }
 
-// Classify maps an append error onto the §8.3 matrix.
+// Classify maps an append error onto the error matrix: the failure class, the
+// component that owns the reaction, and a bounded metric label.
 func Classify(err error) Verdict {
 	if err == nil {
 		return Verdict{Permanent, OwnerExporter, LabelUnknown, false}

@@ -18,6 +18,10 @@ tests:
   config:
     project: my-project
     dataset: otel
+    traces:
+      table: otel_spans
+    logs:
+      table: otel_logs
   skip_lifecycle: true
 
 # Delivery-critical self-telemetry.
@@ -47,9 +51,11 @@ telemetry:
     otelcol_exporter_bigquery_rejected_rows:
       enabled: true
       description: >-
-        Rows permanently rejected and dropped, by reason. There is no
-        dead-letter destination in v1, so this counter is the only record that
-        the data existed.
+        Rows permanently rejected and dropped from the signal tables, by
+        reason. Counted whether or not quarantine is enabled. With quarantine
+        disabled, the default, this counter is the only record that the data
+        existed; with quarantine.enabled the rejected record is also written
+        to the otel_quarantine table.
       unit: "{row}"
       sum:
         value_type: int

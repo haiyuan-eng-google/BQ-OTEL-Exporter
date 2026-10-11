@@ -5,6 +5,44 @@
 
 package bigqueryexporter
 
-import "go.uber.org/goleak"
+import (
+	"os"
 
-func integrationGoleakOptions() []goleak.Option { return nil }
+	"go.uber.org/goleak"
+)
+
+// init makes the unit-test binary hermetic with respect to ambient Google
+// auth configuration.
+//
+// Several tests start the exporter against a no-auth loopback endpoint, which
+// builds a real managedwriter client. When the machine running the tests
+// exports mTLS or context-aware access settings, that client starts an
+// enterprise-certificate-proxy helper whose RPC reader goroutine outlives the
+// test and fails the goroutine-leak check. Unit tests never talk to Google, so
+// the settings are cleared for the whole test binary.
+//
+// This runs from init rather than from TestMain because TestMain lives in the
+// generated generated_package_test.go. Integration builds do not do this; see
+// goleak_options_integration_test.go.
+func init() {
+	if err := os.Setenv("GOOGLE_API_USE_CLIENT_CERTIFICATE", "false"); err != nil {
+		panic(err)
+	}
+	for _, key := range []string{
+		"GOOGLE_API_CERTIFICATE_CONFIG",
+		"GOOGLE_APPLICATION_CREDENTIALS",
+	} {
+		if err := os.Unsetenv(key); err != nil {
+			panic(err)
+		}
+	}
+}
+
+func integrationGoleakOptions() []goleak.Option {
+	return []goleak.Option{
+		// Defense in depth for the environment cleared above: the enterprise
+		// certificate proxy client reads from its helper process for as long
+		// as the process lives, so it is not a leak this package can close.
+		goleak.IgnoreAnyFunction("net/rpc.(*Client).input"),
+	}
+}
