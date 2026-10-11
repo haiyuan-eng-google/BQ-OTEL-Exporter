@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1971,4 +1972,122 @@ func TestQuarantineStopsProcessingOnceBudgetIsExhausted(t *testing.T) {
 		t.Errorf("pushTraceData delayed by %v, want <= 100ms", elapsed)
 	}
 	_ = qStream
+}
+
+// A record whose payload upload fails is withheld from the rows sent and does
+// not take an intra_batch_ordinal, so an identical record behind it is written
+// under the ordinal, and the insert_id, the withheld one would have had. The
+// retries must still leave every record with an insert_id of its own: across
+// the first attempt and its retries, the distinct insert_ids written must be
+// those a run without upload failures writes. Otherwise the dedup view
+// collapses identical records into one.
+func TestPushLogsOffloadRetryKeepsDistinctInsertIDs(t *testing.T) {
+	payload := func(s string) string { return strings.Repeat(s, 2048) }
+	tests := []struct {
+		name        string
+		bodies      []string
+		concurrency int
+		// fail reports whether the nth upload, counted from 1, fails.
+		fail func(n int) bool
+	}{
+		{
+			name:        "two identical records, the first upload fails once",
+			bodies:      []string{payload("A"), payload("A")},
+			concurrency: 1,
+			fail:        func(n int) bool { return n == 1 },
+		},
+		{
+			name:        "three identical records, the second upload fails once",
+			bodies:      []string{payload("A"), payload("A"), payload("A")},
+			concurrency: 1,
+			fail:        func(n int) bool { return n == 2 },
+		},
+		{
+			name:        "identical records among distinct ones, two uploads fail",
+			bodies:      []string{payload("B"), payload("A"), payload("A"), payload("C"), payload("A")},
+			concurrency: 1,
+			fail:        func(n int) bool { return n == 2 || n == 5 },
+		},
+		{
+			name:        "concurrent uploads, the first fails",
+			bodies:      []string{payload("A"), payload("A")},
+			concurrency: 8,
+			fail:        func(n int) bool { return n == 1 },
+		},
+		{
+			name:        "inline identical records around a failed upload",
+			bodies:      []string{"x", "x", payload("Z"), "x"},
+			concurrency: 1,
+			fail:        func(n int) bool { return n == 1 },
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			want := insertIDsWrittenUntilDelivered(t, tc.concurrency, func(int) bool { return false }, logsWithBodies(tc.bodies...))
+			if len(want) != len(tc.bodies) {
+				t.Fatalf("setup: a run without upload failures wrote %d distinct insert_ids, want %d", len(want), len(tc.bodies))
+			}
+			got := insertIDsWrittenUntilDelivered(t, tc.concurrency, tc.fail, logsWithBodies(tc.bodies...))
+			if !slices.Equal(got, want) {
+				t.Fatalf("distinct insert_ids written = %d %v, want the %d of a run without upload failures %v",
+					len(got), got, len(want), want)
+			}
+		})
+	}
+}
+
+// insertIDsWrittenUntilDelivered pushes ld through a logs exporter whose
+// payload uploads fail as fail says, pushes each retry payload it returns
+// until a push succeeds, and returns the sorted distinct insert_ids of every
+// row appended along the way. The writer acknowledges every row it is given.
+func insertIDsWrittenUntilDelivered(t *testing.T, concurrency int, fail func(n int) bool, ld plog.Logs) []string {
+	t.Helper()
+	cfg := validConfig()
+	cfg.Offload.Enabled = true
+	cfg.Offload.Bucket = "otel-offload-bucket"
+	cfg.Offload.MinBytes = 1024
+	cfg.Offload.MaxObjectBytes = 64 * 1024 * 1024
+	cfg.Offload.MaxConcurrency = concurrency
+	e, err := newLogsExporter(component.TelemetrySettings{
+		Logger:        zap.NewNop(),
+		MeterProvider: noop.NewMeterProvider(),
+	}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var uploads atomic.Int32
+	e.offloader.SetStore(funcBlobStore{
+		writeFn: func(_ context.Context, _, _, _ string, _ []byte) (string, error) {
+			if fail(int(uploads.Add(1))) {
+				return "", errors.New("simulated transient upload failure")
+			}
+			return "1", nil
+		},
+	})
+	enc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &recordingEncoder{next: enc}
+	e.enc = rec
+	e.writer = &fakeAppender{appendFn: func(_ context.Context, rows [][]byte) bqi.AppendOutcome {
+		return bqi.AppendOutcome{AcknowledgedRows: len(rows), AckedRanges: [][2]int{{0, len(rows)}}}
+	}}
+
+	payload := ld
+	for range 10 {
+		err := e.pushLogData(context.Background(), payload)
+		if err == nil {
+			ids := column(rec.rows, "insert_id")
+			slices.Sort(ids)
+			return slices.Compact(ids)
+		}
+		var logsErr consumererror.Logs
+		if !errors.As(err, &logsErr) {
+			t.Fatalf("expected a retryable consumererror.Logs, got %T: %v", err, err)
+		}
+		payload = logsErr.Data()
+	}
+	t.Fatal("the batch was not delivered within 10 pushes")
+	return nil
 }
