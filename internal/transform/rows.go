@@ -59,6 +59,14 @@ type Options struct {
 	// rows are fitted to it, by truncating raw_payload; a signal row over it
 	// is rejected by the caller. Zero or less means no cap.
 	MaxRowBytes int
+	// QuarantineMetadataOnly omits raw_payload, raw_attributes, and
+	// payload_ref from quarantine rows when true, preserving only metadata
+	// columns so sensitive telemetry content is never written to the DLQ.
+	QuarantineMetadataOnly bool
+	// MaxQuarantinePayloadBytes bounds the UTF-8 byte length of raw_payload in
+	// quarantine rows before any row-size cap is applied. Zero or less means
+	// no separate payload cap beyond MaxRowBytes.
+	MaxQuarantinePayloadBytes int
 	// PayloadOffloader optionally offloads large attributes, events, links,
 	// or log bodies before row construction and returns the payload_refs
 	// metadata to record on the row. When nil, payloads stay inline and
@@ -229,17 +237,21 @@ func SpanRows(td ptrace.Traces, opts Options) ([]Row, []Rejection) {
 
 			for _, span := range ss.Spans().All() {
 				idx++
-				if bad := checkSpan(span, resource, scope, opts.Limits); bad != nil {
-					rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
-					continue
-				}
 				rowSpan, rowRes, rowScope := span, res, sc
 				var refs []PayloadRef
 				if opts.PayloadOffloader != nil {
+					if bad := checkSpanPreOffload(span, resource, scope, opts.Limits); bad != nil {
+						rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
+						continue
+					}
 					workSpan := cloneSpanForOffload(span)
 					workRes := cloneResourceForOffload(resource)
 					workScope := cloneScopeForOffload(scope)
 					refs = opts.PayloadOffloader.OffloadSpan(workSpan, workRes, workScope)
+					if bad := checkSpan(workSpan, workRes, workScope, opts.Limits); bad != nil {
+						rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
+						continue
+					}
 					rowSpan = workSpan
 					rowRes = encodeBag(workRes.Attributes(), workRes.DroppedAttributesCount())
 					rowScope = encodedScope{
@@ -247,6 +259,9 @@ func SpanRows(td ptrace.Traces, opts Options) ([]Row, []Rejection) {
 						version: sanitize(workScope.Version()),
 						bag:     encodeBag(workScope.Attributes(), workScope.DroppedAttributesCount()),
 					}
+				} else if bad := checkSpan(span, resource, scope, opts.Limits); bad != nil {
+					rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
+					continue
 				}
 				rows = append(rows, spanRow(rowSpan, rs.SchemaUrl(), ss.SchemaUrl(), rowRes, rowScope, svc, received, refs))
 			}
@@ -256,16 +271,24 @@ func SpanRows(td ptrace.Traces, opts Options) ([]Row, []Rejection) {
 }
 
 func checkSpan(span ptrace.Span, resource pcommon.Resource, scope pcommon.InstrumentationScope, l Limits) *Violation {
+	return checkSpanMode(span, resource, scope, l, true)
+}
+
+func checkSpanPreOffload(span ptrace.Span, resource pcommon.Resource, scope pcommon.InstrumentationScope, l Limits) *Violation {
+	return checkSpanMode(span, resource, scope, l, false)
+}
+
+func checkSpanMode(span ptrace.Span, resource pcommon.Resource, scope pcommon.InstrumentationScope, l Limits, checkValueBytes bool) *Violation {
 	if bad := validateSpan(span); bad != nil {
 		return bad
 	}
-	if bad := l.checkMap(resource.Attributes(), "resource.attributes"); bad != nil {
+	if bad := l.checkMapMode(resource.Attributes(), "resource.attributes", checkValueBytes); bad != nil {
 		return bad
 	}
-	if bad := l.checkMap(scope.Attributes(), "instrumentation_scope.attributes"); bad != nil {
+	if bad := l.checkMapMode(scope.Attributes(), "instrumentation_scope.attributes", checkValueBytes); bad != nil {
 		return bad
 	}
-	if bad := l.checkMap(span.Attributes(), "attributes"); bad != nil {
+	if bad := l.checkMapMode(span.Attributes(), "attributes", checkValueBytes); bad != nil {
 		return bad
 	}
 	if n := span.Events().Len(); n > l.MaxEventCount {
@@ -280,12 +303,12 @@ func checkSpan(span ptrace.Span, resource pcommon.Resource, scope pcommon.Instru
 		if overflowsInt64(e.Timestamp()) {
 			return &Violation{Reason: ReasonTimestampOverflow, FieldPath: "events.time_unix_nano"}
 		}
-		if bad := l.checkMap(e.Attributes(), "events.attributes"); bad != nil {
+		if bad := l.checkMapMode(e.Attributes(), "events.attributes", checkValueBytes); bad != nil {
 			return bad
 		}
 	}
 	for _, lk := range span.Links().All() {
-		if bad := l.checkMap(lk.Attributes(), "links.attributes"); bad != nil {
+		if bad := l.checkMapMode(lk.Attributes(), "links.attributes", checkValueBytes); bad != nil {
 			return bad
 		}
 	}
@@ -537,14 +560,38 @@ func LogRows(ld plog.Logs, opts Options) ([]Row, []Rejection) {
 
 			for _, lr := range sl.LogRecords().All() {
 				idx++
-				if bad := checkLog(lr, resource, scope, opts.Limits); bad != nil {
+				rowLR := lr
+				rowRes := origin.res
+				rowScope := origin.scope
+				var refs []PayloadRef
+				if opts.PayloadOffloader != nil {
+					if bad := checkLogPreOffload(lr, resource, scope, opts.Limits); bad != nil {
+						rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
+						continue
+					}
+					workLR := cloneLogRecordForOffload(lr)
+					workRes := cloneResourceForOffload(resource)
+					workScope := cloneScopeForOffload(scope)
+					refs = opts.PayloadOffloader.OffloadLog(workLR, workRes, workScope)
+					if bad := checkLog(workLR, workRes, workScope, opts.Limits); bad != nil {
+						rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
+						continue
+					}
+					rowLR = workLR
+					rowRes = encodeBag(workRes.Attributes(), workRes.DroppedAttributesCount())
+					rowScope = encodedScope{
+						name:    sanitize(workScope.Name()),
+						version: sanitize(workScope.Version()),
+						bag:     encodeBag(workScope.Attributes(), workScope.DroppedAttributesCount()),
+					}
+				} else if bad := checkLog(lr, resource, scope, opts.Limits); bad != nil {
 					rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
 					continue
 				}
 				// Only kept records consume an intra_batch_ordinal. A rejected
 				// record is rejected again on every retry, so the ordinals of
 				// the others still repeat.
-				rows = append(rows, logRow(lr, resource, scope, origin, fingerprints, received, opts))
+				rows = append(rows, logRow(lr, rowLR, rowRes, rowScope, refs, origin, fingerprints, received, opts))
 			}
 		}
 	}
@@ -552,19 +599,27 @@ func LogRows(ld plog.Logs, opts Options) ([]Row, []Rejection) {
 }
 
 func checkLog(lr plog.LogRecord, resource pcommon.Resource, scope pcommon.InstrumentationScope, l Limits) *Violation {
+	return checkLogMode(lr, resource, scope, l, true)
+}
+
+func checkLogPreOffload(lr plog.LogRecord, resource pcommon.Resource, scope pcommon.InstrumentationScope, l Limits) *Violation {
+	return checkLogMode(lr, resource, scope, l, false)
+}
+
+func checkLogMode(lr plog.LogRecord, resource pcommon.Resource, scope pcommon.InstrumentationScope, l Limits, checkValueBytes bool) *Violation {
 	if bad := validateLog(lr); bad != nil {
 		return bad
 	}
-	if bad := l.checkMap(resource.Attributes(), "resource.attributes"); bad != nil {
+	if bad := l.checkMapMode(resource.Attributes(), "resource.attributes", checkValueBytes); bad != nil {
 		return bad
 	}
-	if bad := l.checkMap(scope.Attributes(), "instrumentation_scope.attributes"); bad != nil {
+	if bad := l.checkMapMode(scope.Attributes(), "instrumentation_scope.attributes", checkValueBytes); bad != nil {
 		return bad
 	}
-	if bad := l.checkMap(lr.Attributes(), "attributes"); bad != nil {
+	if bad := l.checkMapMode(lr.Attributes(), "attributes", checkValueBytes); bad != nil {
 		return bad
 	}
-	return l.checkValue(lr.Body(), "body", 1)
+	return l.checkValueMode(lr.Body(), "body", 1, checkValueBytes)
 }
 
 // validateLog enforces the INT64 columns of the log contract before any row is
@@ -595,9 +650,11 @@ type logOrigin struct {
 }
 
 func logRow(
-	lr plog.LogRecord,
-	resource pcommon.Resource,
-	scope pcommon.InstrumentationScope,
+	origLR plog.LogRecord,
+	rowLR plog.LogRecord,
+	rowRes encodedBag,
+	rowScope encodedScope,
+	refs []PayloadRef,
 	origin logOrigin,
 	fingerprints fingerprinter,
 	received time.Time,
@@ -607,31 +664,18 @@ func logRow(
 	// insert_id, event_name) is always computed from the original un-offloaded
 	// OTLP record so offloading large values never collapses distinct records
 	// or strips identity attributes.
-	attrs := encodeBag(lr.Attributes(), lr.DroppedAttributesCount())
-	body, bodySchema := otlpjson.EncodePlainValueWithSchema(lr.Body())
-	fingerprint := fingerprints.next(canonicalLogRecord(lr, attrs, body, bodySchema, origin.canonical))
-	resolvedLogName := logName(lr.Attributes(), origin.svc, opts.LogNameAttribute)
-	resolvedInsertID := insertID(lr.Attributes(), fingerprint, opts.InsertIDAttribute)
-	resolvedEventName := eventName(lr)
+	origAttrs := encodeBag(origLR.Attributes(), origLR.DroppedAttributesCount())
+	origBody, origBodySchema := otlpjson.EncodePlainValueWithSchema(origLR.Body())
+	fingerprint := fingerprints.next(canonicalLogRecord(origLR, origAttrs, origBody, origBodySchema, origin.canonical))
+	resolvedLogName := logName(origLR.Attributes(), origin.svc, opts.LogNameAttribute)
+	resolvedInsertID := insertID(origLR.Attributes(), fingerprint, opts.InsertIDAttribute)
+	resolvedEventName := eventName(origLR)
 
-	rowLR := lr
-	rowRes := origin.res
-	rowScope := origin.scope
-	var refs []PayloadRef
+	attrs := origAttrs
+	body := origBody
 	if opts.PayloadOffloader != nil {
-		workLR := cloneLogRecordForOffload(lr)
-		workRes := cloneResourceForOffload(resource)
-		workScope := cloneScopeForOffload(scope)
-		refs = opts.PayloadOffloader.OffloadLog(workLR, workRes, workScope)
-		rowLR = workLR
-		attrs = encodeBag(workLR.Attributes(), workLR.DroppedAttributesCount())
-		body, _ = otlpjson.EncodePlainValueWithSchema(workLR.Body())
-		rowRes = encodeBag(workRes.Attributes(), workRes.DroppedAttributesCount())
-		rowScope = encodedScope{
-			name:    sanitize(workScope.Name()),
-			version: sanitize(workScope.Version()),
-			bag:     encodeBag(workScope.Attributes(), workScope.DroppedAttributesCount()),
-		}
+		attrs = encodeBag(rowLR.Attributes(), rowLR.DroppedAttributesCount())
+		body, _ = otlpjson.EncodePlainValueWithSchema(rowLR.Body())
 	}
 
 	// The partition key falls back through event time, observed time, then
@@ -984,6 +1028,11 @@ func (q quarantinedRecord) row(e QuarantineEntry, ingest int64, opts Options) Ro
 	putStrIfSet(r, "exporter_instance", truncateUTF8(sanitize(opts.ExporterInstance), quarantineLabelBytes))
 	message := quarantineMessage(e)
 
+	if opts.QuarantineMetadataOnly {
+		r["error_message"] = message
+		return r
+	}
+
 	// raw_payload is the record itself, so it gets the row size budget
 	// first. raw_attributes repeats part of it in queryable form and is
 	// written only when the complete payload fits beside it.
@@ -1005,8 +1054,12 @@ func (q quarantinedRecord) row(e QuarantineEntry, ingest int64, opts Options) Ro
 			r["payload_ref"] = offloaded
 		} else {
 			payload := sanitize(string(q.payload))
-			if len(payload) > budget {
-				kept := truncateUTF8(payload, max(budget, 0))
+			payloadBudget := budget
+			if opts.MaxQuarantinePayloadBytes > 0 && opts.MaxQuarantinePayloadBytes < payloadBudget {
+				payloadBudget = opts.MaxQuarantinePayloadBytes
+			}
+			if len(payload) > payloadBudget {
+				kept := truncateUTF8(payload, max(payloadBudget, 0))
 				message += fmt.Sprintf(" (raw_payload truncated to %d of %d bytes)", len(kept), len(payload))
 				payload = kept
 				budget = 0

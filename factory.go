@@ -25,7 +25,15 @@ const (
 	defaultSpansTable = "otel_spans"
 	defaultLogsTable  = "otel_logs"
 	// defaultQuarantineTable is used only once quarantine.enabled is set.
-	defaultQuarantineTable = "otel_quarantine"
+	defaultQuarantineTable              = "otel_quarantine"
+	defaultQuarantineMaxRawPayloadBytes = 8 * 1024 * 1024
+	defaultQuarantineTimeout            = 5 * time.Second
+
+	// Defaults for optional GCS payload offloading.
+	defaultOffloadPrefix         = "otel-offload"
+	defaultOffloadMinBytes       = 256 * 1024
+	defaultOffloadMaxObjectBytes = 64 * 1024 * 1024
+	defaultOffloadTimeout        = 10 * time.Second
 
 	// defaultMaxRequestBytes leaves headroom under the Storage Write API
 	// per-request limit. This is our threshold, not the API's; the gap
@@ -91,14 +99,25 @@ func createDefaultConfig() component.Config {
 			ConnectionPoolSize:  defaultConnectionPoolSize,
 		},
 		Limits: LimitsConfig{
-			MaxAttributeCount: limits.MaxAttributeCount,
-			MaxEventCount:     limits.MaxEventCount,
-			MaxLinkCount:      limits.MaxLinkCount,
-			MaxNestingDepth:   limits.MaxNestingDepth,
-			MaxCollectionSize: limits.MaxCollectionSize,
-			MaxValueBytes:     limits.MaxValueBytes,
+			MaxAttributeCount:    limits.MaxAttributeCount,
+			MaxEventCount:        limits.MaxEventCount,
+			MaxLinkCount:         limits.MaxLinkCount,
+			MaxNestingDepth:      limits.MaxNestingDepth,
+			MaxCollectionSize:    limits.MaxCollectionSize,
+			MaxAttributeKeyBytes: limits.MaxAttributeKeyBytes,
+			MaxValueBytes:        limits.MaxValueBytes,
 		},
-		Quarantine: QuarantineConfig{Table: defaultQuarantineTable},
+		Quarantine: QuarantineConfig{
+			Table:              defaultQuarantineTable,
+			MaxRawPayloadBytes: defaultQuarantineMaxRawPayloadBytes,
+			Timeout:            defaultQuarantineTimeout,
+		},
+		Offload: OffloadConfig{
+			Prefix:         defaultOffloadPrefix,
+			MinBytes:       defaultOffloadMinBytes,
+			MaxObjectBytes: defaultOffloadMaxObjectBytes,
+			Timeout:        defaultOffloadTimeout,
+		},
 	}
 }
 

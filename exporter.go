@@ -28,6 +28,7 @@ import (
 	bqi "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/bigquery"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/diag"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/metadata"
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/offload"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/protoenc"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
@@ -40,10 +41,18 @@ const writeAPITraceID = "otel-bigqueryexporter"
 // not authorized to create control-plane resources.
 const scopeRead = "https://www.googleapis.com/auth/bigquery.readonly"
 
+// scopeStorageReadWrite authorizes uploading offloaded payloads to GCS.
+const scopeStorageReadWrite = "https://www.googleapis.com/auth/devstorage.read_write"
+
 // newManagedWriterClient is the external constructor seam. Keeping it narrow
 // lets lifecycle tests prove which context is retained without opening a real
 // Storage Write API connection.
 var newManagedWriterClient = managedwriter.NewClient
+
+// newBlobStore constructs the GCS blob store used when offload.enabled is set.
+var newBlobStore = func(ctx context.Context, opts ...option.ClientOption) (offload.BlobStore, error) {
+	return offload.NewGCSBlobStore(ctx, opts...)
+}
 
 // rowAppender is the append surface the push paths depend on. Narrowing it to
 // an interface is what lets the FR6 subset logic be tested without a live
@@ -80,6 +89,10 @@ type signalExporter struct {
 	quarantine       rowAppender
 	quarantineEnc    rowEncoder
 
+	// offloader offloads oversized span/log values and quarantine payloads
+	// when offload.enabled is set.
+	offloader *offload.Offloader
+
 	schema *storagepb.TableSchema
 	opts   transform.Options
 }
@@ -90,19 +103,37 @@ func newSignalExporter(
 	table string,
 	tableSchema *storagepb.TableSchema,
 ) *signalExporter {
-	return &signalExporter{
+	se := &signalExporter{
 		cfg:    cfg,
 		table:  table,
 		logger: set.Logger,
 		schema: tableSchema,
 		opts: transform.Options{
-			Limits:            cfg.Limits.toTransform(),
-			LogNameAttribute:  cfg.Logs.LogNameAttribute,
-			InsertIDAttribute: cfg.Logs.InsertIDAttribute,
-			ExporterInstance:  exporterInstance(set.Resource),
-			MaxRowBytes:       cfg.Write.MaxRowBytes,
+			Limits:                    cfg.Limits.toTransform(),
+			LogNameAttribute:          cfg.Logs.LogNameAttribute,
+			InsertIDAttribute:         cfg.Logs.InsertIDAttribute,
+			ExporterInstance:          exporterInstance(set.Resource),
+			MaxRowBytes:               cfg.Write.MaxRowBytes,
+			QuarantineMetadataOnly:    cfg.Quarantine.MetadataOnly,
+			MaxQuarantinePayloadBytes: cfg.Quarantine.MaxRawPayloadBytes,
 		},
 	}
+	if cfg.Offload.Enabled {
+		off, err := offload.New(nil, offload.Options{
+			Bucket:         cfg.Offload.Bucket,
+			Prefix:         cfg.Offload.Prefix,
+			Authorizer:     cfg.Offload.Authorizer,
+			MinBytes:       cfg.Offload.MinBytes,
+			MaxObjectBytes: cfg.Offload.MaxObjectBytes,
+			Timeout:        cfg.Offload.Timeout,
+		})
+		if err == nil {
+			se.offloader = off
+			se.opts.PayloadOffloader = off
+			se.opts.QuarantinePayloadOffloader = off.OffloadQuarantine
+		}
+	}
+	return se
 }
 
 // exporterInstance labels quarantine rows with the service.instance.id of the
@@ -281,6 +312,13 @@ func (e *signalExporter) writerClientOptions(ctx context.Context) ([]option.Clie
 	return opts, nil
 }
 
+func (e *signalExporter) offloadClientOptions(ctx context.Context) ([]option.ClientOption, error) {
+	if e.cfg.Endpoint.WithoutAuthentication {
+		return []option.ClientOption{option.WithoutAuthentication()}, nil
+	}
+	return e.authenticationOptions(ctx, []string{scopeStorageReadWrite})
+}
+
 func (e *signalExporter) start(ctx context.Context, _ component.Host) (err error) {
 	// Start's context is scoped to component startup. managedwriter retains
 	// both its client and stream constructor contexts for background work, so
@@ -384,6 +422,20 @@ func (e *signalExporter) start(ctx context.Context, _ component.Host) (err error
 		})
 		startedFields = append(startedFields, zap.String("quarantine", e.quarantineTableID()))
 	}
+	if e.cfg.Offload.Enabled && e.offloader != nil {
+		if e.offloader.Store() == nil {
+			offloadOpts, oerr := e.offloadClientOptions(lifetimeCtx)
+			if oerr != nil {
+				return oerr
+			}
+			store, serr := newBlobStore(lifetimeCtx, offloadOpts...)
+			if serr != nil {
+				return fmt.Errorf("creating GCS payload offloader: %w", serr)
+			}
+			e.offloader.SetStore(store)
+		}
+		startedFields = append(startedFields, zap.String("offload_bucket", e.cfg.Offload.Bucket))
+	}
 
 	e.logger.Info("BigQuery exporter started", startedFields...)
 	return nil
@@ -419,6 +471,12 @@ func (e *signalExporter) shutdown(_ context.Context) error {
 			errs = append(errs, err)
 		}
 		e.quarantineClient = nil
+	}
+	if e.offloader != nil {
+		if err := e.offloader.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		e.offloader.SetStore(nil)
 	}
 	if e.client != nil {
 		if err := e.client.Close(); err != nil {
@@ -661,7 +719,14 @@ func (e *signalExporter) quarantineRows(ctx context.Context, rows []transform.Ro
 		return
 	}
 
-	out := e.quarantine.Append(ctx, encoded)
+	timeout := e.cfg.Quarantine.Timeout
+	if timeout <= 0 {
+		timeout = defaultQuarantineTimeout
+	}
+	qCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	defer cancel()
+
+	out := e.quarantine.Append(qCtx, encoded)
 	if out.Err == nil && len(out.RowErrors) == 0 {
 		return
 	}

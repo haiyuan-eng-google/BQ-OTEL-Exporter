@@ -31,6 +31,7 @@ import (
 
 	bqi "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/bigquery"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/metadata"
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/offload"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/protoenc"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
@@ -38,15 +39,19 @@ import (
 
 type fakeAppender struct {
 	outcome  bqi.AppendOutcome
+	appendFn func(context.Context, [][]byte) bqi.AppendOutcome
 	closeErr error
 	gotRows  int
 	appended int
 	closed   int
 }
 
-func (f *fakeAppender) Append(_ context.Context, rows [][]byte) bqi.AppendOutcome {
+func (f *fakeAppender) Append(ctx context.Context, rows [][]byte) bqi.AppendOutcome {
 	f.gotRows = len(rows)
 	f.appended++
+	if f.appendFn != nil {
+		return f.appendFn(ctx, rows)
+	}
 	return f.outcome
 }
 
@@ -1298,4 +1303,119 @@ func metricInt64Sum(t *testing.T, reader *sdkmetric.ManualReader, name string) i
 	}
 	t.Fatalf("metric %s was not collected", name)
 	return 0
+}
+
+func TestNewSignalExporterWiresOffloadAndQuarantinePIIOptions(t *testing.T) {
+	cfg := validConfig()
+	cfg.Offload.Enabled = true
+	cfg.Offload.Bucket = "otel-offload-bucket"
+	cfg.Quarantine.MetadataOnly = true
+	cfg.Quarantine.MaxRawPayloadBytes = 4096
+
+	e, err := newTracesExporter(component.TelemetrySettings{
+		Logger:        zap.NewNop(),
+		MeterProvider: noop.NewMeterProvider(),
+	}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.opts.PayloadOffloader == nil || e.opts.QuarantinePayloadOffloader == nil {
+		t.Fatal("expected PayloadOffloader and QuarantinePayloadOffloader to be wired when offload.enabled is set")
+	}
+	if !e.opts.QuarantineMetadataOnly || e.opts.MaxQuarantinePayloadBytes != 4096 {
+		t.Fatalf("QuarantineMetadataOnly=%v MaxQuarantinePayloadBytes=%d, want true and 4096",
+			e.opts.QuarantineMetadataOnly, e.opts.MaxQuarantinePayloadBytes)
+	}
+}
+
+func TestPushTracesOffloadsOversizedPayloadEndToEnd(t *testing.T) {
+	cfg := validConfig()
+	cfg.Offload.Enabled = true
+	cfg.Offload.Bucket = "otel-offload-bucket"
+	cfg.Offload.MinBytes = 256 * 1024
+	cfg.Offload.MaxObjectBytes = 64 * 1024 * 1024
+
+	e, err := newTracesExporter(component.TelemetrySettings{
+		Logger:        zap.NewNop(),
+		MeterProvider: noop.NewMeterProvider(),
+	}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	memStore := offload.NewMemoryBlobStore()
+	e.offloader.SetStore(memStore)
+
+	enc, err := protoenc.New(schema.SpansTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &recordingEncoder{next: enc}
+	app := &fakeAppender{outcome: bqi.AppendOutcome{AcknowledgedRows: 1}}
+	e.enc = rec
+	e.writer = app
+
+	td := newTestTraces(1)
+	largePrompt := strings.Repeat("P", 512*1024)
+	td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Attributes().PutStr("gen_ai.prompt", largePrompt)
+
+	if err := e.pushTraceData(context.Background(), td); err != nil {
+		t.Fatalf("pushTraceData failed on 512KiB prompt with offload enabled: %v", err)
+	}
+	if app.gotRows != 1 || len(rec.rows) != 1 {
+		t.Fatalf("appended %d rows (encoded %d), want 1", app.gotRows, len(rec.rows))
+	}
+	if memStore.Count() != 1 {
+		t.Fatalf("MemoryBlobStore count = %d, want 1 offloaded object", memStore.Count())
+	}
+	refs, ok := rec.rows[0]["payload_refs"].([]transform.Row)
+	if !ok || len(refs) != 1 {
+		t.Fatalf("payload_refs = %#v, want 1 entry", rec.rows[0]["payload_refs"])
+	}
+	if refs[0]["attribute_path"] != "attributes.gen_ai.prompt" {
+		t.Errorf("payload_refs[0].attribute_path = %v, want attributes.gen_ai.prompt", refs[0]["attribute_path"])
+	}
+}
+
+func TestQuarantineAppendUsesBoundedDetachedContext(t *testing.T) {
+	e, app := newTestTracesExporter(t, bqi.AppendOutcome{AcknowledgedRows: 1})
+	e.cfg.Quarantine.Timeout = 30 * time.Millisecond
+
+	var sawDeadline bool
+	var sawParentCancelled bool
+	_, stream := withQuarantine(t, e.signalExporter, bqi.AppendOutcome{})
+	stream.appendFn = func(qCtx context.Context, _ [][]byte) bqi.AppendOutcome {
+		_, sawDeadline = qCtx.Deadline()
+		// Even if parent was already cancelled before quarantineRows, qCtx must
+		// not inherit its immediate cancellation.
+		sawParentCancelled = qCtx.Err() == context.Canceled
+		<-qCtx.Done()
+		return bqi.AppendOutcome{
+			Verdict: bqi.Classify(qCtx.Err()),
+			Err:     qCtx.Err(),
+		}
+	}
+
+	parentCtx, parentCancel := context.WithCancel(context.Background())
+	parentCancel() // Cancel caller context before quarantineRows runs; signal fakeAppender ignores ctx.
+
+	td := newTestTraces(2)
+	td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(1).SetEndTimestamp(0)
+
+	start := time.Now()
+	if err := e.pushTraceData(parentCtx, td); err != nil {
+		t.Fatalf("quarantine timeout must not fail signal push: %v", err)
+	}
+	elapsed := time.Since(start)
+	if app.gotRows != 1 {
+		t.Fatalf("signal rows = %d, want 1", app.gotRows)
+	}
+	if !sawDeadline {
+		t.Error("quarantine Append context had no deadline")
+	}
+	if sawParentCancelled {
+		t.Error("quarantine Append context inherited caller cancellation instead of detaching via context.WithoutCancel")
+	}
+	if elapsed > time.Second {
+		t.Errorf("blocking quarantine stream stalled pushTraceData for %v, want bounded ~30ms timeout", elapsed)
+	}
 }

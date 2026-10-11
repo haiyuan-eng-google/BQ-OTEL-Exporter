@@ -250,3 +250,89 @@ func TestDefaultRetryHorizon(t *testing.T) {
 			cfg.BackOffConfig.MaxElapsedTime)
 	}
 }
+
+func TestValidateOffloadAndQuarantineHardening(t *testing.T) {
+	cfg := validConfig()
+	if cfg.Offload.Enabled {
+		t.Fatal("offload must be off by default")
+	}
+	if cfg.Limits.MaxAttributeKeyBytes != 1024 {
+		t.Fatalf("default limits.max_attribute_key_bytes = %d, want 1024", cfg.Limits.MaxAttributeKeyBytes)
+	}
+	if cfg.Quarantine.MaxRawPayloadBytes != 8*1024*1024 || cfg.Quarantine.Timeout != 5*time.Second {
+		t.Fatalf("default quarantine max_raw_payload_bytes=%d timeout=%v, want 8MiB and 5s",
+			cfg.Quarantine.MaxRawPayloadBytes, cfg.Quarantine.Timeout)
+	}
+
+	validOffload := validConfig()
+	validOffload.Offload.Enabled = true
+	validOffload.Offload.Bucket = "my-otel-offload-bucket"
+	validOffload.Quarantine.Enabled = true
+	validOffload.Quarantine.MetadataOnly = true
+	if err := validOffload.Validate(); err != nil {
+		t.Fatalf("valid offload + quarantine metadata_only config failed Validate(): %v", err)
+	}
+
+	rejects := map[string]struct {
+		mutate func(*Config)
+		want   string
+	}{
+		"zero attribute key limit": {
+			func(c *Config) { c.Limits.MaxAttributeKeyBytes = 0 },
+			"max_attribute_key_bytes must be positive",
+		},
+		"zero quarantine max_raw_payload_bytes when enabled": {
+			func(c *Config) {
+				c.Quarantine.Enabled = true
+				c.Quarantine.MaxRawPayloadBytes = 0
+			},
+			"quarantine.max_raw_payload_bytes must be positive",
+		},
+		"zero quarantine timeout when enabled": {
+			func(c *Config) {
+				c.Quarantine.Enabled = true
+				c.Quarantine.Timeout = 0
+			},
+			"quarantine.timeout must be positive",
+		},
+		"offload enabled without bucket": {
+			func(c *Config) { c.Offload.Enabled = true },
+			"offload.bucket must not be empty",
+		},
+		"offload bucket with gs prefix": {
+			func(c *Config) {
+				c.Offload.Enabled = true
+				c.Offload.Bucket = "gs://my-bucket"
+			},
+			"bare bucket name without gs://",
+		},
+		"offload max_object_bytes below min_bytes": {
+			func(c *Config) {
+				c.Offload.Enabled = true
+				c.Offload.Bucket = "my-bucket"
+				c.Offload.MinBytes = 4096
+				c.Offload.MaxObjectBytes = 2048
+			},
+			"offload.max_object_bytes (2048) must be at least offload.min_bytes (4096)",
+		},
+		"offload zero timeout": {
+			func(c *Config) {
+				c.Offload.Enabled = true
+				c.Offload.Bucket = "my-bucket"
+				c.Offload.Timeout = 0
+			},
+			"offload.timeout must be positive",
+		},
+	}
+
+	for name, tc := range rejects {
+		t.Run(name, func(t *testing.T) {
+			c := validConfig()
+			tc.mutate(c)
+			err := c.Validate()
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate() = %v, want error containing %q", err, tc.want)
+			}
+		})
+	}
+}
