@@ -267,13 +267,82 @@ and Google ADK / Vertex Agent Analytics:
   breach structural limits, exceed `write.max_row_bytes`, or are rejected per-row
   by BigQuery are routed to `otel_quarantine` (partitioned by `DATE(ingest_time)`
   with 30-day partition expiration and clustered by `(signal, error_code, service_name)`).
-- **Migrating from earlier pre-alpha tables.** `v0alpha2` replaces typed OTLP
-  protojson attribute wrappers with plain JSON plus `attributes_schema`,
-  replaces the earlier two-field log record identity settings with
-  `logs.log_name_attribute` and `logs.insert_id_attribute` (`log_name`,
-  `insert_id`, `record_fingerprint`), and adds `payload_refs`, companion views,
-  and `otel_quarantine`. Recreate pre-alpha tables and `_dedup` views using the
-  DDL in [`internal/schema`](internal/schema/schema.go).
+- **Partitioning and clustering.** `otel_spans` is hourly partitioned on
+  `PARTITION BY TIMESTAMP_TRUNC(start_time, HOUR)` and clustered by
+  `(service_name, trace_id, name)`. `otel_logs` is daily partitioned on
+  `PARTITION BY DATE(timestamp)` and clustered by
+  `(service_name, trace_id, severity_number)`.
+- **Migrating from earlier pre-alpha tables.** `v0alpha2` switches `otel_spans`
+  from daily to hourly partitioning (`TIMESTAMP_TRUNC(start_time, HOUR)`),
+  replaces typed OTLP protojson attribute wrappers with plain JSON plus
+  `attributes_schema`, replaces the earlier two-field log record identity
+  settings with `logs.log_name_attribute` and `logs.insert_id_attribute`
+  (`log_name`, `insert_id`, `record_fingerprint`), and adds `payload_refs`,
+  companion views, and `otel_quarantine`. Recreate pre-alpha tables and `_dedup`
+  views using the DDL in [`internal/schema`](internal/schema/schema.go).
+
+### Operating v0alpha2 tables
+
+- **Hourly `otel_spans` partition cap (10,000 partitions / ~416 days).**
+  `otel_spans` uses `PARTITION BY TIMESTAMP_TRUNC(start_time, HOUR)`, and
+  auto-created signal tables intentionally omit a default partition expiration so
+  telemetry is never dropped without operator consent. Because BigQuery enforces
+  a limit of **10,000 partitions per table** (about **416 days** of hourly
+  partitions), deployments retaining spans longer than ~416 days or enforcing a
+  retention window must configure `partition_expiration_days`:
+
+```sql
+ALTER TABLE `my-project.otel.otel_spans`
+SET OPTIONS (partition_expiration_days = 365);
+```
+
+- **Trace-lookup search indexes (`NO_OP_ANALYZER`).**
+  [`internal/schema`](internal/schema/schema.go) exports `SpansSearchIndexDDL`
+  and `LogsSearchIndexDDL` on `(trace_id, span_id)` for exact-token trace and
+  span correlation lookups using `NO_OP_ANALYZER`. The exporter never runs
+  `CREATE SEARCH INDEX` at startup because DDL queries require
+  `bigquery.jobs.create` in addition to dataset and table metadata permissions;
+  provision them explicitly in BigQuery:
+
+```sql
+CREATE SEARCH INDEX IF NOT EXISTS `otel_spans_trace_lookup_idx`
+ON `my-project.otel.otel_spans` (trace_id, span_id) OPTIONS (analyzer = 'NO_OP_ANALYZER');
+
+CREATE SEARCH INDEX IF NOT EXISTS `otel_logs_trace_lookup_idx`
+ON `my-project.otel.otel_logs` (trace_id, span_id) OPTIONS (analyzer = 'NO_OP_ANALYZER');
+```
+
+- **Exporter-fallback log timestamps on retry.** When a log record omits both
+  `timestamp` and `observed_timestamp` (`0`), `record_fingerprint` and fallback
+  `insert_id` remain deterministic across retries (the canonical record hash
+  excludes `receive_time`), but the row's `timestamp` column falls back to the
+  exporter's wall-clock ingestion time (`timestamp_source = "exporter"`).
+  Because `otel_logs_dedup` partitions its deduplication window by
+  `(timestamp, time_unix_nano, service_name, log_name, insert_id)`, whole-batch
+  retries that execute at a different wall-clock microsecond land in distinct
+  `timestamp` deduplication groups and do not collapse—even if an explicit
+  `insert_id` attribute is set. Producers that require retry-stable log
+  deduplication must populate OTLP `timestamp` or `observed_timestamp`.
+- **Trust model for `log_name` and `insert_id` attributes.** `otel_logs_dedup`
+  deduplicates on `(timestamp, time_unix_nano, service_name, log_name, insert_id)`.
+  When `logs.log_name_attribute` or the default well-known `log_name` attributes
+  (`gcp.log_name`, `logging.googleapis.com/logName`, `log.iostream`), or
+  `logs.insert_id_attribute` or the default well-known `insert_id` attributes
+  (`logging.googleapis.com/insertId`, `gcp.insert.id`, `gcp.insert_id`,
+  `log.record.uid`) are populated by upstream emitters, the pipeline trusts
+  those emitters not to collide `(log_name, insert_id)` across distinct log
+  records at the same timestamp. Multi-tenant collectors accepting untrusted
+  OTLP input should strip or namespace those attributes in a processor before
+  export.
+- **Time-bounded `v_gen_ai_logs` queries.** `v_gen_ai_logs` left-joins
+  `otel_logs_dedup` (`PARTITION BY DATE(timestamp)`) with `otel_spans_dedup`
+  (`PARTITION BY TIMESTAMP_TRUNC(start_time, HOUR)`) using
+  `(service_name, trace_id, span_id)`. Filtering `v_gen_ai_logs` on `timestamp`
+  prunes daily partitions on `otel_logs`, but because the view join does not
+  constrain `otel_spans.start_time` (and does not project `start_time`), queries
+  that need hourly partition pruning on `otel_spans` over large tables should
+  join `otel_logs_dedup` against a `start_time`-bounded `otel_spans_dedup`
+  subquery directly.
 
 ## Delivery semantics
 

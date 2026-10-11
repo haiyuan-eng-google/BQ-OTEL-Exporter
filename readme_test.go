@@ -5,6 +5,7 @@ package bigqueryexporter
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -69,6 +70,9 @@ func TestReadmeReflectsV0Alpha2Contract(t *testing.T) {
 	}
 	readme := string(raw)
 
+	spansIndexDDL := strings.TrimSpace(fmt.Sprintf(schema.SpansSearchIndexDDL, "my-project", "otel", "otel_spans"))
+	logsIndexDDL := strings.TrimSpace(fmt.Sprintf(schema.LogsSearchIndexDDL, "my-project", "otel", "otel_logs"))
+
 	for _, required := range []string{
 		"logs.log_name_attribute",
 		"logs.insert_id_attribute",
@@ -82,6 +86,19 @@ func TestReadmeReflectsV0Alpha2Contract(t *testing.T) {
 		"v_gen_ai_logs",
 		"otel_quarantine",
 		"v0alpha2",
+		"Operating v0alpha2 tables",
+		"TIMESTAMP_TRUNC(start_time, HOUR)",
+		"10,000",
+		"416",
+		"partition_expiration_days",
+		"ALTER TABLE",
+		"CREATE SEARCH INDEX",
+		"otel_spans_trace_lookup_idx",
+		"otel_logs_trace_lookup_idx",
+		"NO_OP_ANALYZER",
+		"bigquery.jobs.create",
+		spansIndexDDL,
+		logsIndexDDL,
 	} {
 		if !strings.Contains(readme, required) {
 			t.Errorf("README.md is missing v0alpha2 contract token %q", required)
