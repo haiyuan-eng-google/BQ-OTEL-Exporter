@@ -55,7 +55,13 @@ func (e *metricsExporter) pushMetricsData(ctx context.Context, md pmetric.Metric
 	decision := e.appendEncoded(ctx, encoded, pointIndex, opID)
 	if e.quarantine != nil {
 		entries := quarantineEntries(rejects, drops, rowToPoint, decision.rowErrors)
-		e.quarantineRows(ctx, transform.MetricQuarantineRows(md, entries, e.opts), opID)
+		if len(entries) > 0 {
+			qCtx, cancel := e.quarantineContext(ctx)
+			qOpts := e.opts
+			qOpts.Context = qCtx
+			e.writeQuarantine(qCtx, entries, transform.MetricQuarantineRows(md, entries, qOpts), opID)
+			cancel()
+		}
 	}
 	if decision.err == nil {
 		return nil

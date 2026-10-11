@@ -8,8 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"slices"
+	"strings"
 
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
@@ -864,6 +866,53 @@ func quarantineRowReason(row transform.Row) string {
 	}
 }
 
+// writeQuarantine writes the rows built for entries to the quarantine table
+// under ctx, the quarantine budget.
+//
+// The row builders produce one row per entry, but stop early once ctx
+// expires. The entries left without a row are counted as quarantine failures
+// here, reason by reason, and quarantineRows counts the built rows it cannot
+// write, so quarantine_failed_rows covers everything targeted for quarantine
+// that never reached the table.
+func (e *signalExporter) writeQuarantine(
+	ctx context.Context, entries []transform.QuarantineEntry, rows []transform.Row, opID string,
+) {
+	if unbuilt := len(entries) - len(rows); unbuilt > 0 {
+		missing := make(map[string]int, len(entries))
+		for _, entry := range entries {
+			missing[quarantineReasonLabel(entry.Reason)]++
+		}
+		for _, row := range rows {
+			missing[quarantineRowReason(row)]--
+		}
+		for _, reason := range slices.Sorted(maps.Keys(missing)) {
+			e.tel.RecordQuarantineFailed(ctx, reason, missing[reason])
+		}
+		e.logger.Warn("quarantine budget exhausted; unwritten quarantine rows are dropped",
+			append(diag.Fields(e.quarantineTableID(), opID), zap.Int("rows", unbuilt))...)
+	}
+	e.quarantineRows(ctx, rows, opID)
+}
+
+// quarantineReasonLabel is the reason label quarantineRowReason gives the
+// quarantine row built for a rejection with reason r.
+func quarantineReasonLabel(r transform.Reason) string {
+	return quarantineRowReason(transform.Row{"error_code": strings.ToUpper(string(r))})
+}
+
+// quarantineRowsDropped counts rows given up on because the quarantine budget
+// ran out before they were written.
+func (e *signalExporter) quarantineRowsDropped(ctx context.Context, rows []transform.Row, opID string) {
+	if len(rows) == 0 {
+		return
+	}
+	for _, row := range rows {
+		e.tel.RecordQuarantineFailed(ctx, quarantineRowReason(row), 1)
+	}
+	e.logger.Warn("quarantine budget exhausted; unwritten quarantine rows are dropped",
+		append(diag.Fields(e.quarantineTableID(), opID), zap.Int("rows", len(rows)))...)
+}
+
 // quarantineRows appends rows to the quarantine table on its dedicated stream.
 //
 // Quarantine is best effort and never changes the outcome of the push that
@@ -875,14 +924,17 @@ func (e *signalExporter) quarantineRows(ctx context.Context, rows []transform.Ro
 		return
 	}
 	if err := ctx.Err(); err != nil {
+		e.quarantineRowsDropped(ctx, rows, opID)
 		return
 	}
 	qid := e.quarantineTableID()
 	encoded := make([][]byte, 0, len(rows))
 	encodedReasons := make([]string, 0, len(rows))
+	var encodedRows []transform.Row
 	for i, row := range rows {
 		if err := ctx.Err(); err != nil {
-			break
+			e.quarantineRowsDropped(ctx, append(encodedRows, rows[i:]...), opID)
+			return
 		}
 		b, err := e.quarantineEnc.Encode(row)
 		if err != nil {
@@ -900,11 +952,13 @@ func (e *signalExporter) quarantineRows(ctx context.Context, rows []transform.Ro
 		}
 		encoded = append(encoded, b)
 		encodedReasons = append(encodedReasons, quarantineRowReason(row))
+		encodedRows = append(encodedRows, row)
 	}
 	if len(encoded) == 0 {
 		return
 	}
 	if err := ctx.Err(); err != nil {
+		e.quarantineRowsDropped(ctx, encodedRows, opID)
 		return
 	}
 

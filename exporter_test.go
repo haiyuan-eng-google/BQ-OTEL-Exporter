@@ -2386,3 +2386,152 @@ func metricInt64SumOrZero(t *testing.T, reader *sdkmetric.ManualReader, name str
 	}
 	return 0
 }
+
+// slowQuarantineStore is a payload store whose every upload outlasts a 10 ms
+// quarantine budget, and that counts the uploads it was asked for.
+func slowQuarantineStore(calls *atomic.Int32) funcBlobStore {
+	return funcBlobStore{
+		writeFn: func(ctx context.Context, _, _, _ string, _ []byte) (string, error) {
+			calls.Add(1)
+			select {
+			case <-time.After(20 * time.Millisecond):
+				return "1", nil
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		},
+	}
+}
+
+// Metric points dropped for quarantine get the same quarantine budget as spans
+// and log records: their payload uploads run under quarantine.timeout rather
+// than offload.timeout from a background context, and building rows stops once
+// the budget is spent. Every point that never reaches the quarantine table is
+// counted in quarantine_failed_rows.
+func TestPushMetricsQuarantineStopsOnceBudgetIsExhausted(t *testing.T) {
+	cfg := validConfig()
+	cfg.Quarantine.Enabled = true
+	cfg.Quarantine.Timeout = 10 * time.Millisecond
+	cfg.Offload.Enabled = true
+	cfg.Offload.Bucket = "otel-offload-bucket"
+	cfg.Offload.MinBytes = 512
+	cfg.Offload.MaxObjectBytes = 64 * 1024 * 1024
+	cfg.Limits.MaxAttributeCount = 1
+
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+	e, err := newMetricsExporter(component.TelemetrySettings{Logger: zap.NewNop(), MeterProvider: mp}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	e.offloader.SetStore(slowQuarantineStore(&calls))
+	enc, err := protoenc.New(schema.MetricsTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.enc = enc
+	e.writer = &fakeAppender{}
+	_, stream := withQuarantine(t, e.signalExporter, bqi.AppendOutcome{AcknowledgedRows: 32})
+
+	// Two attributes against a limit of one reject every point, and the large
+	// one makes each point's quarantine payload eligible for upload.
+	const count = 32
+	md := newTestMetrics(count)
+	dps := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Gauge().DataPoints()
+	for i := range dps.Len() {
+		dps.At(i).Attributes().PutStr("large", strings.Repeat("X", 2048))
+		dps.At(i).Attributes().PutStr("b", "2")
+	}
+
+	start := time.Now()
+	if err := e.pushMetricsData(context.Background(), md); err != nil {
+		t.Fatalf("pushMetricsData returned %v, want nil: every point was rejected", err)
+	}
+	elapsed := time.Since(start)
+
+	if got := calls.Load(); got > 2 {
+		t.Errorf("quarantine payload uploads = %d, want <= 2 once the 10ms budget is spent", got)
+	}
+	if elapsed > 300*time.Millisecond {
+		t.Errorf("pushMetricsData took %v, want it bounded by the 10ms quarantine budget", elapsed)
+	}
+	if stream.appended != 0 {
+		t.Errorf("quarantine appends = %d, want 0 after the budget expired", stream.appended)
+	}
+	quarantined := metricInt64SumOrZero(t, reader, "otelcol_exporter_bigquery_quarantined_rows")
+	failed := metricInt64SumOrZero(t, reader, "otelcol_exporter_bigquery_quarantine_failed_rows")
+	if quarantined != 0 || failed != count {
+		t.Errorf("quarantined_rows = %d, quarantine_failed_rows = %d, want 0 and %d", quarantined, failed, count)
+	}
+}
+
+// Spans and log records whose quarantine rows are given up on when the budget
+// runs out, whether before their row was built or before it was written, are
+// counted in quarantine_failed_rows: it covers every row targeted for
+// quarantine that never reached the table.
+func TestQuarantineBudgetExpiryCountsEveryUnwrittenRow(t *testing.T) {
+	const count = 32
+	for _, signal := range []string{"traces", "logs"} {
+		t.Run(signal, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.Quarantine.Enabled = true
+			cfg.Quarantine.Timeout = 10 * time.Millisecond
+			cfg.Offload.Enabled = true
+			cfg.Offload.Bucket = "otel-offload-bucket"
+			cfg.Offload.MinBytes = 512
+			cfg.Offload.MaxObjectBytes = 64 * 1024 * 1024
+			cfg.Limits.MaxAttributeCount = 1
+
+			reader := sdkmetric.NewManualReader()
+			mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+			t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+			set := component.TelemetrySettings{Logger: zap.NewNop(), MeterProvider: mp}
+			var calls atomic.Int32
+
+			var push func() error
+			switch signal {
+			case "traces":
+				e, err := newTracesExporter(set, cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				e.offloader.SetStore(slowQuarantineStore(&calls))
+				e.writer = &fakeAppender{}
+				withQuarantine(t, e.signalExporter, bqi.AppendOutcome{AcknowledgedRows: count})
+				td := newTestTraces(count)
+				spans := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+				for i := range spans.Len() {
+					spans.At(i).Attributes().PutStr("large", strings.Repeat("X", 2048))
+					spans.At(i).Attributes().PutStr("b", "2")
+				}
+				push = func() error { return e.pushTraceData(context.Background(), td) }
+			case "logs":
+				e, err := newLogsExporter(set, cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				e.offloader.SetStore(slowQuarantineStore(&calls))
+				e.writer = &fakeAppender{}
+				withQuarantine(t, e.signalExporter, bqi.AppendOutcome{AcknowledgedRows: count})
+				ld := logsWithBodies(make([]string, count)...)
+				records := ld.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords()
+				for i := range records.Len() {
+					records.At(i).Attributes().PutStr("large", strings.Repeat("X", 2048))
+					records.At(i).Attributes().PutStr("b", "2")
+				}
+				push = func() error { return e.pushLogData(context.Background(), ld) }
+			}
+
+			if err := push(); err != nil {
+				t.Fatalf("push returned %v, want nil: every record was rejected", err)
+			}
+			quarantined := metricInt64SumOrZero(t, reader, "otelcol_exporter_bigquery_quarantined_rows")
+			failed := metricInt64SumOrZero(t, reader, "otelcol_exporter_bigquery_quarantine_failed_rows")
+			if quarantined+failed != count || quarantined != 0 {
+				t.Errorf("quarantined_rows = %d, quarantine_failed_rows = %d, want 0 and %d", quarantined, failed, count)
+			}
+		})
+	}
+}

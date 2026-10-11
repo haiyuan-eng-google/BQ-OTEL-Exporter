@@ -648,6 +648,9 @@ func MetricQuarantineRows(md pmetric.Metrics, entries []QuarantineEntry, opts Op
 	if len(entries) == 0 {
 		return nil
 	}
+	if err := opts.context().Err(); err != nil {
+		return nil
+	}
 	byIndex := entriesByIndex(entries)
 	ingest := opts.now().UnixMicro()
 	marshaler := &pmetric.JSONMarshaler{}
@@ -662,6 +665,11 @@ func MetricQuarantineRows(md pmetric.Metrics, entries []QuarantineEntry, opts Op
 					idx++
 					group := byIndex[idx]
 					if len(group) == 0 {
+						return
+					}
+					// The visitor cannot stop the walk, so once the quarantine
+					// budget runs out every remaining point is skipped here.
+					if opts.context().Err() != nil {
 						return
 					}
 					one := pmetric.NewMetrics()
@@ -697,6 +705,9 @@ func MetricQuarantineRows(md pmetric.Metrics, entries []QuarantineEntry, opts Op
 						attrs:   attrs,
 					}
 					for _, e := range group {
+						if opts.context().Err() != nil {
+							return
+						}
 						rows = append(rows, rec.row(e, ingest, opts))
 					}
 				})

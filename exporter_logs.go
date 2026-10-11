@@ -70,10 +70,7 @@ func (e *logsExporter) pushLogData(ctx context.Context, ld plog.Logs) error {
 			qCtx, cancel := e.quarantineContext(ctx)
 			qOpts := e.opts
 			qOpts.Context = qCtx
-			rows := transform.LogQuarantineRows(ld, entries, qOpts)
-			if len(rows) > 0 && qCtx.Err() == nil {
-				e.quarantineRows(qCtx, rows, opID)
-			}
+			e.writeQuarantine(qCtx, entries, transform.LogQuarantineRows(ld, entries, qOpts), opID)
 			cancel()
 		}
 	}
