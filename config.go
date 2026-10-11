@@ -162,8 +162,8 @@ type EndpointConfig struct {
 type AutoCreateConfig struct {
 	Dataset bool `mapstructure:"dataset"`
 	Tables  bool `mapstructure:"tables"`
-	// CompanionViews also creates (and updates in place on schema upgrades)
-	// the optional companion views over the dedup views:
+	// CompanionViews creates missing companion views over the dedup views
+	// if absent; existing views are left as they are:
 	// otel_spans_as_allspans, v_gen_ai_spans, v_gen_ai_model_costs,
 	// v_gen_ai_sessions, and v_gen_ai_tool_usage with the traces table, and
 	// v_gen_ai_logs with the logs table once the traces dedup view exists.

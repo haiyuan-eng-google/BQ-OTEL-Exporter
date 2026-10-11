@@ -585,7 +585,7 @@ func TestPrepareDestinationLogsCompanionViewNeedsSpanDedupView(t *testing.T) {
 	}
 }
 
-// Companion views that already exist are updated in place via UpdateTable,
+// Companion views that already exist are preserved as-is (create-only),
 // and any other creation failure fails startup with the view named.
 func TestPrepareDestinationCompanionViewCreationResults(t *testing.T) {
 	createErr := status.Error(codes.PermissionDenied, "cannot create view")
