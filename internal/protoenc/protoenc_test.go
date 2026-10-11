@@ -4,6 +4,7 @@
 package protoenc
 
 import (
+	"context"
 	"math"
 	"strings"
 	"testing"
@@ -732,12 +733,12 @@ type stubOffloader struct {
 	refs []transform.PayloadRef
 }
 
-func (s stubOffloader) OffloadSpan(_ ptrace.Span, _ pcommon.Resource, _ pcommon.InstrumentationScope) []transform.PayloadRef {
-	return s.refs
+func (s stubOffloader) OffloadSpan(_ context.Context, _ ptrace.Span, _ pcommon.Resource, _ pcommon.InstrumentationScope) ([]transform.PayloadRef, error) {
+	return s.refs, nil
 }
 
-func (s stubOffloader) OffloadLog(_ plog.LogRecord, _ pcommon.Resource, _ pcommon.InstrumentationScope) []transform.PayloadRef {
-	return s.refs
+func (s stubOffloader) OffloadLog(_ context.Context, _ plog.LogRecord, _ pcommon.Resource, _ pcommon.InstrumentationScope) ([]transform.PayloadRef, error) {
+	return s.refs, nil
 }
 
 func TestEncodeSpanAndLogRowsWithPayloadRefs(t *testing.T) {
@@ -820,7 +821,7 @@ func TestEncodeSpanAndLogRowsWithPayloadRefs(t *testing.T) {
 	}
 
 	qo := opts()
-	qo.QuarantinePayloadOffloader = func(_ string, _ []byte) transform.ObjectRef {
+	qo.QuarantinePayloadOffloader = func(_ context.Context, _ string, _ []byte) transform.ObjectRef {
 		return ref.ObjectRef
 	}
 	qRows := transform.SpanQuarantineRows(td, []transform.QuarantineEntry{{Rejection: transform.Rejection{Index: 0, Reason: transform.ReasonRowBytes, Limit: 10, Actual: 20}}}, qo)

@@ -323,6 +323,14 @@ func TestValidateOffloadAndQuarantineHardening(t *testing.T) {
 			},
 			"offload.timeout must be positive",
 		},
+		"offload zero max_concurrency": {
+			func(c *Config) {
+				c.Offload.Enabled = true
+				c.Offload.Bucket = "my-bucket"
+				c.Offload.MaxConcurrency = 0
+			},
+			"offload.max_concurrency must be positive",
+		},
 	}
 
 	for name, tc := range rejects {

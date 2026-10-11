@@ -125,6 +125,7 @@ func newSignalExporter(
 			Authorizer:     cfg.Offload.Authorizer,
 			MinBytes:       cfg.Offload.MinBytes,
 			MaxObjectBytes: cfg.Offload.MaxObjectBytes,
+			MaxConcurrency: cfg.Offload.MaxConcurrency,
 			Timeout:        cfg.Offload.Timeout,
 		})
 		if err == nil {
@@ -667,6 +668,35 @@ func rowErrorDetail(re bqi.RowError) string {
 	return re.Code + ": " + re.Message
 }
 
+// mergeOutcomeWithOffloadFailures merges records whose payload offload failed
+// into the retryable subset so they are returned to exporterhelper for retry
+// rather than rejected or dropped.
+func (e *signalExporter) mergeOutcomeWithOffloadFailures(
+	decision appendDecision, offloadFailedIndices []int, offloadErr error, opID string,
+) appendDecision {
+	if len(offloadFailedIndices) == 0 {
+		return decision
+	}
+	e.logger.Warn("payload offload failed; returning affected records for retry",
+		append(diag.Fields(e.tableID(), opID), zap.Int("records", len(offloadFailedIndices)))...)
+	if decision.permanent {
+		return appendDecision{
+			retryableIndices: slices.Clone(offloadFailedIndices),
+			err:              errors.Join(offloadErr, decision.err),
+			rowErrors:        decision.rowErrors,
+		}
+	}
+	combinedErr := offloadErr
+	if decision.err != nil {
+		combinedErr = errors.Join(decision.err, offloadErr)
+	}
+	return appendDecision{
+		retryableIndices: mergeSortedIndices(decision.retryableIndices, offloadFailedIndices),
+		err:              combinedErr,
+		rowErrors:        decision.rowErrors,
+	}
+}
+
 // quarantineEntries lists every record a push drops permanently, indexed by
 // record position: the transform stage's rejections, the rows encodeRows
 // dropped, mapped from row positions through rowToRecord, and the rows the
@@ -688,6 +718,16 @@ func quarantineEntries(
 	return append(entries, rowErrors...)
 }
 
+// quarantineContext derives a single bounded, detached context shared across
+// quarantine payload offloading and the BigQuery quarantine stream append.
+func (e *signalExporter) quarantineContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	timeout := e.cfg.Quarantine.Timeout
+	if timeout <= 0 {
+		timeout = defaultQuarantineTimeout
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), timeout)
+}
+
 // quarantineRows appends rows to the quarantine table on its dedicated stream.
 //
 // Quarantine is best effort and never changes the outcome of the push that
@@ -698,9 +738,15 @@ func (e *signalExporter) quarantineRows(ctx context.Context, rows []transform.Ro
 	if len(rows) == 0 {
 		return
 	}
+	if err := ctx.Err(); err != nil {
+		return
+	}
 	qid := e.quarantineTableID()
 	encoded := make([][]byte, 0, len(rows))
 	for i, row := range rows {
+		if err := ctx.Err(); err != nil {
+			break
+		}
 		b, err := e.quarantineEnc.Encode(row)
 		if err != nil {
 			e.logger.Debug("dropping quarantine row that failed serialization",
@@ -718,13 +764,16 @@ func (e *signalExporter) quarantineRows(ctx context.Context, rows []transform.Ro
 	if len(encoded) == 0 {
 		return
 	}
-
-	timeout := e.cfg.Quarantine.Timeout
-	if timeout <= 0 {
-		timeout = defaultQuarantineTimeout
+	if err := ctx.Err(); err != nil {
+		return
 	}
-	qCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
-	defer cancel()
+
+	qCtx := ctx
+	if _, hasDeadline := qCtx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		qCtx, cancel = e.quarantineContext(ctx)
+		defer cancel()
+	}
 
 	out := e.quarantine.Append(qCtx, encoded)
 	if out.Err == nil && len(out.RowErrors) == 0 {

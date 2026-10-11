@@ -41,13 +41,24 @@ func (e *logsExporter) shutdown(ctx context.Context) error {
 func (e *logsExporter) pushLogData(ctx context.Context, ld plog.Logs) error {
 	opID := diag.OperationID()
 
-	rows, rejects := transform.LogRows(ld, e.opts)
+	var offloadFailedIndices []int
+	var offloadErr error
+	opts := e.opts
+	opts.Context = ctx
+	opts.OnOffloadError = func(index int, err error) {
+		offloadFailedIndices = append(offloadFailedIndices, index)
+		if offloadErr == nil {
+			offloadErr = err
+		}
+	}
+
+	rows, rejects := transform.LogRows(ld, opts)
 	e.recordRejections(ctx, rejects, opID)
 
 	encoded, keptIndex, drops := e.encodeRows(ctx, rows, opID)
 
 	recordIndex := make([]int, len(keptIndex))
-	rowToRecord := rowPositionToRecordIndex(len(rows), rejects)
+	rowToRecord := rowPositionToRecordIndex(len(rows), rejects, offloadFailedIndices...)
 	for i, ri := range keptIndex {
 		recordIndex[i] = rowToRecord[ri]
 	}
@@ -55,8 +66,18 @@ func (e *logsExporter) pushLogData(ctx context.Context, ld plog.Logs) error {
 	decision := e.appendEncoded(ctx, encoded, recordIndex, opID)
 	if e.quarantine != nil {
 		entries := quarantineEntries(rejects, drops, rowToRecord, decision.rowErrors)
-		e.quarantineRows(ctx, transform.LogQuarantineRows(ld, entries, e.opts), opID)
+		if len(entries) > 0 {
+			qCtx, cancel := e.quarantineContext(ctx)
+			qOpts := e.opts
+			qOpts.Context = qCtx
+			rows := transform.LogQuarantineRows(ld, entries, qOpts)
+			if len(rows) > 0 && qCtx.Err() == nil {
+				e.quarantineRows(qCtx, rows, opID)
+			}
+			cancel()
+		}
 	}
+	decision = e.mergeOutcomeWithOffloadFailures(decision, offloadFailedIndices, offloadErr, opID)
 	if decision.err == nil {
 		return nil
 	}
@@ -71,7 +92,10 @@ func (e *logsExporter) pushLogData(ctx context.Context, ld plog.Logs) error {
 	// fingerprinted afresh, so a retried record keeps its intra_batch_ordinal,
 	// and with it its insert_id, only if the identical records ahead of it
 	// travel along.
-	retry := transform.PreserveLogOrdinalPeers(ld,
-		validRecordIndices(recordIndex, decision.rowErrors), decision.retryableIndices)
+	candidates := validRecordIndices(recordIndex, decision.rowErrors)
+	if len(offloadFailedIndices) > 0 {
+		candidates = mergeSortedIndices(candidates, offloadFailedIndices)
+	}
+	retry := transform.PreserveLogOrdinalPeers(ld, candidates, decision.retryableIndices)
 	return consumererror.NewLogs(decision.err, transform.SelectLogs(ld, retry))
 }

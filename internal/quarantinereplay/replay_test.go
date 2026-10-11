@@ -147,12 +147,24 @@ func TestReplayJSONArrayAndJSONWriterSink(t *testing.T) {
 }
 
 func TestGCSObjectFetcher(t *testing.T) {
-	wantPayload := sampleSpanJSON(t, "gcs-fetched-span")
+	livePayload := sampleSpanJSON(t, "gcs-live-span")
+	genPayload := sampleSpanJSON(t, "gcs-gen-42-span")
+	var lastQuery string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lastQuery = r.URL.RawQuery
 		if r.URL.Path != "/storage/v1/b/my-q-bucket/o/path/to/span.json" {
 			t.Errorf("unexpected path %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
 		}
-		_, _ = w.Write([]byte(wantPayload))
+		switch r.URL.Query().Get("generation") {
+		case "":
+			_, _ = w.Write([]byte(livePayload))
+		case "42":
+			_, _ = w.Write([]byte(genPayload))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
 	}))
 	defer srv.Close()
 
@@ -170,14 +182,90 @@ func TestGCSObjectFetcher(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetcher() error = %v", err)
 	}
-	if string(got) != wantPayload {
-		t.Errorf("fetched payload = %q, want %q", string(got), wantPayload)
+	if string(got) != livePayload {
+		t.Errorf("fetched payload = %q, want %q", string(got), livePayload)
 	}
+
+	gotGen, err := fetcher(context.Background(), "gs://my-q-bucket/path/to/span.json?generation=42")
+	if err != nil {
+		t.Fatalf("fetcher(generation=42) error = %v", err)
+	}
+	if string(gotGen) != genPayload || !strings.Contains(lastQuery, "generation=42") {
+		t.Errorf("fetched generation payload = %q (query=%q), want %q with generation=42", string(gotGen), lastQuery, genPayload)
+	}
+
+	// Missing generation must fail rather than reading the live object.
+	if _, err := fetcher(context.Background(), "gs://my-q-bucket/path/to/span.json?generation=999"); err == nil {
+		t.Error("expected error when requested generation returns HTTP 404")
+	}
+
 	if _, err := fetcher(context.Background(), "https://not-gs/bucket/obj"); err == nil {
 		t.Error("expected error for non-gs:// URI")
 	}
 	if _, err := fetcher(context.Background(), "gs://bucket-only/"); err == nil {
 		t.Error("expected error for gs:// URI without object key")
+	}
+}
+
+func TestReplayForwardsPayloadRefGeneration(t *testing.T) {
+	genPayload := sampleSpanJSON(t, "pinned-generation-span")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/storage/v1/b/q-bucket/o/quarantine/spans/item.json" && r.URL.Query().Get("generation") == "777" {
+			_, _ = w.Write([]byte(genPayload))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	fetcher, cleanup, err := NewGCSObjectFetcher(
+		context.Background(),
+		option.WithEndpoint(srv.URL),
+		option.WithoutAuthentication(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	records := []Record{
+		{
+			IngestTime: "2026-10-11T12:00:00Z",
+			Signal:     "spans",
+			ErrorCode:  "OVERSIZE_ROW",
+			PayloadRef: &ObjectRef{
+				URI:     "gs://q-bucket/quarantine/spans/item.json",
+				Version: "777",
+			},
+		},
+		{
+			IngestTime: "2026-10-11T12:01:00Z",
+			Signal:     "spans",
+			ErrorCode:  "OVERSIZE_ROW",
+			PayloadRef: &ObjectRef{
+				URI:     "gs://q-bucket/quarantine/spans/item.json",
+				Version: "888-deleted",
+			},
+		},
+	}
+	rawInput, err := json.Marshal(records)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sink := NewMemorySink()
+	sum, err := Replay(context.Background(), bytes.NewReader(rawInput), sink, Options{
+		ObjectFetcher: fetcher,
+	})
+	if err == nil {
+		t.Fatal("expected error for unavailable generation 888-deleted")
+	}
+	if sum.ReplayedSpans != 1 || sum.FailedUnmarshal != 1 || len(sink.Traces) != 1 {
+		t.Fatalf("Summary = %+v, sink.Traces = %d, want ReplayedSpans=1 FailedUnmarshal=1", sum, len(sink.Traces))
+	}
+	gotName := sink.Traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Name()
+	if gotName != "pinned-generation-span" {
+		t.Errorf("replayed span name = %q, want pinned-generation-span", gotName)
 	}
 }
 

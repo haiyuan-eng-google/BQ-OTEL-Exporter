@@ -184,6 +184,8 @@ func TestPreserveLogOrdinalPeers(t *testing.T) {
 		{"a record that was not sent never comes back", []int{1, 2, 3}, []int{2}, []int{2}},
 		{"candidates in any order give ascending indices", []int{5, 4, 3, 2, 1, 0}, []int{4}, []int{3, 4}},
 		{"a retried record missing from the candidates is kept", []int{0, 2}, []int{1}, []int{1}},
+		{"a retried peer missing from candidates widens candidates in same group", []int{2}, []int{0}, []int{0, 2}},
+		{"offload failed retryable index alongside accepted peer candidate", []int{0, 2}, []int{0}, []int{0, 2}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

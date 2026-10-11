@@ -34,11 +34,12 @@ import (
 )
 
 const (
-	defaultPrefix      = "otel-offload"
-	defaultTimeout     = 10 * time.Second
-	defaultGCSEndpoint = "https://storage.googleapis.com"
-	gcsReadWriteScope  = "https://www.googleapis.com/auth/devstorage.read_write"
-	storageModeGCS     = "gcs_object_ref"
+	defaultPrefix         = "otel-offload"
+	defaultTimeout        = 10 * time.Second
+	defaultMaxConcurrency = 8
+	defaultGCSEndpoint    = "https://storage.googleapis.com"
+	gcsReadWriteScope     = "https://www.googleapis.com/auth/devstorage.read_write"
+	storageModeGCS        = "gcs_object_ref"
 )
 
 // BlobStore writes an object to cloud object storage and returns its storage
@@ -79,6 +80,12 @@ func NewGCSBlobStore(ctx context.Context, opts ...option.ClientOption) (*GCSBlob
 
 // WriteObject uploads data to gs://bucket/object via the GCS JSON media upload
 // endpoint and returns the resulting object generation.
+//
+// Because offload keys are content-addressed by SHA-256, WriteObject sends
+// ifGenerationMatch=0 so a repeated upload of identical content does not
+// overwrite the existing object or churn its generation. On HTTP 412
+// (Precondition Failed), WriteObject fetches and returns the existing object's
+// generation.
 func (s *GCSBlobStore) WriteObject(
 	ctx context.Context, bucket, object string, contentType string, data []byte,
 ) (string, error) {
@@ -86,7 +93,7 @@ func (s *GCSBlobStore) WriteObject(
 		return "", errors.New("GCS blob store is not initialized")
 	}
 	uploadURL := fmt.Sprintf(
-		"%s/upload/storage/v1/b/%s/o?uploadType=media&name=%s",
+		"%s/upload/storage/v1/b/%s/o?uploadType=media&ifGenerationMatch=0&name=%s",
 		s.baseURL,
 		url.PathEscape(bucket),
 		url.QueryEscape(object),
@@ -107,6 +114,9 @@ func (s *GCSBlobStore) WriteObject(
 	defer func() { _ = resp.Body.Close() }()
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode == http.StatusPreconditionFailed {
+		return s.fetchExistingGeneration(ctx, bucket, object, int64(len(data)))
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", fmt.Errorf("GCS upload returned HTTP %d", resp.StatusCode)
 	}
@@ -115,6 +125,49 @@ func (s *GCSBlobStore) WriteObject(
 		Generation string `json:"generation"`
 	}
 	_ = json.Unmarshal(body, &meta)
+	return meta.Generation, nil
+}
+
+func (s *GCSBlobStore) fetchExistingGeneration(
+	ctx context.Context, bucket, object string, wantSize int64,
+) (string, error) {
+	metaURL := fmt.Sprintf(
+		"%s/storage/v1/b/%s/o/%s",
+		s.baseURL,
+		url.PathEscape(bucket),
+		url.PathEscape(object),
+	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metaURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("building GCS metadata request: %w", err)
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("fetching existing GCS object metadata: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("GCS metadata lookup after HTTP 412 returned HTTP %d", resp.StatusCode)
+	}
+	var meta struct {
+		Generation string `json:"generation"`
+		Size       string `json:"size"`
+	}
+	if err := json.Unmarshal(body, &meta); err != nil {
+		return "", fmt.Errorf("decoding existing GCS object metadata: %w", err)
+	}
+	if meta.Size != "" {
+		gotSize, perr := strconv.ParseInt(meta.Size, 10, 64)
+		if perr != nil {
+			return "", fmt.Errorf("parsing existing GCS object size %q: %w", meta.Size, perr)
+		}
+		if gotSize != wantSize {
+			return "", fmt.Errorf("existing GCS object %q size %d does not match upload size %d",
+				object, gotSize, wantSize)
+		}
+	}
 	return meta.Generation, nil
 }
 
@@ -157,7 +210,8 @@ func (m *MemoryBlobStore) SetError(err error) {
 	m.failErr = err
 }
 
-// WriteObject stores data in memory under bucket/object.
+// WriteObject stores data in memory under bucket/object, preserving the
+// existing generation when the same content-addressed key is written again.
 func (m *MemoryBlobStore) WriteObject(
 	ctx context.Context, bucket, object string, contentType string, data []byte,
 ) (string, error) {
@@ -169,9 +223,15 @@ func (m *MemoryBlobStore) WriteObject(
 	if m.failErr != nil {
 		return "", m.failErr
 	}
+	key := bucket + "/" + object
+	if existing, ok := m.objects[key]; ok {
+		if !bytes.Equal(existing.Data, data) {
+			return "", fmt.Errorf("existing memory object %q content mismatch", key)
+		}
+		return existing.Version, nil
+	}
 	m.seq++
 	ver := strconv.FormatInt(m.seq, 10)
-	key := bucket + "/" + object
 	m.objects[key] = MemoryObject{
 		Bucket:      bucket,
 		Object:      object,
@@ -204,6 +264,7 @@ type Options struct {
 	Authorizer     string
 	MinBytes       int
 	MaxObjectBytes int
+	MaxConcurrency int
 	Timeout        time.Duration
 	Now            func() time.Time
 }
@@ -218,6 +279,8 @@ type Offloader struct {
 	authorizer     string
 	minBytes       int
 	maxObjectBytes int
+	maxConcurrency int
+	sem            chan struct{}
 	timeout        time.Duration
 	now            func() time.Time
 }
@@ -239,6 +302,10 @@ func New(store BlobStore, opts Options) (*Offloader, error) {
 	if opts.Prefix == "" {
 		prefix = defaultPrefix
 	}
+	maxConcurrency := opts.MaxConcurrency
+	if maxConcurrency <= 0 {
+		maxConcurrency = defaultMaxConcurrency
+	}
 	timeout := opts.Timeout
 	if timeout <= 0 {
 		timeout = defaultTimeout
@@ -254,9 +321,17 @@ func New(store BlobStore, opts Options) (*Offloader, error) {
 		authorizer:     opts.Authorizer,
 		minBytes:       opts.MinBytes,
 		maxObjectBytes: opts.MaxObjectBytes,
+		maxConcurrency: maxConcurrency,
+		sem:            make(chan struct{}, maxConcurrency),
 		timeout:        timeout,
 		now:            nowFn,
 	}, nil
+}
+
+// MaxConcurrency returns the maximum number of concurrent object-store uploads
+// permitted by this Offloader.
+func (o *Offloader) MaxConcurrency() int {
+	return o.maxConcurrency
 }
 
 // SetStore replaces the underlying BlobStore in a thread-safe manner.
@@ -282,54 +357,67 @@ func (o *Offloader) Close() error {
 	return nil
 }
 
+type offloadCandidate struct {
+	value       pcommon.Value
+	attrPath    string
+	contentType string
+	data        []byte
+}
+
 // OffloadSpan inspects a working span, resource, and instrumentation scope,
 // offloading eligible large values to object storage and replacing them with
-// URI placeholders.
+// URI placeholders. Any upload failure is returned immediately so the caller
+// can surface the span as retryable rather than rejecting it.
 func (o *Offloader) OffloadSpan(
-	span ptrace.Span, resource pcommon.Resource, scope pcommon.InstrumentationScope,
-) []transform.PayloadRef {
-	var refs []transform.PayloadRef
-	o.offloadMap(schema.SignalSpans, resource.Attributes(), "resource.attributes", &refs)
-	o.offloadMap(schema.SignalSpans, scope.Attributes(), "instrumentation_scope.attributes", &refs)
-	o.offloadMap(schema.SignalSpans, span.Attributes(), "attributes", &refs)
+	ctx context.Context, span ptrace.Span, resource pcommon.Resource, scope pcommon.InstrumentationScope,
+) ([]transform.PayloadRef, error) {
+	ctx = transform.WithBatchUploadCache(ctx)
+	var candidates []offloadCandidate
+	o.collectMap(resource.Attributes(), "resource.attributes", &candidates)
+	o.collectMap(scope.Attributes(), "instrumentation_scope.attributes", &candidates)
+	o.collectMap(span.Attributes(), "attributes", &candidates)
 	for i := 0; i < span.Events().Len(); i++ {
-		o.offloadMap(schema.SignalSpans, span.Events().At(i).Attributes(), fmt.Sprintf("events[%d].attributes", i), &refs)
+		o.collectMap(span.Events().At(i).Attributes(), fmt.Sprintf("events[%d].attributes", i), &candidates)
 	}
 	for i := 0; i < span.Links().Len(); i++ {
-		o.offloadMap(schema.SignalSpans, span.Links().At(i).Attributes(), fmt.Sprintf("links[%d].attributes", i), &refs)
+		o.collectMap(span.Links().At(i).Attributes(), fmt.Sprintf("links[%d].attributes", i), &candidates)
 	}
-	return refs
+	return o.uploadCandidates(ctx, schema.SignalSpans, candidates)
 }
 
 // OffloadLog inspects a working log record, resource, and instrumentation
 // scope, offloading an eligible large body or attributes to object storage and
-// replacing them with URI placeholders.
+// replacing them with URI placeholders. Any upload failure is returned
+// immediately so the caller can surface the log record as retryable rather than
+// rejecting it.
 func (o *Offloader) OffloadLog(
-	lr plog.LogRecord, resource pcommon.Resource, scope pcommon.InstrumentationScope,
-) []transform.PayloadRef {
-	var refs []transform.PayloadRef
-	o.offloadValue(schema.SignalLogs, lr.Body(), "body", &refs)
-	o.offloadMap(schema.SignalLogs, resource.Attributes(), "resource.attributes", &refs)
-	o.offloadMap(schema.SignalLogs, scope.Attributes(), "instrumentation_scope.attributes", &refs)
-	o.offloadMap(schema.SignalLogs, lr.Attributes(), "attributes", &refs)
-	return refs
+	ctx context.Context, lr plog.LogRecord, resource pcommon.Resource, scope pcommon.InstrumentationScope,
+) ([]transform.PayloadRef, error) {
+	ctx = transform.WithBatchUploadCache(ctx)
+	var candidates []offloadCandidate
+	o.collectValue(lr.Body(), "body", &candidates)
+	o.collectMap(resource.Attributes(), "resource.attributes", &candidates)
+	o.collectMap(scope.Attributes(), "instrumentation_scope.attributes", &candidates)
+	o.collectMap(lr.Attributes(), "attributes", &candidates)
+	return o.uploadCandidates(ctx, schema.SignalLogs, candidates)
 }
 
 // OffloadQuarantine uploads an eligible quarantined OTLP JSON payload to
-// object storage and returns its ObjectRef, or a zero ObjectRef if the payload
-// is outside the offload threshold or the upload fails.
-func (o *Offloader) OffloadQuarantine(signal string, payload []byte) transform.ObjectRef {
+// object storage under ctx and returns its ObjectRef, or a zero ObjectRef if
+// the payload is outside the offload threshold or the upload fails.
+func (o *Offloader) OffloadQuarantine(ctx context.Context, signal string, payload []byte) transform.ObjectRef {
 	if len(payload) < o.minBytes || len(payload) > o.maxObjectBytes {
 		return transform.ObjectRef{}
 	}
-	ref, ok := o.upload("quarantine/"+signal, "application/json", payload, "raw_payload", ".json")
-	if !ok {
+	ctx = transform.WithBatchUploadCache(ctx)
+	ref, err := o.upload(ctx, "quarantine/"+signal, "application/json", payload, "raw_payload", ".json")
+	if err != nil {
 		return transform.ObjectRef{}
 	}
 	return ref.ObjectRef
 }
 
-func (o *Offloader) offloadMap(signal string, m pcommon.Map, basePath string, refs *[]transform.PayloadRef) {
+func (o *Offloader) collectMap(m pcommon.Map, basePath string, candidates *[]offloadCandidate) {
 	if m.Len() == 0 {
 		return
 	}
@@ -344,49 +432,111 @@ func (o *Offloader) offloadMap(signal string, m pcommon.Map, basePath string, re
 		if !ok {
 			continue
 		}
-		o.offloadValue(signal, v, basePath+"."+k, refs)
+		o.collectValue(v, basePath+"."+k, candidates)
 	}
 }
 
-func (o *Offloader) offloadValue(signal string, v pcommon.Value, attrPath string, refs *[]transform.PayloadRef) {
+func (o *Offloader) collectValue(v pcommon.Value, attrPath string, candidates *[]offloadCandidate) {
 	switch v.Type() {
 	case pcommon.ValueTypeStr:
 		s := v.Str()
 		if len(s) < o.minBytes || len(s) > o.maxObjectBytes {
 			return
 		}
-		if ref, ok := o.upload(signal, "text/plain; charset=utf-8", []byte(s), attrPath, ""); ok {
-			v.SetStr(fmt.Sprintf("<offloaded:%s>", ref.ObjectRef.URI))
-			*refs = append(*refs, ref)
-		}
+		*candidates = append(*candidates, offloadCandidate{
+			value:       v,
+			attrPath:    attrPath,
+			contentType: "text/plain; charset=utf-8",
+			data:        []byte(s),
+		})
 
 	case pcommon.ValueTypeBytes:
 		raw := v.Bytes().AsRaw()
 		if len(raw) < o.minBytes || len(raw) > o.maxObjectBytes {
 			return
 		}
-		if ref, ok := o.upload(signal, "application/octet-stream", raw, attrPath, ""); ok {
-			v.SetStr(fmt.Sprintf("<offloaded:%s>", ref.ObjectRef.URI))
-			*refs = append(*refs, ref)
-		}
+		*candidates = append(*candidates, offloadCandidate{
+			value:       v,
+			attrPath:    attrPath,
+			contentType: "application/octet-stream",
+			data:        raw,
+		})
 
 	case pcommon.ValueTypeMap:
-		o.offloadMap(signal, v.Map(), attrPath, refs)
+		o.collectMap(v.Map(), attrPath, candidates)
 
 	case pcommon.ValueTypeSlice:
 		sl := v.Slice()
 		for i := 0; i < sl.Len(); i++ {
-			o.offloadValue(signal, sl.At(i), fmt.Sprintf("%s[%d]", attrPath, i), refs)
+			o.collectValue(sl.At(i), fmt.Sprintf("%s[%d]", attrPath, i), candidates)
 		}
 	}
 }
 
+func (o *Offloader) uploadCandidates(
+	ctx context.Context, signal string, candidates []offloadCandidate,
+) ([]transform.PayloadRef, error) {
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	if len(candidates) == 1 || o.maxConcurrency <= 1 {
+		refs := make([]transform.PayloadRef, 0, len(candidates))
+		for _, c := range candidates {
+			ref, err := o.upload(ctx, signal, c.contentType, c.data, c.attrPath, "")
+			if err != nil {
+				return nil, err
+			}
+			c.value.SetStr(fmt.Sprintf("<offloaded:%s>", ref.ObjectRef.URI))
+			refs = append(refs, ref)
+		}
+		return refs, nil
+	}
+
+	refs := make([]transform.PayloadRef, len(candidates))
+	errs := make([]error, len(candidates))
+	workers := min(o.maxConcurrency, len(candidates))
+	jobs := make(chan int, len(candidates))
+	for i := range candidates {
+		jobs <- i
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				c := candidates[i]
+				refs[i], errs[i] = o.upload(ctx, signal, c.contentType, c.data, c.attrPath, "")
+			}
+		}()
+	}
+	wg.Wait()
+
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
+		}
+	}
+	for i, c := range candidates {
+		c.value.SetStr(fmt.Sprintf("<offloaded:%s>", refs[i].ObjectRef.URI))
+	}
+	return refs, nil
+}
+
 func (o *Offloader) upload(
-	signal, contentType string, data []byte, attrPath, ext string,
-) (transform.PayloadRef, bool) {
+	ctx context.Context, signal, contentType string, data []byte, attrPath, ext string,
+) (transform.PayloadRef, error) {
 	store := o.Store()
 	if store == nil {
-		return transform.PayloadRef{}, false
+		return transform.PayloadRef{}, errors.New("offload blob store is not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return transform.PayloadRef{}, err
 	}
 
 	sum := sha256.Sum256(data)
@@ -400,12 +550,22 @@ func (o *Offloader) upload(
 		objectKey = fmt.Sprintf("%s/%s/%s%s", signal, datePart, sumHex, ext)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), o.timeout)
-	defer cancel()
-
-	version, err := store.WriteObject(ctx, o.bucket, objectKey, contentType, data)
+	cacheKey := o.bucket + "/" + objectKey
+	version, err := transform.BatchUploadCacheFromContext(ctx).Do(ctx, cacheKey, func() (string, error) {
+		if o.sem != nil {
+			select {
+			case o.sem <- struct{}{}:
+				defer func() { <-o.sem }()
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		}
+		uploadCtx, cancel := context.WithTimeout(ctx, o.timeout)
+		defer cancel()
+		return store.WriteObject(uploadCtx, o.bucket, objectKey, contentType, data)
+	})
 	if err != nil {
-		return transform.PayloadRef{}, false
+		return transform.PayloadRef{}, err
 	}
 
 	uri := fmt.Sprintf("gs://%s/%s", o.bucket, objectKey)
@@ -423,5 +583,5 @@ func (o *Offloader) upload(
 			Authorizer: o.authorizer,
 			Details:    details,
 		},
-	}, true
+	}, nil
 }

@@ -274,13 +274,30 @@ func resolvePayload(ctx context.Context, rec Record, fetcher ObjectFetcher) ([]b
 		if fetcher == nil {
 			return nil, false, fmt.Errorf("payload_ref %q requires an ObjectFetcher", rec.PayloadRef.URI)
 		}
-		b, err := fetcher(ctx, rec.PayloadRef.URI)
+		uri := strings.TrimSpace(rec.PayloadRef.URI)
+		if ver := strings.TrimSpace(rec.PayloadRef.Version); ver != "" && !hasGenerationParam(uri) {
+			sep := "?"
+			if strings.Contains(uri, "?") {
+				sep = "&"
+			}
+			uri = uri + sep + "generation=" + url.QueryEscape(ver)
+		}
+		b, err := fetcher(ctx, uri)
 		if err != nil {
 			return nil, false, err
 		}
 		return b, true, nil
 	}
 	return nil, false, nil
+}
+
+func hasGenerationParam(uri string) bool {
+	_, rawQuery, ok := strings.Cut(uri, "?")
+	if !ok {
+		return false
+	}
+	vals, err := url.ParseQuery(rawQuery)
+	return err == nil && strings.TrimSpace(vals.Get("generation")) != ""
 }
 
 // ReadRecords parses quarantine records from either a JSON array (such as
@@ -443,7 +460,7 @@ func NewGCSObjectFetcher(ctx context.Context, opts ...option.ClientOption) (Obje
 	}
 
 	fetcher := func(reqCtx context.Context, uri string) ([]byte, error) {
-		bucket, object, perr := parseGSURI(uri)
+		bucket, object, generation, perr := parseGSURI(uri)
 		if perr != nil {
 			return nil, perr
 		}
@@ -453,6 +470,9 @@ func NewGCSObjectFetcher(ctx context.Context, opts ...option.ClientOption) (Obje
 			url.PathEscape(bucket),
 			url.PathEscape(object),
 		)
+		if generation != "" {
+			downloadURL += "&generation=" + url.QueryEscape(generation)
+		}
 		req, rerr := http.NewRequestWithContext(reqCtx, http.MethodGet, downloadURL, nil)
 		if rerr != nil {
 			return nil, rerr
@@ -473,14 +493,26 @@ func NewGCSObjectFetcher(ctx context.Context, opts ...option.ClientOption) (Obje
 	return fetcher, cleanup, nil
 }
 
-func parseGSURI(uri string) (bucket, object string, err error) {
+func parseGSURI(uri string) (bucket, object, generation string, err error) {
 	if !strings.HasPrefix(uri, "gs://") {
-		return "", "", fmt.Errorf("unsupported URI scheme in %q (expected gs://)", uri)
+		return "", "", "", fmt.Errorf("unsupported URI scheme in %q (expected gs://)", uri)
 	}
 	rest := strings.TrimPrefix(uri, "gs://")
+	var rawQuery string
+	if pathPart, q, hasQuery := strings.Cut(rest, "?"); hasQuery {
+		rest = pathPart
+		rawQuery = q
+	}
 	slash := strings.IndexByte(rest, '/')
 	if slash <= 0 || slash == len(rest)-1 {
-		return "", "", fmt.Errorf("invalid gs:// URI %q", uri)
+		return "", "", "", fmt.Errorf("invalid gs:// URI %q", uri)
 	}
-	return rest[:slash], rest[slash+1:], nil
+	if rawQuery != "" {
+		vals, qerr := url.ParseQuery(rawQuery)
+		if qerr != nil {
+			return "", "", "", fmt.Errorf("invalid query in gs:// URI %q: %w", uri, qerr)
+		}
+		generation = strings.TrimSpace(vals.Get("generation"))
+	}
+	return rest[:slash], rest[slash+1:], generation, nil
 }

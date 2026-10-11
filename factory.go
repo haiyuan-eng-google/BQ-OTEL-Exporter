@@ -33,6 +33,7 @@ const (
 	defaultOffloadPrefix         = "otel-offload"
 	defaultOffloadMinBytes       = 256 * 1024
 	defaultOffloadMaxObjectBytes = 64 * 1024 * 1024
+	defaultOffloadMaxConcurrency = 8
 	defaultOffloadTimeout        = 10 * time.Second
 
 	// defaultMaxRequestBytes leaves headroom under the Storage Write API
@@ -116,6 +117,7 @@ func createDefaultConfig() component.Config {
 			Prefix:         defaultOffloadPrefix,
 			MinBytes:       defaultOffloadMinBytes,
 			MaxObjectBytes: defaultOffloadMaxObjectBytes,
+			MaxConcurrency: defaultOffloadMaxConcurrency,
 			Timeout:        defaultOffloadTimeout,
 		},
 	}

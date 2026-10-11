@@ -241,6 +241,8 @@ type OffloadConfig struct {
 	MinBytes int `mapstructure:"min_bytes"`
 	// MaxObjectBytes is the maximum byte length eligible for offloading.
 	MaxObjectBytes int `mapstructure:"max_object_bytes"`
+	// MaxConcurrency bounds concurrent GCS uploads within an offload batch.
+	MaxConcurrency int `mapstructure:"max_concurrency"`
 	// Timeout bounds each object upload attempt.
 	Timeout time.Duration `mapstructure:"timeout"`
 }
@@ -466,6 +468,9 @@ func (cfg *Config) validateOffload() []error {
 		errs = append(errs, fmt.Errorf(
 			"offload.max_object_bytes (%d) must be at least offload.min_bytes (%d)",
 			o.MaxObjectBytes, o.MinBytes))
+	}
+	if o.MaxConcurrency <= 0 {
+		errs = append(errs, errors.New("offload.max_concurrency must be positive when offload.enabled is set"))
 	}
 	if o.Timeout <= 0 {
 		errs = append(errs, errors.New("offload.timeout must be positive when offload.enabled is set"))
