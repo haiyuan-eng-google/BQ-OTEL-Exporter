@@ -1,0 +1,43 @@
+{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          {"key": "service.name", "value": {"stringValue": "openai-triage-agent"}},
+          {"key": "service.version", "value": {"stringValue": "0.20.0"}}
+        ]
+      },
+      "scopeLogs": [
+        {
+          "scope": {
+            "name": "opentelemetry.instrumentation.genai.openai",
+            "version": "1.0b0"
+          },
+          "logRecords": [
+            {
+              "timeUnixNano": "1723420830100000000",
+              "observedTimeUnixNano": "1723420830110000000",
+              "severityNumber": 9,
+              "severityText": "INFO",
+              "eventName": "gen_ai.user.message",
+              "traceId": "440102030405060708090a0b0c0d0e04",
+              "spanId": "4401020304050601",
+              "body": {
+                "kvlistValue": {
+                  "values": [
+                    {"key": "role", "value": {"stringValue": "user"}},
+                    {"key": "content", "value": {"stringValue": "Check invoice #1042"}}
+                  ]
+                }
+              },
+              "attributes": [
+                {"key": "gen_ai.system", "value": {"stringValue": "openai"}},
+                {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-oai-88"}}
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

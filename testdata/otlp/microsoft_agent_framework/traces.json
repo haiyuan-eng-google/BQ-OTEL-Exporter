@@ -1,0 +1,41 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {"key": "service.name", "value": {"stringValue": "maf-orchestrator"}},
+          {"key": "service.version", "value": {"stringValue": "1.12.0"}}
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "agent_framework.observability",
+            "version": "1.12.0"
+          },
+          "spans": [
+            {
+              "traceId": "770102030405060708090a0b0c0d0e07",
+              "spanId": "7701020304050601",
+              "name": "invoke_agent support_orchestrator",
+              "kind": 1,
+              "startTimeUnixNano": "1723420860000000000",
+              "endTimeUnixNano": "1723420861400000000",
+              "attributes": [
+                {"key": "gen_ai.system", "value": {"stringValue": "microsoft.agent_framework"}},
+                {"key": "gen_ai.operation.name", "value": {"stringValue": "invoke_agent"}},
+                {"key": "gen_ai.agent.name", "value": {"stringValue": "support_orchestrator"}},
+                {"key": "gen_ai.agent.id", "value": {"stringValue": "maf-agent-09"}},
+                {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-maf-303"}},
+                {"key": "gen_ai.request.model", "value": {"stringValue": "gpt-4o"}},
+                {"key": "gen_ai.usage.input_tokens", "value": {"intValue": "480"}},
+                {"key": "gen_ai.usage.output_tokens", "value": {"intValue": "210"}}
+              ],
+              "status": {"code": 1}
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

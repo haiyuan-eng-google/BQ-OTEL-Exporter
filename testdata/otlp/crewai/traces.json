@@ -1,0 +1,41 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {"key": "service.name", "value": {"stringValue": "crewai-analyst-crew"}},
+          {"key": "service.version", "value": {"stringValue": "1.15.15"}}
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "openinference.instrumentation.crewai",
+            "version": "1.1.12"
+          },
+          "spans": [
+            {
+              "traceId": "550102030405060708090a0b0c0d0e05",
+              "spanId": "5501020304050601",
+              "name": "Crew.kickoff",
+              "kind": 1,
+              "startTimeUnixNano": "1723420840000000000",
+              "endTimeUnixNano": "1723420842200000000",
+              "attributes": [
+                {"key": "gen_ai.system", "value": {"stringValue": "crewai"}},
+                {"key": "gen_ai.operation.name", "value": {"stringValue": "invoke_agent"}},
+                {"key": "gen_ai.agent.name", "value": {"stringValue": "senior_market_analyst"}},
+                {"key": "gen_ai.conversation.id", "value": {"stringValue": "crew-run-501"}},
+                {"key": "gen_ai.request.model", "value": {"stringValue": "gpt-4o-mini"}},
+                {"key": "gen_ai.usage.input_tokens", "value": {"intValue": "920"}},
+                {"key": "gen_ai.usage.output_tokens", "value": {"intValue": "410"}},
+                {"key": "openinference.span.kind", "value": {"stringValue": "AGENT"}}
+              ],
+              "status": {"code": 1}
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

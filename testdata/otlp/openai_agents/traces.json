@@ -1,0 +1,42 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {"key": "service.name", "value": {"stringValue": "openai-triage-agent"}},
+          {"key": "service.version", "value": {"stringValue": "0.20.0"}}
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "opentelemetry.instrumentation.openai_agents",
+            "version": "1.0b0"
+          },
+          "spans": [
+            {
+              "traceId": "440102030405060708090a0b0c0d0e04",
+              "spanId": "4401020304050601",
+              "name": "chat gpt-4o",
+              "kind": 3,
+              "startTimeUnixNano": "1723420830000000000",
+              "endTimeUnixNano": "1723420830900000000",
+              "attributes": [
+                {"key": "gen_ai.system", "value": {"stringValue": "openai"}},
+                {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                {"key": "gen_ai.agent.name", "value": {"stringValue": "billing_triage"}},
+                {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-oai-88"}},
+                {"key": "gen_ai.request.model", "value": {"stringValue": "gpt-4o"}},
+                {"key": "gen_ai.response.model", "value": {"stringValue": "gpt-4o-2024-08-06"}},
+                {"key": "gen_ai.usage.input_tokens", "value": {"intValue": "512"}},
+                {"key": "gen_ai.usage.output_tokens", "value": {"intValue": "128"}},
+                {"key": "gen_ai.response.finish_reasons", "value": {"arrayValue": {"values": [{"stringValue": "stop"}]}}}
+              ],
+              "status": {"code": 1}
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          {"key": "service.name", "value": {"stringValue": "crewai-analyst-crew"}},
+          {"key": "service.version", "value": {"stringValue": "1.15.15"}}
+        ]
+      },
+      "scopeLogs": [
+        {
+          "scope": {
+            "name": "openinference.instrumentation.crewai",
+            "version": "1.1.12"
+          },
+          "logRecords": [
+            {
+              "timeUnixNano": "1723420841000000000",
+              "observedTimeUnixNano": "1723420841010000000",
+              "severityNumber": 9,
+              "severityText": "INFO",
+              "eventName": "gen_ai.assistant.message",
+              "traceId": "550102030405060708090a0b0c0d0e05",
+              "spanId": "5501020304050601",
+              "body": {"stringValue": "Completed task market_summary"},
+              "attributes": [
+                {"key": "gen_ai.system", "value": {"stringValue": "crewai"}},
+                {"key": "gen_ai.conversation.id", "value": {"stringValue": "crew-run-501"}}
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

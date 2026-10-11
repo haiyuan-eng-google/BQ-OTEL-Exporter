@@ -1,0 +1,43 @@
+{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          {"key": "service.name", "value": {"stringValue": "maf-orchestrator"}},
+          {"key": "service.version", "value": {"stringValue": "1.12.0"}}
+        ]
+      },
+      "scopeLogs": [
+        {
+          "scope": {
+            "name": "agent_framework.observability",
+            "version": "1.12.0"
+          },
+          "logRecords": [
+            {
+              "timeUnixNano": "1723420860300000000",
+              "observedTimeUnixNano": "1723420860310000000",
+              "severityNumber": 9,
+              "severityText": "INFO",
+              "eventName": "gen_ai.choice",
+              "traceId": "770102030405060708090a0b0c0d0e07",
+              "spanId": "7701020304050601",
+              "body": {
+                "kvlistValue": {
+                  "values": [
+                    {"key": "role", "value": {"stringValue": "assistant"}},
+                    {"key": "content", "value": {"stringValue": "Ticket escalated to tier 2."}}
+                  ]
+                }
+              },
+              "attributes": [
+                {"key": "gen_ai.system", "value": {"stringValue": "microsoft.agent_framework"}},
+                {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-maf-303"}}
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

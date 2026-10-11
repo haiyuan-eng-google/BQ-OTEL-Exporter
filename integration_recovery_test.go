@@ -44,6 +44,9 @@ import (
 func TestRecoveryAfterAttemptTimeoutsLiveBigQuery(t *testing.T) {
 	project := os.Getenv("BQ_PROJECT")
 	if project == "" {
+		if os.Getenv("REQUIRE_LIVE_BQ") == "1" {
+			t.Fatal("REQUIRE_LIVE_BQ=1 is set but BQ_PROJECT is empty")
+		}
 		t.Skip("BQ_PROJECT is unset; skipping live BigQuery recovery integration test")
 	}
 	location := os.Getenv("BQ_LOCATION")

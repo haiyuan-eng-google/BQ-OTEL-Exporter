@@ -1,0 +1,69 @@
+{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          {"key": "service.name", "value": {"stringValue": "adk-weather-agent"}},
+          {"key": "service.version", "value": {"stringValue": "2.6.3"}}
+        ]
+      },
+      "scopeLogs": [
+        {
+          "scope": {
+            "name": "gcp.vertex.agent",
+            "version": "2.6.3"
+          },
+          "logRecords": [
+            {
+              "timeUnixNano": "1723420810050000000",
+              "observedTimeUnixNano": "1723420810060000000",
+              "severityNumber": 9,
+              "severityText": "INFO",
+              "eventName": "gen_ai.user.message",
+              "traceId": "220102030405060708090a0b0c0d0e02",
+              "spanId": "2201020304050601",
+              "body": {
+                "kvlistValue": {
+                  "values": [
+                    {"key": "role", "value": {"stringValue": "user"}},
+                    {"key": "content", "value": {"stringValue": "What is the forecast for Seattle tomorrow?"}}
+                  ]
+                }
+              },
+              "attributes": [
+                {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                {"key": "gcp.vertex.agent.invocation_id", "value": {"stringValue": "inv-adk-9001"}},
+                {"key": "gcp.vertex.agent.session_id", "value": {"stringValue": "sess-adk-1001"}},
+                {"key": "gcp.vertex.agent.event_id", "value": {"stringValue": "evt-adk-3001"}},
+                {"key": "user.id", "value": {"stringValue": "user-adk-07"}}
+              ]
+            },
+            {
+              "timeUnixNano": "1723420811400000000",
+              "observedTimeUnixNano": "1723420811410000000",
+              "severityNumber": 9,
+              "severityText": "INFO",
+              "eventName": "gen_ai.choice",
+              "traceId": "220102030405060708090a0b0c0d0e02",
+              "spanId": "2201020304050601",
+              "body": {
+                "kvlistValue": {
+                  "values": [
+                    {"key": "role", "value": {"stringValue": "model"}},
+                    {"key": "content", "value": {"stringValue": "Seattle will be partly cloudy and 68F tomorrow."}}
+                  ]
+                }
+              },
+              "attributes": [
+                {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                {"key": "gcp.vertex.agent.invocation_id", "value": {"stringValue": "inv-adk-9001"}},
+                {"key": "gcp.vertex.agent.session_id", "value": {"stringValue": "sess-adk-1001"}},
+                {"key": "gcp.vertex.agent.event_id", "value": {"stringValue": "evt-adk-3003"}}
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

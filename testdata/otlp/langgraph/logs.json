@@ -1,0 +1,36 @@
+{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          {"key": "service.name", "value": {"stringValue": "langgraph-research-graph"}},
+          {"key": "service.version", "value": {"stringValue": "1.2.0"}}
+        ]
+      },
+      "scopeLogs": [
+        {
+          "scope": {
+            "name": "langsmith.otel",
+            "version": "0.10.18"
+          },
+          "logRecords": [
+            {
+              "timeUnixNano": "1723420820500000000",
+              "observedTimeUnixNano": "1723420820510000000",
+              "severityNumber": 9,
+              "severityText": "INFO",
+              "eventName": "gen_ai.system.message",
+              "traceId": "330102030405060708090a0b0c0d0e03",
+              "spanId": "3301020304050601",
+              "body": {"stringValue": "node=planner transition=complete"},
+              "attributes": [
+                {"key": "gen_ai.system", "value": {"stringValue": "langsmith"}},
+                {"key": "gen_ai.conversation.id", "value": {"stringValue": "thread-lg-404"}}
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
