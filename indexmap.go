@@ -27,3 +27,25 @@ func rowPositionToRecordIndex(rowCount int, rejects []transform.Rejection) []int
 	}
 	return out
 }
+
+// validRecordIndices lists, in batch order, the records that were sent to the
+// service and that it did not reject. recordIndex holds the record behind each
+// row sent, and rowErrors the records the service rejected permanently. These
+// are the records a retry payload may carry, whether the service acknowledged
+// them or still owes them delivery.
+func validRecordIndices(recordIndex []int, rowErrors []transform.QuarantineEntry) []int {
+	if len(rowErrors) == 0 {
+		return recordIndex
+	}
+	rejected := make(map[int]bool, len(rowErrors))
+	for _, re := range rowErrors {
+		rejected[re.Index] = true
+	}
+	valid := make([]int, 0, len(recordIndex))
+	for _, ri := range recordIndex {
+		if !rejected[ri] {
+			valid = append(valid, ri)
+		}
+	}
+	return valid
+}

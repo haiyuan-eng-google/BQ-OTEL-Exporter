@@ -919,8 +919,8 @@ func TestClientOptionsSeparateMetadataFromStorageEndpoint(t *testing.T) {
 	if len(metadataOpts) != 2 {
 		t.Fatalf("metadata options = %d, want configured credential and explicit scope", len(metadataOpts))
 	}
-	if len(writerOpts) != 6 {
-		t.Fatalf("writer options = %d, want credential, explicit scope, endpoint, transport, multiplexing, and pool size", len(writerOpts))
+	if len(writerOpts) != 8 {
+		t.Fatalf("writer options = %d, want credential, explicit scope, endpoint, transport, multiplexing, default inflight requests/bytes, and pool size", len(writerOpts))
 	}
 }
 
@@ -936,8 +936,8 @@ func TestAuthenticationOptionsApplyScopesToADC(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(metadataOpts) != 1 || len(writerOpts) != 3 {
-		t.Fatalf("ADC options metadata=%d writer=%d, want 1 metadata scope and 3 writer options (scope, multiplexing, pool)", len(metadataOpts), len(writerOpts))
+	if len(metadataOpts) != 1 || len(writerOpts) != 5 {
+		t.Fatalf("ADC options metadata=%d writer=%d, want 1 metadata scope and 5 writer options (scope, multiplexing, default inflight requests/bytes, pool)", len(metadataOpts), len(writerOpts))
 	}
 }
 
@@ -953,8 +953,8 @@ func TestWriterClientOptionsWithoutAuthenticationSkipAuthOptions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(opts) != 5 {
-		t.Fatalf("no-auth writer options = %d, want endpoint, transport, WithoutAuthentication, multiplexing, and pool size", len(opts))
+	if len(opts) != 7 {
+		t.Fatalf("no-auth writer options = %d, want endpoint, transport, WithoutAuthentication, multiplexing, default inflight requests/bytes, and pool size", len(opts))
 	}
 }
 

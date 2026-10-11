@@ -72,10 +72,13 @@ type signalExporter struct {
 	writer rowAppender
 	enc    rowEncoder
 
-	// quarantine and quarantineEnc write the opt-in quarantine table on a
-	// stream of its own. Both stay nil unless quarantine is enabled.
-	quarantine    rowAppender
-	quarantineEnc rowEncoder
+	// quarantine, quarantineClient, and quarantineEnc write the opt-in
+	// quarantine table on a client and stream of its own so an idle quarantine
+	// stream never holds open the primary writer's multiplexed connection. All
+	// stay nil unless quarantine is enabled.
+	quarantineClient *managedwriter.Client
+	quarantine       rowAppender
+	quarantineEnc    rowEncoder
 
 	schema *storagepb.TableSchema
 	opts   transform.Options
@@ -254,7 +257,11 @@ func (e *signalExporter) writerClientOptions(ctx context.Context) ([]option.Clie
 		}
 	}
 	if e.cfg.Write.EnableMultiplexing {
-		opts = append(opts, managedwriter.WithMultiplexing())
+		opts = append(opts,
+			managedwriter.WithMultiplexing(),
+			managedwriter.WithDefaultInflightRequests(e.cfg.Write.MaxInflightRequests),
+			managedwriter.WithDefaultInflightBytes(e.cfg.Write.MaxInflightBytes),
+		)
 	}
 	if e.cfg.Write.ConnectionPoolSize > 0 {
 		opts = append(opts, option.WithGRPCConnectionPool(e.cfg.Write.ConnectionPoolSize))
@@ -355,9 +362,16 @@ func (e *signalExporter) start(ctx context.Context, _ component.Host) (err error
 			return qerr
 		}
 		e.quarantineEnc = qenc
-		// The quarantine table gets a stream of its own, so a quarantine
-		// append that fails or stalls can never fail a signal append.
-		e.quarantine = bqi.NewWriter(lifetimeCtx, client, bqi.WriterOptions{
+		// The quarantine table gets a client and stream of its own, so a
+		// quarantine append that fails or stalls can never fail a signal
+		// append, and an idle quarantine stream never holds open a shared
+		// multiplexed connection when the signal writer retires its stream.
+		qClient, qClientErr := newManagedWriterClient(lifetimeCtx, e.cfg.Project, writerOpts...)
+		if qClientErr != nil {
+			return fmt.Errorf("creating BigQuery quarantine Storage Write client: %w", qClientErr)
+		}
+		e.quarantineClient = qClient
+		e.quarantine = bqi.NewWriter(lifetimeCtx, qClient, bqi.WriterOptions{
 			Project:             e.cfg.Project,
 			Dataset:             e.cfg.Dataset,
 			Table:               e.cfg.Quarantine.Table,
@@ -399,6 +413,12 @@ func (e *signalExporter) shutdown(_ context.Context) error {
 			errs = append(errs, err)
 		}
 		e.quarantine = nil
+	}
+	if e.quarantineClient != nil {
+		if err := e.quarantineClient.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		e.quarantineClient = nil
 	}
 	if e.client != nil {
 		if err := e.client.Close(); err != nil {
@@ -556,12 +576,18 @@ func (e *signalExporter) appendEncoded(
 		if v.Class == bqi.Permanent && len(out.RowErrors) == 0 {
 			return appendDecision{err: out.Err, permanent: true}
 		}
+		if len(retryable) == 0 {
+			return appendDecision{rowErrors: rowErrors}
+		}
 		// Rows in already-acknowledged sub-requests are excluded via
 		// out.IsAcked; retry every remaining row not permanently rejected.
 		return appendDecision{retryableIndices: retryable, err: out.Err, rowErrors: rowErrors}
 	}
 
 	if len(out.RowErrors) > 0 {
+		if len(retryable) == 0 {
+			return appendDecision{rowErrors: rowErrors}
+		}
 		// The whole request was refused, so the valid rows that travelled with
 		// the invalid ones still need delivering. Permanently invalid rows are
 		// dropped here and never routed back through consumererror.

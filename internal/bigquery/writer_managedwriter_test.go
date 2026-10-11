@@ -5,6 +5,7 @@ package bigquery
 
 import (
 	"context"
+	"errors"
 	"math/rand"
 	"net"
 	"sync"
@@ -662,4 +663,192 @@ func TestConcurrentAppendRetirementAndShutdownOnManagedStream(t *testing.T) {
 		t.Fatal("no generation was retired; the storm did not exercise recovery")
 	}
 	waitForZeroGauges(t, observer)
+}
+
+func newMultiplexedClientUnderTest(
+	t *testing.T,
+	lis *bufconn.Listener,
+	maxInflightReqs, maxInflightBytes int,
+) *managedwriter.Client {
+	t.Helper()
+	conn, err := grpc.NewClient("passthrough:///storage-write-fake",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifetimeCtx, cancelLifetime := context.WithCancel(context.Background())
+	client, err := managedwriter.NewClient(lifetimeCtx, "p",
+		option.WithGRPCConn(conn),
+		option.WithoutAuthentication(),
+		managedwriter.WithMultiplexing(),
+		managedwriter.WithDefaultInflightRequests(maxInflightReqs),
+		managedwriter.WithDefaultInflightBytes(maxInflightBytes),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = client.Close()
+		cancelLifetime()
+		_ = conn.Close()
+	})
+	return client
+}
+
+func testRowDescriptor() *descriptorpb.DescriptorProto {
+	return &descriptorpb.DescriptorProto{
+		Name: proto.String("Row"),
+		Field: []*descriptorpb.FieldDescriptorProto{{
+			Name:   proto.String("v"),
+			Number: proto.Int32(1),
+			Type:   descriptorpb.FieldDescriptorProto_TYPE_BYTES.Enum(),
+			Label:  descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+		}},
+	}
+}
+
+// When multiplexing is enabled, managedwriter enforces WithDefaultInflightBytes
+// on the shared connection rather than per-stream WithMaxInflightBytes. With a
+// 1,500-byte client budget and an unacknowledged 1,000-byte request in flight,
+// a second concurrent 1,000-byte request must block in client flow control and
+// never be dispatched to the backend.
+func TestManagedWriterMultiplexingByteBudgetBlocksSecondSendWhenUnacked(t *testing.T) {
+	lis := bufconn.Listen(1 << 20)
+	backend := &storageWriteFake{mode: fakeNoACK}
+	server := grpc.NewServer()
+	storagepb.RegisterBigQueryWriteServer(server, backend)
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		_ = server.Serve(lis)
+	}()
+	t.Cleanup(func() {
+		server.Stop()
+		<-served
+	})
+
+	client := newMultiplexedClientUnderTest(t, lis, 100, 1500)
+	w := NewWriter(context.Background(), client, WriterOptions{
+		Project: "p", Dataset: "d", Table: "t",
+		Descriptor:          testRowDescriptor(),
+		MaxRequestBytes:     1200,
+		MaxInflightRequests: 100,
+		MaxInflightBytes:    1500,
+		TraceID:             "writer-test",
+	})
+	t.Cleanup(func() { _ = w.Close() })
+
+	row1000 := make([]byte, 1000)
+	row1000[0] = 0x0a
+	row1000[1] = 0xe4
+	row1000[2] = 0x07
+
+	firstDone := make(chan AppendOutcome, 1)
+	go func() {
+		firstDone <- appendWithin(w, 400*time.Millisecond, [][]byte{row1000})
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, reqs, _ := backend.counts(); reqs == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("first multiplexed request never reached the backend")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	secondOut := appendWithin(w, 120*time.Millisecond, [][]byte{row1000})
+	if !errors.Is(secondOut.Err, context.DeadlineExceeded) {
+		t.Fatalf("second append = %+v, want context.DeadlineExceeded while blocked on byte budget", secondOut)
+	}
+	if _, reqs, _ := backend.counts(); reqs != 1 {
+		t.Fatalf("backend received %d requests, want 1 (second 1,000-byte request must be held by 1,500-byte budget)", reqs)
+	}
+	<-firstDone
+}
+
+// Giving the quarantine writer its own managedwriter.Client ensures that an
+// initialized but idle quarantine stream does not remain attached to the
+// primary writer's multiplexed connection and prevent connection retirement
+// after a ten-sender timeout burst.
+func TestManagedWriterMultiplexingRetiresPrimaryWhenQuarantineHasDedicatedClient(t *testing.T) {
+	lis := bufconn.Listen(1 << 20)
+	backend := &storageWriteFake{mode: fakeAck}
+	server := grpc.NewServer()
+	storagepb.RegisterBigQueryWriteServer(server, backend)
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		_ = server.Serve(lis)
+	}()
+	t.Cleanup(func() {
+		server.Stop()
+		<-served
+	})
+
+	primaryClient := newMultiplexedClientUnderTest(t, lis, 1000, 64<<20)
+	quarantineClient := newMultiplexedClientUnderTest(t, lis, 1000, 64<<20)
+
+	primary := NewWriter(context.Background(), primaryClient, WriterOptions{
+		Project: "p", Dataset: "d", Table: "spans",
+		Descriptor:          testRowDescriptor(),
+		MaxRequestBytes:     1 << 20,
+		MaxInflightRequests: 1000,
+		MaxInflightBytes:    64 << 20,
+		TraceID:             "writer-test",
+	})
+	quarantine := NewWriter(context.Background(), quarantineClient, WriterOptions{
+		Project: "p", Dataset: "d", Table: "quarantine",
+		Descriptor:          testRowDescriptor(),
+		MaxRequestBytes:     1 << 20,
+		MaxInflightRequests: 1000,
+		MaxInflightBytes:    64 << 20,
+		TraceID:             "writer-test",
+	})
+	t.Cleanup(func() {
+		_ = primary.Close()
+		_ = quarantine.Close()
+	})
+
+	// Warm both streams while the backend is healthy, then leave quarantine idle.
+	if out := appendWithin(primary, time.Second, rowsOf(1)); out.Err != nil {
+		t.Fatalf("initial primary append failed: %v", out.Err)
+	}
+	if out := appendWithin(quarantine, time.Second, rowsOf(1)); out.Err != nil {
+		t.Fatalf("initial quarantine append failed: %v", out.Err)
+	}
+	connsBefore, _, _ := backend.counts()
+
+	// Wedge the backend and fire 10 concurrent primary appends that time out.
+	backend.setMode(fakeNoACK)
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = appendWithin(primary, 100*time.Millisecond, rowsOf(1))
+		}()
+	}
+	wg.Wait()
+
+	// Restore the backend; primary must open a fresh multiplexed connection
+	// and succeed within < 5s despite quarantine remaining idle.
+	backend.setMode(fakeAck)
+	start := time.Now()
+	out := appendWithin(primary, 3*time.Second, rowsOf(1))
+	if out.Err != nil {
+		t.Fatalf("primary append after retirement failed: %v", out.Err)
+	}
+	if elapsed := time.Since(start); elapsed >= 5*time.Second {
+		t.Fatalf("primary recovery took %v, want < 5s", elapsed)
+	}
+	connsAfter, _, _ := backend.counts()
+	if connsAfter <= connsBefore {
+		t.Fatalf("connections after retirement = %d, want > %d (fresh primary connection)", connsAfter, connsBefore)
+	}
 }
