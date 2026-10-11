@@ -1,5 +1,9 @@
+# These fixtures are synthetic: hand-written OTLP/JSON shaped after the signals,
+# attribute names and event names recorded for each verified framework version
+# in docs/agent-frameworks.md and issue #1. They are not captures from those
+# runs, so their timestamps, IDs and values are illustrative.
 schema_version: v0alpha2
-verified_date: "2026-08-12"
+provenance: synthetic
 frameworks:
   - id: anthropic_agent_sdk
     version: "2.1.229"
@@ -8,6 +12,9 @@ frameworks:
     gen_ai_system: anthropic
     traces_file: anthropic_agent_sdk/traces.json
     logs_file: anthropic_agent_sdk/logs.json
+    # Claude Code's cost event (claude_code.api_request) carries no gen_ai.*
+    # attribute, so v_gen_ai_logs does not select it; query otel_logs.
+    logs_outside_gen_ai_view: true
   - id: google_adk
     version: "2.6.3"
     tier: T1

@@ -22,7 +22,7 @@
               "startTimeUnixNano": "1723420830000000000",
               "endTimeUnixNano": "1723420830900000000",
               "attributes": [
-                {"key": "gen_ai.system", "value": {"stringValue": "openai"}},
+                {"key": "gen_ai.provider.name", "value": {"stringValue": "openai"}},
                 {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
                 {"key": "gen_ai.agent.name", "value": {"stringValue": "billing_triage"}},
                 {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-oai-88"}},

@@ -21,19 +21,16 @@
               "severityText": "INFO",
               "traceId": "110102030405060708090a0b0c0d0e01",
               "spanId": "1101020304050601",
-              "body": {
-                "kvlistValue": {
-                  "values": [
-                    {"key": "cost_usd", "value": {"doubleValue": 0.0184}},
-                    {"key": "duration_ms", "value": {"intValue": "1250"}}
-                  ]
-                }
-              },
+              "body": {"stringValue": "claude_code.api_request"},
               "attributes": [
-                {"key": "event.name", "value": {"stringValue": "gen_ai.cost"}},
-                {"key": "gen_ai.system", "value": {"stringValue": "anthropic"}},
-                {"key": "gen_ai.conversation.id", "value": {"stringValue": "sess-anth-001"}},
-                {"key": "user.id", "value": {"stringValue": "usr-anth-42"}}
+                {"key": "event.name", "value": {"stringValue": "api_request"}},
+                {"key": "event.timestamp", "value": {"stringValue": "2024-08-12T00:00:01.200Z"}},
+                {"key": "session.id", "value": {"stringValue": "sess-anth-001"}},
+                {"key": "model", "value": {"stringValue": "anthropic-v4-default"}},
+                {"key": "cost_usd", "value": {"doubleValue": 0.0184}},
+                {"key": "duration_ms", "value": {"intValue": "1250"}},
+                {"key": "input_tokens", "value": {"intValue": "1420"}},
+                {"key": "output_tokens", "value": {"intValue": "380"}}
               ]
             }
           ]

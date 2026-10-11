@@ -22,7 +22,7 @@
               "startTimeUnixNano": "1723420860000000000",
               "endTimeUnixNano": "1723420861400000000",
               "attributes": [
-                {"key": "gen_ai.system", "value": {"stringValue": "microsoft.agent_framework"}},
+                {"key": "gen_ai.provider.name", "value": {"stringValue": "microsoft.agent_framework"}},
                 {"key": "gen_ai.operation.name", "value": {"stringValue": "invoke_agent"}},
                 {"key": "gen_ai.agent.name", "value": {"stringValue": "support_orchestrator"}},
                 {"key": "gen_ai.agent.id", "value": {"stringValue": "maf-agent-09"}},

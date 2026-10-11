@@ -31,7 +31,7 @@
                 }
               },
               "attributes": [
-                {"key": "gen_ai.system", "value": {"stringValue": "openai"}},
+                {"key": "gen_ai.provider.name", "value": {"stringValue": "openai"}},
                 {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-oai-88"}}
               ]
             }
