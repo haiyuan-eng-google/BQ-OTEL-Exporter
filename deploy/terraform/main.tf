@@ -631,32 +631,17 @@ resource "google_bigquery_table" "v_gen_ai_tool_usage" {
   }
 }
 
-# --- IAM: Least-Privilege Custom Roles ---
-
-resource "google_project_iam_custom_role" "otel_collector" {
-  role_id     = "otelCollector"
-  title       = "OTel BigQuery Collector"
-  description = "Least-privilege role for the BigQuery OTel exporter with auto_create"
-  permissions = [
-    # Read dataset/table metadata for startup validation.
-    "bigquery.datasets.get",
-    "bigquery.tables.get",
-    # Append rows via the Storage Write API.
-    "bigquery.tables.updateData",
-    # Optional: create/update dataset/tables/views if auto_create is enabled.
-    "bigquery.datasets.create",
-    "bigquery.tables.create",
-    "bigquery.tables.update",
-    # Optional: create search indexes if auto_create.search_indexes is enabled.
-    "bigquery.tables.createIndex",
-    "bigquery.jobs.create",
-  ]
-}
+# --- IAM: least privilege ---
+#
+# This module provisions the dataset and every table and view, so by default
+# the collector's service account gets only the data path, and only on this
+# dataset: read the dataset and table metadata it validates at startup, and
+# append rows. Nothing is granted at project scope.
 
 resource "google_project_iam_custom_role" "otel_collector_writer" {
   role_id     = "otelCollectorWriter"
-  title       = "OTel BigQuery Collector Write-Only"
-  description = "Write-only role for the BigQuery OTel exporter when resources are pre-provisioned"
+  title       = "OTel BigQuery Collector Writer"
+  description = "Startup metadata reads and Storage Write appends for the BigQuery OTel exporter"
   permissions = [
     # Read dataset/table metadata for startup validation.
     "bigquery.datasets.get",
@@ -671,8 +656,53 @@ resource "google_service_account" "otel_collector" {
   display_name = "OTel BigQuery Collector"
 }
 
-resource "google_project_iam_member" "otel_collector" {
+resource "google_bigquery_dataset_iam_member" "otel_collector_writer" {
+  dataset_id = google_bigquery_dataset.otel.dataset_id
+  role       = google_project_iam_custom_role.otel_collector_writer.id
+  member     = "serviceAccount:${google_service_account.otel_collector.email}"
+}
+
+# Optional (var.grant_auto_create): what the exporter's auto_create options
+# need on top of the data path, for a collector that creates or reconciles
+# tables and views or creates search indexes itself. The table permissions
+# stay on this dataset; only running the CREATE SEARCH INDEX query job needs a
+# project-level grant. auto_create.dataset is never needed, because this module
+# creates the dataset.
+
+resource "google_project_iam_custom_role" "otel_collector_provisioner" {
+  count       = var.grant_auto_create ? 1 : 0
+  role_id     = "otelCollectorProvisioner"
+  title       = "OTel BigQuery Collector Provisioner"
+  description = "Table, view, and search index creation for the BigQuery OTel exporter's auto_create"
+  permissions = [
+    # Create missing tables and views; reconcile additive columns.
+    "bigquery.tables.create",
+    "bigquery.tables.update",
+    # CREATE SEARCH INDEX on the signal tables.
+    "bigquery.tables.createIndex",
+  ]
+}
+
+resource "google_bigquery_dataset_iam_member" "otel_collector_provisioner" {
+  count      = var.grant_auto_create ? 1 : 0
+  dataset_id = google_bigquery_dataset.otel.dataset_id
+  role       = google_project_iam_custom_role.otel_collector_provisioner[0].id
+  member     = "serviceAccount:${google_service_account.otel_collector.email}"
+}
+
+resource "google_project_iam_custom_role" "otel_collector_jobs" {
+  count       = var.grant_auto_create ? 1 : 0
+  role_id     = "otelCollectorJobs"
+  title       = "OTel BigQuery Collector Jobs"
+  description = "Runs the BigQuery OTel exporter's CREATE SEARCH INDEX query jobs"
+  permissions = [
+    "bigquery.jobs.create",
+  ]
+}
+
+resource "google_project_iam_member" "otel_collector_jobs" {
+  count   = var.grant_auto_create ? 1 : 0
   project = var.project_id
-  role    = google_project_iam_custom_role.otel_collector.id
+  role    = google_project_iam_custom_role.otel_collector_jobs[0].id
   member  = "serviceAccount:${google_service_account.otel_collector.email}"
 }

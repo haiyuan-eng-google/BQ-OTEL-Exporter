@@ -322,3 +322,37 @@ func TestHelmPersistentQueueCompactsOnTheQueueVolume(t *testing.T) {
 		t.Errorf("configmap has %d on_start compactions and %d compaction directories on the queue mount, want them equal and non-zero", starts, dirs)
 	}
 }
+
+// Terraform provisions every table and view, so by default the collector's
+// service account gets only the data path on the dataset. The auto_create
+// permissions are granted only when grant_auto_create is set, and the only
+// project-scope grant is the jobs.create needed for search indexes.
+func TestTerraformGrantsWritePathOnDatasetOnly(t *testing.T) {
+	raw, err := os.ReadFile("deploy/terraform/main.tf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	if !strings.Contains(text, `resource "google_bigquery_dataset_iam_member" "otel_collector_writer"`) {
+		t.Error("main.tf must bind the writer role on the dataset")
+	}
+	for _, block := range regexp.MustCompile(`(?s)resource "google_project_iam_member" "[^"]+" \{.*?\n\}`).FindAllString(text, -1) {
+		if !strings.Contains(block, "count   = var.grant_auto_create ? 1 : 0") ||
+			!strings.Contains(block, "otel_collector_jobs") {
+			t.Errorf("project-scope binding must be the opt-in jobs role only:\n%s", block)
+		}
+	}
+	roles := regexp.MustCompile(`(?s)resource "google_project_iam_custom_role" "([^"]+)" \{(.*?)\n\}`).FindAllStringSubmatch(text, -1)
+	if len(roles) == 0 {
+		t.Fatal("main.tf defines no custom roles")
+	}
+	for _, r := range roles {
+		name, body := r[1], r[2]
+		optIn := strings.Contains(body, "count       = var.grant_auto_create ? 1 : 0")
+		for _, perm := range []string{"bigquery.tables.create", "bigquery.tables.update\"", "bigquery.tables.createIndex", "bigquery.jobs.create", "bigquery.datasets.create"} {
+			if strings.Contains(body, perm) && !optIn {
+				t.Errorf("role %s grants %s without grant_auto_create", name, strings.Trim(perm, `"`))
+			}
+		}
+	}
+}

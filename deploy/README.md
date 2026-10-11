@@ -68,19 +68,31 @@ All deployment models use Google Cloud authentication:
 
 ## IAM Permissions
 
-The least-privilege custom IAM role (provisioned by Terraform) grants:
+Terraform creates the dataset and every table and view, so by default it
+grants the collector's service account one custom role, `otelCollectorWriter`,
+on that dataset only:
 
 | Permission | Purpose |
 |:---|:---|
 | `bigquery.datasets.get` | Startup dataset metadata validation |
 | `bigquery.tables.get` | Startup table schema validation |
 | `bigquery.tables.updateData` | Append rows via Storage Write API |
-| `bigquery.datasets.create` | Optional: auto-create dataset |
-| `bigquery.tables.create` | Optional: auto-create tables and views |
-| `bigquery.jobs.create` | Optional: create search indexes |
 
-If `auto_create` is disabled, the collector only needs `datasets.get`,
-`tables.get`, and `tables.updateData`.
+Run the collector with `auto_create` off on this path. The Cloud Run manifest
+turns off the image's default `auto_create` with `--set` flags, and the Helm
+chart leaves it off unless you set `bigquery.autoCreate*`.
+
+A collector that creates or reconciles its own tables, views, or search
+indexes needs more. Set `-var="grant_auto_create=true"` to grant it:
+
+| Permission | Scope | Purpose |
+|:---|:---|:---|
+| `bigquery.tables.create` | Dataset | `auto_create.tables` / `companion_views`: create missing tables and views |
+| `bigquery.tables.update` | Dataset | `auto_create.tables`: reconcile additive columns |
+| `bigquery.tables.createIndex` | Dataset | `auto_create.search_indexes` |
+| `bigquery.jobs.create` | Project | `auto_create.search_indexes`: run the `CREATE SEARCH INDEX` job |
+
+`auto_create.dataset` is never needed here, because Terraform creates the dataset.
 
 ## Persistent Queue
 

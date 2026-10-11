@@ -44,3 +44,9 @@ variable "service_account_id" {
   type        = string
   default     = "otel-collector"
 }
+
+variable "grant_auto_create" {
+  description = "Also grant what the exporter's auto_create options need: creating and reconciling tables and views on this dataset, and creating search indexes. Off by default because this module provisions every table and view itself."
+  type        = bool
+  default     = false
+}

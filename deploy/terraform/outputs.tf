@@ -29,6 +29,11 @@ output "service_account_email" {
 }
 
 output "iam_role_id" {
-  description = "Custom IAM role ID"
-  value       = google_project_iam_custom_role.otel_collector.id
+  description = "Custom IAM role granted to the collector on the dataset: metadata reads and row appends"
+  value       = google_project_iam_custom_role.otel_collector_writer.id
+}
+
+output "provisioner_role_id" {
+  description = "Custom IAM role granting auto_create table, view, and search index permissions on the dataset, or null unless grant_auto_create is set"
+  value       = var.grant_auto_create ? google_project_iam_custom_role.otel_collector_provisioner[0].id : null
 }
