@@ -213,15 +213,19 @@ func (s *Server) NewHTTPClient() (*http.Client, *http.Transport) {
 	return client, base
 }
 
-// RegisterTableSchema registers a storagepb.TableSchema for decoding ProtoRows
-// sent to the named table.
+// RegisterTableSchema registers a storagepb.TableSchema for validating and
+// decoding ProtoRows sent to the named table.
 func (s *Server) RegisterTableSchema(table string, ts *storagepb.TableSchema) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.registerTableSchemaLocked(table, ts)
+}
+
+func (s *Server) registerTableSchemaLocked(table string, ts *storagepb.TableSchema) error {
 	md, err := descriptorFromTableSchema(ts)
 	if err != nil {
 		return err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.schemas[table] = ts
 	s.descriptors[table] = md
 	return nil
@@ -269,15 +273,18 @@ func (s *Server) ResetRows() {
 	s.ackedRows = 0
 }
 
-// Dataset returns the REST v2 Dataset metadata if created.
+// Dataset returns a snapshot of the REST v2 Dataset metadata if created.
 func (s *Server) Dataset(project, dataset string) (*bigqueryapi.Dataset, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ds, ok := s.datasets[project+"."+dataset]
-	return ds, ok
+	if !ok || ds == nil {
+		return nil, false
+	}
+	return cloneJSON(ds), true
 }
 
-// Table returns the REST v2 Table metadata if created.
+// Table returns a snapshot of the REST v2 Table metadata if created.
 func (s *Server) Table(project, dataset, table string) (*bigqueryapi.Table, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -286,7 +293,10 @@ func (s *Server) Table(project, dataset, table string) (*bigqueryapi.Table, bool
 		return nil, false
 	}
 	tbl, ok := byTable[table]
-	return tbl, ok
+	if !ok || tbl == nil {
+		return nil, false
+	}
+	return cloneJSON(tbl), true
 }
 
 // SeedDataset pre-populates a dataset in the REST v2 server.
@@ -307,11 +317,11 @@ func (s *Server) SeedDataset(project, dataset, location string) {
 // SeedTable pre-populates a table in the REST v2 server and registers its
 // storagepb.TableSchema for ProtoRows decoding.
 func (s *Server) SeedTable(project, dataset, table string, ts *storagepb.TableSchema) error {
-	if err := s.RegisterTableSchema(table, ts); err != nil {
-		return err
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.registerTableSchemaLocked(table, ts); err != nil {
+		return err
+	}
 	key := project + "." + dataset
 	if _, ok := s.datasets[key]; !ok {
 		s.datasets[key] = &bigqueryapi.Dataset{
@@ -385,20 +395,44 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 				streamTable = tbl
 			}
 		}
+
+		var protoDescErr error
 		if protoDesc := req.GetProtoRows().GetWriterSchema().GetProtoDescriptor(); protoDesc != nil {
-			if md, derr := descriptorFromProto(protoDesc); derr == nil {
+			if protoDesc.GetName() == "" || len(protoDesc.GetField()) == 0 {
+				protoDescErr = fmt.Errorf("writer proto descriptor must have a name and at least one field")
+			} else if md, derr := descriptorFromProto(protoDesc); derr != nil {
+				protoDescErr = fmt.Errorf("invalid writer proto descriptor: %w", derr)
+			} else {
 				streamDesc = md
 			}
 		}
 
 		s.mu.Lock()
 		s.requests++
-		md := s.descriptors[streamTable]
-		if md == nil {
-			md = streamDesc
-		}
+		tableDesc := s.descriptors[streamTable]
 		fault := s.popMatchingFaultLocked(streamTable)
 		s.mu.Unlock()
+
+		if protoDescErr != nil {
+			if err := srv.Send(errorResponse(codes.InvalidArgument, protoDescErr.Error(), nil)); err != nil {
+				return nil
+			}
+			continue
+		}
+		if streamDesc == nil {
+			if err := srv.Send(errorResponse(codes.InvalidArgument, "missing writer schema proto descriptor", nil)); err != nil {
+				return nil
+			}
+			continue
+		}
+		if tableDesc != nil {
+			if verr := validateWriterDescriptor(streamDesc, tableDesc); verr != nil {
+				if err := srv.Send(errorResponse(codes.InvalidArgument, verr.Error(), nil)); err != nil {
+					return nil
+				}
+				continue
+			}
+		}
 
 		switch fault.Mode {
 		case FaultStreamClosed:
@@ -472,24 +506,22 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 
 		serialized := req.GetProtoRows().GetRows().GetSerializedRows()
 		decodedBatch := make([]map[string]any, 0, len(serialized))
-		if md != nil {
-			for i, raw := range serialized {
-				row, derr := DecodeProtoRow(md, raw)
-				if derr != nil {
-					rowErr := &storagepb.RowError{
-						Index:   int64(i),
-						Code:    storagepb.RowError_FIELDS_ERROR,
-						Message: derr.Error(),
-					}
-					_ = srv.Send(errorResponse(codes.InvalidArgument, "decode failure", []*storagepb.RowError{rowErr}))
-					decodedBatch = nil
-					break
+		for i, raw := range serialized {
+			row, derr := DecodeProtoRow(streamDesc, raw)
+			if derr != nil {
+				rowErr := &storagepb.RowError{
+					Index:   int64(i),
+					Code:    storagepb.RowError_FIELDS_ERROR,
+					Message: derr.Error(),
 				}
-				decodedBatch = append(decodedBatch, row)
+				_ = srv.Send(errorResponse(codes.InvalidArgument, "decode failure", []*storagepb.RowError{rowErr}))
+				decodedBatch = nil
+				break
 			}
-			if decodedBatch == nil && len(serialized) > 0 {
-				continue
-			}
+			decodedBatch = append(decodedBatch, row)
+		}
+		if decodedBatch == nil && len(serialized) > 0 {
+			continue
 		}
 
 		s.mu.Lock()
@@ -508,6 +540,34 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 			return nil
 		}
 	}
+}
+
+func validateWriterDescriptor(writerDesc, tableDesc protoreflect.MessageDescriptor) error {
+	for i := 0; i < writerDesc.Fields().Len(); i++ {
+		wf := writerDesc.Fields().Get(i)
+		tf := tableDesc.Fields().ByName(wf.Name())
+		if tf == nil {
+			return fmt.Errorf("writer field %q does not exist in destination table schema", wf.Name())
+		}
+		if wf.IsList() != tf.IsList() {
+			return fmt.Errorf("writer field %q repeated=%v does not match destination table repeated=%v", wf.Name(), wf.IsList(), tf.IsList())
+		}
+		if wf.Kind() != tf.Kind() {
+			return fmt.Errorf("writer field %q kind %v does not match destination table kind %v", wf.Name(), wf.Kind(), tf.Kind())
+		}
+		if wf.Kind() == protoreflect.MessageKind {
+			if err := validateWriterDescriptor(wf.Message(), tf.Message()); err != nil {
+				return fmt.Errorf("writer field %q: %w", wf.Name(), err)
+			}
+		}
+	}
+	for i := 0; i < tableDesc.Fields().Len(); i++ {
+		tf := tableDesc.Fields().Get(i)
+		if tf.Cardinality() == protoreflect.Required && writerDesc.Fields().ByName(tf.Name()) == nil {
+			return fmt.Errorf("required destination column %q is missing from writer schema", tf.Name())
+		}
+	}
+	return nil
 }
 
 func (s *Server) popMatchingFaultLocked(table string) Fault {
@@ -556,7 +616,7 @@ func descriptorFromTableSchema(ts *storagepb.TableSchema) (protoreflect.MessageD
 func descriptorFromProto(dp *descriptorpb.DescriptorProto) (protoreflect.MessageDescriptor, error) {
 	name := dp.GetName()
 	if name == "" {
-		name = "Row"
+		return nil, fmt.Errorf("descriptor name is empty")
 	}
 	fdp := &descriptorpb.FileDescriptorProto{
 		Name:        proto.String("stream_row.proto"),
@@ -680,6 +740,21 @@ func cloneMap(in map[string]any) map[string]any {
 	return out
 }
 
+func cloneJSON[T any](in *T) *T {
+	if in == nil {
+		return nil
+	}
+	raw, err := json.Marshal(in)
+	if err != nil {
+		return nil
+	}
+	var out T
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil
+	}
+	return &out
+}
+
 // handleREST implements the subset of the BigQuery REST v2 API used by
 // cloud.google.com/go/bigquery for dataset/table/view metadata and creation.
 func (s *Server) handleREST(w http.ResponseWriter, r *http.Request) {
@@ -729,9 +804,14 @@ func (s *Server) handleREST(w http.ResponseWriter, r *http.Request) {
 		if ds.Etag == "" {
 			ds.Etag = "etag-" + key
 		}
-		s.datasets[key] = &ds
+		s.datasets[key] = cloneJSON(&ds)
+		payload, err := json.Marshal(&ds)
 		s.mu.Unlock()
-		writeRESTJSON(w, http.StatusOK, &ds)
+		if err != nil {
+			writeRESTError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeRESTBytes(w, http.StatusOK, payload)
 		return
 	}
 
@@ -745,12 +825,21 @@ func (s *Server) handleREST(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mu.Lock()
 		ds, ok := s.datasets[dsKey]
+		var payload []byte
+		var err error
+		if ok && ds != nil {
+			payload, err = json.Marshal(ds)
+		}
 		s.mu.Unlock()
-		if !ok {
+		if !ok || ds == nil {
 			writeRESTError(w, http.StatusNotFound, "Not found: Dataset "+dsKey)
 			return
 		}
-		writeRESTJSON(w, http.StatusOK, ds)
+		if err != nil {
+			writeRESTError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeRESTBytes(w, http.StatusOK, payload)
 		return
 	}
 
@@ -804,17 +893,17 @@ func (s *Server) handleREST(w http.ResponseWriter, r *http.Request) {
 		if tbl.Etag == "" {
 			tbl.Etag = "etag-" + tableID
 		}
-		s.tables[dsKey][tableID] = &tbl
-		var storageSchema *storagepb.TableSchema
+		s.tables[dsKey][tableID] = cloneJSON(&tbl)
 		if tbl.Schema != nil && len(tbl.Schema.Fields) > 0 {
-			storageSchema = fromRESTTableSchema(tbl.Schema)
+			_ = s.registerTableSchemaLocked(tableID, fromRESTTableSchema(tbl.Schema))
 		}
+		payload, err := json.Marshal(&tbl)
 		s.mu.Unlock()
-
-		if storageSchema != nil {
-			_ = s.RegisterTableSchema(tableID, storageSchema)
+		if err != nil {
+			writeRESTError(w, http.StatusInternalServerError, err.Error())
+			return
 		}
-		writeRESTJSON(w, http.StatusOK, &tbl)
+		writeRESTBytes(w, http.StatusOK, payload)
 		return
 	}
 
@@ -828,12 +917,21 @@ func (s *Server) handleREST(w http.ResponseWriter, r *http.Request) {
 			if byTable != nil {
 				tbl = byTable[tableID]
 			}
+			var payload []byte
+			var err error
+			if tbl != nil {
+				payload, err = json.Marshal(tbl)
+			}
 			s.mu.Unlock()
 			if tbl == nil {
 				writeRESTError(w, http.StatusNotFound, "Not found: Table "+dsKey+"."+tableID)
 				return
 			}
-			writeRESTJSON(w, http.StatusOK, tbl)
+			if err != nil {
+				writeRESTError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeRESTBytes(w, http.StatusOK, payload)
 			return
 
 		case http.MethodPatch, http.MethodPut:
@@ -854,27 +952,28 @@ func (s *Server) handleREST(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if patch.Schema != nil {
-				existing.Schema = patch.Schema
+				existing.Schema = cloneJSON(patch.Schema)
 			}
 			if patch.View != nil {
-				existing.View = patch.View
+				existing.View = cloneJSON(patch.View)
 				existing.Type = "VIEW"
 			}
 			if patch.TimePartitioning != nil {
-				existing.TimePartitioning = patch.TimePartitioning
+				existing.TimePartitioning = cloneJSON(patch.TimePartitioning)
 			}
 			if patch.Clustering != nil {
-				existing.Clustering = patch.Clustering
+				existing.Clustering = cloneJSON(patch.Clustering)
 			}
-			var storageSchema *storagepb.TableSchema
 			if existing.Schema != nil && len(existing.Schema.Fields) > 0 {
-				storageSchema = fromRESTTableSchema(existing.Schema)
+				_ = s.registerTableSchemaLocked(tableID, fromRESTTableSchema(existing.Schema))
 			}
+			payload, err := json.Marshal(existing)
 			s.mu.Unlock()
-			if storageSchema != nil {
-				_ = s.RegisterTableSchema(tableID, storageSchema)
+			if err != nil {
+				writeRESTError(w, http.StatusInternalServerError, err.Error())
+				return
 			}
-			writeRESTJSON(w, http.StatusOK, existing)
+			writeRESTBytes(w, http.StatusOK, payload)
 			return
 
 		default:
@@ -889,6 +988,13 @@ func (s *Server) handleREST(w http.ResponseWriter, r *http.Request) {
 func decodeJSONBody(r io.Reader, dst any) error {
 	defer func() { _, _ = io.Copy(io.Discard, r) }()
 	return json.NewDecoder(r).Decode(dst)
+}
+
+func writeRESTBytes(w http.ResponseWriter, code int, payload []byte) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_, _ = w.Write(payload)
+	_, _ = w.Write([]byte("\n"))
 }
 
 func writeRESTJSON(w http.ResponseWriter, code int, v any) {

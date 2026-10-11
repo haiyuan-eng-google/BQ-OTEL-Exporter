@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -114,44 +115,54 @@ func TestAllSevenAgentFrameworkGoldenFixturesEndToEnd(t *testing.T) {
 	var traceUnmarshaler ptrace.JSONUnmarshaler
 	var logUnmarshaler plog.JSONUnmarshaler
 
+	totalExpectedSpans := 0
+	totalExpectedLogs := 0
+
 	for _, fw := range m.Frameworks {
 		t.Run(fw.ID, func(t *testing.T) {
-			tracesPath := filepath.Join("testdata", "otlp", fw.TracesFile)
-			tracesRaw, err := os.ReadFile(tracesPath)
-			if err != nil {
-				t.Fatalf("read %s: %v", tracesPath, err)
-			}
-			td, err := traceUnmarshaler.UnmarshalTraces(tracesRaw)
-			if err != nil {
-				t.Fatalf("UnmarshalTraces(%s): %v", tracesPath, err)
+			if slices.Contains(fw.Signals, "traces") && fw.TracesFile != "" {
+				tracesPath := filepath.Join("testdata", "otlp", fw.TracesFile)
+				tracesRaw, err := os.ReadFile(tracesPath)
+				if err != nil {
+					t.Fatalf("read %s: %v", tracesPath, err)
+				}
+				td, err := traceUnmarshaler.UnmarshalTraces(tracesRaw)
+				if err != nil {
+					t.Fatalf("UnmarshalTraces(%s): %v", tracesPath, err)
+				}
+				totalExpectedSpans += td.SpanCount()
+
+				if err := tracesExp.pushTraceData(ctx, td); err != nil {
+					t.Fatalf("pushTraceData(%s): %v", fw.ID, err)
+				}
 			}
 
-			logsPath := filepath.Join("testdata", "otlp", fw.LogsFile)
-			logsRaw, err := os.ReadFile(logsPath)
-			if err != nil {
-				t.Fatalf("read %s: %v", logsPath, err)
-			}
-			ld, err := logUnmarshaler.UnmarshalLogs(logsRaw)
-			if err != nil {
-				t.Fatalf("UnmarshalLogs(%s): %v", logsPath, err)
-			}
+			if slices.Contains(fw.Signals, "logs") && fw.LogsFile != "" {
+				logsPath := filepath.Join("testdata", "otlp", fw.LogsFile)
+				logsRaw, err := os.ReadFile(logsPath)
+				if err != nil {
+					t.Fatalf("read %s: %v", logsPath, err)
+				}
+				ld, err := logUnmarshaler.UnmarshalLogs(logsRaw)
+				if err != nil {
+					t.Fatalf("UnmarshalLogs(%s): %v", logsPath, err)
+				}
+				totalExpectedLogs += ld.LogRecordCount()
 
-			if err := tracesExp.pushTraceData(ctx, td); err != nil {
-				t.Fatalf("pushTraceData(%s): %v", fw.ID, err)
-			}
-			if err := logsExp.pushLogData(ctx, ld); err != nil {
-				t.Fatalf("pushLogData(%s): %v", fw.ID, err)
+				if err := logsExp.pushLogData(ctx, ld); err != nil {
+					t.Fatalf("pushLogData(%s): %v", fw.ID, err)
+				}
 			}
 		})
 	}
 
 	spanRows := srv.Rows("otel_spans")
 	logRows := srv.Rows("otel_logs")
-	if len(spanRows) < 7 {
-		t.Fatalf("expected at least 7 span rows across 7 frameworks, got %d", len(spanRows))
+	if len(spanRows) != totalExpectedSpans {
+		t.Fatalf("expected exactly %d span rows across all frameworks, got %d", totalExpectedSpans, len(spanRows))
 	}
-	if len(logRows) < 7 {
-		t.Fatalf("expected at least 7 log rows across 7 frameworks, got %d", len(logRows))
+	if len(logRows) != totalExpectedLogs {
+		t.Fatalf("expected exactly %d log rows across all frameworks, got %d", totalExpectedLogs, len(logRows))
 	}
 
 	// Index decoded spans by (service_name, trace_id, span_id) to simulate the
@@ -174,21 +185,36 @@ func TestAllSevenAgentFrameworkGoldenFixturesEndToEnd(t *testing.T) {
 			t.Fatalf("unmarshal span attributes JSON: %v", err)
 		}
 
+		svc, _ := r["service_name"].(string)
+		tid, _ := r["trace_id"].(string)
+		sid, _ := r["span_id"].(string)
+		spansByKey[joinKey{serviceName: svc, traceID: tid, spanID: sid}] = attrs
+
 		opName, _ := attrs["gen_ai.operation.name"].(string)
 		sysName, _ := attrs["gen_ai.system"].(string)
 		if sysName == "" {
 			sysName, _ = attrs["gen_ai.provider.name"].(string)
 		}
 		invID, _ := attrs["gcp.vertex.agent.invocation_id"].(string)
-		if opName == "" && sysName == "" && invID == "" {
+
+		if sysName != "" {
+			systemsSeenInSpans[sysName] = true
+		}
+
+		if svc == "crewai-analyst-crew" {
+			// CrewAI is instrumented via OpenInference (openinference-instrumentation-crewai),
+			// which emits openinference.span.kind and crew_tasks rather than gen_ai.system.
+			if attrs["openinference.span.kind"] != "AGENT" {
+				t.Fatalf("CrewAI span missing openinference.span.kind=AGENT: %v", attrs)
+			}
+			if attrs["crew_tasks"] == nil {
+				t.Fatalf("CrewAI span missing crew_tasks: %v", attrs)
+			}
+		} else if opName == "" && sysName == "" && invID == "" {
+			// All other supported agent frameworks emit standard OTel GenAI or Vertex conventions
+			// and pass the v_gen_ai_spans WHERE filter.
 			t.Fatalf("span row %v failed v_gen_ai_spans WHERE filter", r["span_id"])
 		}
-		systemsSeenInSpans[sysName] = true
-
-		svc, _ := r["service_name"].(string)
-		tid, _ := r["trace_id"].(string)
-		sid, _ := r["span_id"].(string)
-		spansByKey[joinKey{serviceName: svc, traceID: tid, spanID: sid}] = attrs
 
 		if sysName == "gcp.vertex.agent" {
 			if invID == "" || attrs["gcp.vertex.agent.session_id"] == nil || attrs["gcp.vertex.agent.event_id"] == nil {
@@ -198,7 +224,7 @@ func TestAllSevenAgentFrameworkGoldenFixturesEndToEnd(t *testing.T) {
 	}
 
 	for _, fw := range m.Frameworks {
-		if !systemsSeenInSpans[fw.GenAISystem] {
+		if fw.GenAISystem != "" && !systemsSeenInSpans[fw.GenAISystem] {
 			t.Errorf("framework %s (gen_ai.system=%q) was not observed in v_gen_ai_spans rows", fw.ID, fw.GenAISystem)
 		}
 	}
@@ -232,7 +258,9 @@ func TestAllSevenAgentFrameworkGoldenFixturesEndToEnd(t *testing.T) {
 		if !strings.HasPrefix(promotedEventName, "gen_ai.") && lSys == "" && lInv == "" {
 			t.Fatalf("log row failed v_gen_ai_logs WHERE predicate: event_name=%q attrs=%v", promotedEventName, lAttrs)
 		}
-		systemsSeenInLogs[lSys] = true
+		if lSys != "" {
+			systemsSeenInLogs[lSys] = true
+		}
 
 		if lSys == "anthropic" && promotedEventName == "gen_ai.cost" && attrEventName == "gen_ai.cost" {
 			anthropicFallbackVerified = true
@@ -250,8 +278,10 @@ func TestAllSevenAgentFrameworkGoldenFixturesEndToEnd(t *testing.T) {
 		t.Fatalf("expected anthropic_agent_sdk log fixture to exercise event.name -> gen_ai.cost promotion")
 	}
 	for _, fw := range m.Frameworks {
-		if !systemsSeenInLogs[fw.GenAISystem] {
-			t.Errorf("framework %s (gen_ai.system=%q) was not observed in v_gen_ai_logs rows", fw.ID, fw.GenAISystem)
+		if slices.Contains(fw.Signals, "logs") && fw.GenAISystem != "" {
+			if !systemsSeenInLogs[fw.GenAISystem] {
+				t.Errorf("framework %s (gen_ai.system=%q) was not observed in v_gen_ai_logs rows", fw.ID, fw.GenAISystem)
+			}
 		}
 	}
 }

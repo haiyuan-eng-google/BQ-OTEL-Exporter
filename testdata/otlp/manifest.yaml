@@ -19,10 +19,9 @@ frameworks:
     version: "1.2.x"
     companion_version: "0.10.18"
     tier: T1
-    signals: [traces, logs]
+    signals: [traces]
     gen_ai_system: langsmith
     traces_file: langgraph/traces.json
-    logs_file: langgraph/logs.json
   - id: openai_agents
     version: "0.20.0"
     companion_version: "1.0b0"
@@ -35,10 +34,8 @@ frameworks:
     version: "1.15.15"
     companion_version: "1.1.12"
     tier: T2
-    signals: [traces, logs]
-    gen_ai_system: crewai
+    signals: [traces]
     traces_file: crewai/traces.json
-    logs_file: crewai/logs.json
   - id: aws_bedrock
     version: "0.65b0"
     tier: T2

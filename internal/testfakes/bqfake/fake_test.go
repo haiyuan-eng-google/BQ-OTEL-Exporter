@@ -5,6 +5,7 @@ package bqfake
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,8 +13,15 @@ import (
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
 	"google.golang.org/api/option"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/descriptorpb"
+	"google.golang.org/protobuf/types/dynamicpb"
 
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/protoenc"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
@@ -233,4 +241,239 @@ func TestRESTMetadataEndpoints(t *testing.T) {
 	if err != nil || gotView.ViewQuery != viewQuery {
 		t.Fatalf("View.Metadata query = %q (err=%v), want %q", gotView.ViewQuery, err, viewQuery)
 	}
+}
+
+func TestAppendRowsDecodesWithWriterDescriptorAndValidatesAgainstTableSchema(t *testing.T) {
+	srv := NewServer(t)
+	ctx := context.Background()
+
+	if err := srv.RegisterTableSchema("pair_table", &storagepb.TableSchema{
+		Fields: []*storagepb.TableFieldSchema{
+			{Name: "first", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_REQUIRED},
+			{Name: "second", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+		},
+	}); err != nil {
+		t.Fatalf("RegisterTableSchema: %v", err)
+	}
+
+	conn, err := grpc.NewClient(srv.Addr(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	writeClient := storagepb.NewBigQueryWriteClient(conn)
+
+	const streamName = "projects/test-project/datasets/otel/tables/pair_table/streams/_default"
+
+	// 1. Reordered field numbers in the writer descriptor must decode by the
+	// writer's field numbers rather than swapping values by table column order.
+	reorderedDP := &descriptorpb.DescriptorProto{
+		Name: proto.String("ReorderedRow"),
+		Field: []*descriptorpb.FieldDescriptorProto{
+			{
+				Name:   proto.String("second"),
+				Number: proto.Int32(1),
+				Label:  descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+				Type:   descriptorpb.FieldDescriptorProto_TYPE_STRING.Enum(),
+			},
+			{
+				Name:   proto.String("first"),
+				Number: proto.Int32(2),
+				Label:  descriptorpb.FieldDescriptorProto_LABEL_REQUIRED.Enum(),
+				Type:   descriptorpb.FieldDescriptorProto_TYPE_STRING.Enum(),
+			},
+		},
+	}
+	fileDesc, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
+		Name:        proto.String("reordered.proto"),
+		Syntax:      proto.String("proto2"),
+		MessageType: []*descriptorpb.DescriptorProto{reorderedDP},
+	}, nil)
+	if err != nil {
+		t.Fatalf("protodesc.NewFile: %v", err)
+	}
+	msg := dynamicpb.NewMessage(fileDesc.Messages().ByName("ReorderedRow"))
+	msg.Set(msg.Descriptor().Fields().ByName("first"), protoreflect.ValueOfString("alpha"))
+	msg.Set(msg.Descriptor().Fields().ByName("second"), protoreflect.ValueOfString("beta"))
+	raw, err := proto.Marshal(msg)
+	if err != nil {
+		t.Fatalf("proto.Marshal: %v", err)
+	}
+
+	stream, err := writeClient.AppendRows(ctx)
+	if err != nil {
+		t.Fatalf("AppendRows: %v", err)
+	}
+	if err := stream.Send(&storagepb.AppendRowsRequest{
+		WriteStream: streamName,
+		Rows: &storagepb.AppendRowsRequest_ProtoRows{
+			ProtoRows: &storagepb.AppendRowsRequest_ProtoData{
+				WriterSchema: &storagepb.ProtoSchema{ProtoDescriptor: reorderedDP},
+				Rows:         &storagepb.ProtoRows{SerializedRows: [][]byte{raw}},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Send reordered row: %v", err)
+	}
+	resp, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("Recv reordered row: %v", err)
+	}
+	if resp.GetError() != nil {
+		t.Fatalf("unexpected error for reordered writer descriptor: %v", resp.GetError())
+	}
+	rows := srv.Rows("pair_table")
+	if len(rows) != 1 || rows[0]["first"] != "alpha" || rows[0]["second"] != "beta" {
+		t.Fatalf("decoded rows = %#v, want first=alpha and second=beta", rows)
+	}
+
+	// 2. Unknown column, incompatible type, missing required column, and
+	// missing/invalid writer descriptor must be rejected with InvalidArgument.
+	for _, tc := range []struct {
+		name string
+		dp   *descriptorpb.DescriptorProto
+	}{
+		{
+			name: "unknown column",
+			dp: &descriptorpb.DescriptorProto{
+				Name: proto.String("UnknownColRow"),
+				Field: []*descriptorpb.FieldDescriptorProto{
+					{
+						Name:   proto.String("first"),
+						Number: proto.Int32(1),
+						Label:  descriptorpb.FieldDescriptorProto_LABEL_REQUIRED.Enum(),
+						Type:   descriptorpb.FieldDescriptorProto_TYPE_STRING.Enum(),
+					},
+					{
+						Name:   proto.String("unknown_column"),
+						Number: proto.Int32(2),
+						Label:  descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+						Type:   descriptorpb.FieldDescriptorProto_TYPE_STRING.Enum(),
+					},
+				},
+			},
+		},
+		{
+			name: "mismatched field type",
+			dp: &descriptorpb.DescriptorProto{
+				Name: proto.String("BadTypeRow"),
+				Field: []*descriptorpb.FieldDescriptorProto{
+					{
+						Name:   proto.String("first"),
+						Number: proto.Int32(1),
+						Label:  descriptorpb.FieldDescriptorProto_LABEL_REQUIRED.Enum(),
+						Type:   descriptorpb.FieldDescriptorProto_TYPE_INT64.Enum(),
+					},
+				},
+			},
+		},
+		{
+			name: "missing required column",
+			dp: &descriptorpb.DescriptorProto{
+				Name: proto.String("MissingReqRow"),
+				Field: []*descriptorpb.FieldDescriptorProto{
+					{
+						Name:   proto.String("second"),
+						Number: proto.Int32(1),
+						Label:  descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+						Type:   descriptorpb.FieldDescriptorProto_TYPE_STRING.Enum(),
+					},
+				},
+			},
+		},
+		{
+			name: "missing writer descriptor",
+			dp:   nil,
+		},
+		{
+			name: "empty writer descriptor",
+			dp:   &descriptorpb.DescriptorProto{Name: proto.String("")},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st, err := writeClient.AppendRows(ctx)
+			if err != nil {
+				t.Fatalf("AppendRows: %v", err)
+			}
+			var ws *storagepb.ProtoSchema
+			if tc.dp != nil {
+				ws = &storagepb.ProtoSchema{ProtoDescriptor: tc.dp}
+			}
+			if err := st.Send(&storagepb.AppendRowsRequest{
+				WriteStream: streamName,
+				Rows: &storagepb.AppendRowsRequest_ProtoRows{
+					ProtoRows: &storagepb.AppendRowsRequest_ProtoData{
+						WriterSchema: ws,
+						Rows:         &storagepb.ProtoRows{SerializedRows: [][]byte{raw}},
+					},
+				},
+			}); err != nil {
+				t.Fatalf("Send: %v", err)
+			}
+			r, err := st.Recv()
+			if err != nil {
+				t.Fatalf("Recv: %v", err)
+			}
+			if r.GetError() == nil || codes.Code(r.GetError().GetCode()) != codes.InvalidArgument {
+				t.Fatalf("response error = %v, want InvalidArgument", r.GetError())
+			}
+		})
+	}
+}
+
+func TestConcurrentTableGetAndPatch(t *testing.T) {
+	srv := NewServer(t)
+	ctx := context.Background()
+
+	httpClient, httpBase := srv.NewHTTPClient()
+	t.Cleanup(func() { httpBase.CloseIdleConnections() })
+
+	client, err := bq.NewClient(ctx, "test-project", option.WithHTTPClient(httpClient))
+	if err != nil {
+		t.Fatalf("bq.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	ds := client.Dataset("race_ds")
+	if err := ds.Create(ctx, &bq.DatasetMetadata{Location: "US"}); err != nil {
+		t.Fatalf("Dataset.Create: %v", err)
+	}
+	tblMD, _, err := schema.DestinationMetadata(schema.SpansTableSchema(), "test-project", "race_ds", "otel_spans")
+	if err != nil {
+		t.Fatalf("DestinationMetadata: %v", err)
+	}
+	tbl := ds.Table("otel_spans")
+	if err := tbl.Create(ctx, tblMD); err != nil {
+		t.Fatalf("Table.Create: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for range 25 {
+				if _, err := tbl.Metadata(ctx); err != nil {
+					t.Errorf("Table.Metadata: %v", err)
+					return
+				}
+				if got, ok := srv.Table("test-project", "race_ds", "otel_spans"); !ok || got == nil {
+					t.Errorf("srv.Table returned (%v, %v)", got, ok)
+					return
+				}
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for range 25 {
+				if _, err := tbl.Update(ctx, bq.TableMetadataToUpdate{
+					Schema: tblMD.Schema,
+				}, ""); err != nil {
+					t.Errorf("Table.Update: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }

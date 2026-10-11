@@ -22,14 +22,11 @@
               "startTimeUnixNano": "1723420840000000000",
               "endTimeUnixNano": "1723420842200000000",
               "attributes": [
-                {"key": "gen_ai.system", "value": {"stringValue": "crewai"}},
-                {"key": "gen_ai.operation.name", "value": {"stringValue": "invoke_agent"}},
-                {"key": "gen_ai.agent.name", "value": {"stringValue": "senior_market_analyst"}},
-                {"key": "gen_ai.conversation.id", "value": {"stringValue": "crew-run-501"}},
-                {"key": "gen_ai.request.model", "value": {"stringValue": "gpt-4o-mini"}},
-                {"key": "gen_ai.usage.input_tokens", "value": {"intValue": "920"}},
-                {"key": "gen_ai.usage.output_tokens", "value": {"intValue": "410"}},
-                {"key": "openinference.span.kind", "value": {"stringValue": "AGENT"}}
+                {"key": "openinference.span.kind", "value": {"stringValue": "AGENT"}},
+                {"key": "crew_tasks", "value": {"stringValue": "Analyze quarterly market trends"}},
+                {"key": "llm.model_name", "value": {"stringValue": "gpt-4o-mini"}},
+                {"key": "llm.token_count.prompt", "value": {"intValue": "920"}},
+                {"key": "llm.token_count.completion", "value": {"intValue": "410"}}
               ],
               "status": {"code": 1}
             }

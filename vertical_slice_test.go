@@ -30,10 +30,10 @@ import (
 
 type testPayloadOffloader struct{}
 
-func (testPayloadOffloader) OffloadSpan(span ptrace.Span, _ pcommon.Resource, _ pcommon.InstrumentationScope) []transform.PayloadRef {
+func (testPayloadOffloader) OffloadSpan(_ context.Context, span ptrace.Span, _ pcommon.Resource, _ pcommon.InstrumentationScope) ([]transform.PayloadRef, error) {
 	v, ok := span.Attributes().Get("gen_ai.prompt.large")
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	origLen := int64(len(v.Str()))
 	span.Attributes().PutStr("gen_ai.prompt.large", "<offloaded:gs://test-bucket/spans/prompt-001.json>")
@@ -52,12 +52,12 @@ func (testPayloadOffloader) OffloadSpan(span ptrace.Span, _ pcommon.Resource, _ 
 				Details:    `{"content_type":"application/json"}`,
 			},
 		},
-	}
+	}, nil
 }
 
-func (testPayloadOffloader) OffloadLog(lr plog.LogRecord, _ pcommon.Resource, _ pcommon.InstrumentationScope) []transform.PayloadRef {
+func (testPayloadOffloader) OffloadLog(_ context.Context, lr plog.LogRecord, _ pcommon.Resource, _ pcommon.InstrumentationScope) ([]transform.PayloadRef, error) {
 	if lr.Body().Type() != pcommon.ValueTypeStr || !strings.HasPrefix(lr.Body().Str(), "OFFLOAD:") {
-		return nil
+		return nil, nil
 	}
 	origLen := int64(len(lr.Body().Str()))
 	lr.Body().SetStr("<offloaded:gs://test-bucket/logs/body-001.txt>")
@@ -74,7 +74,7 @@ func (testPayloadOffloader) OffloadLog(lr plog.LogRecord, _ pcommon.Resource, _ 
 				Version: "1",
 			},
 		},
-	}
+	}, nil
 }
 
 func wireFakeHooks(t *testing.T, srv *bqfake.Server) {
