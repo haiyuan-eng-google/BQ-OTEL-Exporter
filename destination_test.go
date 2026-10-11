@@ -919,8 +919,8 @@ func TestClientOptionsSeparateMetadataFromStorageEndpoint(t *testing.T) {
 	if len(metadataOpts) != 2 {
 		t.Fatalf("metadata options = %d, want configured credential and explicit scope", len(metadataOpts))
 	}
-	if len(writerOpts) != 4 {
-		t.Fatalf("writer options = %d, want credential, explicit scope, endpoint, and transport", len(writerOpts))
+	if len(writerOpts) != 6 {
+		t.Fatalf("writer options = %d, want credential, explicit scope, endpoint, transport, multiplexing, and pool size", len(writerOpts))
 	}
 }
 
@@ -936,8 +936,8 @@ func TestAuthenticationOptionsApplyScopesToADC(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(metadataOpts) != 1 || len(writerOpts) != 1 {
-		t.Fatalf("ADC options metadata=%d writer=%d, want one explicit scope for each", len(metadataOpts), len(writerOpts))
+	if len(metadataOpts) != 1 || len(writerOpts) != 3 {
+		t.Fatalf("ADC options metadata=%d writer=%d, want 1 metadata scope and 3 writer options (scope, multiplexing, pool)", len(metadataOpts), len(writerOpts))
 	}
 }
 
@@ -953,8 +953,30 @@ func TestWriterClientOptionsWithoutAuthenticationSkipAuthOptions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(opts) != 5 {
+		t.Fatalf("no-auth writer options = %d, want endpoint, transport, WithoutAuthentication, multiplexing, and pool size", len(opts))
+	}
+}
+
+func TestWriterClientOptionsMultiplexingKeepaliveAndCompression(t *testing.T) {
+	cfg := validConfig()
+	cfg.Write.EnableMultiplexing = false
+	cfg.Write.ConnectionPoolSize = 0
+	cfg.Write.Compression = "gzip"
+	cfg.Write.Keepalive = KeepaliveConfig{
+		Time:                30 * time.Second,
+		Timeout:             10 * time.Second,
+		PermitWithoutStream: true,
+	}
+	e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+
+	opts, err := e.writerClientOptions(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 1 ADC scope + 1 keepalive dial option + 1 gzip compressor dial option = 3.
 	if len(opts) != 3 {
-		t.Fatalf("no-auth writer options = %d, want only endpoint, transport, and WithoutAuthentication", len(opts))
+		t.Fatalf("writer options = %d, want 3 (ADC scope, keepalive, gzip)", len(opts))
 	}
 }
 

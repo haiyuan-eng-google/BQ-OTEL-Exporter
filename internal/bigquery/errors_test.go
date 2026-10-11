@@ -24,12 +24,28 @@ func TestClassifyMatrix(t *testing.T) {
 		label    string
 		recreate bool
 	}{
-		"quota exhaustion is retryable": {
+		"throughput quota exhaustion is retryable": {
 			status.Error(codes.ResourceExhausted, throughputQuotaPrefix+" for project x"),
 			Retryable, OwnerExporterHelper, LabelQuota, false,
 		},
-		"other resource exhaustion is permanent": {
-			status.Error(codes.ResourceExhausted, "table row limit reached"),
+		"concurrent connections quota exhaustion is retryable": {
+			status.Error(codes.ResourceExhausted, "Exceeds 'Concurrent connections' quota for project x"),
+			Retryable, OwnerExporterHelper, LabelQuota, false,
+		},
+		"rate limit resource exhaustion is retryable": {
+			status.Error(codes.ResourceExhausted, "Rate limit exceeded"),
+			Retryable, OwnerExporterHelper, LabelQuota, false,
+		},
+		"oversize grpc message resource exhaustion is permanent": {
+			status.Error(codes.ResourceExhausted, "grpc: received message larger than max (10485760 vs. 10000000)"),
+			Permanent, OwnerExporter, LabelQuota, false,
+		},
+		"oversize request payload resource exhaustion is permanent": {
+			status.Error(codes.ResourceExhausted, "Request payload size exceeds the limit: 10485760 bytes."),
+			Permanent, OwnerExporter, LabelQuota, false,
+		},
+		"appendrows request size quota is permanent": {
+			status.Error(codes.ResourceExhausted, "Exceeds 'AppendRows request size' quota"),
 			Permanent, OwnerExporter, LabelQuota, false,
 		},
 		"unavailable is retryable": {
@@ -108,6 +124,8 @@ func TestRetryOwnershipIsConsistent(t *testing.T) {
 		status.Error(codes.PermissionDenied, ""),
 		status.Error(codes.InvalidArgument, ""),
 		status.Error(codes.ResourceExhausted, throughputQuotaPrefix),
+		status.Error(codes.ResourceExhausted, "Exceeds 'Concurrent connections' quota"),
+		status.Error(codes.ResourceExhausted, "grpc: received message larger than max"),
 		io.EOF,
 		errors.New("x"),
 	}

@@ -22,6 +22,8 @@ import (
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/encoding/gzip"
+	"google.golang.org/grpc/keepalive"
 
 	bqi "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/bigquery"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/diag"
@@ -250,6 +252,23 @@ func (e *signalExporter) writerClientOptions(ctx context.Context) ([]option.Clie
 		if e.cfg.Endpoint.WithoutAuthentication {
 			opts = append(opts, option.WithoutAuthentication())
 		}
+	}
+	if e.cfg.Write.EnableMultiplexing {
+		opts = append(opts, managedwriter.WithMultiplexing())
+	}
+	if e.cfg.Write.ConnectionPoolSize > 0 {
+		opts = append(opts, option.WithGRPCConnectionPool(e.cfg.Write.ConnectionPoolSize))
+	}
+	if ka := e.cfg.Write.Keepalive; ka.Time > 0 || ka.Timeout > 0 || ka.PermitWithoutStream {
+		opts = append(opts, option.WithGRPCDialOption(grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                ka.Time,
+			Timeout:             ka.Timeout,
+			PermitWithoutStream: ka.PermitWithoutStream,
+		})))
+	}
+	if e.cfg.Write.Compression == "gzip" {
+		opts = append(opts, option.WithGRPCDialOption(
+			grpc.WithDefaultCallOptions(grpc.UseCompressor(gzip.Name))))
 	}
 
 	return opts, nil
@@ -499,7 +518,7 @@ func (e *signalExporter) appendEncoded(
 
 	retryable := make([]int, 0, len(keptIndex)-len(invalid))
 	for pos, origIdx := range keptIndex {
-		if !invalid[pos] {
+		if !invalid[pos] && !out.IsAcked(pos) {
 			retryable = append(retryable, origIdx)
 		}
 	}
@@ -537,9 +556,8 @@ func (e *signalExporter) appendEncoded(
 		if v.Class == bqi.Permanent && len(out.RowErrors) == 0 {
 			return appendDecision{err: out.Err, permanent: true}
 		}
-		// AcknowledgedRows is a count rather than an index set. Conservatively
-		// retry every row not permanently rejected; this may replay confirmed
-		// rows, which the at-least-once contract permits.
+		// Rows in already-acknowledged sub-requests are excluded via
+		// out.IsAcked; retry every remaining row not permanently rejected.
 		return appendDecision{retryableIndices: retryable, err: out.Err, rowErrors: rowErrors}
 	}
 

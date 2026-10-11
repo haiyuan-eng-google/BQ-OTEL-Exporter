@@ -39,6 +39,11 @@ const (
 	defaultMaxInflightRequests = 8
 	defaultMaxInflightBytes    = 64 * 1024 * 1024
 
+	// Multiplexing shares a pool of gRPC connections across default write
+	// streams instead of opening a dedicated connection per stream.
+	defaultEnableMultiplexing = true
+	defaultConnectionPoolSize = 4
+
 	// defaultMaxElapsedTime sits deliberately above the ten-minute outage the
 	// reliability journey exercises. Horizon expiry is terminal — the
 	// persistent queue deletes the item — so a sub-outage horizon would break
@@ -82,6 +87,8 @@ func createDefaultConfig() component.Config {
 			MaxRowBytes:         defaultMaxRowBytes,
 			MaxInflightRequests: defaultMaxInflightRequests,
 			MaxInflightBytes:    defaultMaxInflightBytes,
+			EnableMultiplexing:  defaultEnableMultiplexing,
+			ConnectionPoolSize:  defaultConnectionPoolSize,
 		},
 		Limits: LimitsConfig{
 			MaxAttributeCount: limits.MaxAttributeCount,

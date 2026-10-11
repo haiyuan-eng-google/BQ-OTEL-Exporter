@@ -69,6 +69,16 @@ func TestSplitRequests(t *testing.T) {
 			t.Fatalf("split produced %d rows from %d", count, len(rows))
 		}
 	})
+
+	t.Run("accounts for protobuf wire framing and request envelope reserve", func(t *testing.T) {
+		// Two 480-byte rows sum to 960 raw bytes (<= 1000), but with a 64-byte
+		// envelope reserve and 3 bytes of ProtoRows tag+varint framing per row,
+		// their wire size is 64 + 483 + 483 = 1030 > 1000, so they must split.
+		got := SplitRequests([][]byte{row(480), row(480)}, 1000)
+		if len(got) != 2 {
+			t.Fatalf("got %d requests, want 2 when wire framing exceeds budget", len(got))
+		}
+	})
 }
 
 // --- fakes ---
@@ -1507,5 +1517,31 @@ func TestWriteRetriesAreExplicitlyDisabled(t *testing.T) {
 	}
 	if !retry.IsNil() {
 		t.Fatal("managedwriter write retries are enabled; exporterhelper must be the sole retry owner")
+	}
+}
+
+func TestAppendTracksAckedRangesAcrossSplitRequests(t *testing.T) {
+	first := newControlledResult()
+	second := newControlledResult()
+	first.complete(nil)
+	second.complete(status.Error(codes.Unavailable, "second sub-request failed"))
+
+	s := &scriptedStream{results: []appendResult{first, second}}
+	w, _ := newScriptedWriter(s)
+	w.opts.MaxRequestBytes = 200
+	w.opts.MaxInflightRequests = 2
+
+	row := make([]byte, 60)
+	out := w.Append(context.Background(), [][]byte{row, row, row, row})
+	if out.AcknowledgedRows != 2 {
+		t.Fatalf("acknowledged %d rows, want 2 from first sub-request", out.AcknowledgedRows)
+	}
+	if len(out.AckedRanges) != 1 || out.AckedRanges[0] != [2]int{0, 2} {
+		t.Fatalf("AckedRanges = %v, want [[0 2]]", out.AckedRanges)
+	}
+	for i, want := range []bool{true, true, false, false} {
+		if got := out.IsAcked(i); got != want {
+			t.Errorf("IsAcked(%d) = %v, want %v", i, got, want)
+		}
 	}
 }

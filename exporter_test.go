@@ -205,6 +205,25 @@ func TestPushTracesMixedOutcomeRetriesOnlyNonRejectedRows(t *testing.T) {
 	}
 }
 
+func TestPushTracesSplitBatchExcludesAckedSubRequestsFromRetry(t *testing.T) {
+	e, _ := newTestTracesExporter(t, bqi.AppendOutcome{
+		AcknowledgedRows: 2,
+		AckedRanges:      [][2]int{{0, 2}},
+		Verdict:          bqi.Classify(status.Error(codes.Unavailable, "second sub-request failed")),
+		Err:              status.Error(codes.Unavailable, "second sub-request failed"),
+	})
+
+	err := e.pushTraceData(context.Background(), newTestTraces(4))
+	var traceErr consumererror.Traces
+	if !errors.As(err, &traceErr) {
+		t.Fatalf("expected retryable trace subset, got %T: %v", err, err)
+	}
+	spans := traceErr.Data().ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+	if got := spanNames(spans); !equalStrings(got, []string{"c", "d"}) {
+		t.Fatalf("retry subset = %v, want only unacknowledged spans [c d]", got)
+	}
+}
+
 // A request refused for row errors appended none of its rows, so its valid
 // rows still owe delivery. A permanent rejection of another request in the
 // same batch must not drop them with it.
