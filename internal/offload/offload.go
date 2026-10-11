@@ -267,6 +267,7 @@ type Options struct {
 	MaxConcurrency int
 	Timeout        time.Duration
 	Now            func() time.Time
+	OnOffload      func(payloads int, bytes int64, errClass string)
 }
 
 // Offloader offloads large span/log attributes, log bodies, and quarantine
@@ -283,6 +284,7 @@ type Offloader struct {
 	sem            chan struct{}
 	timeout        time.Duration
 	now            func() time.Time
+	onOffload      func(payloads int, bytes int64, errClass string)
 }
 
 // New constructs an Offloader for the given BlobStore and options.
@@ -325,6 +327,7 @@ func New(store BlobStore, opts Options) (*Offloader, error) {
 		sem:            make(chan struct{}, maxConcurrency),
 		timeout:        timeout,
 		now:            nowFn,
+		onOffload:      opts.OnOffload,
 	}, nil
 }
 
@@ -565,7 +568,17 @@ func (o *Offloader) upload(
 		return store.WriteObject(uploadCtx, o.bucket, objectKey, contentType, data)
 	})
 	if err != nil {
+		if o.onOffload != nil {
+			errClass := "unknown"
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				errClass = "request_canceled"
+			}
+			o.onOffload(0, 0, errClass)
+		}
 		return transform.PayloadRef{}, err
+	}
+	if o.onOffload != nil {
+		o.onOffload(1, int64(len(data)), "")
 	}
 
 	uri := fmt.Sprintf("gs://%s/%s", o.bucket, objectKey)

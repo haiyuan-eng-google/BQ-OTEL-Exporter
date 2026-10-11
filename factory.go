@@ -22,12 +22,14 @@ import (
 const schemaVersion = schema.Version
 
 const (
-	defaultSpansTable = "otel_spans"
-	defaultLogsTable  = "otel_logs"
+	defaultSpansTable   = "otel_spans"
+	defaultLogsTable    = "otel_logs"
+	defaultMetricsTable = "otel_metrics"
 	// defaultQuarantineTable is used only once quarantine.enabled is set.
-	defaultQuarantineTable              = "otel_quarantine"
-	defaultQuarantineMaxRawPayloadBytes = 8 * 1024 * 1024
-	defaultQuarantineTimeout            = 5 * time.Second
+	defaultQuarantineTable               = "otel_quarantine"
+	defaultQuarantinePartitionExpiryDays = 30
+	defaultQuarantineMaxRawPayloadBytes  = 8 * 1024 * 1024
+	defaultQuarantineTimeout             = 5 * time.Second
 
 	// Defaults for optional GCS payload offloading.
 	defaultOffloadPrefix         = "otel-offload"
@@ -61,17 +63,15 @@ const (
 	defaultMaxElapsedTime = 900 * time.Second
 )
 
-// NewFactory creates a factory for the BigQuery exporter.
-//
-// Traces and logs only. The OTLP metrics signal is an independent future
-// proposal rather than a missing feature: it needs its own relational design,
-// and guessing at one would freeze the guess into a versioned contract.
+// NewFactory creates a factory for the BigQuery exporter supporting traces,
+// logs, and metrics.
 func NewFactory() exporter.Factory {
 	return exporter.NewFactory(
 		metadata.Type,
 		createDefaultConfig,
 		exporter.WithTraces(createTracesExporter, metadata.TracesStability),
 		exporter.WithLogs(createLogsExporter, metadata.LogsStability),
+		exporter.WithMetrics(createMetricsExporter, metadata.MetricsStability),
 	)
 }
 
@@ -91,6 +91,7 @@ func createDefaultConfig() component.Config {
 		BackOffConfig:   backoff,
 		Traces:          SignalConfig{Table: defaultSpansTable},
 		Logs:            LogsConfig{Table: defaultLogsTable},
+		Metrics:         SignalConfig{Table: defaultMetricsTable},
 		Write: WriteConfig{
 			MaxRequestBytes:     defaultMaxRequestBytes,
 			MaxRowBytes:         defaultMaxRowBytes,
@@ -109,9 +110,10 @@ func createDefaultConfig() component.Config {
 			MaxValueBytes:        limits.MaxValueBytes,
 		},
 		Quarantine: QuarantineConfig{
-			Table:              defaultQuarantineTable,
-			MaxRawPayloadBytes: defaultQuarantineMaxRawPayloadBytes,
-			Timeout:            defaultQuarantineTimeout,
+			Table:                   defaultQuarantineTable,
+			PartitionExpirationDays: defaultQuarantinePartitionExpiryDays,
+			MaxRawPayloadBytes:      defaultQuarantineMaxRawPayloadBytes,
+			Timeout:                 defaultQuarantineTimeout,
 		},
 		Offload: OffloadConfig{
 			Prefix:         defaultOffloadPrefix,
@@ -165,6 +167,30 @@ func createLogsExporter(
 		set,
 		cfg,
 		exp.pushLogData,
+		exporterhelper.WithStart(exp.start),
+		exporterhelper.WithShutdown(exp.shutdown),
+		exporterhelper.WithTimeout(c.TimeoutSettings),
+		exporterhelper.WithQueue(c.QueueSettings),
+		exporterhelper.WithRetry(c.BackOffConfig),
+	)
+}
+
+func createMetricsExporter(
+	ctx context.Context,
+	set exporter.Settings,
+	cfg component.Config,
+) (exporter.Metrics, error) {
+	c := cfg.(*Config)
+	exp, err := newMetricsExporter(set.TelemetrySettings, c)
+	if err != nil {
+		return nil, err
+	}
+
+	return exporterhelper.NewMetrics(
+		ctx,
+		set,
+		cfg,
+		exp.pushMetricsData,
 		exporterhelper.WithStart(exp.start),
 		exporterhelper.WithShutdown(exp.shutdown),
 		exporterhelper.WithTimeout(c.TimeoutSettings),

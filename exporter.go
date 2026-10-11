@@ -14,6 +14,7 @@ import (
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/component/componentstatus"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.uber.org/zap"
 	"golang.org/x/oauth2/google"
@@ -67,13 +68,15 @@ type rowEncoder interface {
 	Encode(row transform.Row) ([]byte, error)
 }
 
-// signalExporter holds everything both pipelines share. The traces and logs
-// exporters differ only in which table they target and how they build rows.
+// signalExporter holds everything the signal pipelines share. The traces,
+// logs, and metrics exporters differ only in which table they target and how
+// they build rows.
 type signalExporter struct {
 	cfg    *Config
 	table  string
 	logger *zap.Logger
 	tel    *metadata.Telemetry
+	host   component.Host
 
 	lifetimeCancel context.CancelFunc
 
@@ -127,6 +130,19 @@ func newSignalExporter(
 			MaxObjectBytes: cfg.Offload.MaxObjectBytes,
 			MaxConcurrency: cfg.Offload.MaxConcurrency,
 			Timeout:        cfg.Offload.Timeout,
+			OnOffload: func(payloads int, bytes int64, errClass string) {
+				if se.tel == nil {
+					return
+				}
+				ctx := context.Background()
+				if payloads > 0 {
+					se.tel.RecordOffloadedPayloads(ctx, payloads)
+					se.tel.RecordOffloadedBytes(ctx, bytes)
+				}
+				if errClass != "" {
+					se.tel.RecordOffloadError(ctx, errClass, 1)
+				}
+			},
 		})
 		if err == nil {
 			se.offloader = off
@@ -149,14 +165,53 @@ func exporterInstance(res pcommon.Resource) string {
 	return ""
 }
 
+func loadCredentialsJSON(
+	ctx context.Context, rawJSON []byte, scopes []string, universeDomain string,
+) (*google.Credentials, error) {
+	var header struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(rawJSON, &header); err != nil {
+		return nil, fmt.Errorf("parsing credentials JSON: %w", err)
+	}
+	credType := google.CredentialsType(header.Type)
+	switch credType {
+	case google.ServiceAccount,
+		google.AuthorizedUser,
+		google.ExternalAccount,
+		google.ExternalAccountAuthorizedUser,
+		google.ImpersonatedServiceAccount,
+		google.GDCHServiceAccount:
+	case "":
+		return nil, errors.New("google: missing 'type' field in credentials")
+	default:
+		return nil, fmt.Errorf("unsupported credentials type %q", header.Type)
+	}
+	return google.CredentialsFromJSONWithTypeAndParams(ctx, rawJSON, credType, google.CredentialsParams{
+		Scopes:         scopes,
+		UniverseDomain: universeDomain,
+	})
+}
+
 // authenticationOptions renders the configured identity for either BigQuery
-// client. Service endpoint overrides remain a Storage Write-only concern.
+// client.
 func (e *signalExporter) authenticationOptions(
 	ctx context.Context, scopes []string,
 ) ([]option.ClientOption, error) {
 	var opts []option.ClientOption
 
 	switch {
+	case e.cfg.Credentials.JSON != "":
+		creds, err := loadCredentialsJSON(
+			ctx, []byte(e.cfg.Credentials.JSON), scopes, e.cfg.Credentials.UniverseDomain)
+		if err != nil {
+			return nil, fmt.Errorf("loading credentials.json: %w", err)
+		}
+		opts = append(opts,
+			option.WithCredentials(creds),
+			option.WithScopes(scopes...),
+		)
+
 	case e.cfg.Credentials.File != "":
 		credOpt, err := credentialsFileOption(ctx, e.cfg.Credentials.File, scopes)
 		if err != nil {
@@ -172,6 +227,7 @@ func (e *signalExporter) authenticationOptions(
 	case e.cfg.Credentials.ImpersonateServiceAccount != "":
 		ts, err := impersonate.CredentialsTokenSource(ctx, impersonate.CredentialsConfig{
 			TargetPrincipal: e.cfg.Credentials.ImpersonateServiceAccount,
+			Delegates:       e.cfg.Credentials.ImpersonateDelegates,
 			Scopes:          scopes,
 		})
 		if err != nil {
@@ -182,6 +238,13 @@ func (e *signalExporter) authenticationOptions(
 
 	default:
 		opts = append(opts, option.WithScopes(scopes...))
+	}
+
+	if e.cfg.Credentials.QuotaProject != "" {
+		opts = append(opts, option.WithQuotaProject(e.cfg.Credentials.QuotaProject))
+	}
+	if e.cfg.Credentials.UniverseDomain != "" {
+		opts = append(opts, option.WithUniverseDomain(e.cfg.Credentials.UniverseDomain))
 	}
 
 	return opts, nil
@@ -258,11 +321,18 @@ func credentialsFileOption(
 }
 
 func (e *signalExporter) metadataClientOptions(ctx context.Context) ([]option.ClientOption, error) {
-	return e.authenticationOptions(ctx, e.metadataScopes())
+	opts, err := e.authenticationOptions(ctx, e.metadataScopes())
+	if err != nil {
+		return nil, err
+	}
+	if e.cfg.Endpoint.AdminURL != "" {
+		opts = append(opts, option.WithEndpoint(e.cfg.Endpoint.AdminURL))
+	}
+	return opts, nil
 }
 
 func (e *signalExporter) metadataScopes() []string {
-	if e.cfg.AutoCreate.Dataset || e.cfg.AutoCreate.Tables {
+	if e.cfg.AutoCreate.Dataset || e.cfg.AutoCreate.Tables || e.cfg.AutoCreate.SearchIndexes {
 		return []string{bigqueryapi.BigqueryScope}
 	}
 	return []string{scopeRead}
@@ -320,7 +390,10 @@ func (e *signalExporter) offloadClientOptions(ctx context.Context) ([]option.Cli
 	return e.authenticationOptions(ctx, []string{scopeStorageReadWrite})
 }
 
-func (e *signalExporter) start(ctx context.Context, _ component.Host) (err error) {
+func (e *signalExporter) start(ctx context.Context, host component.Host) (err error) {
+	e.host = host
+	componentstatus.ReportStatus(e.host, componentstatus.NewEvent(componentstatus.StatusStarting))
+
 	// Start's context is scoped to component startup. managedwriter retains
 	// both its client and stream constructor contexts for background work, so
 	// give them an exporter-owned lifetime that ends only during cleanup.
@@ -328,7 +401,8 @@ func (e *signalExporter) start(ctx context.Context, _ component.Host) (err error
 	e.lifetimeCancel = lifetimeCancel
 	defer func() {
 		if err != nil {
-			err = errors.Join(err, e.shutdown(context.Background()))
+			componentstatus.ReportStatus(e.host, componentstatus.NewPermanentErrorEvent(err))
+			err = errors.Join(err, e.shutdownStatus(context.Background(), false))
 		}
 	}()
 
@@ -439,6 +513,7 @@ func (e *signalExporter) start(ctx context.Context, _ component.Host) (err error
 	}
 
 	e.logger.Info("BigQuery exporter started", startedFields...)
+	componentstatus.ReportStatus(e.host, componentstatus.NewEvent(componentstatus.StatusOK))
 	return nil
 }
 
@@ -450,7 +525,14 @@ func (e *signalExporter) quarantineTableID() string {
 	return fmt.Sprintf("%s.%s.%s", e.cfg.Project, e.cfg.Dataset, e.cfg.Quarantine.Table)
 }
 
-func (e *signalExporter) shutdown(_ context.Context) error {
+func (e *signalExporter) shutdown(ctx context.Context) error {
+	return e.shutdownStatus(ctx, true)
+}
+
+func (e *signalExporter) shutdownStatus(_ context.Context, report bool) error {
+	if report {
+		componentstatus.ReportStatus(e.host, componentstatus.NewEvent(componentstatus.StatusStopping))
+	}
 	// In-flight appends drain against the caller's context deadline; whatever
 	// has not been acknowledged fails back to the persistent queue and is
 	// replayed after restart.
@@ -488,6 +570,9 @@ func (e *signalExporter) shutdown(_ context.Context) error {
 	if e.lifetimeCancel != nil {
 		e.lifetimeCancel()
 		e.lifetimeCancel = nil
+	}
+	if report {
+		componentstatus.ReportStatus(e.host, componentstatus.NewEvent(componentstatus.StatusStopped))
 	}
 	return errors.Join(errs...)
 }
@@ -573,6 +658,12 @@ func (e *signalExporter) appendEncoded(
 		return appendDecision{}
 	}
 
+	var totalBytes int64
+	for _, b := range encoded {
+		totalBytes += int64(len(b))
+	}
+	e.tel.RecordAppendBytes(ctx, totalBytes)
+
 	out := e.writer.Append(ctx, encoded)
 	e.tel.RecordAcknowledged(ctx, out.AcknowledgedRows)
 
@@ -611,8 +702,12 @@ func (e *signalExporter) appendEncoded(
 			// resolves.
 			e.tel.RecordUncertainAckReplay(ctx)
 			e.tel.RecordRetry(ctx, v.Label)
+			componentstatus.ReportStatus(e.host, componentstatus.NewRecoverableErrorEvent(out.Err))
 		case bqi.Retryable:
 			e.tel.RecordRetry(ctx, v.Label)
+			componentstatus.ReportStatus(e.host, componentstatus.NewRecoverableErrorEvent(out.Err))
+		case bqi.Permanent:
+			componentstatus.ReportStatus(e.host, componentstatus.NewPermanentErrorEvent(out.Err))
 		}
 
 		if v.Label == bqi.LabelPermission {
@@ -657,6 +752,9 @@ func (e *signalExporter) appendEncoded(
 		}
 	}
 
+	if out.AcknowledgedRows > 0 {
+		componentstatus.ReportStatus(e.host, componentstatus.NewEvent(componentstatus.StatusOK))
+	}
 	return appendDecision{}
 }
 
@@ -728,6 +826,40 @@ func (e *signalExporter) quarantineContext(ctx context.Context) (context.Context
 	return context.WithTimeout(context.WithoutCancel(ctx), timeout)
 }
 
+func quarantineRowReason(row transform.Row) string {
+	code, _ := row["error_code"].(string)
+	switch code {
+	case "INVALID_TRACE_ID", "INVALID_SPAN_ID", "INVALID_ID":
+		return string(transform.ReasonInvalidID)
+	case "MISSING_START_TIME", "MISSING_END_TIME", "MISSING_TIMESTAMP":
+		return string(transform.ReasonMissingTimestamp)
+	case "OVERSIZE_ROW", "ROW_BYTES":
+		return string(transform.ReasonRowBytes)
+	case "ATTRIBUTE_COUNT":
+		return string(transform.ReasonAttributeCount)
+	case "ATTRIBUTE_KEY_SIZE":
+		return string(transform.ReasonAttributeKeySize)
+	case "EVENT_COUNT":
+		return string(transform.ReasonEventCount)
+	case "LINK_COUNT":
+		return string(transform.ReasonLinkCount)
+	case "NESTING_DEPTH":
+		return string(transform.ReasonNestingDepth)
+	case "COLLECTION_SIZE":
+		return string(transform.ReasonCollectionSize)
+	case "VALUE_SIZE":
+		return string(transform.ReasonValueSize)
+	case "SERIALIZATION":
+		return string(transform.ReasonSerialization)
+	case "ROW_ERROR":
+		return string(transform.ReasonRowError)
+	case "TIMESTAMP_OVERFLOW":
+		return string(transform.ReasonTimestampOverflow)
+	default:
+		return "other"
+	}
+}
+
 // quarantineRows appends rows to the quarantine table on its dedicated stream.
 //
 // Quarantine is best effort and never changes the outcome of the push that
@@ -743,23 +875,27 @@ func (e *signalExporter) quarantineRows(ctx context.Context, rows []transform.Ro
 	}
 	qid := e.quarantineTableID()
 	encoded := make([][]byte, 0, len(rows))
+	encodedReasons := make([]string, 0, len(rows))
 	for i, row := range rows {
 		if err := ctx.Err(); err != nil {
 			break
 		}
 		b, err := e.quarantineEnc.Encode(row)
 		if err != nil {
+			e.tel.RecordQuarantineFailed(ctx, string(transform.ReasonSerialization), 1)
 			e.logger.Debug("dropping quarantine row that failed serialization",
 				diag.Rejection(qid, opID, i, string(transform.ReasonSerialization), "unknown", 0, 0)...)
 			continue
 		}
 		if len(b) > e.cfg.Write.MaxRowBytes {
+			e.tel.RecordQuarantineFailed(ctx, string(transform.ReasonRowBytes), 1)
 			e.logger.Debug("dropping oversized quarantine row",
 				diag.Rejection(qid, opID, i, string(transform.ReasonRowBytes), "unknown",
 					e.cfg.Write.MaxRowBytes, len(b))...)
 			continue
 		}
 		encoded = append(encoded, b)
+		encodedReasons = append(encodedReasons, quarantineRowReason(row))
 	}
 	if len(encoded) == 0 {
 		return
@@ -776,6 +912,23 @@ func (e *signalExporter) quarantineRows(ctx context.Context, rows []transform.Ro
 	}
 
 	out := e.quarantine.Append(qCtx, encoded)
+	invalid := make(map[int]bool, len(out.RowErrors))
+	for _, re := range out.RowErrors {
+		if pos := int(re.Index); pos >= 0 && pos < len(encodedReasons) {
+			invalid[pos] = true
+		}
+	}
+	remainingAcked := out.AcknowledgedRows
+	for pos, reason := range encodedReasons {
+		if !invalid[pos] && (out.IsAcked(pos) || remainingAcked > 0) {
+			if !out.IsAcked(pos) {
+				remainingAcked--
+			}
+			e.tel.RecordQuarantined(ctx, reason, 1)
+		} else if out.Err != nil || len(out.RowErrors) > 0 {
+			e.tel.RecordQuarantineFailed(ctx, reason, 1)
+		}
+	}
 	if out.Err == nil && len(out.RowErrors) == 0 {
 		return
 	}

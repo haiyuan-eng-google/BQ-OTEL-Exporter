@@ -14,16 +14,36 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
+// DestinationOptions configures table-level partitioning options when
+// creating a destination table via the BigQuery metadata API.
+type DestinationOptions struct {
+	PartitionExpirationDays int
+	RequirePartitionFilter  bool
+}
+
 // DestinationMetadata builds the physical table and logical deduplication
-// view metadata for one of the exporter's canonical signal contracts.
+// view metadata for one of the exporter's canonical signal contracts using
+// default DestinationOptions.
 func DestinationMetadata(
 	in *storagepb.TableSchema, project, dataset, table string,
+) (*bq.TableMetadata, string, error) {
+	return DestinationMetadataWithOptions(in, project, dataset, table, DestinationOptions{})
+}
+
+// DestinationMetadataWithOptions builds the physical table and logical
+// deduplication view metadata for one of the exporter's canonical signal
+// contracts with explicit partitioning options.
+func DestinationMetadataWithOptions(
+	in *storagepb.TableSchema, project, dataset, table string, opts DestinationOptions,
 ) (*bq.TableMetadata, string, error) {
 	bqs, err := ToBigQuery(in)
 	if err != nil {
 		return nil, "", err
 	}
-	md := &bq.TableMetadata{Schema: bqs}
+	md := &bq.TableMetadata{
+		Schema:                 bqs,
+		RequirePartitionFilter: opts.RequirePartitionFilter,
+	}
 	var queryTemplate string
 	switch {
 	case proto.Equal(in, SpansTableSchema()):
@@ -34,8 +54,15 @@ func DestinationMetadata(
 		md.TimePartitioning = &bq.TimePartitioning{Type: bq.DayPartitioningType, Field: "timestamp"}
 		md.Clustering = &bq.Clustering{Fields: []string{"service_name", "trace_id", "severity_number"}}
 		queryTemplate = LogsDedupViewQuery
+	case proto.Equal(in, MetricsTableSchema()):
+		md.TimePartitioning = &bq.TimePartitioning{Type: bq.DayPartitioningType, Field: "timestamp"}
+		md.Clustering = &bq.Clustering{Fields: []string{"service_name", "metric_name", "metric_type"}}
+		queryTemplate = MetricsDedupViewQuery
 	default:
-		return nil, "", fmt.Errorf("schema is not a canonical trace or log contract")
+		return nil, "", fmt.Errorf("schema is not a canonical trace, log, or metric contract")
+	}
+	if opts.PartitionExpirationDays > 0 {
+		md.TimePartitioning.Expiration = time.Duration(opts.PartitionExpirationDays) * 24 * time.Hour
 	}
 	return md, fmt.Sprintf(queryTemplate, project, dataset, table), nil
 }
@@ -48,24 +75,48 @@ const quarantinePartitionExpiration = 30 * 24 * time.Hour
 // opt-in quarantine table, matching QuarantineDDL. Unlike the signal tables,
 // it has no deduplication view.
 func QuarantineDestinationMetadata() (*bq.TableMetadata, error) {
+	return QuarantineDestinationMetadataWithOptions(DestinationOptions{})
+}
+
+// QuarantineDestinationMetadataWithOptions builds the physical table metadata
+// of the opt-in quarantine table with explicit partitioning options. When
+// opts.PartitionExpirationDays is 0, the default 30-day expiration from
+// QuarantineDDL is applied.
+func QuarantineDestinationMetadataWithOptions(opts DestinationOptions) (*bq.TableMetadata, error) {
 	bqs, err := ToBigQuery(QuarantineTableSchema())
 	if err != nil {
 		return nil, err
 	}
+	expiration := quarantinePartitionExpiration
+	if opts.PartitionExpirationDays > 0 {
+		expiration = time.Duration(opts.PartitionExpirationDays) * 24 * time.Hour
+	}
 	return &bq.TableMetadata{
-		Schema: bqs,
+		Schema:                 bqs,
+		RequirePartitionFilter: opts.RequirePartitionFilter,
 		TimePartitioning: &bq.TimePartitioning{
 			Type:       bq.DayPartitioningType,
 			Field:      "ingest_time",
-			Expiration: quarantinePartitionExpiration,
+			Expiration: expiration,
 		},
 		Clustering: &bq.Clustering{Fields: []string{"signal", "error_code", "service_name"}},
 	}, nil
 }
 
+// SpanCompanionViewOrder lists the span companion views in dependency order so
+// v_gen_ai_spans is created before the rollup views that query it.
+var SpanCompanionViewOrder = []string{
+	SpansAsAllSpansViewName,
+	GenAISpansViewName,
+	GenAIModelCostsViewName,
+	GenAISessionsViewName,
+	GenAIToolUsageViewName,
+}
+
 // CompanionViewsMetadata builds the optional companion views of one signal,
-// keyed by view name: otel_spans_as_allspans and v_gen_ai_spans for traces,
-// v_gen_ai_logs for logs. The views read the dedup views, never the raw
+// keyed by view name: otel_spans_as_allspans, v_gen_ai_spans,
+// v_gen_ai_model_costs, v_gen_ai_sessions, and v_gen_ai_tool_usage for traces,
+// and v_gen_ai_logs for logs. The views read the dedup views, never the raw
 // tables, and v_gen_ai_logs reads the span dedup view as well as the log one,
 // so it can only be created once the span dedup view exists.
 func CompanionViewsMetadata(
@@ -78,11 +129,67 @@ func CompanionViewsMetadata(
 		return map[string]*bq.TableMetadata{
 			SpansAsAllSpansViewName: view(fmt.Sprintf(SpansAsAllSpansViewQuery, project, dataset, spansTable)),
 			GenAISpansViewName:      view(fmt.Sprintf(GenAISpansViewQuery, project, dataset, spansTable)),
+			GenAIModelCostsViewName: view(fmt.Sprintf(GenAIModelCostsViewQuery, project, dataset)),
+			GenAISessionsViewName:   view(fmt.Sprintf(GenAISessionsViewQuery, project, dataset)),
+			GenAIToolUsageViewName:  view(fmt.Sprintf(GenAIToolUsageViewQuery, project, dataset)),
 		}
 	}
 	return map[string]*bq.TableMetadata{
 		GenAILogsViewName: view(fmt.Sprintf(GenAILogsViewQuery, project, dataset, logsTable, spansTable)),
 	}
+}
+
+// ReconcileAdditiveSchema appends any NULLABLE or REPEATED fields present in
+// want but missing from existing (both at top level and inside RECORD fields).
+// Required fields missing from existing are not added because BigQuery does
+// not permit adding REQUIRED columns to an existing table.
+func ReconcileAdditiveSchema(existing bq.Schema, want *storagepb.TableSchema) (bq.Schema, bool, error) {
+	if want == nil {
+		return existing, false, nil
+	}
+	wantBQ, err := ToBigQuery(want)
+	if err != nil {
+		return nil, false, err
+	}
+	merged, changed := reconcileBigQueryFields(existing, wantBQ)
+	return merged, changed, nil
+}
+
+func reconcileBigQueryFields(existing, want bq.Schema) (bq.Schema, bool) {
+	wantByName := make(map[string]*bq.FieldSchema, len(want))
+	for _, f := range want {
+		if f != nil {
+			wantByName[f.Name] = f
+		}
+	}
+	existingByName := make(map[string]bool, len(existing))
+	merged := make(bq.Schema, len(existing))
+	changed := false
+	for i, ef := range existing {
+		if ef == nil {
+			continue
+		}
+		existingByName[ef.Name] = true
+		copyField := *ef
+		if wf, ok := wantByName[ef.Name]; ok && ef.Type == bq.RecordFieldType && wf.Type == bq.RecordFieldType &&
+			ef.Required == wf.Required && ef.Repeated == wf.Repeated {
+			nestedMerged, nestedChanged := reconcileBigQueryFields(ef.Schema, wf.Schema)
+			if nestedChanged {
+				copyField.Schema = nestedMerged
+				changed = true
+			}
+		}
+		merged[i] = &copyField
+	}
+	for _, wf := range want {
+		if wf == nil || existingByName[wf.Name] || wf.Required {
+			continue
+		}
+		copyField := *wf
+		merged = append(merged, &copyField)
+		changed = true
+	}
+	return merged, changed
 }
 
 var fieldTypePairs = []struct {

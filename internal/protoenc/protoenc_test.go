@@ -1035,3 +1035,78 @@ func BenchmarkEncodeSpanRow(b *testing.B) {
 		}
 	}
 }
+
+func TestEncodeMetricRow(t *testing.T) {
+	enc, err := New(schema.MetricsTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	row := transform.Row{
+		"timestamp":               int64(1_700_000_000_000_000),
+		"time_unix_nano":          int64(1_700_000_000_000_000_000),
+		"receive_time":            int64(1_700_000_001_000_000),
+		"receive_time_unix_nano":  int64(1_700_000_001_000_000_000),
+		"service_name":            "checkout",
+		"metric_name":             "gen_ai.client.operation.duration",
+		"metric_type":             "HISTOGRAM",
+		"aggregation_temporality": "DELTA",
+		"is_monotonic":            true,
+		"flags":                   int64(0),
+		"attributes":              `{"gen_ai.provider.name":"gcp.vertex_ai"}`,
+		"attributes_schema":       `{"gen_ai.provider.name":"string"}`,
+		"count":                   int64(3),
+		"sum":                     1.75,
+		"explicit_bounds":         []float64{0.25, 0.5, 1.0},
+		"bucket_counts":           []int64{1, 1, 1, 0},
+		"exp_positive": transform.Row{
+			"offset":        int64(1),
+			"bucket_counts": []int64{2, 3},
+		},
+		"summary_quantiles": []transform.Row{
+			{"quantile": 0.95, "value": 0.9},
+		},
+		"exemplars": []transform.Row{
+			{
+				"time":                       int64(1_700_000_000_000_000),
+				"time_unix_nano":             int64(1_700_000_000_000_000_000),
+				"value_double":               0.42,
+				"trace_id":                   "0102030405060708090a0b0c0d0e0f10",
+				"span_id":                    "0102030405060708",
+				"filtered_attributes":        "{}",
+				"filtered_attributes_schema": "{}",
+			},
+		},
+		"resource": transform.Row{
+			"attributes":               `{"service.name":"checkout"}`,
+			"attributes_schema":        `{"service.name":"string"}`,
+			"dropped_attributes_count": int64(0),
+		},
+		"instrumentation_scope": transform.Row{
+			"name":                     "otel-genai",
+			"attributes":               "{}",
+			"attributes_schema":        "{}",
+			"dropped_attributes_count": int64(0),
+		},
+		"point_fingerprint": "fp1:0123456789abcdef",
+		"schema_version":    schema.Version,
+	}
+
+	b, err := enc.Encode(row)
+	if err != nil {
+		t.Fatalf("Encode metric row: %v", err)
+	}
+	norm := decodeNormalized(t, enc, b)
+	if got := get(t, norm, "metric_name").String(); got != "gen_ai.client.operation.duration" {
+		t.Errorf("metric_name = %q", got)
+	}
+	if got := get(t, norm, "is_monotonic").Bool(); !got {
+		t.Errorf("is_monotonic = %v, want true", got)
+	}
+	if bounds := norm.Get(norm.Descriptor().Fields().ByName("explicit_bounds")).List(); bounds.Len() != 3 {
+		t.Errorf("explicit_bounds len = %d, want 3", bounds.Len())
+	}
+	if buckets := norm.Get(norm.Descriptor().Fields().ByName("bucket_counts")).List(); buckets.Len() != 4 {
+		t.Errorf("bucket_counts len = %d, want 4", buckets.Len())
+	}
+}

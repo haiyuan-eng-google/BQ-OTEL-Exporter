@@ -19,9 +19,11 @@ import (
 	bq "cloud.google.com/go/bigquery"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/component/componentstatus"
 	"go.opentelemetry.io/collector/consumer/consumererror"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/otel/metric/noop"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -1332,6 +1334,10 @@ func TestNewSignalExporterWiresOffloadAndQuarantinePIIOptions(t *testing.T) {
 }
 
 func TestPushTracesOffloadsOversizedPayloadEndToEnd(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+
 	cfg := validConfig()
 	cfg.Offload.Enabled = true
 	cfg.Offload.Bucket = "otel-offload-bucket"
@@ -1340,7 +1346,7 @@ func TestPushTracesOffloadsOversizedPayloadEndToEnd(t *testing.T) {
 
 	e, err := newTracesExporter(component.TelemetrySettings{
 		Logger:        zap.NewNop(),
-		MeterProvider: noop.NewMeterProvider(),
+		MeterProvider: mp,
 	}, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -1376,6 +1382,21 @@ func TestPushTracesOffloadsOversizedPayloadEndToEnd(t *testing.T) {
 	}
 	if refs[0]["attribute_path"] != "attributes.gen_ai.prompt" {
 		t.Errorf("payload_refs[0].attribute_path = %v, want attributes.gen_ai.prompt", refs[0]["attribute_path"])
+	}
+	if got := metricInt64Sum(t, reader, "otelcol_exporter_bigquery_offloaded_payloads"); got != 1 {
+		t.Errorf("offloaded_payloads = %d, want 1", got)
+	}
+	if got := metricInt64Sum(t, reader, "otelcol_exporter_bigquery_offloaded_bytes"); got != int64(len(largePrompt)) {
+		t.Errorf("offloaded_bytes = %d, want %d", got, len(largePrompt))
+	}
+
+	// Simulate an offload upload failure and verify offload_errors increments.
+	memStore.SetError(errors.New("gcs write error"))
+	tdFail := newTestTraces(1)
+	tdFail.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Attributes().PutStr("gen_ai.prompt", largePrompt)
+	_ = e.pushTraceData(context.Background(), tdFail)
+	if got := metricInt64Sum(t, reader, "otelcol_exporter_bigquery_offload_errors"); got != 1 {
+		t.Errorf("offload_errors = %d, want 1", got)
 	}
 }
 
@@ -2090,4 +2111,181 @@ func insertIDsWrittenUntilDelivered(t *testing.T, concurrency int, fail func(n i
 	}
 	t.Fatal("the batch was not delivered within 10 pushes")
 	return nil
+}
+
+func newTestMetrics(points int) pmetric.Metrics {
+	md := pmetric.NewMetrics()
+	sm := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
+	m := sm.Metrics().AppendEmpty()
+	m.SetName("gen_ai.client.token.usage")
+	g := m.SetEmptyGauge()
+	for i := 0; i < points; i++ {
+		dp := g.DataPoints().AppendEmpty()
+		dp.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000 + uint64(i)*1_000_000_000))
+		dp.SetIntValue(int64(i + 1))
+	}
+	return md
+}
+
+func newTestMetricsExporter(t *testing.T, out bqi.AppendOutcome) (*metricsExporter, *fakeAppender) {
+	t.Helper()
+	cfg := validConfig()
+	tel, err := metadata.NewTelemetry(noop.NewMeterProvider())
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := protoenc.New(schema.MetricsTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &fakeAppender{outcome: out}
+
+	se := &signalExporter{
+		cfg:    cfg,
+		table:  cfg.Metrics.Table,
+		logger: zap.NewNop(),
+		tel:    tel,
+		writer: app,
+		enc:    enc,
+		schema: schema.MetricsTableSchema(),
+		opts:   transform.Options{Limits: cfg.Limits.toTransform()},
+	}
+	return &metricsExporter{se}, app
+}
+
+func TestPushMetricsSuccess(t *testing.T) {
+	e, app := newTestMetricsExporter(t, bqi.AppendOutcome{AcknowledgedRows: 3})
+
+	if err := e.pushMetricsData(context.Background(), newTestMetrics(3)); err != nil {
+		t.Fatalf("expected success, got %v", err)
+	}
+	if app.gotRows != 3 {
+		t.Fatalf("appended %d rows, want 3", app.gotRows)
+	}
+}
+
+func TestPushMetricsReturnsValidSubsetOnRowErrors(t *testing.T) {
+	e, _ := newTestMetricsExporter(t, bqi.AppendOutcome{
+		RowErrors: []bqi.RowError{{Index: 1, Code: "FIELDS_ERROR", Message: "bad field metric_name"}},
+	})
+
+	err := e.pushMetricsData(context.Background(), newTestMetrics(3))
+	if err == nil || consumererror.IsPermanent(err) {
+		t.Fatalf("error = %v, want retryable subset error", err)
+	}
+	var mdErr consumererror.Metrics
+	if !errors.As(err, &mdErr) {
+		t.Fatalf("error %T does not carry pmetric.Metrics", err)
+	}
+	dps := mdErr.Data().ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Gauge().DataPoints()
+	if dps.Len() != 2 || dps.At(0).IntValue() != 1 || dps.At(1).IntValue() != 3 {
+		t.Fatalf("retry subset len=%d, want 2 points with values [1, 3]", dps.Len())
+	}
+}
+
+func TestPushMetricsQuarantinesEveryDroppedDataPoint(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+	tel, err := metadata.NewTelemetry(mp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, _ := newTestMetricsExporter(t, bqi.AppendOutcome{
+		AcknowledgedRows: 1,
+		RowErrors:        []bqi.RowError{{Index: 1, Code: "FIELDS_ERROR", Message: "bad metric row"}},
+	})
+	e.tel = tel
+	e.cfg.Limits.MaxAttributeCount = 1
+	e.opts.Limits = e.cfg.Limits.toTransform()
+	_, stream := withQuarantine(t, e.signalExporter, bqi.AppendOutcome{AcknowledgedRows: 2})
+
+	md := newTestMetrics(3)
+	dps := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Gauge().DataPoints()
+	dps.At(0).Attributes().PutStr("a", "1")
+	dps.At(0).Attributes().PutStr("b", "2") // exceeds MaxAttributeCount=1
+
+	err = e.pushMetricsData(context.Background(), md)
+	if err == nil || consumererror.IsPermanent(err) {
+		t.Fatalf("pushMetricsData error = %v, want retryable subset error for surviving point", err)
+	}
+	if stream.gotRows != 2 {
+		t.Fatalf("quarantined %d rows, want 2 (1 limit breach + 1 row rejection)", stream.gotRows)
+	}
+	if got := metricInt64Sum(t, reader, "otelcol_exporter_bigquery_quarantined_rows"); got != 2 {
+		t.Errorf("quarantined_rows = %d, want 2", got)
+	}
+	if got := metricInt64Sum(t, reader, "otelcol_exporter_bigquery_append_bytes"); got <= 0 {
+		t.Errorf("append_bytes = %d, want > 0", got)
+	}
+}
+
+type fakeStatusHost struct {
+	events []*componentstatus.Event
+}
+
+func (f *fakeStatusHost) GetExtensions() map[component.ID]component.Component { return nil }
+
+func (f *fakeStatusHost) Report(ev *componentstatus.Event) {
+	f.events = append(f.events, ev)
+}
+
+func TestComponentStatusReportedAcrossLifecycleAndAppend(t *testing.T) {
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(t.TempDir(), "missing-adc.json"))
+	originalAdmin := newDestinationAdmin
+	t.Cleanup(func() { newDestinationAdmin = originalAdmin })
+	newDestinationAdmin = func(
+		context.Context, string, string, ...option.ClientOption,
+	) (destinationAdmin, error) {
+		return &fakeDestinationAdmin{datasetMetadata: &bq.DatasetMetadata{}, tableMetadata: &bq.TableMetadata{Schema: mustBigQuerySchema(t, schema.SpansTableSchema())}}, nil
+	}
+
+	cfg := validConfig()
+	cfg.Endpoint.URL = "localhost:19050"
+	cfg.Endpoint.Insecure = true
+	cfg.Endpoint.WithoutAuthentication = true
+	e := newSignalExporter(componentTelemetryForTest(), cfg, cfg.Traces.Table, schema.SpansTableSchema())
+	host := &fakeStatusHost{}
+
+	if err := e.start(context.Background(), host); err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	// Replace writer with fakeAppender to test appendEncoded status transitions.
+	_ = e.writer.Close()
+	tempErr := status.Error(codes.Unavailable, "temp")
+	app := &fakeAppender{outcome: bqi.AppendOutcome{Verdict: bqi.Classify(tempErr), Err: tempErr}}
+	e.writer = app
+
+	_ = e.appendEncoded(context.Background(), [][]byte{[]byte("row")}, []int{0}, "op-1")
+	app.outcome = bqi.AppendOutcome{AcknowledgedRows: 1}
+	_ = e.appendEncoded(context.Background(), [][]byte{[]byte("row")}, []int{0}, "op-2")
+	permErr := status.Error(codes.PermissionDenied, "denied")
+	app.outcome = bqi.AppendOutcome{Verdict: bqi.Classify(permErr), Err: permErr}
+	_ = e.appendEncoded(context.Background(), [][]byte{[]byte("row")}, []int{0}, "op-3")
+
+	if err := e.shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown failed: %v", err)
+	}
+
+	var gotStatuses []componentstatus.Status
+	for _, ev := range host.events {
+		gotStatuses = append(gotStatuses, ev.Status())
+	}
+	wantStatuses := []componentstatus.Status{
+		componentstatus.StatusStarting,
+		componentstatus.StatusOK,
+		componentstatus.StatusRecoverableError,
+		componentstatus.StatusOK,
+		componentstatus.StatusPermanentError,
+		componentstatus.StatusStopping,
+		componentstatus.StatusStopped,
+	}
+	if len(gotStatuses) != len(wantStatuses) {
+		t.Fatalf("reported statuses = %v, want %v", gotStatuses, wantStatuses)
+	}
+	for i := range wantStatuses {
+		if gotStatuses[i] != wantStatuses[i] {
+			t.Errorf("status[%d] = %v, want %v", i, gotStatuses[i], wantStatuses[i])
+		}
+	}
 }

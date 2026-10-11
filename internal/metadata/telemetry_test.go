@@ -42,14 +42,20 @@ func TestTelemetryRecordsEveryInstrument(t *testing.T) {
 	tel.RecordAppendResultWait(ctx, 1500*time.Millisecond)
 	tel.RecordTimeoutAfterDispatch(ctx)
 	tel.RecordStreamRetirement(ctx)
+	tel.RecordQuarantined(ctx, "row_error", 3)
+	tel.RecordQuarantineFailed(ctx, "serialization", 1)
+	tel.RecordAppendBytes(ctx, 4096)
+	tel.RecordOffloadedPayloads(ctx, 2)
+	tel.RecordOffloadedBytes(ctx, 8192)
+	tel.RecordOffloadError(ctx, "unavailable", 1)
 
 	var resourceMetrics metricdata.ResourceMetrics
 	if err := reader.Collect(ctx, &resourceMetrics); err != nil {
 		t.Fatal(err)
 	}
 	metrics := metricsByName(resourceMetrics)
-	if len(metrics) != 9 {
-		t.Fatalf("collected %d metrics, want 9: %v", len(metrics), metricNames(metrics))
+	if len(metrics) != 15 {
+		t.Fatalf("collected %d metrics, want 15: %v", len(metrics), metricNames(metrics))
 	}
 
 	assertIntSum(t, metrics[nameAcknowledgedRows], 5, nil)
@@ -60,6 +66,12 @@ func TestTelemetryRecordsEveryInstrument(t *testing.T) {
 	assertIntSum(t, metrics[nameUnresolvedResults], 1, nil)
 	assertIntSum(t, metrics[nameTimeoutsAfterDispatch], 1, nil)
 	assertIntSum(t, metrics[nameStreamRetirements], 1, nil)
+	assertIntSum(t, metrics[nameQuarantinedRows], 3, []attribute.KeyValue{attribute.String(AttrReason, "row_error")})
+	assertIntSum(t, metrics[nameQuarantineFailedRows], 1, []attribute.KeyValue{attribute.String(AttrReason, "serialization")})
+	assertIntSum(t, metrics[nameAppendBytes], 4096, nil)
+	assertIntSum(t, metrics[nameOffloadedPayloads], 2, nil)
+	assertIntSum(t, metrics[nameOffloadedBytes], 8192, nil)
+	assertIntSum(t, metrics[nameOffloadErrors], 1, []attribute.KeyValue{attribute.String(AttrClass, "unavailable")})
 
 	histogram, ok := metrics[nameAppendResultWait].Data.(metricdata.Histogram[float64])
 	if !ok || len(histogram.DataPoints) != 1 {
@@ -89,6 +101,12 @@ func TestNilTelemetryIsSafe(_ *testing.T) {
 	tel.RecordAppendResultWait(ctx, time.Millisecond)
 	tel.RecordTimeoutAfterDispatch(ctx)
 	tel.RecordStreamRetirement(ctx)
+	tel.RecordQuarantined(ctx, "x", 1)
+	tel.RecordQuarantineFailed(ctx, "x", 1)
+	tel.RecordAppendBytes(ctx, 1)
+	tel.RecordOffloadedPayloads(ctx, 1)
+	tel.RecordOffloadedBytes(ctx, 1)
+	tel.RecordOffloadError(ctx, "y", 1)
 }
 
 // The instrument names in code must match the ones metadata.yaml documents.
@@ -111,6 +129,12 @@ func TestMetricNamesMatchMetadataYAML(t *testing.T) {
 		nameAppendResultWait,
 		nameTimeoutsAfterDispatch,
 		nameStreamRetirements,
+		nameQuarantinedRows,
+		nameQuarantineFailedRows,
+		nameAppendBytes,
+		nameOffloadedPayloads,
+		nameOffloadedBytes,
+		nameOffloadErrors,
 	} {
 		if !strings.Contains(doc, name+":") {
 			t.Errorf("metric %q is emitted in code but not declared in metadata.yaml", name)

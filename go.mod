@@ -6,6 +6,8 @@ require (
 	cloud.google.com/go/bigquery v1.79.1
 	github.com/googleapis/gax-go/v2 v2.23.0
 	go.opentelemetry.io/collector/component v1.64.0
+	go.opentelemetry.io/collector/component/componentstatus v0.158.0
+	go.opentelemetry.io/collector/config/configopaque v1.64.0
 	go.opentelemetry.io/collector/config/configoptional v1.64.0
 	go.opentelemetry.io/collector/config/configretry v1.64.0
 	go.opentelemetry.io/collector/consumer/consumererror v0.158.0

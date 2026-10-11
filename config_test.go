@@ -4,9 +4,12 @@
 package bigqueryexporter
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
+
+	"go.opentelemetry.io/collector/config/configopaque"
 )
 
 func validConfig() *Config {
@@ -27,12 +30,29 @@ func TestValidateRejects(t *testing.T) {
 		mutate func(*Config)
 		want   string
 	}{
-		"missing project":      {func(c *Config) { c.Project = "" }, "project must be specified"},
-		"bad project":          {func(c *Config) { c.Project = "Not A Project" }, "not a valid Google Cloud project ID"},
-		"missing dataset":      {func(c *Config) { c.Dataset = "" }, "dataset must be specified"},
-		"bad dataset":          {func(c *Config) { c.Dataset = "otel-dash" }, "letters, numbers and underscores"},
-		"empty traces table":   {func(c *Config) { c.Traces.Table = "" }, "traces.table must not be empty"},
-		"empty logs table":     {func(c *Config) { c.Logs.Table = "" }, "logs.table must not be empty"},
+		"missing project":     {func(c *Config) { c.Project = "" }, "project must be specified"},
+		"bad project":         {func(c *Config) { c.Project = "Not A Project" }, "not a valid Google Cloud project ID"},
+		"missing dataset":     {func(c *Config) { c.Dataset = "" }, "dataset must be specified"},
+		"bad dataset":         {func(c *Config) { c.Dataset = "otel-dash" }, "letters, numbers and underscores"},
+		"empty traces table":  {func(c *Config) { c.Traces.Table = "" }, "traces.table must not be empty"},
+		"empty logs table":    {func(c *Config) { c.Logs.Table = "" }, "logs.table must not be empty"},
+		"empty metrics table": {func(c *Config) { c.Metrics.Table = "" }, "metrics.table must not be empty"},
+		"negative traces partition expiry": {
+			func(c *Config) { c.Traces.PartitionExpirationDays = -1 },
+			"traces.partition_expiration_days (-1) must not be negative",
+		},
+		"negative logs partition expiry": {
+			func(c *Config) { c.Logs.PartitionExpirationDays = -1 },
+			"logs.partition_expiration_days (-1) must not be negative",
+		},
+		"negative metrics partition expiry": {
+			func(c *Config) { c.Metrics.PartitionExpirationDays = -1 },
+			"metrics.partition_expiration_days (-1) must not be negative",
+		},
+		"negative quarantine partition expiry": {
+			func(c *Config) { c.Quarantine.PartitionExpirationDays = -1 },
+			"quarantine.partition_expiration_days (-1) must not be negative",
+		},
 		"request over api cap": {func(c *Config) { c.Write.MaxRequestBytes = apiRequestLimitBytes }, "must stay below the Storage Write API"},
 		"row over request":     {func(c *Config) { c.Write.MaxRowBytes = c.Write.MaxRequestBytes + 1 }, "must not exceed"},
 		"no inflight requests": {func(c *Config) { c.Write.MaxInflightRequests = 0 }, "max_inflight_requests must be positive"},
@@ -68,11 +88,26 @@ func TestValidateRejects(t *testing.T) {
 			func(c *Config) { c.AutoCreate.CompanionViews = true },
 			"auto_create.companion_views requires auto_create.tables",
 		},
+		"search indexes need table creation": {
+			func(c *Config) { c.AutoCreate.SearchIndexes = true },
+			"auto_create.search_indexes requires auto_create.tables",
+		},
 		"bad limits": {func(c *Config) { c.Limits.MaxNestingDepth = 0 }, "max_nesting_depth must be positive"},
 		"two credential methods": {func(c *Config) {
 			c.Credentials.File = "/k.json"
 			c.Credentials.ImpersonateServiceAccount = "sa@p.iam.gserviceaccount.com"
 		}, "mutually exclusive"},
+		"file and json credentials": {func(c *Config) {
+			c.Credentials.File = "/k.json"
+			c.Credentials.JSON = configopaque.String(`{"type":"service_account"}`)
+		}, "credentials.file and credentials.json are mutually exclusive"},
+		"json and impersonate credentials": {func(c *Config) {
+			c.Credentials.JSON = configopaque.String(`{"type":"service_account"}`)
+			c.Credentials.ImpersonateServiceAccount = "sa@p.iam.gserviceaccount.com"
+		}, "credentials.json and credentials.impersonate_service_account are mutually exclusive"},
+		"impersonate delegates without target": {func(c *Config) {
+			c.Credentials.ImpersonateDelegates = []string{"delegate@p.iam.gserviceaccount.com"}
+		}, "credentials.impersonate_delegates requires credentials.impersonate_service_account"},
 		"insecure without endpoint": {func(c *Config) { c.Endpoint.Insecure = true }, "endpoint.insecure requires endpoint.url"},
 		"no-auth without endpoint":  {func(c *Config) { c.Endpoint.WithoutAuthentication = true }, "requires endpoint.url"},
 		"no-auth with dataset creation": {func(c *Config) {
@@ -86,6 +121,12 @@ func TestValidateRejects(t *testing.T) {
 			c.Endpoint.WithoutAuthentication = true
 			c.AutoCreate.Tables = true
 		}, "auto_create.tables cannot be enabled"},
+		"no-auth with search index creation": {func(c *Config) {
+			c.Endpoint.URL = "localhost:9050"
+			c.Endpoint.WithoutAuthentication = true
+			c.AutoCreate.Tables = true
+			c.AutoCreate.SearchIndexes = true
+		}, "auto_create.search_indexes cannot be enabled"},
 		"zero exporter timeout": {func(c *Config) {
 			c.TimeoutSettings.Timeout = 0
 		}, "timeout must be positive"},
@@ -106,6 +147,10 @@ func TestValidateRejects(t *testing.T) {
 			c.Quarantine.Enabled = true
 			c.Quarantine.Table = c.Logs.Table
 		}, `quarantine.table "otel_logs" must differ from traces.table and logs.table`},
+		"quarantine in the metrics table": {func(c *Config) {
+			c.Quarantine.Enabled = true
+			c.Quarantine.Table = c.Metrics.Table
+		}, `quarantine.table "otel_metrics" must differ from traces.table and logs.table`},
 	}
 
 	for name, tc := range tests {
@@ -132,8 +177,38 @@ func TestValidateAcceptsCompanionViewsWithTableCreation(t *testing.T) {
 	}
 	cfg.AutoCreate.Tables = true
 	cfg.AutoCreate.CompanionViews = true
+	cfg.AutoCreate.SearchIndexes = true
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() = %v, want nil", err)
+	}
+}
+
+func TestValidateAcceptsEnterpriseAndLifecycleSettings(t *testing.T) {
+	cfg := validConfig()
+	cfg.Traces.PartitionExpirationDays = 365
+	cfg.Traces.RequirePartitionFilter = true
+	cfg.Logs.PartitionExpirationDays = 90
+	cfg.Logs.RequirePartitionFilter = true
+	cfg.Metrics.PartitionExpirationDays = 180
+	cfg.Metrics.RequirePartitionFilter = true
+	cfg.Quarantine.PartitionExpirationDays = 14
+	cfg.Quarantine.RequirePartitionFilter = true
+	cfg.Credentials.ImpersonateServiceAccount = "writer@my-project.iam.gserviceaccount.com"
+	cfg.Credentials.ImpersonateDelegates = []string{"hop1@my-project.iam.gserviceaccount.com"}
+	cfg.Credentials.QuotaProject = "billing-project"
+	cfg.Credentials.UniverseDomain = "apis-tpclp.goog"
+	cfg.Endpoint.AdminURL = "https://bigquery.apis-tpclp.goog"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil", err)
+	}
+
+	jsonCfg := validConfig()
+	jsonCfg.Credentials.JSON = configopaque.String(`{"type":"service_account","private_key":"secret"}`)
+	if err := jsonCfg.Validate(); err != nil {
+		t.Fatalf("Validate() with credentials.json = %v, want nil", err)
+	}
+	if got := fmt.Sprint(jsonCfg.Credentials.JSON); got != "[REDACTED]" {
+		t.Fatalf("credentials.json formatted as %q, want [REDACTED]", got)
 	}
 }
 

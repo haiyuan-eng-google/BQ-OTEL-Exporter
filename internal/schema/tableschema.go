@@ -17,6 +17,8 @@ const (
 	rep  = storagepb.TableFieldSchema_REPEATED
 	str  = storagepb.TableFieldSchema_STRING
 	i64  = storagepb.TableFieldSchema_INT64
+	f64  = storagepb.TableFieldSchema_DOUBLE
+	bl   = storagepb.TableFieldSchema_BOOL
 	ts   = storagepb.TableFieldSchema_TIMESTAMP
 	jsn  = storagepb.TableFieldSchema_JSON
 	strc = storagepb.TableFieldSchema_STRUCT
@@ -100,8 +102,8 @@ func SpansTableSchema() *storagepb.TableSchema {
 }
 
 // resourceRecord, scopeRecord and payloadRefsRecord build the column families
-// the span and log contracts share, so the two tables cannot drift apart on
-// them.
+// the span, log and metric contracts share, so the tables cannot drift apart
+// on them.
 func resourceRecord() *storagepb.TableFieldSchema {
 	return record("resource", opt,
 		f("attributes", jsn, opt),
@@ -191,6 +193,84 @@ func LogsTableSchema() *storagepb.TableSchema {
 	}}
 }
 
+// MetricsTableSchema is the v0alpha2 metric data-point contract: 40 columns,
+// grouped by family in the same order as MetricsDDL.
+func MetricsTableSchema() *storagepb.TableSchema {
+	return &storagepb.TableSchema{Fields: []*storagepb.TableFieldSchema{
+		// Time family.
+		f("timestamp", ts, req),
+		f("time_unix_nano", i64, req),
+		f("start_time", ts, opt),
+		f("start_time_unix_nano", i64, opt),
+		f("receive_time", ts, req),
+		f("receive_time_unix_nano", i64, req),
+
+		// Metric identity and metadata.
+		f("service_name", str, opt),
+		f("metric_name", str, req),
+		f("metric_description", str, opt),
+		f("metric_unit", str, opt),
+		f("metric_type", str, req),
+		f("aggregation_temporality", str, opt),
+		f("is_monotonic", bl, opt),
+		f("flags", i64, opt),
+		f("attributes", jsn, opt),
+		f("attributes_schema", jsn, opt),
+		f("metric_metadata", jsn, opt),
+		f("metric_metadata_schema", jsn, opt),
+
+		// Scalar values (GAUGE / SUM).
+		f("value_type", str, opt),
+		f("value_double", f64, opt),
+		f("value_int64", i64, opt),
+
+		// Distribution values (HISTOGRAM / EXPONENTIAL_HISTOGRAM / SUMMARY).
+		f("count", i64, opt),
+		f("sum", f64, opt),
+		f("min", f64, opt),
+		f("max", f64, opt),
+		f("explicit_bounds", f64, rep),
+		f("bucket_counts", i64, rep),
+		f("exp_scale", i64, opt),
+		f("exp_zero_count", i64, opt),
+		f("exp_zero_threshold", f64, opt),
+		record("exp_positive", opt,
+			f("offset", i64, opt),
+			f("bucket_counts", i64, rep),
+		),
+		record("exp_negative", opt,
+			f("offset", i64, opt),
+			f("bucket_counts", i64, rep),
+		),
+		record("summary_quantiles", rep,
+			f("quantile", f64, opt),
+			f("value", f64, opt),
+		),
+
+		// Exemplars (trace/span correlation).
+		record("exemplars", rep,
+			f("time", ts, opt),
+			f("time_unix_nano", i64, opt),
+			f("value_double", f64, opt),
+			f("value_int64", i64, opt),
+			f("span_id", str, opt),
+			f("trace_id", str, opt),
+			f("filtered_attributes", jsn, opt),
+			f("filtered_attributes_schema", jsn, opt),
+		),
+
+		// Resource and instrumentation scope family.
+		resourceRecord(),
+		f("resource_schema_url", str, opt),
+		scopeRecord(),
+		f("scope_schema_url", str, opt),
+
+		// Dedup and contract identity.
+		f("point_fingerprint", str, req),
+		f("schema_version", str, req),
+	}}
+}
+
 // TimestampSource values for the log timestamp_source column, recording which
 // fallback produced the partition key.
 const (
@@ -200,8 +280,8 @@ const (
 )
 
 // QuarantineTableSchema is the opt-in dead-letter contract: 12 columns, in the
-// same order as QuarantineDDL. A quarantined row records why a span or log
-// record was rejected, enough identity to find it again, and the record
+// same order as QuarantineDDL. A quarantined row records why a span, log, or
+// metric record was rejected, enough identity to find it again, and the record
 // itself serialized as OTLP JSON.
 func QuarantineTableSchema() *storagepb.TableSchema {
 	return &storagepb.TableSchema{Fields: []*storagepb.TableFieldSchema{
@@ -223,8 +303,9 @@ func QuarantineTableSchema() *storagepb.TableSchema {
 // Signal values for the quarantine signal column, naming the table the
 // rejected record was bound for.
 const (
-	SignalSpans = "spans"
-	SignalLogs  = "logs"
+	SignalSpans   = "spans"
+	SignalLogs    = "logs"
+	SignalMetrics = "metrics"
 )
 
 // FieldNames lists the top-level column names of a schema, in order.

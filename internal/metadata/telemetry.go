@@ -61,6 +61,12 @@ type Telemetry struct {
 	AppendResultWait      metric.Float64Histogram
 	TimeoutsAfterDispatch metric.Int64Counter
 	StreamRetirements     metric.Int64Counter
+	QuarantinedRows       metric.Int64Counter
+	QuarantineFailedRows  metric.Int64Counter
+	AppendBytes           metric.Int64Counter
+	OffloadedPayloads     metric.Int64Counter
+	OffloadedBytes        metric.Int64Counter
+	OffloadErrors         metric.Int64Counter
 }
 
 // Metric names, matching metadata.yaml.
@@ -74,6 +80,12 @@ const (
 	nameAppendResultWait      = "otelcol_exporter_bigquery_append_result_wait"
 	nameTimeoutsAfterDispatch = "otelcol_exporter_bigquery_timeouts_after_dispatch"
 	nameStreamRetirements     = "otelcol_exporter_bigquery_stream_retirements"
+	nameQuarantinedRows       = "otelcol_exporter_bigquery_quarantined_rows"
+	nameQuarantineFailedRows  = "otelcol_exporter_bigquery_quarantine_failed_rows"
+	nameAppendBytes           = "otelcol_exporter_bigquery_append_bytes"
+	nameOffloadedPayloads     = "otelcol_exporter_bigquery_offloaded_payloads"
+	nameOffloadedBytes        = "otelcol_exporter_bigquery_offloaded_bytes"
+	nameOffloadErrors         = "otelcol_exporter_bigquery_offload_errors"
 )
 
 // Label keys.
@@ -133,6 +145,36 @@ func NewTelemetry(mp metric.MeterProvider) (*Telemetry, error) {
 		metric.WithDescription("Managed stream generations retired after an unsafe outcome."),
 		metric.WithUnit("{retirement}")); err != nil {
 		return nil, fmt.Errorf("creating %s: %w", nameStreamRetirements, err)
+	}
+	if t.QuarantinedRows, err = m.Int64Counter(nameQuarantinedRows,
+		metric.WithDescription("Rows acknowledged by the BigQuery quarantine table stream, by reason."),
+		metric.WithUnit("{row}")); err != nil {
+		return nil, fmt.Errorf("creating %s: %w", nameQuarantinedRows, err)
+	}
+	if t.QuarantineFailedRows, err = m.Int64Counter(nameQuarantineFailedRows,
+		metric.WithDescription("Rows targeted for quarantine that could not be written, by reason."),
+		metric.WithUnit("{row}")); err != nil {
+		return nil, fmt.Errorf("creating %s: %w", nameQuarantineFailedRows, err)
+	}
+	if t.AppendBytes, err = m.Int64Counter(nameAppendBytes,
+		metric.WithDescription("Serialized protobuf wire bytes dispatched to the BigQuery Storage Write API."),
+		metric.WithUnit("By")); err != nil {
+		return nil, fmt.Errorf("creating %s: %w", nameAppendBytes, err)
+	}
+	if t.OffloadedPayloads, err = m.Int64Counter(nameOffloadedPayloads,
+		metric.WithDescription("Multimodal or oversized payloads offloaded to external object storage."),
+		metric.WithUnit("{payload}")); err != nil {
+		return nil, fmt.Errorf("creating %s: %w", nameOffloadedPayloads, err)
+	}
+	if t.OffloadedBytes, err = m.Int64Counter(nameOffloadedBytes,
+		metric.WithDescription("Payload bytes offloaded to external object storage."),
+		metric.WithUnit("By")); err != nil {
+		return nil, fmt.Errorf("creating %s: %w", nameOffloadedBytes, err)
+	}
+	if t.OffloadErrors, err = m.Int64Counter(nameOffloadErrors,
+		metric.WithDescription("Payload offload attempts to external object storage that failed, by error class."),
+		metric.WithUnit("{error}")); err != nil {
+		return nil, fmt.Errorf("creating %s: %w", nameOffloadErrors, err)
 	}
 	return t, nil
 }
@@ -214,4 +256,52 @@ func (t *Telemetry) RecordStreamRetirement(ctx context.Context) {
 		return
 	}
 	t.StreamRetirements.Add(ctx, 1)
+}
+
+// RecordQuarantined records rows acknowledged by the quarantine stream under a bounded reason.
+func (t *Telemetry) RecordQuarantined(ctx context.Context, reason string, n int) {
+	if t == nil || n <= 0 {
+		return
+	}
+	t.QuarantinedRows.Add(ctx, int64(n), metric.WithAttributes(attribute.String(AttrReason, reason)))
+}
+
+// RecordQuarantineFailed records quarantine rows that could not be written under a bounded reason.
+func (t *Telemetry) RecordQuarantineFailed(ctx context.Context, reason string, n int) {
+	if t == nil || n <= 0 {
+		return
+	}
+	t.QuarantineFailedRows.Add(ctx, int64(n), metric.WithAttributes(attribute.String(AttrReason, reason)))
+}
+
+// RecordAppendBytes records serialized protobuf wire bytes dispatched in an AppendRows call.
+func (t *Telemetry) RecordAppendBytes(ctx context.Context, n int64) {
+	if t == nil || n <= 0 {
+		return
+	}
+	t.AppendBytes.Add(ctx, n)
+}
+
+// RecordOffloadedPayloads records payloads offloaded to external object storage.
+func (t *Telemetry) RecordOffloadedPayloads(ctx context.Context, n int) {
+	if t == nil || n <= 0 {
+		return
+	}
+	t.OffloadedPayloads.Add(ctx, int64(n))
+}
+
+// RecordOffloadedBytes records payload bytes offloaded to external object storage.
+func (t *Telemetry) RecordOffloadedBytes(ctx context.Context, n int64) {
+	if t == nil || n <= 0 {
+		return
+	}
+	t.OffloadedBytes.Add(ctx, n)
+}
+
+// RecordOffloadError records a payload offload failure under a bounded error class.
+func (t *Telemetry) RecordOffloadError(ctx context.Context, class string, n int) {
+	if t == nil || n <= 0 {
+		return
+	}
+	t.OffloadErrors.Add(ctx, int64(n), metric.WithAttributes(attribute.String(AttrClass, class)))
 }

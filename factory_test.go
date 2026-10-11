@@ -29,6 +29,9 @@ func TestCreateExporters(t *testing.T) {
 	if _, err := f.CreateLogs(context.Background(), set, validConfig()); err != nil {
 		t.Fatalf("CreateLogs: %v", err)
 	}
+	if _, err := f.CreateMetrics(context.Background(), set, validConfig()); err != nil {
+		t.Fatalf("CreateMetrics: %v", err)
+	}
 }
 
 func TestDefaultQueueConcurrencyFitsManagedWriterWindow(t *testing.T) {
@@ -43,14 +46,13 @@ func TestDefaultQueueConcurrencyFitsManagedWriterWindow(t *testing.T) {
 	}
 }
 
-// Metrics are out of scope for v1. Asserting the absence keeps the decision
-// honest: if someone wires metrics up, this test makes them revisit the
-// decision record rather than slip it in.
-func TestMetricsNotSupported(t *testing.T) {
-	f := NewFactory()
-	set := exportertest.NewNopSettings(f.Type())
-	if _, err := f.CreateMetrics(context.Background(), set, validConfig()); err == nil {
-		t.Fatal("expected metrics creation to fail while metrics remain out of scope")
+func TestDefaultSignalAndQuarantineConfig(t *testing.T) {
+	cfg := createDefaultConfig().(*Config)
+	if cfg.Metrics.Table != "otel_metrics" {
+		t.Fatalf("default metrics.table = %q, want otel_metrics", cfg.Metrics.Table)
+	}
+	if cfg.Quarantine.PartitionExpirationDays != 30 {
+		t.Fatalf("default quarantine.partition_expiration_days = %d, want 30", cfg.Quarantine.PartitionExpirationDays)
 	}
 }
 
