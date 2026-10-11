@@ -2535,3 +2535,122 @@ func TestQuarantineBudgetExpiryCountsEveryUnwrittenRow(t *testing.T) {
 		})
 	}
 }
+
+func TestPushMetricsPreservesRetryIdentityWhenEarlierOrdinalPeerDroppedByEncodeRows(t *testing.T) {
+	// Construct 3 otherwise identical delta-sum points whose metric descriptions differ.
+	// Point 0 has a long description that makes its proto-encoded row exceed max_row_bytes.
+	// Point 1 and Point 2 fit within max_row_bytes and are sent to the writer.
+	md := pmetric.NewMetrics()
+	rm := md.ResourceMetrics().AppendEmpty()
+	rm.Resource().Attributes().PutStr("service.name", "test-svc")
+	sm := rm.ScopeMetrics().AppendEmpty()
+	sm.Scope().SetName("test-scope")
+
+	addDeltaSum := func(desc string, val int64) {
+		m := sm.Metrics().AppendEmpty()
+		m.SetName("test.counter")
+		m.SetDescription(desc)
+		sum := m.SetEmptySum()
+		sum.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
+		sum.SetIsMonotonic(true)
+		dp := sum.DataPoints().AppendEmpty()
+		dp.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+		dp.SetIntValue(val)
+	}
+
+	// 3 identical delta-sum points (same timestamp, value, metric name, scope, resource).
+	// Because metric description is excluded from canonicalMetricPoint, all 3 points share
+	// the same fingerprint group and consume ordinals 0, 1, 2.
+	addDeltaSum(strings.Repeat("X", 2048), 7) // Point 0: oversized, will be dropped by encodeRows
+	addDeltaSum("short", 7)                   // Point 1: kept in request 0 (fails)
+	addDeltaSum("short", 7)                   // Point 2: kept in request 1 (acknowledged)
+
+	// Verify original row fingerprints: ordinals 0, 1, 2
+	rows, rejects := transform.MetricRows(md, transform.Options{Limits: transform.DefaultLimits()})
+	if len(rejects) != 0 || len(rows) != 3 {
+		t.Fatalf("MetricRows got %d rows, %d rejects; want 3 rows, 0 rejects", len(rows), len(rejects))
+	}
+	fp0 := rows[0]["point_fingerprint"].(string)
+	fp1 := rows[1]["point_fingerprint"].(string)
+	fp2 := rows[2]["point_fingerprint"].(string)
+	if fp0 == fp1 || fp1 == fp2 || fp0 == fp2 {
+		t.Fatalf("expected distinct ordinals/fingerprints; got fps: %s, %s, %s", fp0, fp1, fp2)
+	}
+
+	cfg := validConfig()
+	cfg.Write.MaxRowBytes = 1024 // point 0 exceeds 1024, points 1 and 2 fit
+	tel, err := metadata.NewTelemetry(noop.NewMeterProvider())
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := protoenc.New(schema.MetricsTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Configure fakeAppender:
+	// Points 1 and 2 are passed to Append (2 rows).
+	// Request for row 0 (Point 1) fails with retryable error.
+	// Request for row 1 (Point 2) is acknowledged: AckedRanges = [][2]int{{1, 2}}, AcknowledgedRows = 1.
+	tempErr := status.Error(codes.Unavailable, "request 0 temporary error")
+	app := &fakeAppender{
+		outcome: bqi.AppendOutcome{
+			AcknowledgedRows: 1,
+			AckedRanges:      [][2]int{{1, 2}},
+			Verdict:          bqi.Classify(tempErr),
+			Err:              tempErr,
+		},
+	}
+
+	se := &signalExporter{
+		cfg:    cfg,
+		table:  cfg.Metrics.Table,
+		logger: zap.NewNop(),
+		tel:    tel,
+		writer: app,
+		enc:    enc,
+		schema: schema.MetricsTableSchema(),
+		opts:   transform.Options{Limits: cfg.Limits.toTransform()},
+	}
+	e := &metricsExporter{se}
+
+	pushErr := e.pushMetricsData(context.Background(), md)
+	if pushErr == nil || consumererror.IsPermanent(pushErr) {
+		t.Fatalf("pushMetricsData returned %v, want retryable error", pushErr)
+	}
+	var mdErr consumererror.Metrics
+	if !errors.As(pushErr, &mdErr) {
+		t.Fatalf("error %T does not carry pmetric.Metrics", pushErr)
+	}
+
+	// On retry, the payload must include Point 0 so that Point 1 reproduces its original ordinal 1 and fingerprint!
+	retryRows, _ := transform.MetricRows(mdErr.Data(), e.opts)
+	if len(retryRows) != 3 {
+		t.Fatalf("expected 3 retry rows (peer 0, point 1, point 2), got %d", len(retryRows))
+	}
+	if retryRows[0]["point_fingerprint"].(string) != fp0 {
+		t.Errorf("retried point 0 fingerprint = %s, want %s", retryRows[0]["point_fingerprint"], fp0)
+	}
+	if retryRows[1]["point_fingerprint"].(string) != fp1 {
+		t.Errorf("retried point 1 fingerprint = %s, want %s (original ordinal 1 preserved)",
+			retryRows[1]["point_fingerprint"], fp1)
+	}
+	if retryRows[2]["point_fingerprint"].(string) != fp2 {
+		t.Errorf("retried point 2 fingerprint = %s, want %s (original ordinal 2 preserved)",
+			retryRows[2]["point_fingerprint"], fp2)
+	}
+
+	// When pushMetricsData is retried with mdErr.Data(), point 0 is dropped by encodeRows again,
+	// and point 1 is sent with its original identity to BigQuery.
+	var secondPushRows [][]byte
+	app.appendFn = func(_ context.Context, rows [][]byte) bqi.AppendOutcome {
+		secondPushRows = rows
+		return bqi.AppendOutcome{AcknowledgedRows: len(rows)}
+	}
+	if err := e.pushMetricsData(context.Background(), mdErr.Data()); err != nil {
+		t.Fatalf("retry pushMetricsData failed: %v", err)
+	}
+	if len(secondPushRows) != 2 {
+		t.Fatalf("second push sent %d rows, want 2 (points 1 and 2; point 0 dropped by encoder)", len(secondPushRows))
+	}
+}

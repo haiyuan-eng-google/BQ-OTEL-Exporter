@@ -72,7 +72,7 @@ func (e *metricsExporter) pushMetricsData(ctx context.Context, md pmetric.Metric
 	if len(decision.retryableIndices) == 0 {
 		return decision.err
 	}
-	candidates := validRecordIndices(pointIndex, decision.rowErrors)
+	candidates := validRecordIndices(rowToPoint, decision.rowErrors)
 	retry := transform.PreserveMetricOrdinalPeers(md, candidates, decision.retryableIndices)
 	return consumererror.NewMetrics(decision.err, transform.SelectMetrics(md, retry))
 }
