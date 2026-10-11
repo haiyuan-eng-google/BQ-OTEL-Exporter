@@ -29,11 +29,10 @@ builds:
       - arm64
     flags:
       - -trimpath
+    # OCB's generated main.go has no version variables to set with -X; the
+    # release workflow stamps the tag into dist.version, which it compiles in.
     ldflags:
       - -s -w
-      - -X main.version={{.Version}}
-      - -X main.commit={{.Commit}}
-      - -X main.date={{.Date}}
     ignore:
       # windows/arm64 is not supported by the distroless base image.
       - goos: windows

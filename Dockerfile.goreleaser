@@ -11,5 +11,10 @@ COPY example/otel-collector-config.yml /etc/otel/config.yml
 
 EXPOSE 4317 4318 8888 13133
 
+# The distroless runtime has no shell, so the probe is the bundled static
+# /healthcheck binary in exec form; it exits non-zero unless the health_check
+# extension on :13133 answers 2xx.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD ["/healthcheck"]
+
 ENTRYPOINT ["/otelcol-bq"]
 CMD ["--config=/etc/otel/config.yml"]

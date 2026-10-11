@@ -5,6 +5,7 @@ package bigqueryexporter
 
 import (
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -202,5 +203,58 @@ func TestHelmDeploymentAndDockerComposeHealthcheck(t *testing.T) {
 	}
 	if !strings.Contains(tfText, "otelCollectorWriter") {
 		t.Error("Terraform main.tf must define otelCollectorWriter write-only role")
+	}
+}
+
+// Release binaries embed the standard library they were built with, so the
+// release workflow builds with the same patched Go release example/Dockerfile
+// pins, not the older go.mod minimum. GoReleaser's -X flags for main.version
+// and friends were no-ops on OCB's generated main.go; the version comes from
+// the dist.version the workflow stamps.
+func TestReleaseBuildUsesPinnedPatchedGoAndStampedVersion(t *testing.T) {
+	wf, err := os.ReadFile(".github/workflows/release.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	df, err := os.ReadFile("example/Dockerfile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(wf), "go-version-file") {
+		t.Error("release.yml must pin go-version instead of resolving the go.mod minimum")
+	}
+	got := regexp.MustCompile(`go-version: "?([0-9.]+)"?`).FindStringSubmatch(string(wf))
+	want := regexp.MustCompile(`golang:([0-9.]+)-`).FindStringSubmatch(string(df))
+	if got == nil || want == nil || got[1] != want[1] {
+		t.Errorf("release.yml go-version = %v, example/Dockerfile builder = %v, want the same patched release", got, want)
+	}
+	if strings.Contains(string(wf), "/usr/local/bin") {
+		t.Error("release.yml must not install tools into the root-owned /usr/local/bin")
+	}
+
+	gr, err := os.ReadFile(".goreleaser.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(gr), "-X main.") {
+		t.Error(".goreleaser.yaml sets -X main.* flags, which OCB's generated main.go ignores")
+	}
+	if !strings.Contains(string(wf), "s/version: 0.1.0-dev/version: ${VERSION}/g") {
+		t.Error("release.yml must stamp the release version into the OCB manifest's dist.version")
+	}
+}
+
+// Both runtime images ship the static /healthcheck probe, and declare it as an
+// exec-form HEALTHCHECK, since distroless has no shell for the shell form.
+func TestRuntimeImagesDeclareExecFormHealthcheck(t *testing.T) {
+	for _, path := range []string{"Dockerfile.goreleaser", "example/Dockerfile"} {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(raw)
+		if !regexp.MustCompile(`(?m)^HEALTHCHECK .*CMD \["/healthcheck"\]$`).MatchString(text) {
+			t.Errorf("%s has no exec-form HEALTHCHECK running /healthcheck", path)
+		}
 	}
 }

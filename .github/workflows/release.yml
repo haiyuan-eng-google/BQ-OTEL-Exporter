@@ -27,10 +27,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Release binaries carry the standard library they were built with, so
+      # build with the same patched Go release example/Dockerfile pins rather
+      # than the go.mod minimum, which predates the standard-library fixes.
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: "1.26.9"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -51,10 +54,16 @@ jobs:
       - name: Install Syft
         uses: anchore/sbom-action/download-syft@v0
 
+      # The builder module installs a binary named builder; the GoReleaser
+      # hook calls it as ocb. Both live in a job-local directory added to PATH.
       - name: Install OpenTelemetry Collector Builder (ocb)
         run: |
-          GOBIN=/usr/local/bin GOTOOLCHAIN=local go install go.opentelemetry.io/collector/cmd/builder@v0.158.0
-          sudo ln -sf /usr/local/bin/builder /usr/local/bin/ocb
+          bin="${RUNNER_TEMP}/bin"
+          mkdir -p "${bin}"
+          GOBIN="${bin}" GOTOOLCHAIN=local go install go.opentelemetry.io/collector/cmd/builder@v0.158.0
+          ln -sf "${bin}/builder" "${bin}/ocb"
+          echo "${bin}" >> "${GITHUB_PATH}"
+          export PATH="${bin}:${PATH}"
           ocb version
           syft version
           cosign version
