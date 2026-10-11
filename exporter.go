@@ -5,14 +5,18 @@ package bigqueryexporter // import "github.com/haiyuan-eng-google/BQ-OTEL-Export
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"slices"
 
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.uber.org/zap"
+	"golang.org/x/oauth2/google"
 	bigqueryapi "google.golang.org/api/bigquery/v2"
 	"google.golang.org/api/impersonate"
 	"google.golang.org/api/option"
@@ -117,8 +121,14 @@ func (e *signalExporter) authenticationOptions(
 
 	switch {
 	case e.cfg.Credentials.File != "":
+		credOpt, err := credentialsFileOption(ctx, e.cfg.Credentials.File, scopes)
+		if err != nil {
+			return nil, err
+		}
+		// The scopes are repeated as a client option so the client library
+		// sees the same explicit scope list on every authentication path.
 		opts = append(opts,
-			option.WithCredentialsFile(e.cfg.Credentials.File),
+			credOpt,
 			option.WithScopes(scopes...),
 		)
 
@@ -138,6 +148,76 @@ func (e *signalExporter) authenticationOptions(
 	}
 
 	return opts, nil
+}
+
+// credentialFileTypes lists the credential file formats that credentials.file
+// accepts. The file path comes from the collector's own configuration; the
+// declared type is still checked so that a file of an unexpected kind is
+// rejected with a clear error instead of being interpreted implicitly.
+var credentialFileTypes = []google.CredentialsType{
+	google.ServiceAccount,
+	google.AuthorizedUser,
+	google.ExternalAccount,
+	google.ExternalAccountAuthorizedUser,
+	google.ImpersonatedServiceAccount,
+}
+
+// credentialsFileOption loads the credentials file named by credentials.file,
+// validates it at startup so malformed files fail fast, and returns a client
+// option that uses the auth library's credentials path with the already-read
+// bytes.
+//
+// option.WithAuthCredentialsJSON is used instead of option.WithCredentials
+// for three reasons:
+//
+//  1. Per-call context cancellation: WithCredentials wraps an oauth2.TokenSource
+//     whose Token() method takes no context, binding token refresh to the
+//     exporter's lifetimeCtx. WithAuthCredentialsJSON uses cloud.google.com/go/auth,
+//     whose Credentials.Token(ctx) honors the per-RPC stream context that
+//     Writer.Close() cancels, so shutdown completes promptly even when a
+//     token endpoint stalls.
+//
+//  2. mTLS transport preservation: WithCredentials sets DialSettings.Credentials,
+//     which bypasses GetOAuth2Configuration on the REST metadata client path,
+//     dropping the oauth2.mtls.googleapis.com/token endpoint and the TLS client
+//     certificate callback. WithAuthCredentialsJSON sets
+//     DialSettings.AuthCredentialsJSON, which goes through
+//     GetOAuth2Configuration and preserves mTLS.
+//
+//  3. Local JWT signing for service_account keys: WithAuthCredentialsJSON
+//     passes the validated bytes through cloud.google.com/go/auth, which
+//     signs JWTs locally for service_account keys (0 token_uri calls) instead
+//     of exchanging a refresh token over the network. It also avoids a
+//     second disk read (no TOCTOU).
+func credentialsFileOption(
+	ctx context.Context, path string, scopes []string,
+) (option.ClientOption, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading credentials file: %w", err)
+	}
+
+	var declared struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &declared); err != nil {
+		return nil, fmt.Errorf("parsing credentials file %q: %w", path, err)
+	}
+
+	credType := google.CredentialsType(declared.Type)
+	if !slices.Contains(credentialFileTypes, credType) {
+		return nil, fmt.Errorf("credentials file %q has unsupported type %q; supported types: %v",
+			path, declared.Type, credentialFileTypes)
+	}
+
+	// Validate the file at startup so malformed credentials fail fast
+	// rather than on the first export. The token is not fetched here;
+	// CredentialsFromJSONWithType only parses and constructs the token source.
+	if _, err := google.CredentialsFromJSONWithType(ctx, data, credType, scopes...); err != nil {
+		return nil, fmt.Errorf("loading credentials file %q: %w", path, err)
+	}
+
+	return option.WithAuthCredentialsJSON(option.CredentialsType(declared.Type), data), nil
 }
 
 func (e *signalExporter) metadataClientOptions(ctx context.Context) ([]option.ClientOption, error) {

@@ -13,9 +13,9 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// One row per line of the §8.3 error matrix. Class and owner together are the
-// contract: two components retrying the same failure would multiply attempts
-// and break the duplicate bound.
+// One row per line of the error matrix that Classify implements. Class and
+// owner together are the contract: two components retrying the same failure
+// would multiply attempts and break the duplicate bound.
 func TestClassifyMatrix(t *testing.T) {
 	tests := map[string]struct {
 		err      error

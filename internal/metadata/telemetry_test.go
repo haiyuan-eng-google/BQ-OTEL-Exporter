@@ -77,7 +77,7 @@ func TestTelemetryRecordsEveryInstrument(t *testing.T) {
 
 // A nil Telemetry must be inert rather than panic: a metrics failure should
 // never take down the export path.
-func TestNilTelemetryIsSafe(t *testing.T) {
+func TestNilTelemetryIsSafe(_ *testing.T) {
 	var tel *Telemetry
 	ctx := context.Background()
 	tel.RecordAcknowledged(ctx, 1)

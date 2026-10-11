@@ -147,13 +147,6 @@ func (f *fakeStream) AppendRows(_ context.Context, _ [][]byte, _ ...managedwrite
 
 func (f *fakeStream) Close() error { f.closed++; return nil }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 func newTestWriter(s *fakeStream) *Writer {
 	return &Writer{
 		opts: WriterOptions{Project: "p", Dataset: "d", Table: "t", MaxRequestBytes: 1000},
@@ -1405,7 +1398,7 @@ func TestCloseJoinsUnresolvedResultOwner(t *testing.T) {
 	go func() { done <- w.Append(ctx, [][]byte{{1}}) }()
 	<-pending.started
 	cancel()
-	_ = <-done
+	<-done
 	pending.waitForCalls(t, 2)
 
 	closed := make(chan error, 1)

@@ -23,7 +23,7 @@ func TestVersionIsAlphaBaseline(t *testing.T) {
 	}
 }
 
-// Every column the design doc marks REQUIRED must be NOT NULL in the DDL.
+// Every column the table contract marks REQUIRED must be NOT NULL in the DDL.
 func TestRequiredColumns(t *testing.T) {
 	spans := []string{
 		"start_time", "start_time_unix_nano", "end_time", "end_time_unix_nano",
@@ -846,7 +846,7 @@ func isColumnName(s string) bool {
 		return false
 	}
 	for _, r := range s {
-		if !(r == '_' || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')) {
+		if r != '_' && (r < 'a' || r > 'z') && (r < '0' || r > '9') {
 			return false
 		}
 	}

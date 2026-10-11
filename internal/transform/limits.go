@@ -1,9 +1,10 @@
 // Copyright 2026 Google LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// Package transform maps pdata onto the §7 relational contract: structural
-// limit enforcement (FR8), row construction (§7.1, §7.2) and the log record
-// fingerprint (§7.4).
+// Package transform maps pdata onto the relational table contract: structural
+// limit enforcement (FR8), row construction and the log record fingerprint.
+// docs/schema-rationale.md describes the contract and defines the FR labels used
+// in code comments.
 package transform // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
 
 import (
@@ -71,6 +72,7 @@ func (l Limits) Validate() error {
 // small and must never include anything derived from telemetry content.
 type Reason string
 
+// The rejection reasons. Each value is one label on the rejected_rows counter.
 const (
 	ReasonAttributeCount Reason = "attribute_count"
 	ReasonEventCount     Reason = "event_count"

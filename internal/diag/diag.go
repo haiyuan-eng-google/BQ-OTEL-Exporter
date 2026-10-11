@@ -136,5 +136,8 @@ func SanitizeFieldPath(message string) string {
 }
 
 func isSeparator(r rune) bool {
-	return !(r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'))
+	return r != '_' &&
+		(r < 'a' || r > 'z') &&
+		(r < 'A' || r > 'Z') &&
+		(r < '0' || r > '9')
 }

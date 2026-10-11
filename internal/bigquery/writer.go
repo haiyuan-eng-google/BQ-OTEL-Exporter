@@ -3,7 +3,8 @@
 
 // Package bigquery wraps the Storage Write API managedwriter client with the
 // stream management, request sizing and error classification the exporter
-// needs (§8.1–§8.3).
+// needs. docs/schema-rationale.md describes the delivery guarantees these
+// pieces uphold.
 package bigquery // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/bigquery"
 
 import (

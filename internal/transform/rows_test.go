@@ -589,8 +589,9 @@ func TestAbsentOptionalLogColumnsAreOmitted(t *testing.T) {
 	}
 }
 
-// §7.2 fallback chain for the partition key. OTLP permits both timestamps to
-// be zero, and a row with no partition key cannot be written at all.
+// The log timestamp fallback chain for the partition key. OTLP permits both
+// timestamps to be zero, and a row with no partition key cannot be written at
+// all.
 func TestLogTimestampFallback(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -1030,7 +1031,8 @@ func TestFingerprintStability(t *testing.T) {
 		return rows[0]["record_fingerprint"].(string)
 	}
 
-	if build("same") != build("same") {
+	first, second := build("same"), build("same")
+	if first != second {
 		t.Error("identical records must produce identical fingerprints")
 	}
 	if build("same") == build("different") {

@@ -8,6 +8,7 @@ package bigqueryexporter
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -329,7 +330,7 @@ func waitForRowCount(ctx context.Context, client *bq.Client, project, dataset, t
 					return fmt.Errorf("%s.%s.%s has %d rows, want %d logical records", project, dataset, table, got, want)
 				}
 			}
-			if err != nil && err != iterator.Done {
+			if err != nil && !errors.Is(err, iterator.Done) {
 				return fmt.Errorf("query %s.%s.%s: %w", project, dataset, table, err)
 			}
 		}

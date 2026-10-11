@@ -30,10 +30,10 @@ sample, downsample, or interpret telemetry.
 
 ## Design
 
-This component is built against an internal design document. Section
-references in the code and in this README point at that
-document; the rationale behind each decision is restated here and in the code
-comments so the repository stands on its own.
+The reasoning behind the table layout, deduplication, rejection rules and
+delivery semantics is written down in
+[`docs/schema-rationale.md`](docs/schema-rationale.md). Code comments that need
+that background point to the page, so the repository stands on its own.
 
 ## Getting started
 
@@ -88,6 +88,18 @@ service:
       receivers: [otlp]
       exporters: [bigquery]
 ```
+
+### Transports
+
+> **Keep both OTLP receivers enabled: gRPC on `4317` and HTTP on `4318`.** The
+> sending framework chooses the transport, not the collector. Google ADK and
+> LangGraph (through LangSmith) can send OTLP/HTTP on `4318` only. The other
+> frameworks in the
+> [compatibility matrix](docs/agent-frameworks.md#compatibility-matrix) accept
+> gRPC or HTTP, and most of their setup recipes use gRPC on `4317`. Dropping the
+> `4318` receiver leaves ADK and LangGraph sending nothing; dropping `4317`
+> breaks those gRPC recipes. [`example/otel-collector-config.yml`](example/otel-collector-config.yml)
+> enables both, and CI exercises both ports against it.
 
 ### Startup errors
 
@@ -181,7 +193,7 @@ as log events rather than span attributes.
 | `logs.insert_id_attribute`      | —                     | Optional log attribute carrying `insert_id` before falling back to `logging.googleapis.com/insertId`, `gcp.insert.id`, `gcp.insert_id`, `log.record.uid`, and `record_fingerprint`. |
 | `quarantine.enabled`            | `false`               | Route permanently rejected spans and log records to the dead-letter table (`otel_quarantine`) instead of dropping them only in metrics. |
 | `quarantine.table`              | `otel_quarantine`     | Destination table for quarantined records when `quarantine.enabled` is `true`. |
-| `credentials.file`              | ADC                   | Path to a service account key file. |
+| `credentials.file`              | ADC                   | Path to a Google credentials JSON file. Accepted `type` values: `service_account`, `authorized_user`, `external_account`, `external_account_authorized_user`, `impersonated_service_account`. Any other type is rejected at startup. |
 | `credentials.impersonate_service_account` | —           | Target principal for impersonation, using ambient credentials as the source. |
 | `endpoint.url`                  | —                     | Alternate Storage Write API endpoint. Emulator and development only. |
 | `endpoint.insecure`             | `false`               | Disables TLS. Refused unless the endpoint is loopback. |

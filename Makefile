@@ -18,10 +18,11 @@ vet:
 .PHONY: lint
 lint:
 	golangci-lint run ./...
+	golangci-lint run --build-tags=integration ./...
 
 .PHONY: test
 test:
-	$(GOTEST) -race -cover ./...
+	$(GOTEST) -race -cover -count=1 ./...
 
 # Live-BigQuery integration tests. Requires BQ_PROJECT and BQ_DATASET plus
 # application default credentials.
@@ -51,6 +52,48 @@ collector-check: collector-components collector-validate
 collector-image:
 	docker build --tag bq-otel-collector:0.1.0-dev --file example/Dockerfile .
 
+# Regenerate the files mdatagen derives from metadata.yaml.
+#
+# The mdatagen module carries replace directives, so `go run …@version` and
+# `go install …@version` both refuse to build it. Adding it to this module with
+# `go get -tool` would pull its whole dependency tree into go.mod. Instead it
+# is built from a throwaway module pinned to the same Collector release as the
+# builder, then run from the repository root.
 .PHONY: mdatagen
 mdatagen:
-	$(GOCMD) generate ./...
+	@tmp="$$(mktemp -d)" && trap 'rm -rf "$$tmp"' EXIT && \
+		( cd "$$tmp" && \
+		  $(GOCMD) mod init mdatagen-tool 2>/dev/null && \
+		  $(GOCMD) get -tool go.opentelemetry.io/collector/cmd/mdatagen@$(OCB_VERSION) && \
+		  $(GOCMD) build -o "$$tmp/mdatagen" go.opentelemetry.io/collector/cmd/mdatagen ) && \
+		"$$tmp/mdatagen" metadata.yaml
+
+.PHONY: tidy
+tidy:
+	$(GOCMD) mod tidy
+
+# Reports known vulnerabilities reachable from this module's code. Install with
+# `go install golang.org/x/vuln/cmd/govulncheck@latest`.
+.PHONY: vuln
+vuln:
+	govulncheck ./...
+
+# Runs every benchmark once per package, with allocation counts. Unit tests are
+# skipped.
+.PHONY: bench
+bench:
+	$(GOTEST) -run '^$$' -bench . -benchmem ./...
+
+# Runs each fuzz target for FUZZTIME. Go fuzzes one target per invocation, so
+# the targets of every package are discovered with `go test -list`. Packages
+# without fuzz targets are skipped.
+FUZZTIME ?= 30s
+.PHONY: fuzz
+fuzz:
+	@set -e; \
+	for pkg in $$($(GOCMD) list ./...); do \
+		for target in $$($(GOTEST) -list '^Fuzz' $$pkg | awk '/^Fuzz/ { print $$1 }'); do \
+			echo "==> $$pkg $$target"; \
+			$(GOTEST) -run '^$$' -fuzz "^$$target$$" -fuzztime $(FUZZTIME) $$pkg; \
+		done; \
+	done
