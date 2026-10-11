@@ -213,8 +213,8 @@ as log events rather than span attributes.
 | `endpoint.insecure`             | `false`               | Disables TLS. Refused unless `endpoint.url` is loopback. |
 | `endpoint.without_authentication` | `false`             | Sends no credentials. Refused unless the endpoint is loopback. |
 | `auto_create.dataset`           | `false`               | Create the dataset if absent. Requires `location`. |
-| `auto_create.tables`            | `false`               | Create the active signal's destination table (plus `quarantine.table` when enabled) and `_dedup` view if absent, reconcile additive nullable columns on existing tables (`ReconcileAdditiveSchema`), and update existing views in place. |
-| `auto_create.companion_views`   | `false`               | Create or update the companion views (`otel_spans_as_allspans`, `v_gen_ai_spans`, `v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_gen_ai_tool_usage`, `v_gen_ai_logs`). Requires `auto_create.tables`. |
+| `auto_create.tables`            | `false`               | Create the active signal's destination table (plus `quarantine.table` when enabled) and `_dedup` view if absent, and reconcile additive nullable columns on existing tables (`ReconcileAdditiveSchema`). Views are create-only: an existing view is left as it is. |
+| `auto_create.companion_views`   | `false`               | Create the companion views if absent; existing ones are left as they are (`otel_spans_as_allspans`, `v_gen_ai_spans`, `v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_gen_ai_tool_usage`, `v_gen_ai_logs`). Requires `auto_create.tables`. |
 | `auto_create.search_indexes`    | `false`               | Execute `CREATE SEARCH INDEX IF NOT EXISTS ... OPTIONS (analyzer = 'NO_OP_ANALYZER')` on `(trace_id, span_id)` for `otel_spans` and `otel_logs`. Requires `auto_create.tables` and `bigquery.jobs.create`. |
 | `write.max_request_bytes`       | `8388608` (8 MiB)     | Our request-size headroom threshold, enforced after protobuf serialization and before `AppendRows`. Distinct from, and below, the API's own per-request limit. |
 | `write.max_row_bytes`           | `1048576` (1 MiB)     | Rejects individual serialized signal rows above this size and bounds quarantine rows by truncating `raw_payload`. |
@@ -308,12 +308,15 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
   - `v_gen_ai_logs`: filters `otel_logs_dedup` to GenAI/agent log events and
     joins `otel_spans_dedup` on `(service_name, trace_id, span_id)` to promote
     `gen_ai.*` and `gcp.vertex.agent.*` correlation columns.
-- **Additive schema evolution and in-place view updates (`auto_create.tables`).**
+- **Additive schema evolution and create-only views (`auto_create.tables`).**
   When `auto_create.tables` is `true`, startup reconciles existing tables that
   are missing newly introduced `NULLABLE` or `REPEATED` columns (at top level or
   inside nested `RECORD` fields) via `UpdateTable` with optimistic `ETag`
-  concurrency, and updates existing `_dedup` and companion views in place when
-  their `ViewQuery` evolves. Incompatible type or mode drift is always rejected.
+  concurrency. Incompatible type or mode drift is always rejected. The `_dedup`
+  and companion views are create-only: startup creates a missing view and leaves
+  an existing one as it is, so it needs no `bigquery.tables.update` and never
+  reverts an operator's edit. When an upgrade changes a view's SQL, drop the view
+  (or replace it with the new definition) and restart to pick it up.
 - **Opt-in quarantine dead-letter table (`otel_quarantine`).** When
   `quarantine.enabled` is `true`, spans, log records, and metric data points
   that fail validation, breach structural limits, exceed `write.max_row_bytes`,
