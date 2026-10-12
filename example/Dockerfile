@@ -18,7 +18,7 @@ RUN GOTOOLCHAIN=local go run go.opentelemetry.io/collector/cmd/builder@v0.158.0 
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" \
     -o /out/healthcheck ./cmd/healthcheck
 
-FROM --platform=${TARGETOS}/${TARGETARCH} gcr.io/distroless/base-debian12:nonroot@sha256:b12529fbbd0bb15eea8905f69d83148679e0b4d7d434c8808100792029b1caae
+FROM --platform=${TARGETOS}/${TARGETARCH} gcr.io/distroless/base-debian12:nonroot@sha256:7f0c72cd138b442ae0deeb69c08b1acf5525439ba251a49ad93c320a061567e5
 
 # OCI standard image labels. GoReleaser overrides these at build time.
 LABEL org.opencontainers.image.title="otelcol-bq"
