@@ -133,6 +133,19 @@ telemetry:
         monotonic: true
       attributes: [reason]
 
+    otelcol_exporter_bigquery_redacted_values:
+      enabled: true
+      stability: development
+      description: >-
+        Attribute keys and string values masked by the redaction step before
+        the batch is offloaded, size-checked, fingerprinted, or quarantined,
+        by signal and match type. Key names and values are never recorded.
+      unit: "{value}"
+      sum:
+        value_type: int
+        monotonic: true
+      attributes: [match_type, signal]
+
     otelcol_exporter_bigquery_rejected_rows:
       enabled: true
       stability: development
@@ -222,6 +235,16 @@ attributes:
       - shutdown_timeout
       - unknown
 
+  match_type:
+    description: >-
+      Whether a redaction replaced the value of a blocked attribute key or a
+      substring of a string value that matched a blocked pattern. Bounded by
+      construction; this enumeration is the whole domain.
+    type: string
+    enum:
+      - key
+      - value
+
   reason:
     description: >-
       Why a row was permanently rejected or quarantined. Bounded by construction;
@@ -243,3 +266,13 @@ attributes:
       - missing_timestamp
       - timestamp_overflow
       - other
+
+  signal:
+    description: >-
+      The pipeline signal the exporter instance serves. Bounded by
+      construction; this enumeration is the whole domain.
+    type: string
+    enum:
+      - logs
+      - metrics
+      - spans

@@ -19,6 +19,7 @@ import (
 	"go.opentelemetry.io/collector/config/configretry"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
 
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/redact"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
 )
 
@@ -100,6 +101,11 @@ type Config struct {
 	// Offload routes oversized span/log values and quarantine payloads to
 	// Google Cloud Storage and records ObjectRef references in BigQuery.
 	Offload OffloadConfig `mapstructure:"offload"`
+
+	// Redaction scrubs sensitive attribute keys and string values from
+	// telemetry before any offload, size check, fingerprint, or quarantine
+	// serialization sees it.
+	Redaction RedactionConfig `mapstructure:"redaction"`
 }
 
 // SignalConfig is the per-signal destination, partition lifecycle, and
@@ -310,6 +316,55 @@ type OffloadConfig struct {
 	Timeout time.Duration `mapstructure:"timeout"`
 }
 
+// RedactionConfig configures client-side scrubbing of sensitive attribute
+// keys and string values. Redaction runs as the first step of every
+// transform, on a copy of the batch, so the Storage Write API, the GCS
+// offloader, the record fingerprints, and the quarantine table only ever see
+// the masked form.
+type RedactionConfig struct {
+	Enabled bool `mapstructure:"enabled"`
+	// BlockedKeys are attribute keys whose whole value is replaced by
+	// MaskReplacement. Matching is case-insensitive; a key containing '*' is
+	// a glob. Merged with the built-in list unless DisableDefaultKeys is set.
+	BlockedKeys []string `mapstructure:"blocked_keys"`
+	// DisableDefaultKeys drops the built-in key list (authorization, cookie,
+	// api_key, *token, *secret*, *password*, ...) so only BlockedKeys apply.
+	DisableDefaultKeys bool `mapstructure:"disable_default_keys"`
+	// BlockedValuePatterns are RE2 regular expressions; every match inside a
+	// string value is replaced by MaskReplacement.
+	BlockedValuePatterns []string `mapstructure:"blocked_value_patterns"`
+	// MaskReplacement is the replacement text. Defaults to "[REDACTED]".
+	MaskReplacement string `mapstructure:"mask_replacement"`
+	// RedactLogBody also scans string, map, and slice log bodies.
+	RedactLogBody bool `mapstructure:"redact_log_body"`
+}
+
+// effectiveBlockedKeys is the key list a Redactor is built from: the
+// built-in defaults unless disabled, followed by the configured keys.
+func (r RedactionConfig) effectiveBlockedKeys() []string {
+	var keys []string
+	if !r.DisableDefaultKeys {
+		keys = append(keys, redact.DefaultBlockedKeys()...)
+	}
+	return append(keys, r.BlockedKeys...)
+}
+
+// toRedact builds the redact.Config for this configuration. onRedact may be
+// nil.
+func (r RedactionConfig) toRedact(onRedact func(matchType string, n int)) redact.Config {
+	mask := r.MaskReplacement
+	if mask == "" {
+		mask = redact.DefaultMaskReplacement
+	}
+	return redact.Config{
+		BlockedKeys:          r.effectiveBlockedKeys(),
+		BlockedValuePatterns: r.BlockedValuePatterns,
+		MaskReplacement:      mask,
+		RedactLogBody:        r.RedactLogBody,
+		OnRedact:             onRedact,
+	}
+}
+
 // Validate checks the configuration and fails fast at startup.
 func (cfg *Config) Validate() error {
 	var errs []error
@@ -362,6 +417,7 @@ func (cfg *Config) Validate() error {
 	errs = append(errs, cfg.validateEndpoint()...)
 	errs = append(errs, cfg.validateQuarantine()...)
 	errs = append(errs, cfg.validateOffload()...)
+	errs = append(errs, cfg.validateRedaction()...)
 
 	if err := cfg.Limits.toTransform().Validate(); err != nil {
 		errs = append(errs, err)
@@ -681,6 +737,46 @@ func (cfg *Config) validateOffload() []error {
 	}
 	if o.Timeout <= 0 {
 		errs = append(errs, errors.New("offload.timeout must be positive when offload.enabled is set"))
+	}
+	return errs
+}
+
+// validateRedaction compiles the value patterns whether or not redaction is
+// enabled, so a typo surfaces before the operator flips the switch, and
+// checks the enabled configuration can actually be built.
+func (cfg *Config) validateRedaction() []error {
+	var errs []error
+	r := cfg.Redaction
+	if _, err := redact.CompilePatterns(r.BlockedValuePatterns); err != nil {
+		errs = append(errs, fmt.Errorf("redaction.%w", err))
+	}
+	for i, k := range r.BlockedKeys {
+		if strings.TrimSpace(k) == "" {
+			errs = append(errs, fmt.Errorf("redaction.blocked_keys[%d] is empty", i))
+		}
+	}
+	if !r.Enabled || len(errs) > 0 {
+		return errs
+	}
+	if len(r.effectiveBlockedKeys()) == 0 && len(r.BlockedValuePatterns) == 0 {
+		return append(errs, errors.New(
+			"redaction.enabled is set but disable_default_keys leaves no blocked_keys and no blocked_value_patterns"))
+	}
+	rd, err := redact.New(r.toRedact(nil))
+	if err != nil {
+		return append(errs, fmt.Errorf("redaction: %w", err))
+	}
+	// A log identity attribute that the key list masks would give every
+	// record the same insert_id or log_name and collapse them in the dedup
+	// view, so refuse the combination up front.
+	for _, item := range []struct{ field, key string }{
+		{"logs.insert_id_attribute", cfg.Logs.InsertIDAttribute},
+		{"logs.log_name_attribute", cfg.Logs.LogNameAttribute},
+	} {
+		if item.key != "" && rd.KeyBlocked(item.key) {
+			errs = append(errs, fmt.Errorf(
+				"%s %q matches a blocked redaction key (built-in or redaction.blocked_keys) and would be masked on every record", item.field, item.key))
+		}
 	}
 	return errs
 }

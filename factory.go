@@ -14,6 +14,7 @@ import (
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
 
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/metadata"
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/redact"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
 )
@@ -121,6 +122,9 @@ func createDefaultConfig() component.Config {
 			MaxObjectBytes: defaultOffloadMaxObjectBytes,
 			MaxConcurrency: defaultOffloadMaxConcurrency,
 			Timeout:        defaultOffloadTimeout,
+		},
+		Redaction: RedactionConfig{
+			MaskReplacement: redact.DefaultMaskReplacement,
 		},
 	}
 }

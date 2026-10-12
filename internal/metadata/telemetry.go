@@ -67,6 +67,12 @@ type Telemetry struct {
 	OffloadedPayloads     metric.Int64Counter
 	OffloadedBytes        metric.Int64Counter
 	OffloadErrors         metric.Int64Counter
+
+	// RedactedValues counts attribute keys and string values masked by the
+	// redaction step before offload, fingerprinting, or quarantine. The
+	// labels name the signal and whether a key or a value matched; the key
+	// name and the value itself are never recorded.
+	RedactedValues metric.Int64Counter
 }
 
 // Metric names, matching metadata.yaml.
@@ -86,12 +92,15 @@ const (
 	nameOffloadedPayloads     = "otelcol_exporter_bigquery_offloaded_payloads"
 	nameOffloadedBytes        = "otelcol_exporter_bigquery_offloaded_bytes"
 	nameOffloadErrors         = "otelcol_exporter_bigquery_offload_errors"
+	nameRedactedValues        = "otelcol_exporter_bigquery_redacted_values"
 )
 
 // Label keys.
 const (
-	AttrReason = "reason"
-	AttrClass  = "class"
+	AttrReason    = "reason"
+	AttrClass     = "class"
+	AttrSignal    = "signal"
+	AttrMatchType = "match_type"
 )
 
 // NewTelemetry builds the instrument set.
@@ -175,6 +184,11 @@ func NewTelemetry(mp metric.MeterProvider) (*Telemetry, error) {
 		metric.WithDescription("Payload offload attempts to external object storage that failed, by error class."),
 		metric.WithUnit("{error}")); err != nil {
 		return nil, fmt.Errorf("creating %s: %w", nameOffloadErrors, err)
+	}
+	if t.RedactedValues, err = m.Int64Counter(nameRedactedValues,
+		metric.WithDescription("Attribute keys and string values masked by redaction before offload, fingerprinting, or quarantine, by signal and match type."),
+		metric.WithUnit("{value}")); err != nil {
+		return nil, fmt.Errorf("creating %s: %w", nameRedactedValues, err)
 	}
 	return t, nil
 }
@@ -304,4 +318,17 @@ func (t *Telemetry) RecordOffloadError(ctx context.Context, class string, n int)
 		return
 	}
 	t.OffloadErrors.Add(ctx, int64(n), metric.WithAttributes(attribute.String(AttrClass, class)))
+}
+
+// RecordRedactedValues records keys or values masked by redaction. matchType
+// is "key" or "value"; signal is the pipeline signal name. Neither the key
+// name nor the value ever reaches the metric.
+func (t *Telemetry) RecordRedactedValues(ctx context.Context, signal, matchType string, n int64) {
+	if t == nil || n <= 0 {
+		return
+	}
+	t.RedactedValues.Add(ctx, n, metric.WithAttributes(
+		attribute.String(AttrSignal, signal),
+		attribute.String(AttrMatchType, matchType),
+	))
 }

@@ -216,6 +216,12 @@ as log events rather than span attributes.
 | `quarantine.kms_key_name`       | —                     | Per-table Cloud KMS CryptoKey override when creating `quarantine.table`. |
 | `quarantine.labels`             | —                     | Labels merged on top of top-level `labels` when creating `quarantine.table`. |
 | `quarantine.max_staleness`      | —                     | BigQuery table `max_staleness` duration (`1s`..`168h`) when creating `quarantine.table`. |
+| `redaction.enabled`             | `false`               | Mask sensitive attribute keys and string values before payload offload, `limits.*` checks, fingerprinting, and quarantine. See [Redaction](#redaction). |
+| `redaction.blocked_keys`        | —                     | Extra attribute keys whose entire value is replaced by `redaction.mask_replacement`. Case-insensitive; `*` is a wildcard. Merged with the built-in list. |
+| `redaction.disable_default_keys` | `false`              | Drop the built-in key list so only `redaction.blocked_keys` apply. |
+| `redaction.blocked_value_patterns` | —                  | RE2 regular expressions; every match inside a string value is replaced by `redaction.mask_replacement`. A pattern that does not compile fails startup. |
+| `redaction.mask_replacement`    | `[REDACTED]`          | Replacement text, inserted literally (no `$1` expansion). |
+| `redaction.redact_log_body`     | `false`               | Also scan string, map, and slice log record bodies. |
 | `credentials.file`              | ADC                   | Path to a Google credentials JSON file (mutually exclusive with `credentials.json`). Accepted `type` values: `service_account`, `authorized_user`, `external_account`, `external_account_authorized_user`, `impersonated_service_account`. Any other type is rejected at startup. |
 | `credentials.json`              | —                     | Inline credential JSON (`service_account`, `authorized_user`, `external_account` WIF, `external_account_authorized_user`, `impersonated_service_account`, or `gdch_service_account`), injectable via `${env:BQ_CREDENTIALS_JSON}` and wrapped in `configopaque.String`. |
 | `credentials.impersonate_service_account` | —           | Target principal for service-account impersonation, using ambient ADC as the source. |
@@ -262,6 +268,93 @@ validate the complete typed schema before opening the Storage Write client.
 An authoritative `NotFound` fails startup with the corresponding
 `auto_create` setting named in the error; other metadata-read failures warn and
 defer the authorization verdict to the real append.
+
+### Redaction
+
+Redaction is off by default. With `redaction.enabled: true` the exporter masks
+sensitive attribute keys and string values before anything it writes can carry
+them:
+
+```yaml
+exporters:
+  bigquery:
+    redaction:
+      enabled: true
+      blocked_keys: ["x-customer-id", "*.ssn"]
+      blocked_value_patterns:
+        - '\b\d{3}-\d{2}-\d{4}\b'
+        - 'Bearer\s+[A-Za-z0-9._~+/=-]+'
+      redact_log_body: true
+```
+
+It is the first step of every export and works on a copy: the batch the
+Collector handed over is never modified, so a retried batch is redacted again
+from the original. A batch with no match is scanned and left as it is; a batch
+with a match is copied once. The masked form is what reaches:
+
+- payload offload, where object names are SHA-256 digests of the content, so a
+  secret masked only at encoding time would still be uploaded and would still
+  shape the object name;
+- the `limits.*` checks;
+- `record_fingerprint` and `point_fingerprint`;
+- the Storage Write API rows;
+- `otel_quarantine` rows, including `raw_payload` and `raw_attributes`.
+
+Scanned: resource and scope attributes; span, span event, and span link
+attributes; log record attributes; metric metadata, data point attributes, and
+exemplar filtered attributes; and, when `redaction.redact_log_body` is `true`,
+string, map, and slice log bodies.
+
+- **Blocked keys** replace the entire value, whatever its type, with
+  `redaction.mask_replacement` (default `[REDACTED]`, inserted literally).
+  Matching is case-insensitive, `*` matches any run of characters, and keys
+  inside nested map values are matched too. `redaction.blocked_keys` adds to
+  the built-in list; `redaction.disable_default_keys` drops that list.
+- **Blocked value patterns** are RE2 regular expressions. Every match inside a
+  string value is replaced and the rest of the string is kept. Integer, double,
+  boolean, and bytes values are never scanned for patterns. A pattern that is
+  empty or does not compile fails startup, even while redaction is disabled, so
+  a typo surfaces before the switch is flipped.
+
+The built-in key list is `authorization`, `proxy-authorization`, `cookie`,
+`set-cookie`, `x-api-key`, `api_key`, `api-key`, `apikey`, `client_secret`,
+`access_token`, `refresh_token`, `id_token`, `token`, `password`, `passwd`,
+`secret`, `private_key`, and `credentials`, plus the globs `*secret*`,
+`*password*`, `*passwd*`, `*private_key*`, `*token`, `*_api_key`, `*-api-key`,
+`*.api_key`, `*apikey`, `*.authorization`, `*-authorization`, and `*cookie`.
+
+`*token` is anchored at the end on purpose. A `*token*` glob would also mask
+`gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, and
+`gen_ai.token.type`, which are counts and an enum, and the GenAI views read the
+counts as integers, so masking them turns those view columns to `NULL`. Keys
+such as `token_value` or a plural `tokens` are therefore not blocked by
+default; add `*token*` to `redaction.blocked_keys` if you want them masked.
+
+Startup also refuses a configuration where `logs.insert_id_attribute` or
+`logs.log_name_attribute` names a key the redaction would mask: every record
+would then carry the same `insert_id` or `log_name`, and the deduplication view
+would treat distinct records as duplicates.
+
+`otelcol_exporter_bigquery_redacted_values` (`{signal, match_type}`, where
+`match_type` is `key` or `value`) counts what was masked. It never records key
+names or values, and it counts each time a batch is redacted, so a retried
+batch is counted again.
+
+Fingerprints and offloaded object names are computed from the masked content,
+so changing the redaction settings changes them for the same input. Rows
+written before and after such a change are not matched as duplicates wherever
+the deduplication identity includes `record_fingerprint` or `point_fingerprint`.
+
+What it does not do:
+
+- It protects what this exporter writes. The Collector's `sending_queue`,
+  including a persistent queue, holds batches as they arrived, before the
+  exporter runs, and other components in the pipeline see the original data.
+- Value patterns apply only to string attribute values and, when enabled, log
+  bodies. Span, event, link, and metric names, span status messages, scope
+  names, and schema URLs are not scanned, and blocked keys are matched against
+  attribute and map-body keys only.
+- It does not find secrets that no configured key or pattern describes.
 
 ## Schema contract (`v0alpha2`)
 
@@ -476,6 +569,7 @@ Use these content-free self-telemetry instruments to detect a stuck path:
 | `otelcol_exporter_bigquery_offloaded_payloads` | Payloads offloaded to object storage (`{signal, mime_type}`). |
 | `otelcol_exporter_bigquery_offloaded_bytes` | Bytes offloaded to object storage (`{signal}`). |
 | `otelcol_exporter_bigquery_offload_errors` | Object storage offload failures (`{signal, stage}`). |
+| `otelcol_exporter_bigquery_redacted_values` | Attribute keys and string values masked by [redaction](#redaction) (`{signal, match_type}`); never records key names or values. |
 
 Both current-value instruments should return to zero after recovery or clean
 shutdown. A sustained nonzero value, rising timeout/retirement counters, or

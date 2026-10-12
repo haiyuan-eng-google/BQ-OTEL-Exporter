@@ -27,12 +27,14 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/encoding/gzip"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/protobuf/proto"
 
 	bqi "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/bigquery"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/diag"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/metadata"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/offload"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/protoenc"
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/redact"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
 )
@@ -100,6 +102,11 @@ type signalExporter struct {
 
 	schema *storagepb.TableSchema
 	opts   transform.Options
+
+	// startErr is a construction-time failure that start returns, so a
+	// misbuilt security control fails the component instead of being
+	// silently skipped.
+	startErr error
 }
 
 func newSignalExporter(
@@ -152,7 +159,36 @@ func newSignalExporter(
 			se.opts.QuarantinePayloadOffloader = off.OffloadQuarantine
 		}
 	}
+	if cfg.Redaction.Enabled {
+		signal := signalForSchema(tableSchema)
+		rd, err := redact.New(cfg.Redaction.toRedact(func(matchType string, n int) {
+			if se.tel == nil {
+				return
+			}
+			se.tel.RecordRedactedValues(context.Background(), signal, matchType, int64(n))
+		}))
+		if err != nil {
+			// Validate rejects every input that can get here, so this is a
+			// programming error; fail start rather than export cleartext.
+			se.startErr = fmt.Errorf("building redactor: %w", err)
+		} else {
+			se.opts.Redactor = rd
+		}
+	}
 	return se
+}
+
+// signalForSchema names the signal an exporter instance serves for the
+// closed signal label on self-telemetry.
+func signalForSchema(s *storagepb.TableSchema) string {
+	switch {
+	case proto.Equal(s, schema.LogsTableSchema()):
+		return schema.SignalLogs
+	case proto.Equal(s, schema.MetricsTableSchema()):
+		return schema.SignalMetrics
+	default:
+		return schema.SignalSpans
+	}
 }
 
 // exporterInstance labels quarantine rows with the service.instance.id of the
@@ -399,6 +435,10 @@ func (e *signalExporter) offloadClientOptions(ctx context.Context) ([]option.Cli
 func (e *signalExporter) start(ctx context.Context, host component.Host) (err error) {
 	e.host = host
 	componentstatus.ReportStatus(e.host, componentstatus.NewEvent(componentstatus.StatusStarting))
+	if e.startErr != nil {
+		componentstatus.ReportStatus(e.host, componentstatus.NewPermanentErrorEvent(e.startErr))
+		return e.startErr
+	}
 
 	// Start's context is scoped to component startup. managedwriter retains
 	// both its client and stream constructor contexts for background work, so

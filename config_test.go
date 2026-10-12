@@ -5,6 +5,7 @@ package bigqueryexporter
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -525,5 +526,146 @@ func TestConfigValidateAcceptsDomainPrefixedProjectAndGovernanceOptions(t *testi
 	c.Quarantine.MaxStaleness = "5m"
 	if err := c.Validate(); err != nil {
 		t.Fatalf("Validate() unexpected error: %v", err)
+	}
+}
+
+func TestValidateRedaction(t *testing.T) {
+	t.Run("default config carries the mask and is disabled", func(t *testing.T) {
+		cfg := validConfig()
+		if cfg.Redaction.Enabled {
+			t.Fatal("redaction must be opt-in")
+		}
+		if cfg.Redaction.MaskReplacement != "[REDACTED]" {
+			t.Fatalf("default mask_replacement = %q", cfg.Redaction.MaskReplacement)
+		}
+	})
+
+	t.Run("enabled with defaults validates", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.Redaction.Enabled = true
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("enabled redaction with default keys should validate, got: %v", err)
+		}
+		keys := cfg.Redaction.effectiveBlockedKeys()
+		if len(keys) == 0 {
+			t.Fatal("effective keys must include the defaults")
+		}
+	})
+
+	t.Run("enabled with custom keys and patterns validates", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.Redaction.Enabled = true
+		cfg.Redaction.DisableDefaultKeys = true
+		cfg.Redaction.BlockedKeys = []string{"x-internal-*", "Customer.SSN"}
+		cfg.Redaction.BlockedValuePatterns = []string{`\d{3}-\d{2}-\d{4}`}
+		cfg.Redaction.MaskReplacement = "***"
+		cfg.Redaction.RedactLogBody = true
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("custom redaction should validate, got: %v", err)
+		}
+		if got := cfg.Redaction.effectiveBlockedKeys(); len(got) != 2 {
+			t.Fatalf("effective keys = %v, want only the two custom keys", got)
+		}
+	})
+
+	rejects := map[string]struct {
+		mutate func(*Config)
+		want   string
+	}{
+		"invalid regex even when disabled": {
+			func(c *Config) { c.Redaction.BlockedValuePatterns = []string{"ok", "(unclosed"} },
+			"redaction.blocked_value_patterns[1]",
+		},
+		"empty pattern": {
+			func(c *Config) { c.Redaction.BlockedValuePatterns = []string{" "} },
+			"redaction.blocked_value_patterns[0] is empty",
+		},
+		"empty key": {
+			func(c *Config) { c.Redaction.BlockedKeys = []string{"authorization", ""} },
+			"redaction.blocked_keys[1] is empty",
+		},
+		"enabled with nothing to match": {
+			func(c *Config) {
+				c.Redaction.Enabled = true
+				c.Redaction.DisableDefaultKeys = true
+			},
+			"no blocked_keys and no blocked_value_patterns",
+		},
+		"insert_id attribute would be masked": {
+			func(c *Config) {
+				c.Redaction.Enabled = true
+				c.Logs.InsertIDAttribute = "session_token"
+			},
+			`logs.insert_id_attribute "session_token" matches a blocked redaction key`,
+		},
+		"log_name attribute would be masked by a custom glob": {
+			func(c *Config) {
+				c.Redaction.Enabled = true
+				c.Redaction.BlockedKeys = []string{"gcp.*"}
+				c.Logs.LogNameAttribute = "gcp.log_name"
+			},
+			`logs.log_name_attribute "gcp.log_name" matches a blocked redaction key`,
+		},
+	}
+	for name, tc := range rejects {
+		t.Run(name, func(t *testing.T) {
+			cfg := validConfig()
+			tc.mutate(cfg)
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("expected error containing %q", tc.want)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want it to contain %q", err, tc.want)
+			}
+		})
+	}
+
+	t.Run("identity attribute that is not blocked validates", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.Redaction.Enabled = true
+		cfg.Logs.InsertIDAttribute = "log.record.uid"
+		cfg.Logs.LogNameAttribute = "gcp.log_name"
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("toRedact falls back to the default mask", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.Redaction.Enabled = true
+		cfg.Redaction.MaskReplacement = ""
+		rc := cfg.Redaction.toRedact(nil)
+		if rc.MaskReplacement != "[REDACTED]" {
+			t.Fatalf("mask = %q", rc.MaskReplacement)
+		}
+	})
+}
+
+// TestRedactionConfigKeys pins the YAML keys operators write. A mistyped
+// mapstructure tag would otherwise surface only when a collector refuses to
+// start with the documented configuration.
+func TestRedactionConfigKeys(t *testing.T) {
+	top, ok := reflect.TypeOf(Config{}).FieldByName("Redaction")
+	if !ok || top.Tag.Get("mapstructure") != "redaction" {
+		t.Fatalf("Config.Redaction mapstructure tag = %q, want %q", top.Tag.Get("mapstructure"), "redaction")
+	}
+	want := map[string]string{
+		"Enabled":              "enabled",
+		"BlockedKeys":          "blocked_keys",
+		"DisableDefaultKeys":   "disable_default_keys",
+		"BlockedValuePatterns": "blocked_value_patterns",
+		"MaskReplacement":      "mask_replacement",
+		"RedactLogBody":        "redact_log_body",
+	}
+	rt := reflect.TypeOf(RedactionConfig{})
+	if rt.NumField() != len(want) {
+		t.Fatalf("RedactionConfig has %d fields, want %d; document and pin any new option here", rt.NumField(), len(want))
+	}
+	for field, key := range want {
+		f, ok := rt.FieldByName(field)
+		if !ok || f.Tag.Get("mapstructure") != key {
+			t.Errorf("RedactionConfig.%s mapstructure tag = %q, want %q", field, f.Tag.Get("mapstructure"), key)
+		}
 	}
 }
