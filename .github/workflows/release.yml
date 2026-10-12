@@ -31,7 +31,7 @@ jobs:
       # build with the same patched Go release example/Dockerfile pins rather
       # than the go.mod minimum, which predates the standard-library fixes.
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: "1.26.9"
 
