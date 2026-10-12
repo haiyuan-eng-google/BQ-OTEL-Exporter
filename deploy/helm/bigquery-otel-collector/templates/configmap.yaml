@@ -1,0 +1,94 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: bigquery-otel-collector
+    app.kubernetes.io/instance: {{ .Release.Name }}
+data:
+  config.yml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:{{ .Values.receivers.grpc.port }}
+          http:
+            endpoint: 0.0.0.0:{{ .Values.receivers.http.port }}
+
+    processors:
+      memory_limiter:
+        check_interval: 1s
+        limit_percentage: 80
+        spike_limit_percentage: 25
+      batch:
+        timeout: 5s
+        send_batch_size: 1000
+
+    exporters:
+      bigquery:
+        project: ${env:BQ_PROJECT}
+        dataset: ${env:BQ_DATASET}
+        location: ${env:BQ_LOCATION}
+        auto_create:
+          dataset: {{ .Values.bigquery.autoCreateDataset }}
+          tables: {{ .Values.bigquery.autoCreateTables }}
+        traces:
+          table: {{ .Values.bigquery.tracesTable }}
+        logs:
+          table: {{ .Values.bigquery.logsTable }}
+        retry_on_failure:
+          enabled: true
+          max_elapsed_time: 900s
+        sending_queue:
+          enabled: true
+          {{- if .Values.persistentQueue.enabled }}
+          storage: file_storage
+          {{- end }}
+
+    {{- if .Values.healthCheck.enabled }}
+    extensions:
+      {{- if .Values.persistentQueue.enabled }}
+      file_storage:
+        directory: {{ .Values.persistentQueue.mountPath }}
+        timeout: 1s
+        compaction:
+          on_start: true
+          # filestorage otherwise compacts in its default directory,
+          # /var/lib/otelcol/file_storage, which the read-only image lacks.
+          directory: {{ .Values.persistentQueue.mountPath }}
+      {{- end }}
+      health_check:
+        endpoint: 0.0.0.0:{{ .Values.healthCheck.port }}
+    {{- else if .Values.persistentQueue.enabled }}
+    extensions:
+      file_storage:
+        directory: {{ .Values.persistentQueue.mountPath }}
+        timeout: 1s
+        compaction:
+          on_start: true
+          # filestorage otherwise compacts in its default directory,
+          # /var/lib/otelcol/file_storage, which the read-only image lacks.
+          directory: {{ .Values.persistentQueue.mountPath }}
+    {{- end }}
+
+    service:
+      extensions:
+        {{- if .Values.healthCheck.enabled }}
+        - health_check
+        {{- end }}
+        {{- if .Values.persistentQueue.enabled }}
+        - file_storage
+        {{- end }}
+      telemetry:
+        logs:
+          level: info
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [bigquery]
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [bigquery]

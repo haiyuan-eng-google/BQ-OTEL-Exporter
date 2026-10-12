@@ -1,0 +1,120 @@
+apiVersion: apps/v1
+{{- if .Values.persistentQueue.enabled }}
+kind: StatefulSet
+{{- else }}
+kind: Deployment
+{{- end }}
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: bigquery-otel-collector
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  {{- if .Values.persistentQueue.enabled }}
+  serviceName: {{ .Release.Name }}
+  {{- end }}
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: bigquery-otel-collector
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: bigquery-otel-collector
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      serviceAccountName: {{ include "bigquery-otel-collector.serviceAccountName" . }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: otelcol-bq
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "--config=/etc/otel/config.yml"
+          env:
+            - name: BQ_PROJECT
+              value: {{ .Values.bigquery.project | quote }}
+            - name: BQ_DATASET
+              value: {{ .Values.bigquery.dataset | quote }}
+            - name: BQ_LOCATION
+              value: {{ .Values.bigquery.location | quote }}
+          ports:
+            - name: otlp-grpc
+              containerPort: {{ .Values.receivers.grpc.port }}
+              protocol: TCP
+            - name: otlp-http
+              containerPort: {{ .Values.receivers.http.port }}
+              protocol: TCP
+            - name: metrics
+              containerPort: 8888
+              protocol: TCP
+            {{- if .Values.healthCheck.enabled }}
+            - name: health
+              containerPort: {{ .Values.healthCheck.port }}
+              protocol: TCP
+            {{- end }}
+          {{- if .Values.healthCheck.enabled }}
+          livenessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          {{- end }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otel
+              readOnly: true
+            {{- if .Values.persistentQueue.enabled }}
+            - name: file-storage
+              mountPath: {{ .Values.persistentQueue.mountPath }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}-config
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.persistentQueue.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: file-storage
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        {{- if .Values.persistentQueue.storageClass }}
+        storageClassName: {{ .Values.persistentQueue.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistentQueue.size }}
+  {{- end }}

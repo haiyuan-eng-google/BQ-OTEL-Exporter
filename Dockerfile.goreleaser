@@ -1,0 +1,20 @@
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:a9329520abc449e3b14d5bc3a6ffae065bdde0f02667fa10880c49b35c109fd1
+
+LABEL org.opencontainers.image.title="otelcol-bq"
+LABEL org.opencontainers.image.description="OpenTelemetry Collector with the BigQuery exporter"
+LABEL org.opencontainers.image.source="https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+
+COPY otelcol-bq /otelcol-bq
+COPY healthcheck /healthcheck
+COPY example/otel-collector-config.yml /etc/otel/config.yml
+
+EXPOSE 4317 4318 8888 13133
+
+# The distroless runtime has no shell, so the probe is the bundled static
+# /healthcheck binary in exec form; it exits non-zero unless the health_check
+# extension on :13133 answers 2xx.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD ["/healthcheck"]
+
+ENTRYPOINT ["/otelcol-bq"]
+CMD ["--config=/etc/otel/config.yml"]

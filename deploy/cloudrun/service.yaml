@@ -1,0 +1,78 @@
+# Cloud Run Knative service manifest for the BigQuery OTel Collector.
+#
+# Compatible with `gcloud run services replace deploy/cloudrun/service.yaml`.
+# Cloud Run allows a single ingress containerPort per service (`http1` on 4318
+# for OTLP/HTTP by default; change to `name: h2c` and `containerPort: 4317` to
+# expose OTLP/gRPC instead). The container image bundles a default collector
+# configuration at `/etc/otel/config.yml` driven by BQ_PROJECT, BQ_DATASET, and
+# BQ_LOCATION environment variables.
+#
+# Prerequisites:
+# - Cloud Run pulls images only from Artifact Registry, Container Registry, or
+#   Docker Hub, not from GHCR. Copy the release image into an Artifact Registry
+#   repository (for example `gcrane cp ghcr.io/haiyuan-eng-google/bq-otel-collector:0.1.0
+#   us-central1-docker.pkg.dev/my-project/otel/bq-otel-collector:0.1.0`), or
+#   point an Artifact Registry remote repository at ghcr.io, and set `image`.
+# - The service account from deploy/terraform/ must exist. By default it may
+#   only read metadata and append rows, so the dataset, tables, and views must
+#   already be provisioned by deploy/terraform/. The `--set` arguments below
+#   therefore turn off the image's default auto_create.
+
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: bq-otel-collector
+  labels:
+    cloud.googleapis.com/location: us-central1
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "1"
+        autoscaling.knative.dev/maxScale: "10"
+        run.googleapis.com/cpu-throttling: "false"
+        run.googleapis.com/startup-cpu-boost: "true"
+    spec:
+      containerConcurrency: 100
+      timeoutSeconds: 300
+      serviceAccountName: otel-collector@my-project.iam.gserviceaccount.com
+      containers:
+        - name: otelcollector
+          image: us-central1-docker.pkg.dev/my-project/otel/bq-otel-collector:0.1.0
+          args:
+            - "--config=/etc/otel/config.yml"
+            - "--set=exporters.bigquery.auto_create.dataset=false"
+            - "--set=exporters.bigquery.auto_create.tables=false"
+          ports:
+            - name: http1
+              containerPort: 4318
+          env:
+            - name: BQ_PROJECT
+              value: my-project
+            - name: BQ_DATASET
+              value: otel
+            - name: BQ_LOCATION
+              value: US
+          resources:
+            limits:
+              cpu: "1"
+              memory: 512Mi
+            requests:
+              cpu: "100m"
+              memory: 128Mi
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 13133
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          startupProbe:
+            httpGet:
+              path: /
+              port: 13133
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 30
+  traffic:
+    - percent: 100
+      latestRevision: true
