@@ -7,14 +7,25 @@ exporters:
     project: my-project
     dataset: otel
     location: US
+    kms_key_name: projects/my-project/locations/us/keyRings/otel/cryptoKeys/default
+    labels:
+      env: prod
     traces:
       table: spans
       partition_expiration_days: 365
       require_partition_filter: true
+      kms_key_name: projects/my-project/locations/us/keyRings/otel/cryptoKeys/spans
+      labels:
+        signal: traces
+      max_staleness: 15m
     logs:
       table: logs
       partition_expiration_days: 90
       require_partition_filter: true
+      kms_key_name: projects/my-project/locations/us/keyRings/otel/cryptoKeys/logs
+      labels:
+        signal: logs
+      max_staleness: 15m
       # Optional. Records without these attributes fall back to well-known
       # attributes, then to the service name and the record fingerprint.
       log_name_attribute: log.file.name
@@ -23,11 +34,19 @@ exporters:
       table: metrics
       partition_expiration_days: 180
       require_partition_filter: true
+      kms_key_name: projects/my-project/locations/us/keyRings/otel/cryptoKeys/metrics
+      labels:
+        signal: metrics
+      max_staleness: 15m
     quarantine:
       enabled: true
       table: otel_quarantine
       partition_expiration_days: 30
       require_partition_filter: false
+      kms_key_name: projects/my-project/locations/us/keyRings/otel/cryptoKeys/quarantine
+      labels:
+        signal: quarantine
+      max_staleness: 30m
     credentials:
       impersonate_service_account: writer@my-project.iam.gserviceaccount.com
       impersonate_delegates:

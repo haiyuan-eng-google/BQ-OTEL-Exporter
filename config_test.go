@@ -459,6 +459,12 @@ func TestValidateOffloadAndQuarantineHardening(t *testing.T) {
 			func(c *Config) { c.Traces.KMSKeyName = "bad-kms-key" },
 			"traces.kms_key_name \"bad-kms-key\" must match projects/{project}/locations/{location}/keyRings/{keyRing}/cryptoKeys/{cryptoKey}",
 		},
+		"kms_key_name with cryptoKeyVersions rejected": {
+			func(c *Config) {
+				c.Traces.KMSKeyName = "projects/my-project/locations/us-central1/keyRings/otel-ring/cryptoKeys/traces-key/cryptoKeyVersions/1"
+			},
+			"traces.kms_key_name \"projects/my-project/locations/us-central1/keyRings/otel-ring/cryptoKeys/traces-key/cryptoKeyVersions/1\" must match projects/{project}/locations/{location}/keyRings/{keyRing}/cryptoKeys/{cryptoKey}",
+		},
 		"invalid label key": {
 			func(c *Config) { c.Labels = map[string]string{"InvalidUpper": "ok"} },
 			"labels key \"InvalidUpper\" must start with a lowercase letter and contain at most 63",
@@ -511,7 +517,7 @@ func TestConfigValidateAcceptsDomainPrefixedProjectAndGovernanceOptions(t *testi
 		"env":  "prod",
 		"team": "observability_1",
 	}
-	c.Traces.KMSKeyName = "projects/my-project/locations/us-central1/keyRings/otel-ring/cryptoKeys/traces-key/cryptoKeyVersions/1"
+	c.Traces.KMSKeyName = "projects/my-project/locations/us-central1/keyRings/otel-ring/cryptoKeys/traces-key"
 	c.Traces.Labels = map[string]string{"signal": "traces"}
 	c.Traces.MaxStaleness = "15m"
 	c.Logs.MaxStaleness = "1h"
@@ -521,3 +527,4 @@ func TestConfigValidateAcceptsDomainPrefixedProjectAndGovernanceOptions(t *testi
 		t.Fatalf("Validate() unexpected error: %v", err)
 	}
 }
+

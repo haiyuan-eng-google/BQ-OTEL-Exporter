@@ -1400,6 +1400,8 @@ func quarantineErrorCode(r Rejection) string {
 		return "MISSING_END_TIME"
 	case r.Reason == ReasonRowBytes:
 		return "OVERSIZE_ROW"
+	case r.Reason == ReasonRequestPermanent:
+		return "REQUEST_PERMANENT"
 	}
 	return strings.ToUpper(string(r.Reason))
 }

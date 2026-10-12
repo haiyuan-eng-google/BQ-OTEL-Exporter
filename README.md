@@ -184,24 +184,38 @@ as log events rather than span attributes.
 
 | Option                          | Default               | Description |
 | ------------------------------- | --------------------- | ----------- |
-| `project`                       | *required*            | Google Cloud project owning the destination dataset. |
+| `project`                       | *required*            | Google Cloud project owning the destination dataset (supports domain-scoped IDs such as `example.com:my-project`). |
 | `dataset`                       | *required*            | Destination BigQuery dataset ID. |
 | `location`                      | —                     | Dataset location. Required only when creating a dataset. |
+| `kms_key_name`                  | —                     | Default Cloud KMS CryptoKey resource name (`projects/{p}/locations/{l}/keyRings/{kr}/cryptoKeys/{ck}`) applied when creating the dataset, signal tables, or quarantine table unless overridden per signal/quarantine. |
+| `labels`                        | —                     | Default Google Cloud resource labels (`map[string]string`, up to 64 entries) applied when creating the dataset, signal tables, quarantine table, and views. |
 | `traces.table`                  | `otel_spans`          | Destination table for OTLP spans. |
 | `traces.partition_expiration_days` | `0`                | Partition retention in days when creating `traces.table` (`0` omits partition expiration). |
 | `traces.require_partition_filter` | `false`             | Require a partition filter on queries over `traces.table` when created. |
+| `traces.kms_key_name`           | —                     | Per-table Cloud KMS CryptoKey override when creating `traces.table`. |
+| `traces.labels`                 | —                     | Labels merged on top of top-level `labels` when creating `traces.table` and its deduplication/companion views. |
+| `traces.max_staleness`          | —                     | BigQuery table `max_staleness` duration (`1s`..`168h`, e.g. `15m`) when creating `traces.table`. |
 | `logs.table`                    | `otel_logs`           | Destination table for OTLP log records. |
 | `logs.log_name_attribute`       | —                     | Optional log attribute carrying `log_name` before falling back to `gcp.log_name`, `logging.googleapis.com/logName`, `log.iostream`, `service_name`, and `"default"`. |
 | `logs.insert_id_attribute`      | —                     | Optional log attribute carrying `insert_id` before falling back to `logging.googleapis.com/insertId`, `gcp.insert.id`, `gcp.insert_id`, `log.record.uid`, and `record_fingerprint`. |
 | `logs.partition_expiration_days` | `0`                  | Partition retention in days when creating `logs.table`. |
 | `logs.require_partition_filter` | `false`               | Require a partition filter on queries over `logs.table` when created. |
+| `logs.kms_key_name`             | —                     | Per-table Cloud KMS CryptoKey override when creating `logs.table`. |
+| `logs.labels`                   | —                     | Labels merged on top of top-level `labels` when creating `logs.table` and its deduplication/companion views. |
+| `logs.max_staleness`            | —                     | BigQuery table `max_staleness` duration (`1s`..`168h`) when creating `logs.table`. |
 | `metrics.table`                 | `otel_metrics`        | Destination table for OTLP metric data points. |
 | `metrics.partition_expiration_days` | `0`               | Partition retention in days when creating `metrics.table`. |
 | `metrics.require_partition_filter` | `false`            | Require a partition filter on queries over `metrics.table` when created. |
+| `metrics.kms_key_name`          | —                     | Per-table Cloud KMS CryptoKey override when creating `metrics.table`. |
+| `metrics.labels`                | —                     | Labels merged on top of top-level `labels` when creating `metrics.table` and its deduplication view. |
+| `metrics.max_staleness`         | —                     | BigQuery table `max_staleness` duration (`1s`..`168h`) when creating `metrics.table`. |
 | `quarantine.enabled`            | `false`               | Route permanently rejected spans, log records, and metric data points to the dead-letter table (`otel_quarantine`) instead of dropping them only in metrics. |
 | `quarantine.table`              | `otel_quarantine`     | Destination table for quarantined records when `quarantine.enabled` is `true`. |
 | `quarantine.partition_expiration_days` | `30`           | Partition retention in days when creating `quarantine.table`. |
 | `quarantine.require_partition_filter` | `false`         | Require a partition filter on queries over `quarantine.table` when created. |
+| `quarantine.kms_key_name`       | —                     | Per-table Cloud KMS CryptoKey override when creating `quarantine.table`. |
+| `quarantine.labels`             | —                     | Labels merged on top of top-level `labels` when creating `quarantine.table`. |
+| `quarantine.max_staleness`      | —                     | BigQuery table `max_staleness` duration (`1s`..`168h`) when creating `quarantine.table`. |
 | `credentials.file`              | ADC                   | Path to a Google credentials JSON file (mutually exclusive with `credentials.json`). Accepted `type` values: `service_account`, `authorized_user`, `external_account`, `external_account_authorized_user`, `impersonated_service_account`. Any other type is rejected at startup. |
 | `credentials.json`              | —                     | Inline credential JSON (`service_account`, `authorized_user`, `external_account` WIF, `external_account_authorized_user`, `impersonated_service_account`, or `gdch_service_account`), injectable via `${env:BQ_CREDENTIALS_JSON}` and wrapped in `configopaque.String`. |
 | `credentials.impersonate_service_account` | —           | Target principal for service-account impersonation, using ambient ADC as the source. |
@@ -215,7 +229,7 @@ as log events rather than span attributes.
 | `auto_create.dataset`           | `false`               | Create the dataset if absent. Requires `location`. |
 | `auto_create.tables`            | `false`               | Create the active signal's destination table (plus `quarantine.table` when enabled) and `_dedup` view if absent, and reconcile additive nullable columns on existing tables (`ReconcileAdditiveSchema`). Views are create-only: an existing view is left as it is. |
 | `auto_create.companion_views`   | `false`               | Create the companion views if absent; existing ones are left as they are (`otel_spans_as_allspans`, `v_gen_ai_spans`, `v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_gen_ai_tool_usage`, `v_gen_ai_logs`). Requires `auto_create.tables`. |
-| `auto_create.search_indexes`    | `false`               | Execute `CREATE SEARCH INDEX IF NOT EXISTS ... OPTIONS (analyzer = 'NO_OP_ANALYZER')` on `(trace_id, span_id)` for `otel_spans` and `otel_logs`. Requires `auto_create.tables` and `bigquery.jobs.create`. |
+| `auto_create.search_indexes`    | `false`               | Execute `CREATE SEARCH INDEX IF NOT EXISTS ... ON ALL COLUMNS OPTIONS (analyzer = 'NO_OP_ANALYZER')` for `otel_spans`, `otel_logs`, and `otel_metrics`. Requires `auto_create.tables` and `bigquery.jobs.create`. |
 | `write.max_request_bytes`       | `8388608` (8 MiB)     | Our request-size headroom threshold, enforced after protobuf serialization and before `AppendRows`. Distinct from, and below, the API's own per-request limit. |
 | `write.max_row_bytes`           | `1048576` (1 MiB)     | Rejects individual serialized signal rows above this size and bounds quarantine rows by truncating `raw_payload`. |
 | `write.max_inflight_requests`   | `8`                   | Bounds asynchronous in-flight appends. |

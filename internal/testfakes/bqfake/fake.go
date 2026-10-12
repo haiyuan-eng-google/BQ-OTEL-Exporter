@@ -93,6 +93,7 @@ type Server struct {
 	connections int
 	requests    int
 	ackedRows   int
+	etagSeq     int
 
 	datasets map[string]*bigqueryapi.Dataset
 	tables   map[string]map[string]*bigqueryapi.Table
@@ -1027,8 +1028,8 @@ func (s *Server) handleREST(w http.ResponseWriter, r *http.Request) {
 			if patch.Clustering != nil {
 				existing.Clustering = cloneJSON(patch.Clustering)
 			}
-			s.requests++
-			existing.Etag = fmt.Sprintf("etag-%s-%d", tableID, s.requests)
+			s.etagSeq++
+			existing.Etag = fmt.Sprintf("etag-%s-%d", tableID, s.etagSeq)
 			if existing.Schema != nil && len(existing.Schema.Fields) > 0 {
 				_ = s.registerTableSchemaLocked(tableID, fromRESTTableSchema(existing.Schema))
 			}

@@ -33,8 +33,8 @@ var (
 	// Project IDs are lowercase letters, digits and hyphens, with an optional
 	// organization domain prefix (e.g. "example.com:my-project").
 	projectPattern = regexp.MustCompile(`^(?:[a-z0-9.-]+\.[a-z]{2,}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$`)
-	// KMSKeyName must be a Cloud KMS CryptoKey (or CryptoKeyVersion) resource path.
-	kmsKeyPattern = regexp.MustCompile(`^projects/[^/\s]+/locations/[^/\s]+/keyRings/[^/\s]+/cryptoKeys/[^/\s]+(?:/cryptoKeyVersions/[^/\s]+)?$`)
+	// KMSKeyName must be a Cloud KMS CryptoKey resource path.
+	kmsKeyPattern = regexp.MustCompile(`^projects/[^/\s]+/locations/[^/\s]+/keyRings/[^/\s]+/cryptoKeys/[^/\s]+$`)
 	// BigQuery label keys and values follow Google Cloud resource label rules.
 	labelKeyPattern   = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,62}$`)
 	labelValuePattern = regexp.MustCompile(`^[a-z0-9_-]{0,63}$`)
@@ -197,8 +197,8 @@ type AutoCreateConfig struct {
 	// v_gen_ai_logs with the logs table once the traces dedup view exists.
 	// Requires tables.
 	CompanionViews bool `mapstructure:"companion_views"`
-	// SearchIndexes runs CREATE SEARCH INDEX IF NOT EXISTS on trace/span
-	// lookup columns at startup. Requires tables and bigquery.jobs.create.
+	// SearchIndexes runs CREATE SEARCH INDEX IF NOT EXISTS on signal tables
+	// at startup. Requires tables and bigquery.jobs.create.
 	SearchIndexes bool `mapstructure:"search_indexes"`
 }
 

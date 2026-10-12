@@ -5,6 +5,7 @@ package bqfake
 
 import (
 	"context"
+	"errors"
 	"maps"
 	"slices"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	bq "cloud.google.com/go/bigquery"
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -736,11 +738,13 @@ func TestRESTTableUpdateEnforcesIfMatchETagAndAdditiveSchema(t *testing.T) {
 		{Name: "trace_id", Type: bq.StringFieldType, Required: true},
 		{Name: "payload_refs", Type: bq.StringFieldType, Required: false},
 	}
-	if _, err := tbl.Update(ctx, bq.TableMetadataToUpdate{Schema: additiveSchema}, "stale-etag"); err == nil {
-		t.Fatal("expected Table.Update with stale ETag to fail with 412 Precondition Failed")
+	_, err = tbl.Update(ctx, bq.TableMetadataToUpdate{Schema: additiveSchema}, "stale-etag")
+	var gerr *googleapi.Error
+	if !errors.As(err, &gerr) || gerr.Code != 412 {
+		t.Fatalf("Table.Update with stale ETag err = %v, want googleapi.Error with HTTP 412", err)
 	}
 
-	// 2. Matching ETag succeeds and advances ETag.
+	// 2. Matching ETag succeeds and advances ETag without inflating AppendRows request count.
 	md2, err := tbl.Update(ctx, bq.TableMetadataToUpdate{Schema: additiveSchema}, md1.ETag)
 	if err != nil {
 		t.Fatalf("Table.Update with matching ETag failed: %v", err)
@@ -748,10 +752,15 @@ func TestRESTTableUpdateEnforcesIfMatchETagAndAdditiveSchema(t *testing.T) {
 	if md2.ETag == "" || md2.ETag == md1.ETag {
 		t.Errorf("updated ETag = %q, want distinct non-empty ETag from %q", md2.ETag, md1.ETag)
 	}
+	if _, reqs, _ := srv.Counts(); reqs != 0 {
+		t.Errorf("srv.Counts() requests = %d after REST PATCH, want 0", reqs)
+	}
 
 	// 3. Removing an existing column fails with HTTP 400 Bad Request.
-	if _, err := tbl.Update(ctx, bq.TableMetadataToUpdate{Schema: initialSchema}, md2.ETag); err == nil {
-		t.Fatal("expected Table.Update removing payload_refs column to fail")
+	_, err = tbl.Update(ctx, bq.TableMetadataToUpdate{Schema: initialSchema}, md2.ETag)
+	gerr = nil
+	if !errors.As(err, &gerr) || gerr.Code != 400 {
+		t.Fatalf("Table.Update removing payload_refs err = %v, want googleapi.Error with HTTP 400", err)
 	}
 
 	// 4. Adding a new REQUIRED column fails with HTTP 400 Bad Request.
@@ -760,7 +769,10 @@ func TestRESTTableUpdateEnforcesIfMatchETagAndAdditiveSchema(t *testing.T) {
 		{Name: "payload_refs", Type: bq.StringFieldType, Required: false},
 		{Name: "must_fail", Type: bq.StringFieldType, Required: true},
 	}
-	if _, err := tbl.Update(ctx, bq.TableMetadataToUpdate{Schema: withNewRequired}, md2.ETag); err == nil {
-		t.Fatal("expected Table.Update adding new REQUIRED column to fail")
+	_, err = tbl.Update(ctx, bq.TableMetadataToUpdate{Schema: withNewRequired}, md2.ETag)
+	gerr = nil
+	if !errors.As(err, &gerr) || gerr.Code != 400 {
+		t.Fatalf("Table.Update adding new REQUIRED column err = %v, want googleapi.Error with HTTP 400", err)
 	}
 }
+

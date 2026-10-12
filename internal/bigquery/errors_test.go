@@ -110,9 +110,17 @@ func TestClassifyMatrix(t *testing.T) {
 			mustStatusWithStorageError(t, codes.NotFound, "table missing", storagepb.StorageError_TABLE_NOT_FOUND),
 			Permanent, OwnerExporter, LabelInvalidStream, true,
 		},
-		"structured StorageError OFFSET_OUT_OF_RANGE is permanent invalid argument even if message mentions schema": {
-			mustStatusWithStorageError(t, codes.InvalidArgument, "offset out of range for schema", storagepb.StorageError_OFFSET_OUT_OF_RANGE),
+		"structured StorageError OFFSET_OUT_OF_RANGE overrides Schema mismatch message": {
+			mustStatusWithStorageError(t, codes.InvalidArgument, "Schema mismatch for field foo", storagepb.StorageError_OFFSET_OUT_OF_RANGE),
 			Permanent, OwnerExporter, LabelInvalidArgument, false,
+		},
+		"structured StorageError STREAM_NOT_FOUND overrides Internal status code": {
+			mustStatusWithStorageError(t, codes.Internal, "internal stream failure", storagepb.StorageError_STREAM_NOT_FOUND),
+			Permanent, OwnerExporter, LabelInvalidStream, true,
+		},
+		"structured StorageError STORAGE_ERROR_CODE_UNSPECIFIED falls through to message/code heuristic": {
+			mustStatusWithStorageError(t, codes.InvalidArgument, "Schema mismatch for field foo", storagepb.StorageError_STORAGE_ERROR_CODE_UNSPECIFIED),
+			Permanent, OwnerExporter, LabelSchemaMismatch, true,
 		},
 		"structured StorageError CMEK_NOT_PROVIDED is permanent invalid argument": {
 			mustStatusWithStorageError(t, codes.InvalidArgument, "cmek missing", storagepb.StorageError_CMEK_NOT_PROVIDED),

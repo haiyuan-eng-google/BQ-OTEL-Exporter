@@ -1545,3 +1545,46 @@ func TestAppendTracksAckedRangesAcrossSplitRequests(t *testing.T) {
 		}
 	}
 }
+
+func TestAppendStreamRecreateOutranksPermanentAndStopsDispatch(t *testing.T) {
+	t.Run("StreamRecreate outranks plain Permanent across concurrent sub-requests", func(t *testing.T) {
+		first := newControlledResult()
+		second := newControlledResult()
+		first.complete(status.Error(codes.InvalidArgument, "malformed request"))
+		second.complete(status.Error(codes.FailedPrecondition, "stream is finalized"))
+
+		s := &scriptedStream{results: []appendResult{first, second}}
+		w, _ := newScriptedWriter(s)
+		w.opts.MaxRequestBytes = 100
+		w.opts.MaxInflightRequests = 2
+
+		row := make([]byte, 60)
+		out := w.Append(context.Background(), [][]byte{row, row})
+		if !out.Verdict.StreamRecreate || out.Verdict.Label != LabelInvalidStream {
+			t.Fatalf("out.Verdict = %+v, want StreamRecreate=true with label=%s", out.Verdict, LabelInvalidStream)
+		}
+	})
+
+	t.Run("StreamRecreate stops subsequent sub-request dispatch and preserves verdict label", func(t *testing.T) {
+		first := newControlledResult()
+		second := newControlledResult()
+		first.complete(status.Error(codes.InvalidArgument, "Schema mismatch for field foo"))
+		second.complete(nil)
+
+		s := &scriptedStream{results: []appendResult{first, second}}
+		w, _ := newScriptedWriter(s)
+		w.opts.MaxRequestBytes = 100
+		w.opts.MaxInflightRequests = 1
+
+		row := make([]byte, 60)
+		out := w.Append(context.Background(), [][]byte{row, row})
+		if s.calls != 1 {
+			t.Fatalf("AppendRows calls = %d, want 1 (replayOwed stops second sub-request dispatch)", s.calls)
+		}
+		if !out.Verdict.StreamRecreate || out.Verdict.Label != LabelSchemaMismatch {
+			t.Fatalf("out.Verdict = %+v, want StreamRecreate=true and label=%s preserved without errStreamRetired overwrite",
+				out.Verdict, LabelSchemaMismatch)
+		}
+	})
+}
+

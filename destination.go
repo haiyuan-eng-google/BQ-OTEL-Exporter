@@ -292,6 +292,9 @@ func (e *signalExporter) reconcileTableSchema(
 				zap.String("table", table), zap.Error(err))
 			return md, nil
 		}
+		if !changed {
+			return md, nil
+		}
 		haveMerged, err := schema.FromBigQuery(merged)
 		if err != nil {
 			e.logger.Warn("additive schema reconciliation skipped due to incompatible existing schema",
@@ -301,9 +304,6 @@ func (e *signalExporter) reconcileTableSchema(
 		if diffs := schema.CompatibilityDifferences(want, haveMerged); len(diffs) > 0 {
 			e.logger.Warn("additive schema reconciliation skipped due to incompatible existing schema",
 				zap.String("table", table), zap.Strings("differences", diffs))
-			return md, nil
-		}
-		if !changed {
 			return md, nil
 		}
 		err = admin.UpdateTable(ctx, table, bq.TableMetadataToUpdate{Schema: merged}, md.ETag)

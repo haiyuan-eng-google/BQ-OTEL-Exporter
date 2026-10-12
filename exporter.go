@@ -739,11 +739,11 @@ func (e *signalExporter) appendEncoded(
 		// unacknowledged rows on a freshly opened stream.
 		if v.Class == bqi.Permanent && !v.StreamRecreate && len(out.RowErrors) == 0 {
 			if len(retryable) > 0 {
-				e.tel.RecordRejected(ctx, v.Label, len(retryable))
+				e.tel.RecordRejected(ctx, string(transform.ReasonRequestPermanent), len(retryable))
 				detail := v.Label + ": " + out.Err.Error()
 				for _, origIdx := range retryable {
 					rowErrors = append(rowErrors, transform.QuarantineEntry{
-						Rejection: transform.Rejection{Index: origIdx, Reason: transform.ReasonRowError},
+						Rejection: transform.Rejection{Index: origIdx, Reason: transform.ReasonRequestPermanent},
 						Detail:    detail,
 					})
 				}
@@ -873,6 +873,8 @@ func quarantineRowReason(row transform.Row) string {
 		return string(transform.ReasonSerialization)
 	case "ROW_ERROR":
 		return string(transform.ReasonRowError)
+	case "REQUEST_PERMANENT":
+		return string(transform.ReasonRequestPermanent)
 	case "TIMESTAMP_OVERFLOW":
 		return string(transform.ReasonTimestampOverflow)
 	default:

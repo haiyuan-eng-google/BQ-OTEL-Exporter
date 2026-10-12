@@ -1255,10 +1255,14 @@ func TestReconcileTableSchemaRetriesOnPreconditionFailedAndLogsWarningOnIncompat
 		}
 	})
 
-	t.Run("logs warning when additive schema reconciliation fails on incompatible type", func(t *testing.T) {
+	t.Run("logs warning when additive schema reconciliation is skipped due to incompatible type", func(t *testing.T) {
 		cfg := validConfig()
 		cfg.AutoCreate.Tables = true
-		incompatible := mustBigQuerySchema(t, schema.SpansTableSchema())
+		incompatible := make(bq.Schema, len(withoutPayloadRefs))
+		for i, f := range withoutPayloadRefs {
+			cp := *f
+			incompatible[i] = &cp
+		}
 		incompatible[0].Type = bq.StringFieldType
 
 		core, recorded := observer.New(zap.WarnLevel)
@@ -1339,7 +1343,7 @@ func TestPrepareDestinationAppliesGovernanceOptionsToDatasetTablesAndViews(t *te
 	if !maps.Equal(logsMD.Labels, wantLogsLabels) {
 		t.Errorf("logs table Labels = %v, want %v", logsMD.Labels, wantLogsLabels)
 	}
-	if logsMD.MaxStaleness == nil || *logsMD.MaxStaleness != *bq.IntervalValueFromDuration(15 * time.Minute) {
+	if logsMD.MaxStaleness == nil || *logsMD.MaxStaleness != *bq.IntervalValueFromDuration(15*time.Minute) {
 		t.Errorf("logs table MaxStaleness = %v, want 15m", logsMD.MaxStaleness)
 	}
 
@@ -1347,9 +1351,15 @@ func TestPrepareDestinationAppliesGovernanceOptionsToDatasetTablesAndViews(t *te
 	if dedupMD == nil || !maps.Equal(dedupMD.Labels, wantLogsLabels) {
 		t.Errorf("dedup view Labels = %v, want %v", dedupMD, wantLogsLabels)
 	}
+	if dedupMD.EncryptionConfig != nil || dedupMD.MaxStaleness != nil {
+		t.Errorf("dedup view must not set EncryptionConfig (%v) or MaxStaleness (%v)", dedupMD.EncryptionConfig, dedupMD.MaxStaleness)
+	}
 	compMD := admin.createdTables[schema.GenAILogsViewName]
 	if compMD == nil || !maps.Equal(compMD.Labels, wantLogsLabels) {
 		t.Errorf("companion view Labels = %v, want %v", compMD, wantLogsLabels)
+	}
+	if compMD.EncryptionConfig != nil || compMD.MaxStaleness != nil {
+		t.Errorf("companion view must not set EncryptionConfig (%v) or MaxStaleness (%v)", compMD.EncryptionConfig, compMD.MaxStaleness)
 	}
 
 	qMD := admin.createdTables[cfg.Quarantine.Table]
@@ -1360,7 +1370,7 @@ func TestPrepareDestinationAppliesGovernanceOptionsToDatasetTablesAndViews(t *te
 	if !maps.Equal(qMD.Labels, wantQLabels) {
 		t.Errorf("quarantine table Labels = %v, want %v", qMD.Labels, wantQLabels)
 	}
-	if qMD.MaxStaleness == nil || *qMD.MaxStaleness != *bq.IntervalValueFromDuration(30 * time.Minute) {
+	if qMD.MaxStaleness == nil || *qMD.MaxStaleness != *bq.IntervalValueFromDuration(30*time.Minute) {
 		t.Errorf("quarantine table MaxStaleness = %v, want 30m", qMD.MaxStaleness)
 	}
 }
