@@ -1,6 +1,6 @@
 GOTEST ?= go test
 GOCMD  ?= go
-OCB_VERSION ?= v0.158.0
+OCB_VERSION ?= v0.162.0
 COLLECTOR_DIR ?= otelcol-bq-dist
 COLLECTOR_BIN ?= $(COLLECTOR_DIR)/otelcol-bq
 
@@ -52,13 +52,26 @@ collector-check: collector-components collector-validate
 collector-image:
 	docker build --tag bq-otel-collector:0.1.0-dev --file example/Dockerfile .
 
-# Regenerate the files mdatagen derives from metadata.yaml.
+# Regenerate the files mdatagen derives from metadata.yaml, and fail when
+# metadata.yaml no longer satisfies the schema of the pinned mdatagen release.
 #
-# The mdatagen module carries replace directives, so `go run …@version` and
-# `go install …@version` both refuse to build it. Adding it to this module with
-# `go get -tool` would pull its whole dependency tree into go.mod. Instead it
-# is built from a throwaway module pinned to the same Collector release as the
-# builder, then run from the repository root.
+# Three constraints shape the recipe.
+#
+# * The mdatagen module carries replace directives, so `go run …@version` and
+#   `go install …@version` both refuse to build it. Adding it to this module with
+#   `go get -tool` would pull its whole dependency tree into go.mod. Instead it
+#   is built from a throwaway module pinned to the same Collector release as the
+#   builder.
+# * mdatagen names the Go package of the test files it writes after the
+#   directory that holds metadata.yaml, so it fails in a directory whose name is
+#   not a valid Go identifier, such as a checkout called BQ-OTEL-Exporter. The
+#   inputs are therefore staged in a scratch directory named after the package.
+# * The exporter's self-telemetry is written by hand in
+#   internal/metadata/telemetry.go, so what mdatagen generates from the
+#   telemetry section is validated and then discarded. Only generated_status.go
+#   is copied back, under the repository's license header.
+#   generated_package_test.go is deliberately not regenerated: it carries goleak
+#   options that mdatagen cannot express (see goleak_options_unit_test.go).
 .PHONY: mdatagen
 mdatagen:
 	@tmp="$$(mktemp -d)" && trap 'rm -rf "$$tmp"' EXIT && \
@@ -66,7 +79,11 @@ mdatagen:
 		  $(GOCMD) mod init mdatagen-tool 2>/dev/null && \
 		  $(GOCMD) get -tool go.opentelemetry.io/collector/cmd/mdatagen@$(OCB_VERSION) && \
 		  $(GOCMD) build -o "$$tmp/mdatagen" go.opentelemetry.io/collector/cmd/mdatagen ) && \
-		"$$tmp/mdatagen" metadata.yaml
+		stage="$$tmp/bigqueryexporter" && mkdir "$$stage" && \
+		cp go.mod doc.go metadata.yaml "$$stage" && \
+		( cd "$$stage" && "$$tmp/mdatagen" metadata.yaml ) && \
+		{ printf '%s\n' '// Copyright 2026 Google LLC' '// SPDX-License-Identifier: Apache-2.0' ''; \
+		  cat "$$stage/internal/metadata/generated_status.go"; } > internal/metadata/generated_status.go
 
 .PHONY: tidy
 tidy:

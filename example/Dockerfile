@@ -7,13 +7,13 @@
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
 
-FROM --platform=${TARGETOS}/${TARGETARCH} golang:1.27.0-bookworm@sha256:ded31c68586d2e49e760acc2e65a884b23d032e9bbbed0ae0c55abd3fcaf4452 AS builder
+FROM --platform=${TARGETOS}/${TARGETARCH} golang:1.27.2-bookworm@sha256:5cf287a799e6b94384bad13d16b14904c531f51ba65792237e122ce42b392f61 AS builder
 
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN GOTOOLCHAIN=local go run go.opentelemetry.io/collector/cmd/builder@v0.158.0 \
+RUN GOTOOLCHAIN=local go run go.opentelemetry.io/collector/cmd/builder@v0.162.0 \
     --config example/otelcol-builder.yaml
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" \
     -o /out/healthcheck ./cmd/healthcheck
@@ -30,7 +30,7 @@ COPY --from=builder /src/otelcol-bq-dist/otelcol-bq /otelcol-bq
 COPY --from=builder /out/healthcheck /healthcheck
 COPY example/otel-collector-config.yml /etc/otel/config.yml
 
-EXPOSE 4317 4318 13133
+EXPOSE 4317 4318 8888 13133
 
 # The distroless runtime has no shell, so the probe is the bundled static
 # /healthcheck binary in exec form; it exits non-zero unless the health_check

@@ -13,8 +13,10 @@ updates:
     groups:
       # The Collector, pdata and contrib modules are versioned in lockstep, so
       # they move together or not at all. After merging one of these PRs, also
-      # update OCB_VERSION in the Makefile, the pins in example/otelcol-builder.yaml
-      # and the builder version in example/Dockerfile to the same release.
+      # update OCB_VERSION in the Makefile, both example/otelcol-builder*.yaml
+      # manifests, the builder version in example/Dockerfile, ci.yml and
+      # release.yml, and the STOCK_IMAGE tag and digest in ci.yml to the same
+      # release. TestCollectorPinsStayInLockstepWithGoMod fails until they match.
       opentelemetry:
         patterns:
           - "go.opentelemetry.io/*"
@@ -41,6 +43,16 @@ updates:
   # Tracks the pinned builder and runtime base images of the example collector.
   - package-ecosystem: docker
     directory: /example
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(docker)"
+
+  # Tracks the pinned runtime base image of the released collector image
+  # (Dockerfile.goreleaser), which shares its digest with the example image.
+  # Raise the two pins together; a test fails if they diverge.
+  - package-ecosystem: docker
+    directory: /
     schedule:
       interval: weekly
     commit-message:

@@ -52,8 +52,9 @@ make mdatagen            # regenerate the files derived from metadata.yaml
 ```
 
 CI runs gofmt, build, vet (with and without the `integration` build tag),
-`go mod tidy -diff`, golangci-lint, govulncheck and the unit tests on every pull
-request. The unit tests run twice: once normally, and once with
+`go mod tidy -diff`, `make mdatagen` followed by a clean-diff check,
+golangci-lint, govulncheck and the unit tests on every pull request. The unit
+tests run twice: once normally, and once with
 `GOOGLE_API_USE_CLIENT_CERTIFICATE=true` to prove that they do not depend on the
 credential and mTLS environment of the machine they run on.
 
@@ -63,10 +64,14 @@ the auto-create logic, run `make integration-test` against a scratch project and
 say so in the pull request.
 
 `make mdatagen` builds the `mdatagen` release that matches the Collector version
-pinned in the Makefile and runs it on `metadata.yaml`. The `telemetry` section of
-`metadata.yaml` does not yet satisfy that release's schema, so the target stops
-at validation and writes nothing until the section is reconciled.
-`internal/metadata/telemetry.go` is hand-written in the meantime.
+pinned in the Makefile, validates `metadata.yaml` against its schema, and
+regenerates `internal/metadata/generated_status.go`. mdatagen also derives
+telemetry code from the `telemetry` section; that output is validated and then
+discarded, because `internal/metadata/telemetry.go` is hand-written.
+`generated_package_test.go` is not regenerated either: it carries goleak options
+that mdatagen cannot express. CI runs the target and fails on any resulting diff,
+so keep the `telemetry` metrics and attributes in ASCII order and give every
+metric a `stability`.
 
 New Go files start with the same two-line header as the rest of the repository:
 

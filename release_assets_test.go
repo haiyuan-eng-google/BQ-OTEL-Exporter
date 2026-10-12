@@ -4,6 +4,7 @@
 package bigqueryexporter
 
 import (
+	"fmt"
 	"os"
 	"regexp"
 	"strings"
@@ -77,9 +78,10 @@ func TestReleaseWorkflowInstallsPrerequisitesAndResolvesManifestDigest(t *testin
 	}
 	text := string(raw)
 
+	collectorVersion, _ := collectorVersionsFromGoMod(t, "go.mod")
 	for _, needle := range []string{
 		"anchore/sbom-action/download-syft",
-		"go.opentelemetry.io/collector/cmd/builder@v0.158.0",
+		"go.opentelemetry.io/collector/cmd/builder@" + collectorVersion,
 		"ocb version",
 		"syft version",
 		"id: manifest_digest",
@@ -228,6 +230,22 @@ func TestReleaseBuildUsesPinnedPatchedGoAndStampedVersion(t *testing.T) {
 	if got == nil || want == nil || got[1] != want[1] {
 		t.Errorf("release.yml go-version = %v, example/Dockerfile builder = %v, want the same patched release", got, want)
 	}
+
+	// CI tests the toolchain that ships, so every setup-go step in ci.yml, and
+	// each of the four jobs that run Go code in particular, pins that release.
+	ciGo := workflowSetupGoVersions(t, ".github/workflows/ci.yml")
+	for _, job := range []string{"build", "lint", "vulncheck", "release-stamping"} {
+		if len(ciGo[job]) == 0 {
+			t.Errorf("ci.yml job %q has no actions/setup-go step", job)
+		}
+	}
+	for job, versions := range ciGo {
+		for _, version := range versions {
+			if want == nil || version != want[1] {
+				t.Errorf("ci.yml job %q sets up Go %q, example/Dockerfile builder = %v, want the same patched release", job, version, want)
+			}
+		}
+	}
 	if strings.Contains(string(wf), "/usr/local/bin") {
 		t.Error("release.yml must not install tools into the root-owned /usr/local/bin")
 	}
@@ -354,5 +372,233 @@ func TestTerraformGrantsWritePathOnDatasetOnly(t *testing.T) {
 				t.Errorf("role %s grants %s without grant_auto_create", name, strings.Trim(perm, `"`))
 			}
 		}
+	}
+}
+
+// readRepoText returns the contents of a repository file as a string.
+func readRepoText(t *testing.T, path string) string {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	return string(raw)
+}
+
+// firstCapture returns the first capture group of the first match of pattern in
+// text, or "" when pattern does not match.
+func firstCapture(pattern, text string) string {
+	m := regexp.MustCompile(pattern).FindStringSubmatch(text)
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
+// collectorVersionsFromGoMod reads the Collector release this module builds
+// against from go.mod: the v0.x version shared by the Collector component and
+// contrib modules (read from componentstatus) and the v1.x version shared by the
+// stable modules (read from confmap). Every pin that has to follow a Collector
+// bump is compared with these two values instead of repeating a literal that
+// must be edited by hand with each release.
+func collectorVersionsFromGoMod(t *testing.T, path string) (collectorVersion, confmapVersion string) {
+	t.Helper()
+	goMod := readRepoText(t, path)
+	required := func(module string) string {
+		t.Helper()
+		version := firstCapture(`(?m)^\s*(?:require\s+)?`+regexp.QuoteMeta(module)+` (v\d+\.\d+\.\d+)`, goMod)
+		if version == "" {
+			t.Fatalf("%s has no requirement for %s", path, module)
+		}
+		return version
+	}
+	return required("go.opentelemetry.io/collector/component/componentstatus"),
+		required("go.opentelemetry.io/collector/confmap")
+}
+
+// builderModule is one gomod entry of an OCB manifest.
+type builderModule struct {
+	Gomod string `yaml:"gomod"`
+}
+
+// builderManifestModules returns every gomod entry of the OCB manifest at path,
+// across all of its component sections and its telemetry section.
+func builderManifestModules(t *testing.T, path string) []string {
+	t.Helper()
+	var manifest struct {
+		Receivers  []builderModule `yaml:"receivers"`
+		Processors []builderModule `yaml:"processors"`
+		Exporters  []builderModule `yaml:"exporters"`
+		Connectors []builderModule `yaml:"connectors"`
+		Extensions []builderModule `yaml:"extensions"`
+		Providers  []builderModule `yaml:"providers"`
+		Telemetry  builderModule   `yaml:"telemetry"`
+	}
+	if err := yaml.Unmarshal([]byte(readRepoText(t, path)), &manifest); err != nil {
+		t.Fatalf("unmarshaling %s: %v", path, err)
+	}
+	var gomods []string
+	for _, section := range [][]builderModule{
+		manifest.Receivers, manifest.Processors, manifest.Exporters, manifest.Connectors,
+		manifest.Extensions, manifest.Providers, {manifest.Telemetry},
+	} {
+		for _, module := range section {
+			if module.Gomod != "" {
+				gomods = append(gomods, module.Gomod)
+			}
+		}
+	}
+	return gomods
+}
+
+// workflowSetupGoVersions returns, per job, the go-version of every
+// actions/setup-go step in the workflow at path. A step that sets no go-version,
+// for example one that resolves the go.mod minimum, is reported as "(none)".
+func workflowSetupGoVersions(t *testing.T, path string) map[string][]string {
+	t.Helper()
+	var workflow struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Uses string         `yaml:"uses"`
+				With map[string]any `yaml:"with"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal([]byte(readRepoText(t, path)), &workflow); err != nil {
+		t.Fatalf("unmarshaling %s: %v", path, err)
+	}
+	versions := map[string][]string{}
+	for name, job := range workflow.Jobs {
+		for _, step := range job.Steps {
+			if !strings.HasPrefix(step.Uses, "actions/setup-go@") {
+				continue
+			}
+			version := "(none)"
+			if v, ok := step.With["go-version"]; ok {
+				version = fmt.Sprint(v)
+			}
+			versions[name] = append(versions[name], version)
+		}
+	}
+	return versions
+}
+
+// The Collector release is pinned in several places that no tool bumps
+// together: the Makefile, both OCB manifests, the example Dockerfile, and the CI
+// and release workflows. go.mod is the source of truth. A pin that lags it
+// builds the custom distribution from a different Collector than the one the
+// exporter's own tests ran against, and leaves the stock image that CI compares
+// the example against on another release than the builder.
+func TestCollectorPinsStayInLockstepWithGoMod(t *testing.T) {
+	collectorVersion, confmapVersion := collectorVersionsFromGoMod(t, "go.mod")
+
+	if got := firstCapture(`(?m)^OCB_VERSION \?= (\S+)$`, readRepoText(t, "Makefile")); got != collectorVersion {
+		t.Errorf("Makefile OCB_VERSION = %q, want %q from go.mod", got, collectorVersion)
+	}
+
+	builderPin := regexp.MustCompile(`go\.opentelemetry\.io/collector/cmd/builder@(v\d+\.\d+\.\d+)`)
+	for _, path := range []string{"example/Dockerfile", ".github/workflows/ci.yml", ".github/workflows/release.yml"} {
+		pins := builderPin.FindAllStringSubmatch(readRepoText(t, path), -1)
+		if len(pins) == 0 {
+			t.Errorf("%s does not pin the OpenTelemetry Collector builder", path)
+		}
+		for _, pin := range pins {
+			if pin[1] != collectorVersion {
+				t.Errorf("%s pins the builder at %s, want %s from go.mod", path, pin[1], collectorVersion)
+			}
+		}
+	}
+
+	for _, path := range []string{"example/otelcol-builder.yaml", "example/otelcol-builder-release.yaml"} {
+		var collectorModules, providers int
+		var service bool
+		for _, gomod := range builderManifestModules(t, path) {
+			fields := strings.Fields(gomod)
+			if len(fields) != 2 {
+				t.Errorf("%s: gomod %q is not \"<module> <version>\"", path, gomod)
+				continue
+			}
+			module, version := fields[0], fields[1]
+			var want string
+			switch {
+			case strings.HasPrefix(module, "go.opentelemetry.io/collector/confmap/provider/"):
+				want = confmapVersion
+				providers++
+			case strings.HasPrefix(module, "go.opentelemetry.io/collector/"),
+				strings.HasPrefix(module, "github.com/open-telemetry/opentelemetry-collector-contrib/"):
+				want = collectorVersion
+				collectorModules++
+			default:
+				// The exporter itself, pinned to the checkout being built.
+				continue
+			}
+			service = service || module == "go.opentelemetry.io/collector/service"
+			if version != want {
+				t.Errorf("%s pins %s at %s, want %s from go.mod", path, module, version, want)
+			}
+		}
+		if collectorModules == 0 || providers == 0 || !service {
+			t.Errorf("%s: checked %d Collector modules and %d confmap providers, service pinned = %v; want all three present", path, collectorModules, providers, service)
+		}
+	}
+
+	stock := firstCapture(`(?m)^\s*STOCK_IMAGE: otel/opentelemetry-collector-contrib:(\d+\.\d+\.\d+)@sha256:[0-9a-f]{64}$`, readRepoText(t, ".github/workflows/ci.yml"))
+	if stock == "" {
+		t.Error("ci.yml STOCK_IMAGE is not an otel/opentelemetry-collector-contrib image pinned by version and sha256 digest")
+	} else if "v"+stock != collectorVersion {
+		t.Errorf("ci.yml STOCK_IMAGE is v%s, want %s from go.mod", stock, collectorVersion)
+	}
+}
+
+// runtimeImage returns the image the last stage of a Dockerfile runs on, which
+// is the image that ships. Stage flags such as --platform and an AS alias are
+// not part of it.
+func runtimeImage(t *testing.T, path string) string {
+	t.Helper()
+	froms := regexp.MustCompile(`(?m)^FROM\s+(?:--\S+\s+)*(\S+)(?:\s+AS\s+\S+)?\s*$`).FindAllStringSubmatch(readRepoText(t, path), -1)
+	if len(froms) == 0 {
+		t.Fatalf("%s has no FROM instruction", path)
+	}
+	return froms[len(froms)-1][1]
+}
+
+// Dockerfile.goreleaser builds the released image and example/Dockerfile builds
+// the Compose and CI image. Both run on the same distroless base, pinned by tag
+// and digest, so the image that is tested is the image that ships and a
+// Dependabot bump of one cannot silently leave the other behind.
+func TestRuntimeImagesShareBaseImageAndDigest(t *testing.T) {
+	pinned := regexp.MustCompile(`^gcr\.io/distroless/[^:@\s]+:[^:@\s]+@sha256:[0-9a-f]{64}$`)
+	images := map[string]string{}
+	for _, path := range []string{"Dockerfile.goreleaser", "example/Dockerfile"} {
+		images[path] = runtimeImage(t, path)
+		if !pinned.MatchString(images[path]) {
+			t.Errorf("%s runs on %q, want a gcr.io/distroless image pinned by tag and sha256 digest", path, images[path])
+		}
+	}
+	if images["Dockerfile.goreleaser"] != images["example/Dockerfile"] {
+		t.Errorf("runtime images differ: Dockerfile.goreleaser runs on %q, example/Dockerfile on %q; raise both pins together",
+			images["Dockerfile.goreleaser"], images["example/Dockerfile"])
+	}
+}
+
+// Both runtime images publish the OTLP, self-telemetry and health-check ports
+// the example configuration serves, so a container started from either behaves
+// the same.
+func TestRuntimeImagesExposeSamePorts(t *testing.T) {
+	exposeLine := regexp.MustCompile(`(?m)^EXPOSE\s+(.+?)\s*$`)
+	ports := map[string]string{}
+	for _, path := range []string{"Dockerfile.goreleaser", "example/Dockerfile"} {
+		var all []string
+		for _, line := range exposeLine.FindAllStringSubmatch(readRepoText(t, path), -1) {
+			all = append(all, strings.Fields(line[1])...)
+		}
+		if len(all) == 0 {
+			t.Errorf("%s exposes no ports", path)
+		}
+		ports[path] = strings.Join(all, " ")
+	}
+	if ports["Dockerfile.goreleaser"] != ports["example/Dockerfile"] {
+		t.Errorf("exposed ports differ: Dockerfile.goreleaser %q, example/Dockerfile %q",
+			ports["Dockerfile.goreleaser"], ports["example/Dockerfile"])
 	}
 }
