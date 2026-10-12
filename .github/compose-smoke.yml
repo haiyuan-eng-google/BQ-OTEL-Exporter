@@ -11,4 +11,4 @@ services:
     command:
       - --config=/etc/otel/config.yml
       - "--config=yaml:exporters::bigquery::endpoint: {url: '127.0.0.1:1', insecure: true, without_authentication: true}"
-      - "--config=yaml:exporters::bigquery::auto_create: {dataset: false, tables: false}"
+      - "--config=yaml:exporters::bigquery::auto_create: {dataset: false, tables: false, companion_views: false, search_indexes: false}"

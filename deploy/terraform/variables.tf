@@ -10,9 +10,14 @@ variable "dataset_id" {
 }
 
 variable "location" {
-  description = "BigQuery dataset location"
+  description = "BigQuery dataset location (e.g. US, us-central1, eu)"
   type        = string
   default     = "US"
+
+  validation {
+    condition     = can(regex("^\\S+$", var.location))
+    error_message = "Location must not be empty or contain whitespace."
+  }
 }
 
 variable "spans_table" {
@@ -49,4 +54,32 @@ variable "grant_auto_create" {
   description = "Also grant what the exporter's auto_create options need: creating and reconciling tables and views on this dataset, and creating search indexes. Off by default because this module provisions every table and view itself."
   type        = bool
   default     = false
+}
+
+# --- Enterprise governance ---
+
+variable "kms_key_name" {
+  description = "Cloud KMS key resource name for CMEK encryption of the BigQuery dataset and tables. Leave empty to use Google-managed encryption. When set, also grants the BigQuery service agent decrypt permission on the key."
+  type        = string
+  default     = ""
+
+  validation {
+    condition = var.kms_key_name == "" ? true : can(regex(
+      "^projects/[^/\\s]+/locations/[^/\\s]+/keyRings/[^/\\s]+/cryptoKeys/[^/\\s]+$",
+      var.kms_key_name
+    ))
+    error_message = "kms_key_name must be a full Cloud KMS key resource name (projects/<project>/locations/<location>/keyRings/<keyRing>/cryptoKeys/<key>)."
+  }
+}
+
+variable "labels" {
+  description = "Labels applied to the BigQuery dataset and all provisioned tables and views for cost allocation and governance."
+  type        = map(string)
+  default     = {}
+}
+
+variable "offload_bucket" {
+  description = "GCS bucket name for optional large-payload offloading. When set, grants the collector service account objectCreator and objectViewer on the bucket. The bucket must already exist."
+  type        = string
+  default     = ""
 }

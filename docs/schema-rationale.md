@@ -242,10 +242,6 @@ invalid ones.
   so semantic opinion belongs in a view that can be revised without a table
   migration.
 - **Side tables for events and links.** See the table contract above.
-- **Metrics in the same design.** The metrics signal needs its own relational
-  design (five data-point types, delta versus cumulative temporality, exemplars,
-  per-series identity), and getting it wrong would freeze it into a versioned
-  contract.
 - **Exactly-once delivery.** See the write path above.
 
 ## What is not settled

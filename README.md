@@ -387,9 +387,9 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
   `otel_metrics` stores all five OTLP metric data-point types (`GAUGE`, `SUM`,
   `HISTOGRAM`, `EXPONENTIAL_HISTOGRAM`, `SUMMARY`) in a single 40-column
   relational table partitioned by `DATE(timestamp)` and clustered by
-  `(service_name, metric_name, metric_type)`, with `attributes_fingerprint STRING NOT NULL`
+  `(service_name, metric_name, metric_type)`, with `point_fingerprint STRING NOT NULL`
   (`fp1:<sha256_hex>` over canonical `attributes` JSON) and
-  `exemplars ARRAY<STRUCT<filtered_attributes JSON, filtered_attributes_schema JSON, timestamp TIMESTAMP, time_unix_nano STRING, value_int INT64, value_double FLOAT64, span_id STRING, trace_id STRING>>`
+  `exemplars ARRAY<STRUCT<time TIMESTAMP, time_unix_nano INT64, value_int64 INT64, value_double FLOAT64, span_id STRING, trace_id STRING, filtered_attributes JSON, filtered_attributes_schema JSON>>`
   so GenAI token/latency histograms join directly back to `otel_spans_dedup`.
 - **Companion and GenAI rollup views (`auto_create.companion_views`).**
   - `otel_spans_as_allspans`: projects `otel_spans_dedup` into the 25-column
@@ -675,6 +675,7 @@ Use these content-free self-telemetry instruments to detect a stuck path:
 | `otelcol_exporter_bigquery_offloaded_payloads` | Payloads offloaded to object storage (`{signal, mime_type}`). |
 | `otelcol_exporter_bigquery_offloaded_bytes` | Bytes offloaded to object storage (`{signal}`). |
 | `otelcol_exporter_bigquery_offload_errors` | Object storage offload failures (`{signal, stage}`). |
+| `otelcol_exporter_bigquery_offload_dedup_hits` | Offload attempts satisfied from the cross-batch LRU cache instead of uploading (`{signal}`). |
 | `otelcol_exporter_bigquery_redacted_values` | Attribute keys and string values masked by [redaction](#redaction) (`{signal, match_type}`); never records key names or values. |
 
 Both current-value instruments should return to zero after recovery or clean

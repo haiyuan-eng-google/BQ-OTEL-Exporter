@@ -1,7 +1,7 @@
 // Copyright 2026 Google LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//go:generate mdatagen metadata.yaml
+//go:generate make mdatagen
 
 // Package bigqueryexporter exports OTLP traces and logs to BigQuery relational
 // tables through the Storage Write API.

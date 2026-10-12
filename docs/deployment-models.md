@@ -154,3 +154,118 @@ All deployment templates apply:
 - `tmpfs: [/tmp]` for writable scratch space
 - Bind to loopback where applicable (Docker Compose, sidecar)
 - Health check on port 13133 for liveness/readiness probes
+
+## Enterprise Features
+
+All deployment templates support the full signal set and enterprise
+governance options. The configuration blocks below are opt-in; each defaults
+to a safe value when omitted.
+
+### Signal Pipelines
+
+The collector exports **traces**, **logs**, and **metrics** pipelines to
+BigQuery. The `metrics` pipeline writes to `otel_metrics` (all five OTLP
+metric data-point types in a single relational table) and is wired by default
+in the Helm chart, Cloud Run image, and example config. Disable it by
+removing the `metrics:` entry from `service.pipelines`.
+
+### GCS Offload
+
+Large prompts, completions, and multimodal payloads can be offloaded to Google
+Cloud Storage and referenced from BigQuery `payload_refs` via `ObjectRef`:
+
+```yaml
+offload:
+  enabled: true
+  bucket: my-otel-offload-bucket
+  prefix: otel
+  min_bytes: 1048576
+  max_object_bytes: 67108864
+  max_concurrency: 4
+  timeout: 30s
+  cache_size: 4096
+```
+
+`cache_size` bounds a cross-batch LRU cache that deduplicates offload attempts
+for the same payload across batches, avoiding redundant GCS uploads. The
+exporter does not delete offloaded objects; configure a [GCS lifecycle
+policy](https://cloud.google.com/storage/docs/lifecycle) to manage retention.
+A `401`/`403`/`404` on GCS upload is classified as a permanent error and
+routes the record to quarantine instead of triggering retries.
+
+### Quarantine and Replay
+
+Rejected records (validation failures, structural limit breaches, oversized
+rows, permanent offload errors) can be routed to a dead-letter table:
+
+```yaml
+quarantine:
+  enabled: true
+  table: otel_quarantine
+  metadata_only: false
+  partition_expiration_days: 30
+```
+
+Use `cmd/bq-quarantine-replay` to replay quarantined records after fixing the
+underlying issue:
+
+```bash
+go run ./cmd/bq-quarantine-replay \
+  --project=my-project \
+  --dataset=otel \
+  --table=otel_quarantine \
+  --signal=all
+```
+
+### Redaction
+
+Client-side PII and secret redaction runs at Step 0, before offload,
+fingerprinting, and quarantine:
+
+```yaml
+redaction:
+  enabled: true
+  blocked_keys: ["x-custom-secret"]
+  disable_default_keys: false
+  blocked_value_patterns: ["Bearer [A-Za-z0-9._-]+"]
+  mask_replacement: "[REDACTED]"
+  redact_log_body: false
+```
+
+Default sensitive keys (`authorization`, `token`, `password`, `api_key`,
+`secret`, `private_key`, etc.) are redacted unless `disable_default_keys` is
+true.
+
+### CMEK Encryption and Labels
+
+Enterprise customers can configure CMEK encryption and labels for cost
+allocation and governance:
+
+```yaml
+kms_key_name: projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/bq
+labels:
+  environment: production
+  team: observability
+```
+
+The Terraform module (`deploy/terraform/`) provisions CMEK on the dataset and
+all tables when `kms_key_name` is set, and grants the BigQuery encryption
+service agent decrypt permission on the KMS key. Labels are applied to the
+dataset, all tables, and all views.
+
+### Search Indexes
+
+Trace-lookup search indexes on `(trace_id, span_id)` for `otel_spans` and
+`otel_logs`, and all-columns indexes on `otel_metrics`, can be created at
+startup:
+
+```yaml
+auto_create:
+  tables: true
+  companion_views: true
+  search_indexes: true
+```
+
+`search_indexes` requires `auto_create.tables` and `bigquery.jobs.create` (the
+Terraform module grants this when `grant_auto_create` is set).
+

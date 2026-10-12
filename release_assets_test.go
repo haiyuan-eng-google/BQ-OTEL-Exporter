@@ -602,3 +602,105 @@ func TestRuntimeImagesExposeSamePorts(t *testing.T) {
 			ports["Dockerfile.goreleaser"], ports["example/Dockerfile"])
 	}
 }
+
+// TestDeploymentTemplatesCoverExporterConfigKeys verifies that the example
+// collector config, the Helm ConfigMap, and testdata/config.yaml each expose
+// the metrics pipeline and cover the major exporter config sections.
+func TestDeploymentTemplatesCoverExporterConfigKeys(t *testing.T) {
+	// The example config and the Helm ConfigMap must wire the metrics pipeline.
+	exampleCfg := readRepoText(t, "example/otel-collector-config.yml")
+	if !strings.Contains(exampleCfg, "metrics:") {
+		t.Error("example/otel-collector-config.yml must configure the metrics exporter section")
+	}
+	if !strings.Contains(exampleCfg, "metrics:") || !strings.Contains(exampleCfg, "exporters: [bigquery]") {
+		t.Error("example/otel-collector-config.yml must wire the metrics pipeline with exporters: [bigquery]")
+	}
+	// Check that metrics pipeline is wired in the service.pipelines section.
+	if !strings.Contains(exampleCfg, "    metrics:\n      receivers: [otlp]") {
+		t.Error("example/otel-collector-config.yml must have a metrics pipeline in service.pipelines")
+	}
+
+	helmCfg := readRepoText(t, "deploy/helm/bigquery-otel-collector/templates/configmap.yaml")
+	if !strings.Contains(helmCfg, "metrics:") {
+		t.Error("Helm configmap.yaml must configure the metrics exporter section")
+	}
+	if !strings.Contains(helmCfg, "metrics:") || !strings.Contains(helmCfg, "exporters: [bigquery]") {
+		t.Error("Helm configmap.yaml must wire the metrics pipeline with exporters: [bigquery]")
+	}
+
+	helmValues := readRepoText(t, "deploy/helm/bigquery-otel-collector/values.yaml")
+	if !strings.Contains(helmValues, "metricsTable") {
+		t.Error("Helm values.yaml must expose bigquery.metricsTable")
+	}
+	if !strings.Contains(helmValues, "offload:") {
+		t.Error("Helm values.yaml must expose offload config section")
+	}
+	if !strings.Contains(helmValues, "quarantine:") {
+		t.Error("Helm values.yaml must expose quarantine config section")
+	}
+	if !strings.Contains(helmValues, "redaction:") {
+		t.Error("Helm values.yaml must expose redaction config section")
+	}
+	if !strings.Contains(helmValues, "kmsKeyName") {
+		t.Error("Helm values.yaml must expose bigquery.kmsKeyName for CMEK")
+	}
+	if !strings.Contains(helmValues, "autoCreateCompanionViews") {
+		t.Error("Helm values.yaml must expose bigquery.autoCreateCompanionViews")
+	}
+	if !strings.Contains(helmValues, "autoCreateSearchIndexes") {
+		t.Error("Helm values.yaml must expose bigquery.autoCreateSearchIndexes")
+	}
+
+	// testdata/config.yaml must cover the full exporter config surface.
+	testdataCfg := readRepoText(t, "testdata/config.yaml")
+	for _, key := range []string{
+		"metrics:",
+		"offload:",
+		"redaction:",
+		"quarantine:",
+		"kms_key_name:",
+		"labels:",
+		"companion_views:",
+		"search_indexes:",
+	} {
+		if !strings.Contains(testdataCfg, key) {
+			t.Errorf("testdata/config.yaml must contain %q", key)
+		}
+	}
+
+	// Cloud Run service.yaml must document enterprise --set overrides.
+	cloudRun := readRepoText(t, "deploy/cloudrun/service.yaml")
+	for _, key := range []string{
+		"metrics.table",
+		"companion_views",
+		"search_indexes",
+		"offload",
+		"quarantine",
+		"redaction",
+		"kms_key_name",
+	} {
+		if !strings.Contains(cloudRun, key) {
+			t.Errorf("deploy/cloudrun/service.yaml must document --set override for %q", key)
+		}
+	}
+}
+
+// TestDependabotCombinesDockerEntries verifies that dependabot.yml uses a
+// single docker entry with directories instead of separate entries.
+func TestDependabotCombinesDockerEntries(t *testing.T) {
+	raw := readRepoText(t, ".github/dependabot.yml")
+	// Count docker ecosystem entries.
+	dockerCount := strings.Count(raw, "package-ecosystem: docker")
+	if dockerCount != 1 {
+		t.Errorf(".github/dependabot.yml has %d docker entries, want 1 (combined with directories)", dockerCount)
+	}
+	if !strings.Contains(raw, "directories:") {
+		t.Error(".github/dependabot.yml must use directories: for the combined docker entry")
+	}
+	if !strings.Contains(raw, "- /") && !strings.Contains(raw, "\"/\"") {
+		t.Error(".github/dependabot.yml must list / in directories")
+	}
+	if !strings.Contains(raw, "- /example") && !strings.Contains(raw, "\"/example\"") {
+		t.Error(".github/dependabot.yml must list /example in directories")
+	}
+}

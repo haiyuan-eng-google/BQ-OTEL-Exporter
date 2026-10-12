@@ -7,25 +7,14 @@ exporters:
     project: my-project
     dataset: otel
     location: US
-    kms_key_name: projects/my-project/locations/us/keyRings/otel/cryptoKeys/default
-    labels:
-      env: prod
     traces:
       table: spans
       partition_expiration_days: 365
       require_partition_filter: true
-      kms_key_name: projects/my-project/locations/us/keyRings/otel/cryptoKeys/spans
-      labels:
-        signal: traces
-      max_staleness: 15m
     logs:
       table: logs
       partition_expiration_days: 90
       require_partition_filter: true
-      kms_key_name: projects/my-project/locations/us/keyRings/otel/cryptoKeys/logs
-      labels:
-        signal: logs
-      max_staleness: 15m
       # Optional. Records without these attributes fall back to well-known
       # attributes, then to the service name and the record fingerprint.
       log_name_attribute: log.file.name
@@ -34,19 +23,30 @@ exporters:
       table: metrics
       partition_expiration_days: 180
       require_partition_filter: true
-      kms_key_name: projects/my-project/locations/us/keyRings/otel/cryptoKeys/metrics
-      labels:
-        signal: metrics
-      max_staleness: 15m
     quarantine:
       enabled: true
       table: otel_quarantine
+      metadata_only: true
       partition_expiration_days: 30
       require_partition_filter: false
-      kms_key_name: projects/my-project/locations/us/keyRings/otel/cryptoKeys/quarantine
-      labels:
-        signal: quarantine
-      max_staleness: 30m
+    offload:
+      enabled: true
+      bucket: my-otel-offload-bucket
+      prefix: otel
+      min_bytes: 1048576
+      max_object_bytes: 67108864
+      max_concurrency: 4
+      timeout: 30s
+      cache_size: 4096
+    redaction:
+      enabled: true
+      blocked_keys:
+        - x-custom-secret
+      disable_default_keys: false
+      blocked_value_patterns:
+        - "Bearer [A-Za-z0-9._-]+"
+      mask_replacement: "[REDACTED]"
+      redact_log_body: false
     credentials:
       impersonate_service_account: writer@my-project.iam.gserviceaccount.com
       impersonate_delegates:
@@ -60,6 +60,11 @@ exporters:
       tables: true
       companion_views: true
       search_indexes: true
+    # Enterprise governance.
+    kms_key_name: projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/bq
+    labels:
+      environment: test
+      team: observability
     write:
       max_request_bytes: 8388608
       max_row_bytes: 1048576
@@ -87,6 +92,8 @@ exporters:
   bigquery/emulator:
     project: my-project
     dataset: otel
+    metrics:
+      table: metrics
     endpoint:
       url: localhost:9050
       insecure: true

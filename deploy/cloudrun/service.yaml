@@ -17,6 +17,21 @@
 #   only read metadata and append rows, so the dataset, tables, and views must
 #   already be provisioned by deploy/terraform/. The `--set` arguments below
 #   therefore turn off the image's default auto_create.
+# - Enterprise overrides (uncomment to enable):
+#   --set=exporters.bigquery.metrics.table=otel_metrics
+#   --set=exporters.bigquery.auto_create.companion_views=true
+#   --set=exporters.bigquery.auto_create.search_indexes=true
+#   --set=exporters.bigquery.offload.enabled=true \
+#   --set=exporters.bigquery.offload.bucket=my-otel-offload-bucket
+#   --set=exporters.bigquery.quarantine.enabled=true \
+#   --set=exporters.bigquery.quarantine.table=otel_quarantine
+#   --set=exporters.bigquery.redaction.enabled=true
+#   --set=exporters.bigquery.kms_key_name=projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/bq
+#   --set=exporters.bigquery.labels.environment=production
+#   --set=exporters.bigquery.traces.partition_expiration_days=365
+#   The bundled config wires traces, logs, and metrics pipelines to the bigquery
+#   exporter.  Override the table names above to match your Terraform-provisioned
+#   tables when not using auto_create.
 
 apiVersion: serving.knative.dev/v1
 kind: Service

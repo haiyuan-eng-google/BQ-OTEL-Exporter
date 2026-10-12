@@ -40,19 +40,14 @@ updates:
     commit-message:
       prefix: "chore(ci)"
 
-  # Tracks the pinned builder and runtime base images of the example collector.
-  - package-ecosystem: docker
-    directory: /example
-    schedule:
-      interval: weekly
-    commit-message:
-      prefix: "chore(docker)"
-
-  # Tracks the pinned runtime base image of the released collector image
-  # (Dockerfile.goreleaser), which shares its digest with the example image.
+  # Tracks the pinned builder and runtime base images of both the example
+  # collector (example/Dockerfile) and the released collector image
+  # (Dockerfile.goreleaser), which share the same distroless base image digest.
   # Raise the two pins together; a test fails if they diverge.
   - package-ecosystem: docker
-    directory: /
+    directories:
+      - /
+      - /example
     schedule:
       interval: weekly
     commit-message:

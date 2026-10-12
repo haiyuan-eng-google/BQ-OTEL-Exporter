@@ -33,10 +33,150 @@ data:
         auto_create:
           dataset: {{ .Values.bigquery.autoCreateDataset }}
           tables: {{ .Values.bigquery.autoCreateTables }}
+          {{- if .Values.bigquery.autoCreateCompanionViews }}
+          companion_views: {{ .Values.bigquery.autoCreateCompanionViews }}
+          {{- end }}
+          {{- if .Values.bigquery.autoCreateSearchIndexes }}
+          search_indexes: {{ .Values.bigquery.autoCreateSearchIndexes }}
+          {{- end }}
         traces:
           table: {{ .Values.bigquery.tracesTable }}
+          {{- if .Values.bigquery.traces.partitionExpirationDays }}
+          partition_expiration_days: {{ .Values.bigquery.traces.partitionExpirationDays }}
+          {{- end }}
+          {{- if .Values.bigquery.traces.requirePartitionFilter }}
+          require_partition_filter: {{ .Values.bigquery.traces.requirePartitionFilter }}
+          {{- end }}
+          {{- if .Values.bigquery.traces.kmsKeyName }}
+          kms_key_name: {{ .Values.bigquery.traces.kmsKeyName }}
+          {{- end }}
+          {{- with .Values.bigquery.traces.labels }}
+          labels:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if .Values.bigquery.traces.maxStaleness }}
+          max_staleness: {{ .Values.bigquery.traces.maxStaleness }}
+          {{- end }}
         logs:
           table: {{ .Values.bigquery.logsTable }}
+          {{- if .Values.bigquery.logs.partitionExpirationDays }}
+          partition_expiration_days: {{ .Values.bigquery.logs.partitionExpirationDays }}
+          {{- end }}
+          {{- if .Values.bigquery.logs.requirePartitionFilter }}
+          require_partition_filter: {{ .Values.bigquery.logs.requirePartitionFilter }}
+          {{- end }}
+          {{- if .Values.bigquery.logs.kmsKeyName }}
+          kms_key_name: {{ .Values.bigquery.logs.kmsKeyName }}
+          {{- end }}
+          {{- with .Values.bigquery.logs.labels }}
+          labels:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if .Values.bigquery.logs.maxStaleness }}
+          max_staleness: {{ .Values.bigquery.logs.maxStaleness }}
+          {{- end }}
+        metrics:
+          table: {{ .Values.bigquery.metricsTable }}
+          {{- if .Values.bigquery.metrics.partitionExpirationDays }}
+          partition_expiration_days: {{ .Values.bigquery.metrics.partitionExpirationDays }}
+          {{- end }}
+          {{- if .Values.bigquery.metrics.requirePartitionFilter }}
+          require_partition_filter: {{ .Values.bigquery.metrics.requirePartitionFilter }}
+          {{- end }}
+          {{- if .Values.bigquery.metrics.kmsKeyName }}
+          kms_key_name: {{ .Values.bigquery.metrics.kmsKeyName }}
+          {{- end }}
+          {{- with .Values.bigquery.metrics.labels }}
+          labels:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if .Values.bigquery.metrics.maxStaleness }}
+          max_staleness: {{ .Values.bigquery.metrics.maxStaleness }}
+          {{- end }}
+        {{- if .Values.bigquery.kmsKeyName }}
+        kms_key_name: {{ .Values.bigquery.kmsKeyName }}
+        {{- end }}
+        {{- with .Values.bigquery.labels }}
+        labels:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- if .Values.offload.enabled }}
+        offload:
+          enabled: true
+          bucket: {{ .Values.offload.bucket }}
+          {{- if .Values.offload.prefix }}
+          prefix: {{ .Values.offload.prefix }}
+          {{- end }}
+          {{- if .Values.offload.authorizer }}
+          authorizer: {{ .Values.offload.authorizer }}
+          {{- end }}
+          {{- if .Values.offload.minBytes }}
+          min_bytes: {{ .Values.offload.minBytes }}
+          {{- end }}
+          {{- if .Values.offload.maxObjectBytes }}
+          max_object_bytes: {{ .Values.offload.maxObjectBytes }}
+          {{- end }}
+          {{- if .Values.offload.maxConcurrency }}
+          max_concurrency: {{ .Values.offload.maxConcurrency }}
+          {{- end }}
+          {{- if .Values.offload.timeout }}
+          timeout: {{ .Values.offload.timeout }}
+          {{- end }}
+          {{- if .Values.offload.cacheSize }}
+          cache_size: {{ .Values.offload.cacheSize }}
+          {{- end }}
+        {{- end }}
+        {{- if .Values.quarantine.enabled }}
+        quarantine:
+          enabled: true
+          table: {{ .Values.quarantine.table }}
+          {{- if .Values.quarantine.metadataOnly }}
+          metadata_only: {{ .Values.quarantine.metadataOnly }}
+          {{- end }}
+          {{- if .Values.quarantine.maxRawPayloadBytes }}
+          max_raw_payload_bytes: {{ .Values.quarantine.maxRawPayloadBytes }}
+          {{- end }}
+          {{- if .Values.quarantine.timeout }}
+          timeout: {{ .Values.quarantine.timeout }}
+          {{- end }}
+          {{- if .Values.quarantine.partitionExpirationDays }}
+          partition_expiration_days: {{ .Values.quarantine.partitionExpirationDays }}
+          {{- end }}
+          {{- if .Values.quarantine.requirePartitionFilter }}
+          require_partition_filter: {{ .Values.quarantine.requirePartitionFilter }}
+          {{- end }}
+          {{- if .Values.quarantine.kmsKeyName }}
+          kms_key_name: {{ .Values.quarantine.kmsKeyName }}
+          {{- end }}
+          {{- with .Values.quarantine.labels }}
+          labels:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if .Values.quarantine.maxStaleness }}
+          max_staleness: {{ .Values.quarantine.maxStaleness }}
+          {{- end }}
+        {{- end }}
+        {{- if .Values.redaction.enabled }}
+        redaction:
+          enabled: true
+          {{- with .Values.redaction.blockedKeys }}
+          blocked_keys:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if .Values.redaction.disableDefaultKeys }}
+          disable_default_keys: {{ .Values.redaction.disableDefaultKeys }}
+          {{- end }}
+          {{- with .Values.redaction.blockedValuePatterns }}
+          blocked_value_patterns:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if .Values.redaction.maskReplacement }}
+          mask_replacement: {{ .Values.redaction.maskReplacement }}
+          {{- end }}
+          {{- if .Values.redaction.redactLogBody }}
+          redact_log_body: {{ .Values.redaction.redactLogBody }}
+          {{- end }}
+        {{- end }}
         retry_on_failure:
           enabled: true
           max_elapsed_time: 900s
@@ -89,6 +229,10 @@ data:
           processors: [memory_limiter, batch]
           exporters: [bigquery]
         logs:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [bigquery]
+        metrics:
           receivers: [otlp]
           processors: [memory_limiter, batch]
           exporters: [bigquery]

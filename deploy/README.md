@@ -104,3 +104,65 @@ For crash-replay durability, enable the `file_storage` extension:
   config and mount a volume
 
 See [docs/deployment-models.md](../docs/deployment-models.md) for more details.
+
+## Enterprise Governance
+
+### CMEK Encryption
+
+Set `kms_key_name` in the Terraform module to encrypt the BigQuery dataset and
+all tables with a Cloud KMS key:
+
+```bash
+terraform apply \
+  -var="project_id=my-project" \
+  -var="kms_key_name=projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/bq"
+```
+
+Terraform also grants the BigQuery encryption service agent decrypt permission
+on the key automatically. When `kms_key_name` is empty (the default), the
+dataset uses Google-managed encryption.
+
+### Labels
+
+Set `labels` in the Terraform module to apply labels to the dataset, all
+tables, and all views for cost allocation and governance:
+
+```bash
+terraform apply \
+  -var="project_id=my-project" \
+  -var='labels={environment="production",team="observability"}'
+```
+
+### GCS Offload IAM
+
+Set `offload_bucket` in the Terraform module to grant the collector service
+account `roles/storage.objectCreator` and `roles/storage.objectViewer` on the
+bucket so the collector can upload large payloads and verify them:
+
+```bash
+terraform apply \
+  -var="project_id=my-project" \
+  -var="offload_bucket=my-otel-offload-bucket"
+```
+
+The bucket must already exist. Configure a GCS lifecycle policy to manage
+retention of offloaded objects.
+
+### Metrics Pipeline
+
+All deployment templates wire the `metrics` pipeline by default, writing to
+`otel_metrics`. Disable it by removing the `metrics:` entry from
+`service.pipelines` in the collector config.
+
+### Quarantine and Replay
+
+Enable the quarantine dead-letter table by setting `quarantine.enabled: true`
+in the collector config. Use `cmd/bq-quarantine-replay` to replay quarantined
+records after fixing the underlying issue.
+
+### Redaction
+
+Enable client-side PII and secret redaction by setting `redaction.enabled: true`
+in the collector config. Redaction runs at Step 0, before offload,
+fingerprinting, and quarantine.
+
