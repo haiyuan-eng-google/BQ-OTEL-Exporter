@@ -666,7 +666,7 @@ func TestDependabotCombinesDockerEntries(t *testing.T) {
 	var doc struct {
 		Updates []struct {
 			PackageEcosystem string   `yaml:"package-ecosystem"`
-			Directories       []string `yaml:"directories"`
+			Directories      []string `yaml:"directories"`
 			Groups           map[string]struct {
 				GroupBy string `yaml:"group-by"`
 			} `yaml:"groups"`
