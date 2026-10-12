@@ -113,7 +113,7 @@ jobs:
             "ghcr.io/haiyuan-eng-google/bq-otel-collector@${DIGEST}"
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-name: ghcr.io/haiyuan-eng-google/bq-otel-collector
           subject-digest: ${{ steps.manifest_digest.outputs.digest }}
