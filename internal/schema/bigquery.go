@@ -5,6 +5,7 @@ package schema
 
 import (
 	"fmt"
+	"maps"
 	"strings"
 	"time"
 
@@ -14,11 +15,14 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
-// DestinationOptions configures table-level partitioning options when
-// creating a destination table via the BigQuery metadata API.
+// DestinationOptions configures table-level partitioning and governance options
+// when creating a destination table via the BigQuery metadata API.
 type DestinationOptions struct {
 	PartitionExpirationDays int
 	RequirePartitionFilter  bool
+	KMSKeyName              string
+	Labels                  map[string]string
+	MaxStaleness            time.Duration
 }
 
 // DestinationMetadata builds the physical table and logical deduplication
@@ -32,7 +36,7 @@ func DestinationMetadata(
 
 // DestinationMetadataWithOptions builds the physical table and logical
 // deduplication view metadata for one of the exporter's canonical signal
-// contracts with explicit partitioning options.
+// contracts with explicit partitioning and governance options.
 func DestinationMetadataWithOptions(
 	in *storagepb.TableSchema, project, dataset, table string, opts DestinationOptions,
 ) (*bq.TableMetadata, string, error) {
@@ -64,6 +68,7 @@ func DestinationMetadataWithOptions(
 	if opts.PartitionExpirationDays > 0 {
 		md.TimePartitioning.Expiration = time.Duration(opts.PartitionExpirationDays) * 24 * time.Hour
 	}
+	applyGovernanceOptions(md, opts)
 	return md, fmt.Sprintf(queryTemplate, project, dataset, table), nil
 }
 
@@ -79,9 +84,9 @@ func QuarantineDestinationMetadata() (*bq.TableMetadata, error) {
 }
 
 // QuarantineDestinationMetadataWithOptions builds the physical table metadata
-// of the opt-in quarantine table with explicit partitioning options. When
-// opts.PartitionExpirationDays is 0, the default 30-day expiration from
-// QuarantineDDL is applied.
+// of the opt-in quarantine table with explicit partitioning and governance
+// options. When opts.PartitionExpirationDays is 0, the default 30-day
+// expiration from QuarantineDDL is applied.
 func QuarantineDestinationMetadataWithOptions(opts DestinationOptions) (*bq.TableMetadata, error) {
 	bqs, err := ToBigQuery(QuarantineTableSchema())
 	if err != nil {
@@ -91,7 +96,7 @@ func QuarantineDestinationMetadataWithOptions(opts DestinationOptions) (*bq.Tabl
 	if opts.PartitionExpirationDays > 0 {
 		expiration = time.Duration(opts.PartitionExpirationDays) * 24 * time.Hour
 	}
-	return &bq.TableMetadata{
+	md := &bq.TableMetadata{
 		Schema:                 bqs,
 		RequirePartitionFilter: opts.RequirePartitionFilter,
 		TimePartitioning: &bq.TimePartitioning{
@@ -100,7 +105,21 @@ func QuarantineDestinationMetadataWithOptions(opts DestinationOptions) (*bq.Tabl
 			Expiration: expiration,
 		},
 		Clustering: &bq.Clustering{Fields: []string{"signal", "error_code", "service_name"}},
-	}, nil
+	}
+	applyGovernanceOptions(md, opts)
+	return md, nil
+}
+
+func applyGovernanceOptions(md *bq.TableMetadata, opts DestinationOptions) {
+	if opts.KMSKeyName != "" {
+		md.EncryptionConfig = &bq.EncryptionConfig{KMSKeyName: opts.KMSKeyName}
+	}
+	if len(opts.Labels) > 0 {
+		md.Labels = maps.Clone(opts.Labels)
+	}
+	if opts.MaxStaleness > 0 {
+		md.MaxStaleness = bq.IntervalValueFromDuration(opts.MaxStaleness)
+	}
 }
 
 // SpanCompanionViewOrder lists the span companion views in dependency order so

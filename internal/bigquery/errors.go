@@ -9,6 +9,7 @@ import (
 	"io"
 	"strings"
 
+	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -151,6 +152,34 @@ func Classify(err error) Verdict {
 			return Verdict{Retryable, OwnerExporterHelper, LabelCanceled, false}
 		default:
 			return Verdict{Permanent, OwnerExporter, LabelUnknown, false}
+		}
+	}
+
+	for _, detail := range s.Details() {
+		se, ok := detail.(*storagepb.StorageError)
+		if !ok || se == nil {
+			continue
+		}
+		switch se.GetCode() {
+		case storagepb.StorageError_SCHEMA_MISMATCH_EXTRA_FIELDS:
+			return Verdict{Permanent, OwnerExporter, LabelSchemaMismatch, true}
+		case storagepb.StorageError_STREAM_NOT_FOUND,
+			storagepb.StorageError_INVALID_STREAM_STATE,
+			storagepb.StorageError_INVALID_STREAM_TYPE,
+			storagepb.StorageError_STREAM_ALREADY_COMMITTED,
+			storagepb.StorageError_STREAM_FINALIZED,
+			storagepb.StorageError_TABLE_NOT_FOUND:
+			return Verdict{Permanent, OwnerExporter, LabelInvalidStream, true}
+		case storagepb.StorageError_OFFSET_ALREADY_EXISTS,
+			storagepb.StorageError_OFFSET_OUT_OF_RANGE,
+			storagepb.StorageError_CMEK_NOT_PROVIDED,
+			storagepb.StorageError_INVALID_CMEK_PROVIDED,
+			storagepb.StorageError_CMEK_ENCRYPTION_ERROR:
+			return Verdict{Permanent, OwnerExporter, LabelInvalidArgument, false}
+		case storagepb.StorageError_KMS_PERMISSION_DENIED:
+			return Verdict{Permanent, OwnerExporter, LabelPermission, false}
+		case storagepb.StorageError_KMS_SERVICE_ERROR:
+			return Verdict{Retryable, OwnerExporterHelper, LabelUnavailable, false}
 		}
 	}
 

@@ -150,9 +150,14 @@ func TestDestinationMetadata(t *testing.T) {
 }
 
 func TestDestinationMetadataWithOptions(t *testing.T) {
+	const kmsKey = "projects/proj/locations/us/keyRings/ring/cryptoKeys/key"
+	labels := map[string]string{"env": "prod", "team": "observability"}
 	md, _, err := DestinationMetadataWithOptions(SpansTableSchema(), "proj", "ds", "tbl", DestinationOptions{
 		PartitionExpirationDays: 90,
 		RequirePartitionFilter:  true,
+		KMSKeyName:              kmsKey,
+		Labels:                  labels,
+		MaxStaleness:            15 * time.Minute,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -162,6 +167,15 @@ func TestDestinationMetadataWithOptions(t *testing.T) {
 	}
 	if !md.RequirePartitionFilter {
 		t.Fatal("RequirePartitionFilter = false, want true")
+	}
+	if md.EncryptionConfig == nil || md.EncryptionConfig.KMSKeyName != kmsKey {
+		t.Fatalf("EncryptionConfig = %+v, want KMSKeyName %q", md.EncryptionConfig, kmsKey)
+	}
+	if !maps.Equal(md.Labels, labels) {
+		t.Fatalf("Labels = %v, want %v", md.Labels, labels)
+	}
+	if md.MaxStaleness == nil || md.MaxStaleness.SubSecondNanos != 0 || md.MaxStaleness.Hours != 0 || md.MaxStaleness.Minutes != 15 {
+		t.Fatalf("MaxStaleness = %+v, want 15m interval", md.MaxStaleness)
 	}
 }
 
@@ -201,15 +215,28 @@ func TestQuarantineDestinationMetadata(t *testing.T) {
 		t.Errorf("quarantine table metadata must not define a view, got %q", md.ViewQuery)
 	}
 
+	const qKMS = "projects/proj/locations/us/keyRings/ring/cryptoKeys/qkey"
 	customMD, err := QuarantineDestinationMetadataWithOptions(DestinationOptions{
 		PartitionExpirationDays: 14,
 		RequirePartitionFilter:  true,
+		KMSKeyName:              qKMS,
+		Labels:                  map[string]string{"tier": "quarantine"},
+		MaxStaleness:            5 * time.Minute,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if customMD.TimePartitioning.Expiration != 14*24*time.Hour || !customMD.RequirePartitionFilter {
 		t.Fatalf("custom quarantine options = %+v, want 14d expiration and RequirePartitionFilter=true", customMD)
+	}
+	if customMD.EncryptionConfig == nil || customMD.EncryptionConfig.KMSKeyName != qKMS {
+		t.Fatalf("quarantine EncryptionConfig = %+v, want %q", customMD.EncryptionConfig, qKMS)
+	}
+	if !maps.Equal(customMD.Labels, map[string]string{"tier": "quarantine"}) {
+		t.Fatalf("quarantine Labels = %v, want tier=quarantine", customMD.Labels)
+	}
+	if customMD.MaxStaleness == nil || customMD.MaxStaleness.Minutes != 5 {
+		t.Fatalf("quarantine MaxStaleness = %+v, want 5m", customMD.MaxStaleness)
 	}
 }
 

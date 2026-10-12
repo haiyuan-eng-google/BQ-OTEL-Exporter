@@ -701,3 +701,66 @@ func TestConcurrentTableGetAndPatch(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestRESTTableUpdateEnforcesIfMatchETagAndAdditiveSchema(t *testing.T) {
+	srv := NewServer(t)
+	ctx := context.Background()
+
+	httpClient, httpBase := srv.NewHTTPClient()
+	t.Cleanup(func() { httpBase.CloseIdleConnections() })
+
+	client, err := bq.NewClient(ctx, "test-project", option.WithHTTPClient(httpClient))
+	if err != nil {
+		t.Fatalf("bq.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	ds := client.Dataset("etag_ds")
+	if err := ds.Create(ctx, &bq.DatasetMetadata{Location: "US"}); err != nil {
+		t.Fatalf("Dataset.Create: %v", err)
+	}
+	tbl := ds.Table("otel_spans")
+	initialSchema := bq.Schema{
+		{Name: "trace_id", Type: bq.StringFieldType, Required: true},
+	}
+	if err := tbl.Create(ctx, &bq.TableMetadata{Schema: initialSchema}); err != nil {
+		t.Fatalf("Table.Create: %v", err)
+	}
+	md1, err := tbl.Metadata(ctx)
+	if err != nil || md1.ETag == "" {
+		t.Fatalf("Table.Metadata = (%#v, %v), want non-empty ETag", md1, err)
+	}
+
+	// 1. Stale ETag must fail with HTTP 412 Precondition Failed.
+	additiveSchema := bq.Schema{
+		{Name: "trace_id", Type: bq.StringFieldType, Required: true},
+		{Name: "payload_refs", Type: bq.StringFieldType, Required: false},
+	}
+	if _, err := tbl.Update(ctx, bq.TableMetadataToUpdate{Schema: additiveSchema}, "stale-etag"); err == nil {
+		t.Fatal("expected Table.Update with stale ETag to fail with 412 Precondition Failed")
+	}
+
+	// 2. Matching ETag succeeds and advances ETag.
+	md2, err := tbl.Update(ctx, bq.TableMetadataToUpdate{Schema: additiveSchema}, md1.ETag)
+	if err != nil {
+		t.Fatalf("Table.Update with matching ETag failed: %v", err)
+	}
+	if md2.ETag == "" || md2.ETag == md1.ETag {
+		t.Errorf("updated ETag = %q, want distinct non-empty ETag from %q", md2.ETag, md1.ETag)
+	}
+
+	// 3. Removing an existing column fails with HTTP 400 Bad Request.
+	if _, err := tbl.Update(ctx, bq.TableMetadataToUpdate{Schema: initialSchema}, md2.ETag); err == nil {
+		t.Fatal("expected Table.Update removing payload_refs column to fail")
+	}
+
+	// 4. Adding a new REQUIRED column fails with HTTP 400 Bad Request.
+	withNewRequired := bq.Schema{
+		{Name: "trace_id", Type: bq.StringFieldType, Required: true},
+		{Name: "payload_refs", Type: bq.StringFieldType, Required: false},
+		{Name: "must_fail", Type: bq.StringFieldType, Required: true},
+	}
+	if _, err := tbl.Update(ctx, bq.TableMetadataToUpdate{Schema: withNewRequired}, md2.ETag); err == nil {
+		t.Fatal("expected Table.Update adding new REQUIRED column to fail")
+	}
+}
