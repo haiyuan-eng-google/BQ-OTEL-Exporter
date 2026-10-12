@@ -5,16 +5,43 @@ package example_test
 
 import (
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
 	"go.yaml.in/yaml/v3"
 )
 
+// collectorVersionsFromGoMod reads the Collector release this module builds
+// against from go.mod: the v0.x version shared by the Collector component and
+// contrib modules (read from componentstatus) and the v1.x version shared by the
+// stable modules (read from confmap). The example's pins are compared with these
+// values instead of repeating a literal that must be edited with each release.
+func collectorVersionsFromGoMod(t *testing.T, path string) (collectorVersion, confmapVersion string) {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	required := func(module string) string {
+		t.Helper()
+		m := regexp.MustCompile(`(?m)^\s*(?:require\s+)?` + regexp.QuoteMeta(module) + ` (v\d+\.\d+\.\d+)`).FindSubmatch(raw)
+		if m == nil {
+			t.Fatalf("%s has no requirement for %s", path, module)
+		}
+		return string(m[1])
+	}
+	return required("go.opentelemetry.io/collector/component/componentstatus"),
+		required("go.opentelemetry.io/collector/confmap")
+}
+
 func TestCustomCollectorExampleIsSelfContainedAndPinned(t *testing.T) {
+	collectorVersion, confmapVersion := collectorVersionsFromGoMod(t, "../go.mod")
+
 	tests := []struct {
 		path       string
 		contains   []string
+		matches    []string
 		notContain []string
 	}{
 		{
@@ -23,18 +50,23 @@ func TestCustomCollectorExampleIsSelfContainedAndPinned(t *testing.T) {
 				"name: bigqueryexporter",
 				"import: github.com/haiyuan-eng-google/BQ-OTEL-Exporter",
 				"path: .",
-				"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/fileexporter v0.158.0",
-				"go.opentelemetry.io/collector/receiver/otlpreceiver v0.158.0",
-				"go.opentelemetry.io/collector/processor/memorylimiterprocessor v0.158.0",
-				"github.com/open-telemetry/opentelemetry-collector-contrib/extension/healthcheckextension v0.158.0",
+				"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/fileexporter " + collectorVersion,
+				"go.opentelemetry.io/collector/receiver/otlpreceiver " + collectorVersion,
+				"go.opentelemetry.io/collector/processor/memorylimiterprocessor " + collectorVersion,
+				"github.com/open-telemetry/opentelemetry-collector-contrib/extension/healthcheckextension " + collectorVersion,
+				"go.opentelemetry.io/collector/confmap/provider/envprovider " + confmapVersion,
 			},
 		},
 		{
 			path: "Dockerfile",
 			contains: []string{
-				"golang:1.27.0-bookworm@sha256:",
+				"go.opentelemetry.io/collector/cmd/builder@" + collectorVersion,
 				"gcr.io/distroless/base-debian12:nonroot@sha256:",
 			},
+			// The builder image is pinned by release and digest. Which release
+			// is compared with the CI and release workflows by the root
+			// package's release asset tests.
+			matches:    []string{`golang:\d+\.\d+\.\d+-bookworm@sha256:[0-9a-f]{64}`},
 			notContain: []string{"latest"},
 		},
 		{
@@ -57,6 +89,11 @@ func TestCustomCollectorExampleIsSelfContainedAndPinned(t *testing.T) {
 			for _, want := range tc.contains {
 				if !strings.Contains(text, want) {
 					t.Errorf("%s does not contain %q", tc.path, want)
+				}
+			}
+			for _, pattern := range tc.matches {
+				if !regexp.MustCompile(pattern).MatchString(text) {
+					t.Errorf("%s does not match %q", tc.path, pattern)
 				}
 			}
 			for _, forbidden := range tc.notContain {

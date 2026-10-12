@@ -30,10 +30,16 @@ tests:
 # Queue depth and queue drops are deliberately absent. exporterhelper already
 # publishes them for the sending queue, and a second set of counters measuring
 # the same queue would disagree under load and be worse than none.
+#
+# `make mdatagen` checks this file against the schema of the mdatagen release
+# pinned by OCB_VERSION in the Makefile: metric and attribute keys must stay in
+# ASCII order, every metric needs a stability level, and the label domains are
+# declared once in the top-level attributes section at the end of the file.
 telemetry:
   metrics:
     otelcol_exporter_bigquery_acknowledged_rows:
       enabled: true
+      stability: development
       description: >-
         Rows acknowledged by the BigQuery Storage Write API. Incremented only
         after acknowledgement, never at enqueue time, so it can be compared
@@ -43,8 +49,93 @@ telemetry:
         value_type: int
         monotonic: true
 
+    otelcol_exporter_bigquery_append_bytes:
+      enabled: true
+      stability: development
+      description: >-
+        Serialized protobuf wire bytes dispatched to the BigQuery Storage Write API.
+      unit: By
+      sum:
+        value_type: int
+        monotonic: true
+
+    otelcol_exporter_bigquery_append_result_wait:
+      enabled: true
+      stability: development
+      description: Time from append dispatch until its result owner finishes.
+      unit: s
+      histogram:
+        value_type: double
+        bucket_boundaries: [0.001, 0.01, 0.1, 1, 5, 30, 70, 120]
+
+    otelcol_exporter_bigquery_inflight_requests:
+      enabled: true
+      stability: development
+      description: >-
+        Dispatched append results that have not reached an exporter-owned
+        terminal state.
+      unit: "{request}"
+      sum:
+        value_type: int
+        monotonic: false
+
+    otelcol_exporter_bigquery_offload_errors:
+      enabled: true
+      stability: development
+      description: >-
+        Payload offload attempts to external object storage that failed, by error class.
+      unit: "{error}"
+      sum:
+        value_type: int
+        monotonic: true
+      attributes: [class]
+
+    otelcol_exporter_bigquery_offloaded_bytes:
+      enabled: true
+      stability: development
+      description: >-
+        Payload bytes offloaded to external object storage.
+      unit: By
+      sum:
+        value_type: int
+        monotonic: true
+
+    otelcol_exporter_bigquery_offloaded_payloads:
+      enabled: true
+      stability: development
+      description: >-
+        Multimodal or oversized payloads offloaded to external object storage.
+      unit: "{payload}"
+      sum:
+        value_type: int
+        monotonic: true
+
+    otelcol_exporter_bigquery_quarantine_failed_rows:
+      enabled: true
+      stability: development
+      description: >-
+        Rows targeted for quarantine that could not be written due to
+        serialization, size limit, or quarantine stream append failures.
+      unit: "{row}"
+      sum:
+        value_type: int
+        monotonic: true
+      attributes: [reason]
+
+    otelcol_exporter_bigquery_quarantined_rows:
+      enabled: true
+      stability: development
+      description: >-
+        Rows acknowledged by the BigQuery quarantine table stream, by reason.
+      unit: "{row}"
+      sum:
+        value_type: int
+        monotonic: true
+      attributes: [reason]
+
     otelcol_exporter_bigquery_rejected_rows:
       enabled: true
+      stability: development
       description: >-
         Rows permanently rejected and dropped from the signal tables, by
         reason. Counted whether or not quarantine is enabled. With quarantine
@@ -59,6 +150,7 @@ telemetry:
 
     otelcol_exporter_bigquery_retries:
       enabled: true
+      stability: development
       description: Retryable append failures, by error class.
       unit: "{failure}"
       sum:
@@ -66,8 +158,28 @@ telemetry:
         monotonic: true
       attributes: [class]
 
+    otelcol_exporter_bigquery_stream_retirements:
+      enabled: true
+      stability: development
+      description: >-
+        Managed stream generations retired after an unsafe append outcome.
+      unit: "{retirement}"
+      sum:
+        value_type: int
+        monotonic: true
+
+    otelcol_exporter_bigquery_timeouts_after_dispatch:
+      enabled: true
+      stability: development
+      description: Append attempts whose context ended after dispatch began.
+      unit: "{timeout}"
+      sum:
+        value_type: int
+        monotonic: true
+
     otelcol_exporter_bigquery_uncertain_ack_replays:
       enabled: true
+      stability: development
       description: >-
         Append replays triggered by an uncertain acknowledgement. This is the
         observable side of the duplicate bound: N replays permit at most N+1
@@ -78,18 +190,9 @@ telemetry:
         value_type: int
         monotonic: true
 
-    otelcol_exporter_bigquery_inflight_requests:
-      enabled: true
-      description: >-
-        Dispatched append results that have not reached an exporter-owned
-        terminal state.
-      unit: "{request}"
-      sum:
-        value_type: int
-        monotonic: false
-
     otelcol_exporter_bigquery_unresolved_results:
       enabled: true
+      stability: development
       description: >-
         Append results retained by lifecycle drainers after their original
         exporterhelper attempt ended.
@@ -98,127 +201,44 @@ telemetry:
         value_type: int
         monotonic: false
 
-    otelcol_exporter_bigquery_append_result_wait:
-      enabled: true
-      description: Time from append dispatch until its result owner finishes.
-      unit: s
-      histogram:
-        value_type: double
-        bucket_boundaries: [0.001, 0.01, 0.1, 1, 5, 30, 70, 120]
+attributes:
+  class:
+    description: >-
+      The error class of a retryable append or offload failure. Bounded by
+      construction; this enumeration is the whole domain.
+    type: string
+    enum:
+      - quota_exhausted
+      - unavailable
+      - internal
+      - permission_denied
+      - credential
+      - invalid_stream
+      - schema_mismatch
+      - invalid_argument
+      - uncertain_ack
+      - connection
+      - request_canceled
+      - shutdown_timeout
+      - unknown
 
-    otelcol_exporter_bigquery_timeouts_after_dispatch:
-      enabled: true
-      description: Append attempts whose context ended after dispatch began.
-      unit: "{timeout}"
-      sum:
-        value_type: int
-        monotonic: true
-
-    otelcol_exporter_bigquery_stream_retirements:
-      enabled: true
-      description: >-
-        Managed stream generations retired after an unsafe append outcome.
-      unit: "{retirement}"
-      sum:
-        value_type: int
-        monotonic: true
-
-    otelcol_exporter_bigquery_quarantined_rows:
-      enabled: true
-      description: >-
-        Rows acknowledged by the BigQuery quarantine table stream, by reason.
-      unit: "{row}"
-      sum:
-        value_type: int
-        monotonic: true
-      attributes: [reason]
-
-    otelcol_exporter_bigquery_quarantine_failed_rows:
-      enabled: true
-      description: >-
-        Rows targeted for quarantine that could not be written due to
-        serialization, size limit, or quarantine stream append failures.
-      unit: "{row}"
-      sum:
-        value_type: int
-        monotonic: true
-      attributes: [reason]
-
-    otelcol_exporter_bigquery_append_bytes:
-      enabled: true
-      description: >-
-        Serialized protobuf wire bytes dispatched to the BigQuery Storage Write API.
-      unit: By
-      sum:
-        value_type: int
-        monotonic: true
-
-    otelcol_exporter_bigquery_offloaded_payloads:
-      enabled: true
-      description: >-
-        Multimodal or oversized payloads offloaded to external object storage.
-      unit: "{payload}"
-      sum:
-        value_type: int
-        monotonic: true
-
-    otelcol_exporter_bigquery_offloaded_bytes:
-      enabled: true
-      description: >-
-        Payload bytes offloaded to external object storage.
-      unit: By
-      sum:
-        value_type: int
-        monotonic: true
-
-    otelcol_exporter_bigquery_offload_errors:
-      enabled: true
-      description: >-
-        Payload offload attempts to external object storage that failed, by error class.
-      unit: "{error}"
-      sum:
-        value_type: int
-        monotonic: true
-      attributes: [class]
-
-  attributes:
-    reason:
-      description: >-
-        Why a row was permanently rejected or quarantined. Bounded by construction;
-        this enumeration is the whole domain.
-      type: string
-      enum:
-        - attribute_count
-        - attribute_key_size
-        - event_count
-        - link_count
-        - nesting_depth
-        - collection_size
-        - value_size
-        - serialization
-        - row_bytes
-        - row_error
-        - invalid_id
-        - missing_timestamp
-        - timestamp_overflow
-        - other
-
-    class:
-      description: >-
-        The error class of a retryable append or offload failure. Bounded by
-        construction; this enumeration is the whole domain.
-      type: string
-      enum:
-        - quota_exhausted
-        - unavailable
-        - internal
-        - permission_denied
-        - credential
-        - invalid_stream
-        - schema_mismatch
-        - invalid_argument
-        - uncertain_ack
-        - connection
-        - request_canceled
-        - shutdown_timeout
-        - unknown
+  reason:
+    description: >-
+      Why a row was permanently rejected or quarantined. Bounded by construction;
+      this enumeration is the whole domain.
+    type: string
+    enum:
+      - attribute_count
+      - attribute_key_size
+      - event_count
+      - link_count
+      - nesting_depth
+      - collection_size
+      - value_size
+      - serialization
+      - row_bytes
+      - row_error
+      - invalid_id
+      - missing_timestamp
+      - timestamp_overflow
+      - other
