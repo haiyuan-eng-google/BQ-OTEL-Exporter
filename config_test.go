@@ -527,4 +527,3 @@ func TestConfigValidateAcceptsDomainPrefixedProjectAndGovernanceOptions(t *testi
 		t.Fatalf("Validate() unexpected error: %v", err)
 	}
 }
-

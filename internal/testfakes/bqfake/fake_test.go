@@ -775,4 +775,3 @@ func TestRESTTableUpdateEnforcesIfMatchETagAndAdditiveSchema(t *testing.T) {
 		t.Fatalf("Table.Update adding new REQUIRED column err = %v, want googleapi.Error with HTTP 400", err)
 	}
 }
-

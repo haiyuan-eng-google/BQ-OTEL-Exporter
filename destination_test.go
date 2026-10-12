@@ -1343,7 +1343,7 @@ func TestPrepareDestinationAppliesGovernanceOptionsToDatasetTablesAndViews(t *te
 	if !maps.Equal(logsMD.Labels, wantLogsLabels) {
 		t.Errorf("logs table Labels = %v, want %v", logsMD.Labels, wantLogsLabels)
 	}
-	if logsMD.MaxStaleness == nil || *logsMD.MaxStaleness != *bq.IntervalValueFromDuration(15*time.Minute) {
+	if logsMD.MaxStaleness == nil || *logsMD.MaxStaleness != *bq.IntervalValueFromDuration(15 * time.Minute) {
 		t.Errorf("logs table MaxStaleness = %v, want 15m", logsMD.MaxStaleness)
 	}
 
@@ -1370,7 +1370,7 @@ func TestPrepareDestinationAppliesGovernanceOptionsToDatasetTablesAndViews(t *te
 	if !maps.Equal(qMD.Labels, wantQLabels) {
 		t.Errorf("quarantine table Labels = %v, want %v", qMD.Labels, wantQLabels)
 	}
-	if qMD.MaxStaleness == nil || *qMD.MaxStaleness != *bq.IntervalValueFromDuration(30*time.Minute) {
+	if qMD.MaxStaleness == nil || *qMD.MaxStaleness != *bq.IntervalValueFromDuration(30 * time.Minute) {
 		t.Errorf("quarantine table MaxStaleness = %v, want 30m", qMD.MaxStaleness)
 	}
 }

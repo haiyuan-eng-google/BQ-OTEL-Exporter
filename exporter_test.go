@@ -2805,4 +2805,3 @@ func TestPushPermanentRequestLevelFailureQuarantinesAndRecordsRejected(t *testin
 		t.Errorf("quarantined_rows{reason=request_permanent} = %d, want 2", got)
 	}
 }
-
