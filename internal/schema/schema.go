@@ -320,11 +320,15 @@ OPTIONS (
 //
 // Identity is (start_time, service_name, trace_id, span_id). Every retry of a
 // span carries the same start time and service, so this is the span identity
-// with the partitioning column and the leading clustering columns added: a
-// filter on any of them can be pushed below the window function, and a query
-// over the view still prunes partitions and clusters. Ordering is on the raw
-// nanos rather than end_time, because microsecond precision alone can tie
-// across retries; receive_time_unix_nano breaks any remaining tie.
+// with the partitioning column and the leading clustering columns added.
+// name, the last clustering column, is added too: it is fixed for a span, so
+// it never splits the retries of one. BigQuery pushes a filter below a window
+// function only when the filter refers to PARTITION BY columns, so the window
+// partitions on every column the base table is partitioned, clustered or
+// search-indexed on. A filter on any of them then reaches the table scan, and
+// a query over the view still prunes partitions and clusters. Ordering is on
+// the raw nanos rather than end_time, because microsecond precision alone can
+// tie across retries; receive_time_unix_nano breaks any remaining tie.
 //
 // Planned: once truncate-and-flag lands, an is_truncated ASC term goes first
 // in the ORDER BY, so a truncated copy can never outrank the full copy it
@@ -345,7 +349,8 @@ QUALIFY ROW_NUMBER() OVER (
     start_time,
     service_name,
     trace_id,
-    span_id
+    span_id,
+    name
   ORDER BY
     end_time_unix_nano DESC,
     receive_time_unix_nano DESC
@@ -357,11 +362,16 @@ QUALIFY ROW_NUMBER() OVER (
 // Identity is (timestamp, time_unix_nano, service_name, log_name, insert_id),
 // aligned with the Cloud Logging (log_name, insert_id) identity. insert_id is
 // the upstream record ID when instrumentation supplies one and the record
-// fingerprint otherwise. The partitioning column and the leading clustering
-// column come first, so a filter on either can be pushed below the window
-// function and a query over the view still prunes partitions and clusters;
-// time_unix_nano keeps apart records that share a microsecond timestamp. The
-// most recently received copy wins.
+// fingerprint otherwise. The window also partitions on trace_id, span_id and
+// severity_number. They are part of what the record fingerprint covers, so
+// retries of one record agree on them, and records that share an insert_id but
+// differ in any of them are not retries of each other. With the partitioning
+// column and service_name they cover every column the base table is
+// partitioned, clustered or search-indexed on. BigQuery pushes a filter below
+// a window function only when the filter refers to PARTITION BY columns, so a
+// filter on any of them reaches the table scan and a query over the view still
+// prunes partitions and clusters; time_unix_nano keeps apart records that
+// share a microsecond timestamp. The most recently received copy wins.
 //
 // Scope of the promise, deliberately narrow: this removes retry duplicates.
 // The fingerprint separates identical records only within one export batch,
@@ -384,6 +394,9 @@ QUALIFY ROW_NUMBER() OVER (
     timestamp,
     time_unix_nano,
     service_name,
+    trace_id,
+    span_id,
+    severity_number,
     log_name,
     insert_id
   ORDER BY
@@ -394,10 +407,17 @@ QUALIFY ROW_NUMBER() OVER (
 // MetricsDedupViewDDL is the canonical metric deduplication view.
 //
 // Identity is (timestamp, time_unix_nano, service_name, metric_name,
-// point_fingerprint). The partitioning column and leading clustering columns
-// come first so filters on them prune partitions and clusters before the
-// window function runs; receive_time_unix_nano selects the most recently
-// received copy.
+// point_fingerprint). The window also partitions on metric_type, the last
+// clustering column of the base table: the fingerprint covers it, so retries
+// of one point agree on it. BigQuery pushes a filter below a window function
+// only when the filter refers to PARTITION BY columns, so partitioning on the
+// partitioning column and every clustering column lets filters on them prune
+// partitions and clusters before the window function runs.
+// receive_time_unix_nano selects the most recently received copy.
+//
+// The search index covers all columns, which adds nothing to the window: the
+// exemplar trace_id and span_id it serves sit inside a repeated field, so
+// they cannot be PARTITION BY keys.
 const MetricsDedupViewDDL = `
 CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s.%[3]s_dedup`" + ` AS
 ` + MetricsDedupViewQuery + `;
@@ -414,6 +434,7 @@ QUALIFY ROW_NUMBER() OVER (
     time_unix_nano,
     service_name,
     metric_name,
+    metric_type,
     point_fingerprint
   ORDER BY
     receive_time_unix_nano DESC
@@ -461,6 +482,7 @@ const (
 	SpansAsAllSpansViewName = "otel_spans_as_allspans"
 	GenAISpansViewName      = "v_gen_ai_spans"
 	GenAILogsViewName       = "v_gen_ai_logs"
+	GenAIMetricsViewName    = "v_gen_ai_metrics"
 	GenAIModelCostsViewName = "v_gen_ai_model_costs"
 	GenAISessionsViewName   = "v_gen_ai_sessions"
 	GenAIToolUsageViewName  = "v_gen_ai_tool_usage"
@@ -516,7 +538,11 @@ FROM ` + "`%[1]s.%[2]s.%[3]s_dedup`" + `
 // Development Kit gcp.vertex.agent.* attributes promoted out of the plain
 // JSON attributes into typed top-level columns. Where the same fact can arrive
 // under more than one key, such as gen_ai.system and its successor
-// gen_ai.provider.name, the keys are coalesced in a fixed order. The raw
+// gen_ai.provider.name, or the reasoning token count under
+// gen_ai.usage.reasoning.output_tokens and its earlier name
+// gen_ai.usage.reasoning_tokens, the keys are coalesced in a fixed order, the
+// current key first. The error.type attribute is promoted as error_type, the
+// last column, so the position of every earlier column is unchanged. The raw
 // attribute, resource, scope, event and link columns and payload_refs are
 // kept for anything not promoted.
 const GenAISpansViewDDL = `
@@ -593,7 +619,10 @@ SELECT
     LAX_INT64(attributes['gen_ai.usage.cache_creation.input_tokens']),
     LAX_INT64(attributes['gen_ai.usage.cache_creation_input_tokens'])
   ) AS gen_ai_usage_cache_creation_input_tokens,
-  LAX_INT64(attributes['gen_ai.usage.reasoning_tokens']) AS gen_ai_usage_reasoning_tokens,
+  COALESCE(
+    LAX_INT64(attributes['gen_ai.usage.reasoning.output_tokens']),
+    LAX_INT64(attributes['gen_ai.usage.reasoning_tokens'])
+  ) AS gen_ai_usage_reasoning_tokens,
   LAX_FLOAT64(attributes['gen_ai.request.top_p']) AS gen_ai_request_top_p,
   LAX_INT64(attributes['gen_ai.request.top_k']) AS gen_ai_request_top_k,
   LAX_INT64(attributes['gen_ai.request.max_tokens']) AS gen_ai_request_max_tokens,
@@ -607,7 +636,8 @@ SELECT
   COALESCE(
     LAX_FLOAT64(attributes['gen_ai.evaluation.score.value']),
     LAX_FLOAT64(attributes['gen_ai.evaluation.score'])
-  ) AS gen_ai_evaluation_score
+  ) AS gen_ai_evaluation_score,
+  JSON_VALUE(attributes, '$."error.type"') AS error_type
 FROM ` + "`%[1]s.%[2]s.%[3]s_dedup`" + `
 WHERE JSON_VALUE(attributes, '$."gen_ai.operation.name"') IS NOT NULL
    OR JSON_VALUE(attributes, '$."gen_ai.system"') IS NOT NULL
@@ -620,18 +650,33 @@ WHERE JSON_VALUE(attributes, '$."gen_ai.operation.name"') IS NOT NULL
 // gcp.vertex.agent.invocation_id, with the GenAI and agent fields promoted
 // from the record's own attributes and, where the record lacks one, from the
 // attributes of the span it belongs to. The event name falls back from the
-// event_name column to the event.name attribute.
+// event_name column to the event.name attribute. The agent name, session ID
+// and user ID are coalesced over the same attribute keys, in the same order,
+// as the columns of v_gen_ai_spans with those names, the record's attributes
+// first and the span's second. Unlike the span view, the agent name does not
+// fall back to service_name.
 const GenAILogsViewDDL = `
 CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAILogsViewName + "`" + ` AS
 ` + GenAILogsViewQuery + `;
 `
 
 // GenAILogsViewQuery is shared by operator-run DDL and metadata-API view
-// creation. It takes (project, dataset, logs table, spans table) and joins
-// the log dedup view to the span dedup view on (service_name, trace_id,
-// span_id), so the span dedup view must exist before this view can be
-// created. The LIKE pattern's percent sign is doubled because every template
-// here goes through fmt.Sprintf.
+// creation. It takes (project, dataset, logs table, spans table) and left-joins
+// the log dedup view to the span dedup view, so the span dedup view must exist
+// before this view can be created.
+//
+// The join matches on trace_id and span_id, and on service_name with IS NOT
+// DISTINCT FROM so that a record and a span that both lack a service name
+// still match, which a plain equality or a USING clause would not do. The join
+// also carries a range predicate on the span table's partitioning column: only
+// a span that started from 24 hours before to 1 hour after the record's
+// timestamp enriches the record. The range is expressed on start_time so the
+// engine may use it to skip span partitions; the view's results do not depend
+// on whether it does. A span outside that window (a span that began more than
+// a day before one of its log records, or more than an hour after it) does not
+// enrich the record, whose own attributes are still projected. The LIKE
+// pattern's percent sign is doubled because every template here goes through
+// fmt.Sprintf.
 const GenAILogsViewQuery = `
 SELECT
   l.timestamp,
@@ -649,11 +694,26 @@ SELECT
     JSON_VALUE(s.attributes, '$."gen_ai.system"'),
     JSON_VALUE(s.attributes, '$."gen_ai.provider.name"')
   ) AS gen_ai_system,
-  COALESCE(JSON_VALUE(l.attributes, '$."gen_ai.agent.name"'), JSON_VALUE(s.attributes, '$."gen_ai.agent.name"')) AS gen_ai_agent_name,
-  COALESCE(JSON_VALUE(l.attributes, '$."gen_ai.conversation.id"'), JSON_VALUE(s.attributes, '$."gen_ai.conversation.id"'), JSON_VALUE(s.attributes, '$."gcp.vertex.agent.session_id"')) AS adk_session_id,
+  COALESCE(
+    JSON_VALUE(l.attributes, '$."gen_ai.agent.name"'),
+    JSON_VALUE(l.attributes, '$."gcp.vertex.agent.name"'),
+    JSON_VALUE(s.attributes, '$."gen_ai.agent.name"'),
+    JSON_VALUE(s.attributes, '$."gcp.vertex.agent.name"')
+  ) AS gen_ai_agent_name,
+  COALESCE(
+    JSON_VALUE(l.attributes, '$."gcp.vertex.agent.session_id"'),
+    JSON_VALUE(l.attributes, '$."gen_ai.conversation.id"'),
+    JSON_VALUE(s.attributes, '$."gcp.vertex.agent.session_id"'),
+    JSON_VALUE(s.attributes, '$."gen_ai.conversation.id"')
+  ) AS adk_session_id,
   COALESCE(JSON_VALUE(l.attributes, '$."gcp.vertex.agent.invocation_id"'), JSON_VALUE(s.attributes, '$."gcp.vertex.agent.invocation_id"')) AS adk_invocation_id,
   COALESCE(JSON_VALUE(l.attributes, '$."gcp.vertex.agent.event_id"'), JSON_VALUE(s.attributes, '$."gcp.vertex.agent.event_id"')) AS adk_event_id,
-  COALESCE(JSON_VALUE(l.attributes, '$."user.id"'), JSON_VALUE(s.attributes, '$."user.id"')) AS adk_user_id,
+  COALESCE(
+    JSON_VALUE(l.attributes, '$."user.id"'),
+    JSON_VALUE(l.attributes, '$."gen_ai.user.id"'),
+    JSON_VALUE(s.attributes, '$."user.id"'),
+    JSON_VALUE(s.attributes, '$."gen_ai.user.id"')
+  ) AS adk_user_id,
   l.body,
   l.payload_refs,
   l.attributes,
@@ -661,59 +721,224 @@ SELECT
   l.instrumentation_scope
 FROM ` + "`%[1]s.%[2]s.%[3]s_dedup`" + ` l
 LEFT JOIN ` + "`%[1]s.%[2]s.%[4]s_dedup`" + ` s
-  USING (service_name, trace_id, span_id)
+  ON l.trace_id = s.trace_id
+  AND l.span_id = s.span_id
+  AND l.service_name IS NOT DISTINCT FROM s.service_name
+  AND s.start_time BETWEEN TIMESTAMP_SUB(l.timestamp, INTERVAL 24 HOUR) AND TIMESTAMP_ADD(l.timestamp, INTERVAL 1 HOUR)
 WHERE COALESCE(NULLIF(l.event_name, ''), JSON_VALUE(l.attributes, '$."event.name"')) LIKE 'gen_ai.%%'
    OR JSON_VALUE(l.attributes, '$."gen_ai.system"') IS NOT NULL
    OR JSON_VALUE(l.attributes, '$."gen_ai.provider.name"') IS NOT NULL
    OR JSON_VALUE(l.attributes, '$."gcp.vertex.agent.invocation_id"') IS NOT NULL
 `
 
+// GenAIMetricsViewDDL creates v_gen_ai_metrics: the metric points whose name
+// starts with "gen_ai.", such as gen_ai.client.token.usage and
+// gen_ai.client.operation.duration, with the OpenTelemetry GenAI semantic
+// convention attributes promoted out of the plain JSON attributes into typed
+// columns. The system is coalesced from gen_ai.system and its successor
+// gen_ai.provider.name, the current key second as in v_gen_ai_spans, and the
+// token type (input or output) of a token usage point is promoted as
+// gen_ai_token_type. Every point-value column of the metrics table passes
+// through unchanged, so a histogram keeps its count, sum, bounds and bucket
+// counts, an exponential histogram its buckets, and each point its exemplars,
+// whose trace_id and span_id link a point to a trace. The raw attribute,
+// resource and scope columns are kept for anything not promoted.
+const GenAIMetricsViewDDL = `
+CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAIMetricsViewName + "`" + ` AS
+` + GenAIMetricsViewQuery + `;
+`
+
+// GenAIMetricsViewQuery is shared by operator-run DDL and metadata-API view
+// creation. It takes (project, dataset, metrics table) and reads the metric
+// dedup view, never the raw table. The LIKE pattern's percent sign is doubled
+// because every template here goes through fmt.Sprintf.
+const GenAIMetricsViewQuery = `
+SELECT
+  timestamp,
+  start_time,
+  receive_time,
+  service_name,
+  metric_name,
+  metric_description,
+  metric_unit,
+  metric_type,
+  aggregation_temporality,
+  is_monotonic,
+  -- Promoted OTel GenAI semantic convention fields (Plain JSON)
+  JSON_VALUE(attributes, '$."gen_ai.operation.name"') AS gen_ai_operation_name,
+  COALESCE(
+    JSON_VALUE(attributes, '$."gen_ai.system"'),
+    JSON_VALUE(attributes, '$."gen_ai.provider.name"')
+  ) AS gen_ai_system,
+  JSON_VALUE(attributes, '$."gen_ai.provider.name"') AS gen_ai_provider_name,
+  JSON_VALUE(attributes, '$."gen_ai.request.model"') AS gen_ai_request_model,
+  JSON_VALUE(attributes, '$."gen_ai.response.model"') AS gen_ai_response_model,
+  JSON_VALUE(attributes, '$."gen_ai.token.type"') AS gen_ai_token_type,
+  JSON_VALUE(attributes, '$."error.type"') AS error_type,
+  -- Point values
+  value_type,
+  value_double,
+  value_int64,
+  count,
+  sum,
+  min,
+  max,
+  explicit_bounds,
+  bucket_counts,
+  exp_scale,
+  exp_zero_count,
+  exp_zero_threshold,
+  exp_positive,
+  exp_negative,
+  summary_quantiles,
+  exemplars,
+  -- Raw bags
+  attributes,
+  resource,
+  instrumentation_scope
+FROM ` + "`%[1]s.%[2]s.%[3]s_dedup`" + `
+WHERE metric_name LIKE 'gen_ai.%%'
+`
+
 // GenAIModelCostsViewDDL creates v_gen_ai_model_costs: hourly token and
 // latency rollup per service, agent, provider, and model over v_gen_ai_spans.
+// Each LLM call is counted once: a span whose direct children report token
+// usage is assumed to report their sum and is left out, and so is an agent or
+// tool span that reports no tokens of its own. See genAILLMCallPredicate for
+// the exact rule.
 const GenAIModelCostsViewDDL = `
 CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAIModelCostsViewName + "`" + ` AS
 ` + GenAIModelCostsViewQuery + `;
 `
 
+// genAITokenParentsCTE is the token_parents common table expression shared by
+// the two rollup views. It lists the (trace_id, span_id) of every span in
+// v_gen_ai_spans that has at least one direct child span reporting input or
+// output tokens. A span with such a child is taken to report the sum of its
+// children's tokens, so the rollups leave its own tokens out instead of
+// counting the same tokens twice. It takes (project, dataset) and carries no
+// WITH keyword, so a query can follow it with further CTEs.
+//
+// Only direct children are visible: a span is listed when one of its own
+// children carries tokens, not when a deeper descendant does, and a child that
+// is not in v_gen_ai_spans takes no part. The rollups read v_gen_ai_spans a
+// second time through this CTE, and a filter on a rollup does not narrow that
+// second read.
+const genAITokenParentsCTE = `token_parents AS (
+  SELECT DISTINCT trace_id, parent_span_id AS span_id
+  FROM ` + "`%[1]s.%[2]s." + GenAISpansViewName + "`" + `
+  WHERE parent_span_id IS NOT NULL
+    AND (gen_ai_usage_input_tokens IS NOT NULL OR gen_ai_usage_output_tokens IS NOT NULL)
+)`
+
+// genAILLMCallPredicate is the condition that selects the spans a rollup view
+// counts as one LLM call each. It refers to v_gen_ai_spans as s and to
+// genAITokenParentsCTE as tp, left-joined on trace_id and span_id, and it holds
+// for a span that:
+//   - has no direct child reporting tokens, so a parent that reports the sum of
+//     its children is skipped;
+//   - is an inference span: it has an inference operation name or a request
+//     model; and
+//   - is not an agent or tool span, unless it reports tokens itself, so an
+//     invocation span that names a request model and is the only span of its
+//     framework to carry tokens still contributes them. An invocation span
+//     that reports tokens but names no request model is not an inference span,
+//     so it is not counted as a call.
+const genAILLMCallPredicate = `tp.span_id IS NULL
+  AND (
+    s.gen_ai_operation_name IN ('chat', 'generate_content', 'text_completion', 'embeddings')
+    OR s.gen_ai_request_model IS NOT NULL
+  )
+  AND (
+    COALESCE(s.gen_ai_operation_name, '') NOT IN ('invoke_agent', 'create_agent', 'execute_tool')
+    OR s.gen_ai_usage_input_tokens IS NOT NULL
+    OR s.gen_ai_usage_output_tokens IS NOT NULL
+  )`
+
 // GenAIModelCostsViewQuery is shared by operator-run DDL and metadata-API
-// view creation. It takes (project, dataset) and reads v_gen_ai_spans.
+// view creation. It takes (project, dataset) and reads v_gen_ai_spans, twice:
+// once for the spans and once through genAITokenParentsCTE.
 const GenAIModelCostsViewQuery = `
+WITH ` + genAITokenParentsCTE + `
 SELECT
-  TIMESTAMP_TRUNC(start_time, HOUR) AS usage_hour,
-  service_name,
-  gen_ai_agent_name,
-  COALESCE(gen_ai_provider_name, gen_ai_system) AS provider,
-  COALESCE(gen_ai_response_model, gen_ai_request_model) AS model,
+  TIMESTAMP_TRUNC(s.start_time, HOUR) AS usage_hour,
+  s.service_name,
+  s.gen_ai_agent_name,
+  COALESCE(s.gen_ai_provider_name, s.gen_ai_system) AS provider,
+  COALESCE(s.gen_ai_response_model, s.gen_ai_request_model) AS model,
   COUNT(*) AS call_count,
-  COUNTIF(status_code = 2) AS error_count,
-  SUM(COALESCE(gen_ai_usage_input_tokens, 0)) AS total_input_tokens,
-  SUM(COALESCE(gen_ai_usage_output_tokens, 0)) AS total_output_tokens,
-  SUM(COALESCE(gen_ai_usage_cache_read_input_tokens, 0)) AS total_cache_read_input_tokens,
-  SUM(COALESCE(gen_ai_usage_cache_creation_input_tokens, 0)) AS total_cache_creation_input_tokens,
-  SUM(COALESCE(gen_ai_usage_reasoning_tokens, 0)) AS total_reasoning_tokens,
-  APPROX_QUANTILES(duration_ms, 100)[OFFSET(50)] AS p50_duration_ms,
-  APPROX_QUANTILES(duration_ms, 100)[OFFSET(95)] AS p95_duration_ms,
-  APPROX_QUANTILES(duration_ms, 100)[OFFSET(99)] AS p99_duration_ms
-FROM ` + "`%[1]s.%[2]s." + GenAISpansViewName + "`" + `
-WHERE gen_ai_operation_name IN ('chat', 'generate_content', 'text_completion', 'embeddings')
-   OR gen_ai_request_model IS NOT NULL
+  COUNTIF(s.status_code = 2) AS error_count,
+  SUM(COALESCE(s.gen_ai_usage_input_tokens, 0)) AS total_input_tokens,
+  SUM(COALESCE(s.gen_ai_usage_output_tokens, 0)) AS total_output_tokens,
+  SUM(COALESCE(s.gen_ai_usage_cache_read_input_tokens, 0)) AS total_cache_read_input_tokens,
+  SUM(COALESCE(s.gen_ai_usage_cache_creation_input_tokens, 0)) AS total_cache_creation_input_tokens,
+  SUM(COALESCE(s.gen_ai_usage_reasoning_tokens, 0)) AS total_reasoning_tokens,
+  APPROX_QUANTILES(s.duration_ms, 100)[OFFSET(50)] AS p50_duration_ms,
+  APPROX_QUANTILES(s.duration_ms, 100)[OFFSET(95)] AS p95_duration_ms,
+  APPROX_QUANTILES(s.duration_ms, 100)[OFFSET(99)] AS p99_duration_ms
+FROM ` + "`%[1]s.%[2]s." + GenAISpansViewName + "`" + ` AS s
+LEFT JOIN token_parents AS tp
+  ON tp.trace_id = s.trace_id
+  AND tp.span_id = s.span_id
+WHERE ` + genAILLMCallPredicate + `
 GROUP BY 1, 2, 3, 4, 5
 `
 
 // GenAISessionsViewDDL creates v_gen_ai_sessions: per-session / conversation
-// summary over v_gen_ai_spans.
+// summary over v_gen_ai_spans. A row is one session within one UTC date of its
+// spans' start times, grouped by service_name, session_start_date and
+// session_id, so a session that runs across midnight UTC has one row for each
+// date, and a filter on service_name or session_start_date applies to grouping
+// keys. The token totals sum only the spans whose direct children report no
+// tokens, so a parent span that reports the sum of its children is not counted
+// with them. llm_call_count counts the LLM calls by the same rule as
+// v_gen_ai_model_costs, and agent_invocation_count counts the invoke_agent
+// spans separately. session_start_date, total_cache_creation_input_tokens,
+// llm_call_count and agent_invocation_count are the last four columns, so the
+// position of every earlier column is unchanged.
 const GenAISessionsViewDDL = `
 CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAISessionsViewName + "`" + ` AS
 ` + GenAISessionsViewQuery + `;
 `
 
 // GenAISessionsViewQuery is shared by operator-run DDL and metadata-API view
-// creation. It takes (project, dataset) and reads v_gen_ai_spans.
+// creation. It takes (project, dataset) and reads v_gen_ai_spans, twice: once
+// for the spans and once through genAITokenParentsCTE. The session_spans CTE
+// marks each span once, as is_token_leaf (no direct child reports tokens) and
+// as is_llm_call (genAILLMCallPredicate), and the outer query only aggregates.
 const GenAISessionsViewQuery = `
+WITH ` + genAITokenParentsCTE + `,
+session_spans AS (
+  SELECT
+    s.service_name,
+    DATE(s.start_time) AS session_start_date,
+    COALESCE(s.adk_session_id, s.gen_ai_conversation_id) AS session_id,
+    s.adk_user_id,
+    s.gen_ai_agent_name,
+    s.start_time,
+    s.end_time,
+    s.trace_id,
+    s.adk_invocation_id,
+    s.gen_ai_operation_name,
+    s.gen_ai_tool_name,
+    s.status_code,
+    s.gen_ai_usage_input_tokens,
+    s.gen_ai_usage_output_tokens,
+    s.gen_ai_usage_cache_read_input_tokens,
+    s.gen_ai_usage_cache_creation_input_tokens,
+    s.gen_ai_usage_reasoning_tokens,
+    tp.span_id IS NULL AS is_token_leaf,
+    COALESCE(` + genAILLMCallPredicate + `, FALSE) AS is_llm_call
+  FROM ` + "`%[1]s.%[2]s." + GenAISpansViewName + "`" + ` AS s
+  LEFT JOIN token_parents AS tp
+    ON tp.trace_id = s.trace_id
+    AND tp.span_id = s.span_id
+  WHERE COALESCE(s.adk_session_id, s.gen_ai_conversation_id) IS NOT NULL
+)
 SELECT
-  COALESCE(adk_session_id, gen_ai_conversation_id) AS session_id,
+  session_id,
   ANY_VALUE(adk_user_id) AS user_id,
-  ANY_VALUE(service_name) AS service_name,
+  service_name,
   ANY_VALUE(gen_ai_agent_name) AS agent_name,
   MIN(start_time) AS session_start_time,
   MAX(end_time) AS session_end_time,
@@ -722,13 +947,16 @@ SELECT
   COUNT(DISTINCT adk_invocation_id) AS invocation_count,
   COUNTIF(gen_ai_operation_name = 'execute_tool' OR gen_ai_tool_name IS NOT NULL) AS tool_call_count,
   COUNTIF(status_code = 2) AS error_count,
-  SUM(COALESCE(gen_ai_usage_input_tokens, 0)) AS total_input_tokens,
-  SUM(COALESCE(gen_ai_usage_output_tokens, 0)) AS total_output_tokens,
-  SUM(COALESCE(gen_ai_usage_cache_read_input_tokens, 0)) AS total_cache_read_input_tokens,
-  SUM(COALESCE(gen_ai_usage_reasoning_tokens, 0)) AS total_reasoning_tokens
-FROM ` + "`%[1]s.%[2]s." + GenAISpansViewName + "`" + `
-WHERE COALESCE(adk_session_id, gen_ai_conversation_id) IS NOT NULL
-GROUP BY session_id
+  SUM(IF(is_token_leaf, COALESCE(gen_ai_usage_input_tokens, 0), 0)) AS total_input_tokens,
+  SUM(IF(is_token_leaf, COALESCE(gen_ai_usage_output_tokens, 0), 0)) AS total_output_tokens,
+  SUM(IF(is_token_leaf, COALESCE(gen_ai_usage_cache_read_input_tokens, 0), 0)) AS total_cache_read_input_tokens,
+  SUM(IF(is_token_leaf, COALESCE(gen_ai_usage_reasoning_tokens, 0), 0)) AS total_reasoning_tokens,
+  session_start_date,
+  SUM(IF(is_token_leaf, COALESCE(gen_ai_usage_cache_creation_input_tokens, 0), 0)) AS total_cache_creation_input_tokens,
+  COUNTIF(is_llm_call) AS llm_call_count,
+  COUNTIF(gen_ai_operation_name = 'invoke_agent') AS agent_invocation_count
+FROM session_spans
+GROUP BY service_name, session_start_date, session_id
 `
 
 // GenAIToolUsageViewDDL creates v_gen_ai_tool_usage: hourly tool invocation

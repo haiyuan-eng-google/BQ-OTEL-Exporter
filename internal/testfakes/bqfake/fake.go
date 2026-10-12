@@ -137,6 +137,10 @@ func New() (*Server, error) {
 		_ = lis.Close()
 		return nil, err
 	}
+	if err := s.RegisterTableSchema("otel_metrics", schema.MetricsTableSchema()); err != nil {
+		_ = lis.Close()
+		return nil, err
+	}
 	if err := s.RegisterTableSchema("otel_quarantine", schema.QuarantineTableSchema()); err != nil {
 		_ = lis.Close()
 		return nil, err

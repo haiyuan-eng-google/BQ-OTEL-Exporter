@@ -10,6 +10,7 @@ import (
 	"io"
 	"maps"
 	stdhttp "net/http"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -45,16 +46,25 @@ type fakeDestinationAdmin struct {
 	// tableMetadataByID answers reads of the listed IDs ahead of, and
 	// without consuming, the shared tableResponses sequence.
 	tableMetadataByID map[string]fakeTableMetadataResponse
+	// tableSequenceByID answers successive reads of the listed IDs with the
+	// next response in order, repeating the last one once it is the only one
+	// left. It is consulted ahead of tableMetadataByID.
+	tableSequenceByID map[string][]fakeTableMetadataResponse
 	// createErrByID overrides the creation result for the listed IDs.
 	createErrByID map[string]error
 	// updateErrByID overrides the update result for the listed IDs.
 	updateErrByID map[string]error
+	// updateSequenceByID answers successive updates of the listed IDs with the
+	// next result in order, repeating the last one once it is the only one
+	// left. It is consulted ahead of updateErrByID.
+	updateSequenceByID map[string][]error
 
 	createdDataset    *bq.DatasetMetadata
 	createdTables     map[string]*bq.TableMetadata
 	createdTableOrder []string
 	updatedTables     map[string]bq.TableMetadataToUpdate
 	updatedETags      map[string]string
+	updates           []fakeUpdateCall
 	ranDDLs           []string
 	tableResponses    []fakeTableMetadataResponse
 	tableReads        int
@@ -64,6 +74,13 @@ type fakeDestinationAdmin struct {
 type fakeTableMetadataResponse struct {
 	metadata *bq.TableMetadata
 	err      error
+}
+
+// fakeUpdateCall records one UpdateTable call.
+type fakeUpdateCall struct {
+	id   string
+	etag string
+	md   bq.TableMetadataToUpdate
 }
 
 func (f *fakeDestinationAdmin) DatasetMetadata(ctx context.Context) (*bq.DatasetMetadata, error) {
@@ -81,6 +98,13 @@ func (f *fakeDestinationAdmin) CreateDataset(_ context.Context, md *bq.DatasetMe
 
 func (f *fakeDestinationAdmin) TableMetadata(_ context.Context, id string) (*bq.TableMetadata, error) {
 	f.tableReadIDs = append(f.tableReadIDs, id)
+	if sequence := f.tableSequenceByID[id]; len(sequence) > 0 {
+		response := sequence[0]
+		if len(sequence) > 1 {
+			f.tableSequenceByID[id] = sequence[1:]
+		}
+		return response.metadata, response.err
+	}
 	if response, ok := f.tableMetadataByID[id]; ok {
 		return response.metadata, response.err
 	}
@@ -117,6 +141,14 @@ func (f *fakeDestinationAdmin) UpdateTable(_ context.Context, id string, md bq.T
 	}
 	f.updatedTables[id] = md
 	f.updatedETags[id] = etag
+	f.updates = append(f.updates, fakeUpdateCall{id: id, etag: etag, md: md})
+	if sequence := f.updateSequenceByID[id]; len(sequence) > 0 {
+		err := sequence[0]
+		if len(sequence) > 1 {
+			f.updateSequenceByID[id] = sequence[1:]
+		}
+		return err
+	}
 	if err, ok := f.updateErrByID[id]; ok {
 		return err
 	}
@@ -279,7 +311,11 @@ func TestPrepareDestinationCreatesOnlyActiveSignalTableAndView(t *testing.T) {
 	}
 }
 
-func TestPrepareDestinationDoesNotReplaceExistingView(t *testing.T) {
+// An existing table is never replaced, and an existing object under a view's
+// name that is not a view (the fake answers every read with the table's
+// schema-only metadata) is never updated. Stale views are reconciled instead;
+// see TestPrepareDestinationReconcilesExistingViews.
+func TestPrepareDestinationDoesNotReplaceExistingTableOrNonViewObject(t *testing.T) {
 	cfg := validConfig()
 	cfg.AutoCreate.Tables = true
 	admin := &fakeDestinationAdmin{
@@ -296,7 +332,7 @@ func TestPrepareDestinationDoesNotReplaceExistingView(t *testing.T) {
 		t.Fatal("existing table must not be replaced")
 	}
 	if len(admin.updatedTables) > 0 {
-		t.Fatalf("existing views must not be modified, updated = %#v", admin.updatedTables)
+		t.Fatalf("an existing object that is not a view must not be updated, updated = %#v", admin.updatedTables)
 	}
 }
 
@@ -396,8 +432,11 @@ func TestPrepareDestinationRecognizesGRPCProvisioningCodes(t *testing.T) {
 	if err := e.prepareDestination(context.Background(), admin); err != nil {
 		t.Fatalf("gRPC NotFound/AlreadyExists provisioning should be idempotent: %v", err)
 	}
-	if admin.tableReads != 2 {
-		t.Fatalf("table reads = %d, want initial gRPC NotFound and concurrent-winner validation", admin.tableReads)
+	// Three reads: the initial gRPC NotFound, the concurrent-winner
+	// validation, and the read of the existing dedup view that startup
+	// performs so a stale definition can be reconciled.
+	if admin.tableReads != 3 {
+		t.Fatalf("table reads = %d, want initial gRPC NotFound, concurrent-winner validation, and the existing dedup view read", admin.tableReads)
 	}
 }
 
@@ -585,8 +624,10 @@ func TestPrepareDestinationLogsCompanionViewNeedsSpanDedupView(t *testing.T) {
 	}
 }
 
-// Companion views that already exist are preserved as-is (create-only),
-// and any other creation failure fails startup with the view named.
+// An existing companion object that is not a view (the fake answers every read
+// with schema-only metadata) is preserved as-is and never updated; existing
+// views are reconciled in TestPrepareDestinationReconcilesExistingViews. Any
+// other creation failure fails startup with the view named.
 func TestPrepareDestinationCompanionViewCreationResults(t *testing.T) {
 	createErr := status.Error(codes.PermissionDenied, "cannot create view")
 	for _, tc := range []struct {
@@ -645,8 +686,376 @@ func TestPrepareDestinationCompanionViewCreationResults(t *testing.T) {
 			}
 			if tc.wantErr == nil {
 				if len(admin.updatedTables) > 0 {
-					t.Errorf("existing companion views must not be modified in place, updated = %#v", admin.updatedTables)
+					t.Errorf("an existing object that is not a view must not be updated, updated = %#v", admin.updatedTables)
 				}
+			}
+		})
+	}
+}
+
+// A metrics exporter with auto_create.companion_views creates v_gen_ai_metrics
+// over the metric dedup view, after the table and that view. It reads no other
+// signal's view, so it needs no peer probe.
+func TestPrepareDestinationCreatesMetricsCompanionView(t *testing.T) {
+	cfg := companionViewConfig()
+	cfg.Labels = map[string]string{"env": "prod"}
+	cfg.Metrics.Labels = map[string]string{"signal": "metrics"}
+	admin := &fakeDestinationAdmin{datasetMetadata: &bq.DatasetMetadata{}, tableMetadataErr: notFound()}
+	e := newTestSignalExporter(cfg, cfg.Metrics.Table, schema.MetricsTableSchema())
+
+	if err := e.prepareDestination(context.Background(), admin); err != nil {
+		t.Fatal(err)
+	}
+	wantOrder := []string{cfg.Metrics.Table, cfg.Metrics.Table + "_dedup", schema.GenAIMetricsViewName}
+	if !equalStrings(admin.createdTableOrder, wantOrder) {
+		t.Errorf("created %v, want %v", admin.createdTableOrder, wantOrder)
+	}
+	want := fmt.Sprintf(schema.GenAIMetricsViewQuery, "my-project", "otel", cfg.Metrics.Table)
+	md := admin.createdTables[schema.GenAIMetricsViewName]
+	if md == nil || md.ViewQuery != want || md.UseLegacySQL {
+		t.Fatalf("v_gen_ai_metrics = %#v, want the standard-SQL view over the metric dedup view", md)
+	}
+	if !strings.Contains(md.ViewQuery, "`my-project.otel."+cfg.Metrics.Table+"_dedup`") {
+		t.Errorf("v_gen_ai_metrics must read the metric dedup view, got %q", md.ViewQuery)
+	}
+	if wantLabels := map[string]string{"env": "prod", "signal": "metrics"}; !maps.Equal(md.Labels, wantLabels) {
+		t.Errorf("v_gen_ai_metrics labels = %v, want %v", md.Labels, wantLabels)
+	}
+	if !equalStrings(admin.tableReadIDs, []string{cfg.Metrics.Table}) {
+		t.Errorf("table reads = %v, want only the destination table probe", admin.tableReadIDs)
+	}
+}
+
+// reconcileTarget is a view that startup may find already present: a signal's
+// deduplication view or one of its companion views.
+type reconcileTarget struct {
+	name        string
+	table       string
+	tableSchema *storagepb.TableSchema
+	viewID      string
+	// query is the definition this release wants for viewID.
+	query string
+	// peers answers the reads an exporter must pass before it reaches viewID,
+	// such as the span dedup view that v_gen_ai_logs joins.
+	peers map[string]fakeTableMetadataResponse
+}
+
+func reconcileTargets() []reconcileTarget {
+	const project, dataset = "my-project", "otel"
+	return []reconcileTarget{
+		{
+			name: "span dedup view", table: defaultSpansTable, tableSchema: schema.SpansTableSchema(),
+			viewID: defaultSpansTable + "_dedup",
+			query:  fmt.Sprintf(schema.SpansDedupViewQuery, project, dataset, defaultSpansTable),
+		},
+		{
+			name: "log dedup view", table: defaultLogsTable, tableSchema: schema.LogsTableSchema(),
+			viewID: defaultLogsTable + "_dedup",
+			query:  fmt.Sprintf(schema.LogsDedupViewQuery, project, dataset, defaultLogsTable),
+		},
+		{
+			name: "metric dedup view", table: defaultMetricsTable, tableSchema: schema.MetricsTableSchema(),
+			viewID: defaultMetricsTable + "_dedup",
+			query:  fmt.Sprintf(schema.MetricsDedupViewQuery, project, dataset, defaultMetricsTable),
+		},
+		{
+			name: "span companion view", table: defaultSpansTable, tableSchema: schema.SpansTableSchema(),
+			viewID: schema.GenAISpansViewName,
+			query:  fmt.Sprintf(schema.GenAISpansViewQuery, project, dataset, defaultSpansTable),
+		},
+		{
+			name: "log companion view", table: defaultLogsTable, tableSchema: schema.LogsTableSchema(),
+			viewID: schema.GenAILogsViewName,
+			query:  fmt.Sprintf(schema.GenAILogsViewQuery, project, dataset, defaultLogsTable, defaultSpansTable),
+			peers: map[string]fakeTableMetadataResponse{
+				defaultSpansTable + "_dedup": {metadata: &bq.TableMetadata{Type: bq.ViewTable}},
+			},
+		},
+		{
+			name: "metric companion view", table: defaultMetricsTable, tableSchema: schema.MetricsTableSchema(),
+			viewID: schema.GenAIMetricsViewName,
+			query:  fmt.Sprintf(schema.GenAIMetricsViewQuery, project, dataset, defaultMetricsTable),
+		},
+	}
+}
+
+// A view that already exists is reconciled to the current definition, so a
+// collector upgraded to a release with newer view SQL replaces the stale
+// definition on its next start. Only the query changes, and nothing is written
+// when the view is already current. A view that cannot be read, is not a view,
+// or cannot be updated is kept as it is with a warning, since a view must not
+// block export; a context error fails startup like every other metadata call.
+func TestPrepareDestinationReconcilesExistingViews(t *testing.T) {
+	const (
+		msgReplaced   = "replaced the stale view definition with this release's"
+		msgNotAView   = "existing object is not a view; leaving it as it is"
+		msgUnreadable = "existing view is unreadable; leaving it as it is"
+		msgNotUpdated = "view definition differs from this release's but could not be updated; leaving it as it is"
+		stale         = "SELECT 1 AS stale"
+		concurrent    = "SELECT 2 AS changed_concurrently"
+	)
+	view := func(query, etag string) fakeTableMetadataResponse {
+		return fakeTableMetadataResponse{metadata: &bq.TableMetadata{
+			Type: bq.ViewTable, ViewQuery: query, ETag: etag,
+		}}
+	}
+	readFails := func(err error) fakeTableMetadataResponse { return fakeTableMetadataResponse{err: err} }
+	reads := func(responses ...fakeTableMetadataResponse) func(string) []fakeTableMetadataResponse {
+		return func(string) []fakeTableMetadataResponse { return responses }
+	}
+	preconditionFailed := &googleapi.Error{Code: stdhttp.StatusPreconditionFailed, Message: "Precondition Failed"}
+	rejectedQuery := &googleapi.Error{Code: stdhttp.StatusBadRequest, Message: "Unrecognized name: removed_column"}
+
+	scenarios := []struct {
+		name string
+		// reads are the successive answers to reading the existing view; the
+		// wanted definition is passed in for the ones that depend on it.
+		reads func(want string) []fakeTableMetadataResponse
+		// updates are the results of successive updates of the view.
+		updates []error
+		// wantETags are the ETags the updates must carry, in order.
+		wantETags    []string
+		wantErr      error
+		wantReplaced bool
+		wantWarn     string
+	}{
+		{
+			name: "current definition is left alone",
+			reads: func(want string) []fakeTableMetadataResponse {
+				return []fakeTableMetadataResponse{view(want, "etag-1")}
+			},
+		},
+		{
+			name: "whitespace-only difference is left alone",
+			reads: func(want string) []fakeTableMetadataResponse {
+				return []fakeTableMetadataResponse{view(strings.Join(strings.Fields(want), "\n"), "etag-1")}
+			},
+		},
+		{
+			name:         "stale definition is replaced",
+			reads:        reads(view(stale, "etag-1")),
+			wantETags:    []string{"etag-1"},
+			wantReplaced: true,
+		},
+		{
+			name: "legacy SQL view with the current text is replaced",
+			reads: func(want string) []fakeTableMetadataResponse {
+				legacy := view(want, "etag-1")
+				legacy.metadata.UseLegacySQL = true
+				return []fakeTableMetadataResponse{legacy}
+			},
+			wantETags:    []string{"etag-1"},
+			wantReplaced: true,
+		},
+		{
+			name: "object that is not a view is left alone",
+			reads: reads(fakeTableMetadataResponse{
+				metadata: &bq.TableMetadata{Type: bq.RegularTable, ETag: "etag-1"},
+			}),
+			wantWarn: msgNotAView,
+		},
+		{
+			name:     "unreadable view is left alone",
+			reads:    reads(readFails(forbidden())),
+			wantWarn: msgUnreadable,
+		},
+		{
+			name:    "read that runs out of time fails startup",
+			reads:   reads(readFails(context.DeadlineExceeded)),
+			wantErr: context.DeadlineExceeded,
+		},
+		{
+			name:      "update that is refused is tolerated",
+			reads:     reads(view(stale, "etag-1")),
+			updates:   []error{forbidden()},
+			wantETags: []string{"etag-1"},
+			wantWarn:  msgNotUpdated,
+		},
+		{
+			name:      "update that rejects the query is tolerated",
+			reads:     reads(view(stale, "etag-1")),
+			updates:   []error{rejectedQuery},
+			wantETags: []string{"etag-1"},
+			wantWarn:  msgNotUpdated,
+		},
+		{
+			name:      "update that is canceled fails startup",
+			reads:     reads(view(stale, "etag-1")),
+			updates:   []error{context.Canceled},
+			wantETags: []string{"etag-1"},
+			wantErr:   context.Canceled,
+		},
+		{
+			name: "concurrent collector that already replaced it wins",
+			reads: func(want string) []fakeTableMetadataResponse {
+				return []fakeTableMetadataResponse{view(stale, "etag-1"), view(want, "etag-2")}
+			},
+			updates:   []error{preconditionFailed},
+			wantETags: []string{"etag-1"},
+		},
+		{
+			name:         "concurrent change is retried once with the fresh ETag",
+			reads:        reads(view(stale, "etag-1"), view(concurrent, "etag-2")),
+			updates:      []error{preconditionFailed, nil},
+			wantETags:    []string{"etag-1", "etag-2"},
+			wantReplaced: true,
+		},
+		{
+			name:      "second precondition failure is tolerated",
+			reads:     reads(view(stale, "etag-1"), view(concurrent, "etag-2")),
+			updates:   []error{preconditionFailed, preconditionFailed},
+			wantETags: []string{"etag-1", "etag-2"},
+			wantWarn:  msgNotUpdated,
+		},
+		{
+			name:      "read that fails after a precondition failure is tolerated",
+			reads:     reads(view(stale, "etag-1"), readFails(forbidden())),
+			updates:   []error{preconditionFailed},
+			wantETags: []string{"etag-1"},
+			wantWarn:  msgUnreadable,
+		},
+	}
+
+	for _, target := range reconcileTargets() {
+		for _, sc := range scenarios {
+			t.Run(target.name+"/"+sc.name, func(t *testing.T) {
+				cfg := companionViewConfig()
+				core, logs := observer.New(zap.InfoLevel)
+				e := newSignalExporter(
+					component.TelemetrySettings{Logger: zap.New(core)}, cfg, target.table, target.tableSchema)
+				admin := &fakeDestinationAdmin{
+					datasetMetadata:    &bq.DatasetMetadata{},
+					tableMetadataErr:   notFound(),
+					tableMetadataByID:  maps.Clone(target.peers),
+					tableSequenceByID:  map[string][]fakeTableMetadataResponse{target.viewID: sc.reads(target.query)},
+					createErrByID:      map[string]error{target.viewID: alreadyExists()},
+					updateSequenceByID: map[string][]error{target.viewID: sc.updates},
+				}
+				viewName := "my-project.otel." + target.viewID
+
+				err := e.prepareDestination(context.Background(), admin)
+				switch {
+				case sc.wantErr == nil && err != nil:
+					t.Fatalf("prepareDestination = %v, want startup to succeed", err)
+				case sc.wantErr != nil && !errors.Is(err, sc.wantErr):
+					t.Fatalf("prepareDestination = %v, want %v", err, sc.wantErr)
+				case sc.wantErr != nil && !strings.Contains(err.Error(), viewName):
+					t.Errorf("error %q must name the view %q", err, viewName)
+				}
+
+				wantUpdate := bq.TableMetadataToUpdate{ViewQuery: target.query, UseLegacySQL: false}
+				var etags []string
+				for _, u := range admin.updates {
+					etags = append(etags, u.etag)
+					if u.id != target.viewID || !reflect.DeepEqual(u.md, wantUpdate) {
+						t.Errorf("update of %s = %#v, want only the query and standard SQL of %s", u.id, u.md, target.viewID)
+					}
+				}
+				if !equalStrings(etags, sc.wantETags) {
+					t.Errorf("update ETags = %v, want %v", etags, sc.wantETags)
+				}
+
+				if got := logs.FilterMessage(msgReplaced).Len(); (got == 1) != sc.wantReplaced || got > 1 {
+					t.Errorf("%d %q notices, want one: %v", got, msgReplaced, sc.wantReplaced)
+				}
+				warnings := logs.FilterLevelExact(zap.WarnLevel).All()
+				switch {
+				case sc.wantWarn == "" && len(warnings) != 0:
+					t.Errorf("warnings = %v, want none", warnings)
+				case sc.wantWarn != "" && (len(warnings) != 1 ||
+					warnings[0].Message != sc.wantWarn || warnings[0].ContextMap()["view"] != viewName):
+					t.Errorf("warnings = %v, want one %q about %s", warnings, sc.wantWarn, viewName)
+				}
+			})
+		}
+	}
+}
+
+// A rollup view whose creation fails is tolerated only after a companion view
+// it may depend on was preserved as it is: one that could not be read or
+// updated, or that is not a view. A view reconciled to the current definition
+// is not preserved, so a rollup failure after it fails startup, and a context
+// error fails startup either way.
+func TestPrepareDestinationRollupFailureToleranceFollowsPreservedViews(t *testing.T) {
+	rollupErr := status.Error(codes.InvalidArgument, "column not found in underlying view")
+	spansQuery := fmt.Sprintf(schema.GenAISpansViewQuery, "my-project", "otel", defaultSpansTable)
+	view := func(query string) fakeTableMetadataResponse {
+		return fakeTableMetadataResponse{metadata: &bq.TableMetadata{Type: bq.ViewTable, ViewQuery: query, ETag: "etag-1"}}
+	}
+	for _, tc := range []struct {
+		name        string
+		spansView   fakeTableMetadataResponse
+		updateErr   error
+		rollupErr   error
+		wantErr     error
+		wantSkipped bool
+	}{
+		{
+			name:        "stale span view that cannot be updated",
+			spansView:   view("SELECT 1 AS stale"),
+			updateErr:   forbidden(),
+			rollupErr:   rollupErr,
+			wantSkipped: true,
+		},
+		{
+			name: "span object that is not a view",
+			spansView: fakeTableMetadataResponse{
+				metadata: &bq.TableMetadata{Type: bq.RegularTable},
+			},
+			rollupErr:   rollupErr,
+			wantSkipped: true,
+		},
+		{
+			name:      "stale span view that is replaced",
+			spansView: view("SELECT 1 AS stale"),
+			rollupErr: rollupErr,
+			wantErr:   rollupErr,
+		},
+		{
+			name:      "current span view",
+			spansView: view(spansQuery),
+			rollupErr: rollupErr,
+			wantErr:   rollupErr,
+		},
+		{
+			name: "context error is never tolerated",
+			spansView: fakeTableMetadataResponse{
+				metadata: &bq.TableMetadata{Type: bq.RegularTable},
+			},
+			rollupErr: context.DeadlineExceeded,
+			wantErr:   context.DeadlineExceeded,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := companionViewConfig()
+			core, logs := observer.New(zap.WarnLevel)
+			e := newSignalExporter(
+				component.TelemetrySettings{Logger: zap.New(core)}, cfg, cfg.Traces.Table, schema.SpansTableSchema())
+			admin := &fakeDestinationAdmin{
+				datasetMetadata:   &bq.DatasetMetadata{},
+				tableMetadataErr:  notFound(),
+				tableMetadataByID: map[string]fakeTableMetadataResponse{schema.GenAISpansViewName: tc.spansView},
+				createErrByID: map[string]error{
+					schema.GenAISpansViewName:      alreadyExists(),
+					schema.GenAIModelCostsViewName: tc.rollupErr,
+				},
+				updateErrByID: map[string]error{schema.GenAISpansViewName: tc.updateErr},
+			}
+
+			err := e.prepareDestination(context.Background(), admin)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tc.wantErr)
+			}
+			rollupName := "my-project.otel." + schema.GenAIModelCostsViewName
+			if tc.wantErr != nil && !strings.Contains(err.Error(), rollupName) {
+				t.Errorf("error %q must name the rollup view %q", err, rollupName)
+			}
+			skipped := logs.FilterMessage("skipping rollup view creation over preserved companion view").Len()
+			if (skipped == 1) != tc.wantSkipped || skipped > 1 {
+				t.Errorf("%d skipped-rollup warnings, want one: %v", skipped, tc.wantSkipped)
+			}
+			if tc.wantSkipped && admin.createdTables[schema.GenAISessionsViewName] == nil {
+				t.Error("the rollup views after the skipped one must still be created")
 			}
 		})
 	}

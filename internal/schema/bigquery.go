@@ -158,6 +158,20 @@ func CompanionViewsMetadata(
 	}
 }
 
+// MetricsCompanionViewsMetadata builds the optional companion views of the
+// metrics signal, keyed by view name. There is one, v_gen_ai_metrics, which
+// reads the metric dedup view of metricsTable and never the raw table. It is
+// separate from CompanionViewsMetadata because it depends on the metrics table
+// alone and none of the span or log views.
+func MetricsCompanionViewsMetadata(project, dataset, metricsTable string) map[string]*bq.TableMetadata {
+	return map[string]*bq.TableMetadata{
+		GenAIMetricsViewName: {
+			ViewQuery:    fmt.Sprintf(GenAIMetricsViewQuery, project, dataset, metricsTable),
+			UseLegacySQL: false,
+		},
+	}
+}
+
 // ReconcileAdditiveSchema appends any NULLABLE or REPEATED fields present in
 // want but missing from existing (both at top level and inside RECORD fields).
 // Required fields missing from existing are not added because BigQuery does

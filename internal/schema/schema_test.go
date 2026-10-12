@@ -5,6 +5,7 @@ package schema
 
 import (
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -131,12 +132,13 @@ func TestSpanDedupOrdersOnRawNanos(t *testing.T) {
 }
 
 // The span dedup window must partition on the full span identity, led by the
-// partitioning and clustering columns so a filter on them still prunes when
-// pushed below the window function.
+// partitioning column and followed by every clustering and search-index
+// column, so a filter on any of them still prunes when pushed below the window
+// function.
 func TestSpanDedupWindow(t *testing.T) {
 	query := strings.Join(strings.Fields(SpansDedupViewQuery), " ")
 	want := "QUALIFY ROW_NUMBER() OVER ( " +
-		"PARTITION BY start_time, service_name, trace_id, span_id " +
+		"PARTITION BY start_time, service_name, trace_id, span_id, name " +
 		"ORDER BY end_time_unix_nano DESC, receive_time_unix_nano DESC ) = 1"
 	if !strings.Contains(query, want) {
 		t.Errorf("span dedup window = %q, want it to contain %q", query, want)
@@ -144,17 +146,18 @@ func TestSpanDedupWindow(t *testing.T) {
 }
 
 // The log dedup window must partition on the full record identity as
-// separate columns, led by the partitioning and clustering columns so a
-// filter on them still prunes when pushed below the window function. It must
-// never flatten the identity into one string: CONCAT(log_name, '/', id) would
-// collide ('a/b', 'c') with ('a', 'b/c').
+// separate columns, led by the partitioning column and followed by every
+// clustering and search-index column, so a filter on any of them still prunes
+// when pushed below the window function. It must never flatten the identity
+// into one string: CONCAT(log_name, '/', id) would collide ('a/b', 'c') with
+// ('a', 'b/c').
 func TestLogDedupWindow(t *testing.T) {
 	if strings.Contains(LogsDedupViewDDL, "CONCAT(") {
 		t.Fatal("log dedup must not concatenate identity columns into one partition key")
 	}
 	query := strings.Join(strings.Fields(LogsDedupViewQuery), " ")
 	want := "QUALIFY ROW_NUMBER() OVER ( " +
-		"PARTITION BY timestamp, time_unix_nano, service_name, log_name, insert_id " +
+		"PARTITION BY timestamp, time_unix_nano, service_name, trace_id, span_id, severity_number, log_name, insert_id " +
 		"ORDER BY receive_time_unix_nano DESC ) = 1"
 	if !strings.Contains(query, want) {
 		t.Errorf("log dedup window = %q, want it to contain %q", query, want)
@@ -232,7 +235,7 @@ func TestDedupViewsMatchPublishedContract(t *testing.T) {
 			ddl:   SpansDedupViewDDL,
 			table: "otel_spans",
 			wantQuery: "SELECT * FROM `proj.ds.otel_spans` QUALIFY ROW_NUMBER() OVER ( " +
-				"PARTITION BY start_time, service_name, trace_id, span_id " +
+				"PARTITION BY start_time, service_name, trace_id, span_id, name " +
 				"ORDER BY end_time_unix_nano DESC, receive_time_unix_nano DESC ) = 1",
 		},
 		{
@@ -241,7 +244,7 @@ func TestDedupViewsMatchPublishedContract(t *testing.T) {
 			ddl:   LogsDedupViewDDL,
 			table: "otel_logs",
 			wantQuery: "SELECT * FROM `proj.ds.otel_logs` QUALIFY ROW_NUMBER() OVER ( " +
-				"PARTITION BY timestamp, time_unix_nano, service_name, log_name, insert_id " +
+				"PARTITION BY timestamp, time_unix_nano, service_name, trace_id, span_id, severity_number, log_name, insert_id " +
 				"ORDER BY receive_time_unix_nano DESC ) = 1",
 		},
 		{
@@ -250,7 +253,7 @@ func TestDedupViewsMatchPublishedContract(t *testing.T) {
 			ddl:   MetricsDedupViewDDL,
 			table: "otel_metrics",
 			wantQuery: "SELECT * FROM `proj.ds.otel_metrics` QUALIFY ROW_NUMBER() OVER ( " +
-				"PARTITION BY timestamp, time_unix_nano, service_name, metric_name, point_fingerprint " +
+				"PARTITION BY timestamp, time_unix_nano, service_name, metric_name, metric_type, point_fingerprint " +
 				"ORDER BY receive_time_unix_nano DESC ) = 1",
 		},
 	} {
@@ -264,6 +267,169 @@ func TestDedupViewsMatchPublishedContract(t *testing.T) {
 				t.Errorf("dedup view DDL = %q, want it to start with %q", ddl, want)
 			}
 		})
+	}
+}
+
+// accessPaths are the columns a base table is physically organized by: the
+// column it is partitioned on, the columns it is clustered on, and the
+// columns of its trace lookup search index.
+type accessPaths struct {
+	partition string
+	cluster   []string
+	index     []string
+	indexAll  bool // the index covers ALL COLUMNS instead of a column list
+}
+
+var (
+	partitionByRE = regexp.MustCompile(`(?m)^PARTITION BY \w+\((\w+)(?:, \w+)?\)$`)
+	clusterByRE   = regexp.MustCompile(`(?m)^CLUSTER BY ([\w, ]+);$`)
+	searchIndexRE = regexp.MustCompile(`\(([\w, ]+)\) OPTIONS \(analyzer`)
+	windowKeysRE  = regexp.MustCompile(`(?s)PARTITION BY\s+(.+?)\s+ORDER BY`)
+)
+
+// parseAccessPaths reads the partitioning, clustering and search-index
+// columns out of a table DDL and the DDL of its search index, both formatted
+// for one table.
+func parseAccessPaths(tableDDL, indexDDL string) (accessPaths, error) {
+	var paths accessPaths
+	m := partitionByRE.FindStringSubmatch(tableDDL)
+	if m == nil {
+		return paths, fmt.Errorf("no PARTITION BY clause in\n%s", tableDDL)
+	}
+	paths.partition = m[1]
+	if m = clusterByRE.FindStringSubmatch(tableDDL); m == nil {
+		return paths, fmt.Errorf("no CLUSTER BY clause in\n%s", tableDDL)
+	}
+	paths.cluster = splitColumns(m[1])
+	if m = searchIndexRE.FindStringSubmatch(indexDDL); m == nil {
+		return paths, fmt.Errorf("no indexed column list in\n%s", indexDDL)
+	}
+	if m[1] == "ALL COLUMNS" {
+		paths.indexAll = true
+	} else {
+		paths.index = splitColumns(m[1])
+	}
+	return paths, nil
+}
+
+func splitColumns(list string) []string {
+	var cols []string
+	for _, col := range strings.Split(list, ",") {
+		cols = append(cols, strings.TrimSpace(col))
+	}
+	return cols
+}
+
+// windowKeys returns the PARTITION BY columns of the window function in a
+// dedup view query.
+func windowKeys(viewQuery string) ([]string, error) {
+	m := windowKeysRE.FindStringSubmatch(viewQuery)
+	if m == nil {
+		return nil, fmt.Errorf("no PARTITION BY ... ORDER BY window in\n%s", viewQuery)
+	}
+	return splitColumns(m[1]), nil
+}
+
+// uncoveredAccessPaths lists the partitioning, clustering and search-index
+// columns that a dedup window does not partition on.
+func uncoveredAccessPaths(window []string, paths accessPaths) []string {
+	var missing []string
+	for _, col := range slices.Concat([]string{paths.partition}, paths.cluster, paths.index) {
+		if !slices.Contains(window, col) && !slices.Contains(missing, col) {
+			missing = append(missing, col)
+		}
+	}
+	return missing
+}
+
+// BigQuery pushes a filter below a window function only when the filter refers
+// to PARTITION BY columns. Each dedup view must therefore partition on every
+// column its base table is partitioned, clustered or search-indexed on, or a
+// filter on a column it leaves out is applied only after the whole table has
+// been scanned. The access paths are read out of the table DDLs instead of
+// being repeated here, so adding a clustering column to a table without adding
+// it to the dedup view fails this test.
+//
+// The metrics search index covers ALL COLUMNS, which adds no key: the exemplar
+// trace_id and span_id it serves sit inside a repeated field, and a repeated
+// field cannot be a PARTITION BY key.
+func TestDedupWindowsCoverBaseTableAccessPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		tableDDL string
+		indexDDL string
+		view     string
+		contract *storagepb.TableSchema
+	}{
+		{"spans", SpansDDL, SpansSearchIndexDDL, SpansDedupViewQuery, SpansTableSchema()},
+		{"logs", LogsDDL, LogsSearchIndexDDL, LogsDedupViewQuery, LogsTableSchema()},
+		{"metrics", MetricsDDL, MetricsSearchIndexDDL, MetricsDedupViewQuery, MetricsTableSchema()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			format := func(tmpl string) string { return fmt.Sprintf(tmpl, "proj", "ds", "tbl") }
+			paths, err := parseAccessPaths(format(tc.tableDDL), format(tc.indexDDL))
+			if err != nil {
+				t.Fatal(err)
+			}
+			window, err := windowKeys(format(tc.view))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// A parse that found nothing would make the coverage check pass
+			// vacuously.
+			if paths.partition == "" || len(paths.cluster) == 0 || (len(paths.index) == 0 && !paths.indexAll) || len(window) == 0 {
+				t.Fatalf("access paths %+v and window %v must all be non-empty", paths, window)
+			}
+			if missing := uncoveredAccessPaths(window, paths); len(missing) > 0 {
+				t.Errorf("dedup window %v does not partition on %v, so a filter on them is not pushed below it (table access paths %+v)",
+					window, missing, paths)
+			}
+			inTable := map[string]bool{}
+			for _, name := range FieldNames(tc.contract) {
+				inTable[name] = true
+			}
+			for _, key := range window {
+				if !inTable[key] {
+					t.Errorf("window key %q is not a column of the table", key)
+				}
+			}
+			// The exporter creates the table from the metadata API, not from
+			// the DDL, so the two must organize it the same way.
+			md, _, err := DestinationMetadata(tc.contract, "proj", "ds", "tbl")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if md.TimePartitioning.Field != paths.partition || !slices.Equal(md.Clustering.Fields, paths.cluster) {
+				t.Errorf("table metadata partitions on %q and clusters on %v, the DDL on %q and %v",
+					md.TimePartitioning.Field, md.Clustering.Fields, paths.partition, paths.cluster)
+			}
+		})
+	}
+}
+
+// The coverage check must not be able to pass vacuously: a window that drops
+// any partitioning, clustering or search-index column has to be reported.
+func TestDedupWindowCoverageDetectsAMissingKey(t *testing.T) {
+	format := func(tmpl string) string { return fmt.Sprintf(tmpl, "proj", "ds", "tbl") }
+	paths, err := parseAccessPaths(format(SpansDDL), format(SpansSearchIndexDDL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	full, err := windowKeys(format(SpansDedupViewQuery))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if missing := uncoveredAccessPaths(full, paths); len(missing) != 0 {
+		t.Fatalf("the published span window leaves %v uncovered", missing)
+	}
+	for _, drop := range []string{"start_time", "service_name", "trace_id", "name", "span_id"} {
+		window := slices.DeleteFunc(slices.Clone(full), func(key string) bool { return key == drop })
+		if len(window) != len(full)-1 {
+			t.Fatalf("the span window %v does not contain %q", full, drop)
+		}
+		if missing := uncoveredAccessPaths(window, paths); !slices.Equal(missing, []string{drop}) {
+			t.Errorf("a window without %q reports %v as uncovered, want [%s]", drop, missing, drop)
+		}
 	}
 }
 
@@ -341,8 +507,20 @@ func TestCompanionViewTemplates(t *testing.T) {
 			args:  []any{"proj", "ds", "logs_tbl", "spans_tbl"},
 			sources: []string{
 				"FROM `proj.ds.logs_tbl_dedup` l",
-				"LEFT JOIN `proj.ds.spans_tbl_dedup` s USING (service_name, trace_id, span_id)",
+				"LEFT JOIN `proj.ds.spans_tbl_dedup` s " +
+					"ON l.trace_id = s.trace_id AND l.span_id = s.span_id " +
+					"AND l.service_name IS NOT DISTINCT FROM s.service_name " +
+					"AND s.start_time BETWEEN TIMESTAMP_SUB(l.timestamp, INTERVAL 24 HOUR) " +
+					"AND TIMESTAMP_ADD(l.timestamp, INTERVAL 1 HOUR)",
 			},
+		},
+		{
+			name:    "gen_ai_metrics",
+			view:    "v_gen_ai_metrics",
+			query:   GenAIMetricsViewQuery,
+			ddl:     GenAIMetricsViewDDL,
+			args:    []any{"proj", "ds", "metrics_tbl"},
+			sources: []string{"FROM `proj.ds.metrics_tbl_dedup`"},
 		},
 		{
 			name:    "gen_ai_model_costs",
@@ -412,17 +590,190 @@ func TestGenAILogsViewMatchesGenAIEventNamePrefix(t *testing.T) {
 	}
 }
 
+var attributeKeyRE = regexp.MustCompile(`(?:(\w+)\.)?attributes(?:, '\$\."([^"]+)"'|\['([^']+)'\])`)
+
+// attributeKeys lists the attribute keys an expression reads, in order. A key
+// read through a table alias is prefixed with it, so "s:gen_ai.system" is the
+// key of the span a log record joins.
+func attributeKeys(expr string) []string {
+	var keys []string
+	for _, m := range attributeKeyRE.FindAllStringSubmatch(expr, -1) {
+		key := m[2]
+		if key == "" {
+			key = m[3]
+		}
+		if m[1] != "" {
+			key = m[1] + ":" + key
+		}
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+// projectionExprs maps each column a view projects to the expression that
+// produces it.
+func projectionExprs(t *testing.T, tmpl string, args ...any) map[string]string {
+	t.Helper()
+	items, err := selectList(fmt.Sprintf(tmpl, args...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	exprs := make(map[string]string, len(items))
+	for _, item := range items {
+		exprs[item.alias] = item.expr
+	}
+	return exprs
+}
+
+func normalizeSQL(sql string) string {
+	return strings.Join(strings.Fields(sql), " ")
+}
+
+// The reasoning token count arrives under gen_ai.usage.reasoning.output_tokens
+// and, from earlier instrumentation, under gen_ai.usage.reasoning_tokens, and
+// the current key must win. error.type is promoted for failure breakdowns.
+func TestGenAISpansViewPromotesReasoningTokensAndErrorType(t *testing.T) {
+	exprs := projectionExprs(t, GenAISpansViewQuery, "proj", "ds", "spans")
+	for col, want := range map[string][]string{
+		"gen_ai_usage_reasoning_tokens": {"gen_ai.usage.reasoning.output_tokens", "gen_ai.usage.reasoning_tokens"},
+		"error_type":                    {"error.type"},
+	} {
+		if got := attributeKeys(exprs[col]); !slices.Equal(got, want) {
+			t.Errorf("v_gen_ai_spans.%s reads %v, want %v", col, got, want)
+		}
+	}
+}
+
+// A log record and the span it belongs to describe one operation, so the
+// system, the agent name, the session and the user come out of the same
+// attribute keys, in the same order, as the columns of the span view with
+// those names: the record's own attributes first, then the span's.
+func TestGenAILogsViewAlignsWithGenAISpansView(t *testing.T) {
+	spans := projectionExprs(t, GenAISpansViewQuery, "proj", "ds", "spans")
+	logs := projectionExprs(t, GenAILogsViewQuery, "proj", "ds", "logs", "spans")
+	for _, col := range []string{"gen_ai_system", "gen_ai_agent_name", "adk_session_id", "adk_user_id"} {
+		keys := attributeKeys(spans[col])
+		if len(keys) < 2 {
+			t.Fatalf("v_gen_ai_spans.%s reads %v; expected a chain of attribute keys", col, keys)
+		}
+		var want []string
+		for _, alias := range []string{"l", "s"} {
+			for _, key := range keys {
+				want = append(want, alias+":"+key)
+			}
+		}
+		if got := attributeKeys(logs[col]); !slices.Equal(got, want) {
+			t.Errorf("v_gen_ai_logs.%s reads %v, want the keys of v_gen_ai_spans.%s first from the record, then from the span: %v",
+				col, got, col, want)
+		}
+	}
+}
+
+// v_gen_ai_model_costs and v_gen_ai_sessions must decide what an LLM call is,
+// and which spans have token-reporting children, by one rule. Otherwise the
+// call counts of the two views disagree.
+func TestRollupViewsShareTheTokenParentsRule(t *testing.T) {
+	cte := normalizeSQL(fmt.Sprintf(genAITokenParentsCTE, "proj", "ds"))
+	for _, tc := range []struct {
+		name  string
+		query string
+	}{
+		{"gen_ai_model_costs", GenAIModelCostsViewQuery},
+		{"gen_ai_sessions", GenAISessionsViewQuery},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			query := normalizeSQL(fmt.Sprintf(tc.query, "proj", "ds"))
+			if !strings.HasPrefix(query, "WITH "+cte) {
+				t.Errorf("query must open with the shared token_parents CTE:\n%s\nwant prefix\nWITH %s", query, cte)
+			}
+			if !strings.Contains(query, normalizeSQL(genAILLMCallPredicate)) {
+				t.Errorf("query must apply the shared LLM call predicate:\n%s", query)
+			}
+			if !strings.Contains(query, "LEFT JOIN token_parents AS tp ON tp.trace_id = s.trace_id AND tp.span_id = s.span_id") {
+				t.Errorf("query must left-join the token parents on trace_id and span_id:\n%s", query)
+			}
+		})
+	}
+	if !strings.HasPrefix(cte, "token_parents AS ( SELECT DISTINCT trace_id, parent_span_id AS span_id FROM `proj.ds.v_gen_ai_spans`") {
+		t.Errorf("token_parents must list the parents of spans in v_gen_ai_spans, got %q", cte)
+	}
+}
+
+// A session is one row for each service, UTC date of its spans' start times
+// and session ID, so a filter on a grouping key reaches the span scan. Token
+// totals count only spans without token-reporting children, which keeps a
+// parent span from adding what its children already reported.
+func TestGenAISessionsViewGrainAndTokenRule(t *testing.T) {
+	query := normalizeSQL(fmt.Sprintf(GenAISessionsViewQuery, "proj", "ds"))
+	for _, want := range []string{
+		"DATE(s.start_time) AS session_start_date",
+		"GROUP BY service_name, session_start_date, session_id",
+	} {
+		if !strings.Contains(query, want) {
+			t.Errorf("sessions view must contain %q, got %q", want, query)
+		}
+	}
+	if strings.Contains(query, "ANY_VALUE(service_name)") {
+		t.Error("service_name is a grouping key of the sessions view, not an ANY_VALUE aggregate")
+	}
+	exprs := projectionExprs(t, GenAISessionsViewQuery, "proj", "ds")
+	for _, col := range []string{
+		"total_input_tokens", "total_output_tokens", "total_cache_read_input_tokens",
+		"total_cache_creation_input_tokens", "total_reasoning_tokens",
+	} {
+		if !strings.HasPrefix(exprs[col], "SUM(IF(is_token_leaf, COALESCE(") {
+			t.Errorf("sessions %s = %q, want a sum over token leaf spans only", col, exprs[col])
+		}
+	}
+	for col, want := range map[string]string{
+		"llm_call_count":         "COUNTIF(is_llm_call)",
+		"agent_invocation_count": "COUNTIF(gen_ai_operation_name = 'invoke_agent')",
+	} {
+		if exprs[col] != want {
+			t.Errorf("sessions %s = %q, want %q", col, exprs[col], want)
+		}
+	}
+}
+
+// v_gen_ai_metrics keeps only the gen_ai.* instruments, and the LIKE
+// pattern's percent sign is doubled in the source because the template goes
+// through fmt.Sprintf, so the formatted view must carry exactly one.
+func TestGenAIMetricsView(t *testing.T) {
+	query := strings.TrimSpace(fmt.Sprintf(GenAIMetricsViewQuery, "proj", "ds", "metrics_tbl"))
+	if !strings.HasSuffix(query, "\nWHERE metric_name LIKE 'gen_ai.%'") {
+		t.Errorf("v_gen_ai_metrics must end by matching metric names by the gen_ai. prefix, got:\n%s", query)
+	}
+	if strings.Contains(query, "%%") {
+		t.Errorf("formatted v_gen_ai_metrics still has an escaped percent sign:\n%s", query)
+	}
+	exprs := projectionExprs(t, GenAIMetricsViewQuery, "proj", "ds", "metrics_tbl")
+	for col, want := range map[string][]string{
+		"gen_ai_system":         {"gen_ai.system", "gen_ai.provider.name"},
+		"gen_ai_provider_name":  {"gen_ai.provider.name"},
+		"gen_ai_operation_name": {"gen_ai.operation.name"},
+		"gen_ai_request_model":  {"gen_ai.request.model"},
+		"gen_ai_response_model": {"gen_ai.response.model"},
+		"gen_ai_token_type":     {"gen_ai.token.type"},
+		"error_type":            {"error.type"},
+	} {
+		if got := attributeKeys(exprs[col]); !slices.Equal(got, want) {
+			t.Errorf("v_gen_ai_metrics.%s reads %v, want %v", col, got, want)
+		}
+	}
+}
+
 // The companion views are published layouts that queries pin against, so
 // compare every projected column, in order. A column passed through unchanged
 // must exist in the contract of the table it comes from, or BigQuery rejects
-// the view when it is created.
+// the view when it is created. The rollup views read another view rather than
+// a table, so they have no contract and only their projection is compared.
 func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		query     string
 		args      []any
-		contract  *storagepb.TableSchema
-		qualifier string // table alias every passed-through column must use
+		contract  *storagepb.TableSchema // nil for a view over another view
+		qualifier string                 // table alias every passed-through column must use
 		want      []string
 	}{
 		{
@@ -446,8 +797,9 @@ func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 			args:     []any{"proj", "ds", "spans"},
 			contract: SpansTableSchema(),
 			// 29 identity, timing and promoted columns, the six raw columns
-			// kept for anything not promoted, then the 15 OTel GenAI
-			// v1.37+/v1.40+ promoted columns.
+			// kept for anything not promoted, the 15 OTel GenAI
+			// v1.37+/v1.40+ promoted columns, then error_type, which was
+			// appended last so that no earlier column moved.
 			want: []string{
 				"start_time", "end_time", "duration_nano", "duration_ms",
 				"trace_id", "span_id", "parent_span_id", "service_name",
@@ -464,6 +816,7 @@ func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 				"gen_ai_output_type", "gen_ai_tool_type", "gen_ai_tool_description",
 				"gen_ai_agent_description", "gen_ai_agent_parent_id", "gen_ai_data_source_id",
 				"gen_ai_evaluation_name", "gen_ai_evaluation_score",
+				"error_type",
 			},
 		},
 		{
@@ -482,6 +835,58 @@ func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 				"body", "payload_refs", "attributes", "resource", "instrumentation_scope",
 			},
 		},
+		{
+			name:     "gen_ai_metrics",
+			query:    GenAIMetricsViewQuery,
+			args:     []any{"proj", "ds", "metrics"},
+			contract: MetricsTableSchema(),
+			// 36 columns: the metric identity, seven promoted GenAI
+			// attributes, every point-value column of the table, and the
+			// raw attribute, resource and scope bags.
+			want: []string{
+				"timestamp", "start_time", "receive_time", "service_name",
+				"metric_name", "metric_description", "metric_unit", "metric_type",
+				"aggregation_temporality", "is_monotonic",
+				"gen_ai_operation_name", "gen_ai_system", "gen_ai_provider_name",
+				"gen_ai_request_model", "gen_ai_response_model", "gen_ai_token_type", "error_type",
+				"value_type", "value_double", "value_int64",
+				"count", "sum", "min", "max", "explicit_bounds", "bucket_counts",
+				"exp_scale", "exp_zero_count", "exp_zero_threshold", "exp_positive", "exp_negative",
+				"summary_quantiles", "exemplars",
+				"attributes", "resource", "instrumentation_scope",
+			},
+		},
+		{
+			name:      "gen_ai_model_costs",
+			query:     GenAIModelCostsViewQuery,
+			args:      []any{"proj", "ds"},
+			qualifier: "s",
+			// The 15 columns the view had before the double-counting fix,
+			// in their original order.
+			want: []string{
+				"usage_hour", "service_name", "gen_ai_agent_name", "provider", "model",
+				"call_count", "error_count",
+				"total_input_tokens", "total_output_tokens", "total_cache_read_input_tokens",
+				"total_cache_creation_input_tokens", "total_reasoning_tokens",
+				"p50_duration_ms", "p95_duration_ms", "p99_duration_ms",
+			},
+		},
+		{
+			name:  "gen_ai_sessions",
+			query: GenAISessionsViewQuery,
+			args:  []any{"proj", "ds"},
+			// The 15 columns the view had before the grain change, in
+			// their original order, then the four it gained.
+			want: []string{
+				"session_id", "user_id", "service_name", "agent_name",
+				"session_start_time", "session_end_time", "session_duration_ms",
+				"turn_count", "invocation_count", "tool_call_count", "error_count",
+				"total_input_tokens", "total_output_tokens", "total_cache_read_input_tokens",
+				"total_reasoning_tokens",
+				"session_start_date", "total_cache_creation_input_tokens",
+				"llm_call_count", "agent_invocation_count",
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			items, err := selectList(fmt.Sprintf(tc.query, tc.args...))
@@ -489,8 +894,10 @@ func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 				t.Fatal(err)
 			}
 			inContract := map[string]bool{}
-			for _, name := range FieldNames(tc.contract) {
-				inContract[name] = true
+			if tc.contract != nil {
+				for _, name := range FieldNames(tc.contract) {
+					inContract[name] = true
+				}
 			}
 			var got []string
 			for _, item := range items {
@@ -501,7 +908,7 @@ func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 				if item.qualifier != tc.qualifier {
 					t.Errorf("column %q is read through %q, want %q", item.alias, item.qualifier, tc.qualifier)
 				}
-				if !inContract[item.alias] {
+				if tc.contract != nil && !inContract[item.alias] {
 					t.Errorf("column %q passes through but is not in the contract", item.alias)
 				}
 			}
@@ -515,6 +922,7 @@ func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 // selectItem is one entry of a view's projection.
 type selectItem struct {
 	alias       string // output column name
+	expr        string // the expression that produces it, or the column itself
 	qualifier   string // table alias of a passed-through column, if any
 	passthrough bool   // the entry is a bare, possibly qualified, column
 }
@@ -522,24 +930,29 @@ type selectItem struct {
 // selectList parses the projection of a query laid out as the companion views
 // are: SELECT alone on a line, entries separated by top-level commas, "--"
 // comment lines, and FROM at the start of the first line after the
-// projection. An entry is a column, optionally qualified, or an expression
-// ending in "AS alias".
+// projection. A query that opens with common table expressions has one such
+// block per SELECT, and the last one is the projection of the view itself. An
+// entry is a column, optionally qualified, or an expression ending in "AS
+// alias".
 func selectList(query string) ([]selectItem, error) {
-	var lines []string
+	var lines, last []string
 	inSelect := false
 	for _, line := range strings.Split(query, "\n") {
 		trimmed := strings.TrimSpace(line)
 		switch {
 		case trimmed == "SELECT":
-			inSelect = true
+			inSelect, lines = true, nil
 		case !inSelect || strings.HasPrefix(trimmed, "--"):
 		case strings.HasPrefix(trimmed, "FROM "):
-			return splitSelectList(strings.Join(lines, " "))
+			inSelect, last = false, lines
 		default:
 			lines = append(lines, trimmed)
 		}
 	}
-	return nil, fmt.Errorf("no SELECT ... FROM projection in %q", query)
+	if len(last) == 0 {
+		return nil, fmt.Errorf("no SELECT ... FROM projection in %q", query)
+	}
+	return splitSelectList(strings.Join(last, " "))
 }
 
 // splitSelectList splits a projection on the commas that are outside quotes,
@@ -575,7 +988,7 @@ func splitSelectList(list string) ([]selectItem, error) {
 func parseSelectItem(entry string) (selectItem, error) {
 	if i := strings.LastIndex(entry, " AS "); i >= 0 {
 		if alias := entry[i+len(" AS "):]; isColumnName(alias) {
-			return selectItem{alias: alias}, nil
+			return selectItem{alias: alias, expr: entry[:i]}, nil
 		}
 	}
 	qualifier, column, qualified := strings.Cut(entry, ".")
@@ -585,7 +998,7 @@ func parseSelectItem(entry string) (selectItem, error) {
 	if !isColumnName(column) || (qualified && !isColumnName(qualifier)) {
 		return selectItem{}, fmt.Errorf("projection entry %q is neither a column nor an aliased expression", entry)
 	}
-	return selectItem{alias: column, qualifier: qualifier, passthrough: true}, nil
+	return selectItem{alias: column, expr: entry, qualifier: qualifier, passthrough: true}, nil
 }
 
 // The DDL and the storagepb.TableSchema describe the same contract from two

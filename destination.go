@@ -403,25 +403,98 @@ func (e *signalExporter) createDestinationTable(
 	return nil
 }
 
+// ensureView creates the view id, or reconciles an existing one to the wanted
+// definition in md, so a collector upgraded to a release with newer view SQL
+// replaces the stale definition on its next start. kind names the view in
+// errors, as in "creating deduplication view".
+//
+// Only the query is reconciled; labels and every other property of an
+// existing view are left alone, and an existing view that has the wanted query
+// is not touched. Reconciliation is best effort: a view that cannot be read, is
+// not a view, or cannot be updated (for lack of permission, or because its
+// query no longer validates) is kept as it is with a warning, and ensureView
+// reports it as preserved, because a view is a convenience and must not block
+// export. A context error always fails, like every other metadata call, and so
+// does any error from creating a view that does not yet exist.
+func (e *signalExporter) ensureView(
+	ctx context.Context, admin destinationAdmin, kind, id string, md *bq.TableMetadata,
+) (preserved bool, err error) {
+	name := e.cfg.Project + "." + e.cfg.Dataset + "." + id
+	createErr := admin.CreateTable(ctx, id, md)
+	if createErr == nil {
+		return false, nil
+	}
+	if !isAlreadyExists(createErr) {
+		return false, fmt.Errorf("creating %s %s: %w", kind, name, createErr)
+	}
+
+	// The view exists. A concurrent collector may reconcile it at the same
+	// moment, in which case the first update fails its ETag precondition and
+	// the retry finds the definition already current.
+	for attempt := range 2 {
+		existing, readErr := admin.TableMetadata(ctx, id)
+		switch {
+		case readErr != nil && isContextError(readErr):
+			return false, fmt.Errorf("reading existing %s %s: %w", kind, name, readErr)
+		case readErr != nil:
+			e.logger.Warn("existing view is unreadable; leaving it as it is",
+				zap.String("view", name), zap.Error(readErr))
+			return true, nil
+		case existing == nil || existing.ViewQuery == "":
+			e.logger.Warn("existing object is not a view; leaving it as it is",
+				zap.String("view", name))
+			return true, nil
+		case !existing.UseLegacySQL && sameViewQuery(existing.ViewQuery, md.ViewQuery):
+			return false, nil
+		}
+
+		updateErr := admin.UpdateTable(ctx, id, bq.TableMetadataToUpdate{
+			ViewQuery:    md.ViewQuery,
+			UseLegacySQL: false,
+		}, existing.ETag)
+		switch {
+		case updateErr == nil:
+			e.logger.Info("replaced the stale view definition with this release's",
+				zap.String("view", name))
+			return false, nil
+		case isContextError(updateErr):
+			return false, fmt.Errorf("updating existing %s %s: %w", kind, name, updateErr)
+		case attempt == 0 && isPreconditionFailed(updateErr):
+			continue
+		default:
+			e.logger.Warn("view definition differs from this release's but could not be updated; leaving it as it is",
+				zap.String("view", name), zap.Error(updateErr))
+			return true, nil
+		}
+	}
+	return true, nil
+}
+
+// sameViewQuery reports whether two view queries differ at most in whitespace.
+func sameViewQuery(a, b string) bool {
+	return strings.Join(strings.Fields(a), " ") == strings.Join(strings.Fields(b), " ")
+}
+
+// createDedupView creates the deduplication view of the active signal, or
+// reconciles an existing one to the current definition. See ensureView.
 func (e *signalExporter) createDedupView(
 	ctx context.Context, admin destinationAdmin, query string,
 ) error {
-	viewID := e.table + "_dedup"
 	md := &bq.TableMetadata{ViewQuery: query, UseLegacySQL: false}
 	if labels := e.destinationOptions().Labels; len(labels) > 0 {
 		md.Labels = maps.Clone(labels)
 	}
-	err := admin.CreateTable(ctx, viewID, md)
-	if err == nil || isAlreadyExists(err) {
-		return nil
-	}
-	return fmt.Errorf("creating deduplication view %s.%s.%s: %w",
-		e.cfg.Project, e.cfg.Dataset, viewID, err)
+	_, err := e.ensureView(ctx, admin, "deduplication view", e.table+"_dedup", md)
+	return err
 }
 
 // createCompanionViews creates the optional companion views of the active
-// signal when enabled. Like the dedup view they are create-only: an existing
-// view produces AlreadyExists and is left as it is.
+// signal when enabled. Like the dedup view, an existing companion view is
+// reconciled to the current definition rather than left stale: when its query
+// differs it is updated, and when it already matches nothing is written. See
+// ensureView for how a view that cannot be read or updated is handled. With
+// this option on, the exporter therefore owns these fixed-name views, and a
+// customized definition under one of their names is replaced.
 //
 // v_gen_ai_logs joins the log and span dedup views, which belong to separate
 // signal exporters, so whichever exporter starts second creates v_gen_ai_logs
@@ -430,9 +503,14 @@ func (e *signalExporter) createDedupView(
 // a notice rather than failing startup, and a later start creates it. An
 // unreadable peer dedup view is skipped with a warning because companion views
 // are a convenience and must not block export.
+//
+// The metrics signal has one companion view, v_gen_ai_metrics, which reads the
+// metric dedup view only and so needs no peer probe.
 func (e *signalExporter) createCompanionViews(ctx context.Context, admin destinationAdmin) error {
 	if proto.Equal(e.schema, schema.MetricsTableSchema()) {
-		return nil
+		views := schema.MetricsCompanionViewsMetadata(e.cfg.Project, e.cfg.Dataset, e.table)
+		return e.ensureCompanionViews(ctx, admin,
+			slices.Sorted(maps.Keys(views)), views, e.destinationOptions().Labels)
 	}
 	isSpans := proto.Equal(e.schema, schema.SpansTableSchema())
 	spansTable, logsTable := e.table, e.cfg.Logs.Table
@@ -445,35 +523,12 @@ func (e *signalExporter) createCompanionViews(ctx context.Context, admin destina
 	}
 
 	views := schema.CompanionViewsMetadata(e.cfg.Project, e.cfg.Dataset, spansTable, logsTable, isSpans)
-	signalLabels := e.destinationOptions().Labels
 	order := slices.Sorted(maps.Keys(views))
 	if isSpans {
 		order = schema.SpanCompanionViewOrder
 	}
-	var companionViewsPreserved bool
-	for _, id := range order {
-		md, ok := views[id]
-		if !ok {
-			continue
-		}
-		if len(signalLabels) > 0 {
-			md.Labels = maps.Clone(signalLabels)
-		}
-		err := admin.CreateTable(ctx, id, md)
-		if isAlreadyExists(err) {
-			companionViewsPreserved = true
-			continue
-		}
-		if err != nil {
-			if isRollupView(id) && companionViewsPreserved {
-				e.logger.Warn("skipping rollup view creation over preserved companion view",
-					zap.String("view", e.cfg.Project+"."+e.cfg.Dataset+"."+id),
-					zap.Error(err))
-				continue
-			}
-			return fmt.Errorf("creating companion view %s.%s.%s: %w",
-				e.cfg.Project, e.cfg.Dataset, id, err)
-		}
+	if err := e.ensureCompanionViews(ctx, admin, order, views, e.destinationOptions().Labels); err != nil {
+		return err
 	}
 
 	if isSpans {
@@ -482,16 +537,45 @@ func (e *signalExporter) createCompanionViews(ctx context.Context, admin destina
 			return err
 		}
 		logViews := schema.CompanionViewsMetadata(e.cfg.Project, e.cfg.Dataset, spansTable, logsTable, false)
-		logLabels := e.effectiveLabels(e.cfg.Logs.Labels)
-		for _, id := range slices.Sorted(maps.Keys(logViews)) {
-			md := logViews[id]
-			if len(logLabels) > 0 {
-				md.Labels = maps.Clone(logLabels)
+		return e.ensureCompanionViews(ctx, admin,
+			slices.Sorted(maps.Keys(logViews)), logViews, e.effectiveLabels(e.cfg.Logs.Labels))
+	}
+	return nil
+}
+
+// ensureCompanionViews creates or reconciles the companion views in order,
+// giving each view it creates the labels. A rollup view whose creation fails
+// after an earlier companion view was preserved is skipped with a warning
+// instead of failing startup: the preserved view may lack a column the rollup
+// needs, and a later start can retry.
+func (e *signalExporter) ensureCompanionViews(
+	ctx context.Context,
+	admin destinationAdmin,
+	order []string,
+	views map[string]*bq.TableMetadata,
+	labels map[string]string,
+) error {
+	var companionViewsPreserved bool
+	for _, id := range order {
+		md, ok := views[id]
+		if !ok {
+			continue
+		}
+		if len(labels) > 0 {
+			md.Labels = maps.Clone(labels)
+		}
+		preserved, err := e.ensureView(ctx, admin, "companion view", id, md)
+		if err != nil {
+			if isRollupView(id) && companionViewsPreserved && !isContextError(err) {
+				e.logger.Warn("skipping rollup view creation over preserved companion view",
+					zap.String("view", e.cfg.Project+"."+e.cfg.Dataset+"."+id),
+					zap.Error(err))
+				continue
 			}
-			if err := admin.CreateTable(ctx, id, md); err != nil && !isAlreadyExists(err) {
-				return fmt.Errorf("creating companion view %s.%s.%s: %w",
-					e.cfg.Project, e.cfg.Dataset, id, err)
-			}
+			return err
+		}
+		if preserved {
+			companionViewsPreserved = true
 		}
 	}
 	return nil

@@ -286,6 +286,33 @@ func TestCompanionViewsMetadata(t *testing.T) {
 	}
 }
 
+// The metrics signal has one companion view, v_gen_ai_metrics. It reads the
+// metric dedup view of the configured metrics table, so a custom table name
+// must reach the query, and it must be a plain standard SQL view like the
+// others. None of the span or log companion views is created for metrics, and
+// v_gen_ai_metrics is not created for them.
+func TestMetricsCompanionViewsMetadata(t *testing.T) {
+	got := MetricsCompanionViewsMetadata("proj", "ds", "metrics_tbl")
+	if names := slices.Sorted(maps.Keys(got)); !slices.Equal(names, []string{"v_gen_ai_metrics"}) {
+		t.Fatalf("views = %v, want [v_gen_ai_metrics]", names)
+	}
+	md := got[GenAIMetricsViewName]
+	if want := fmt.Sprintf(GenAIMetricsViewQuery, "proj", "ds", "metrics_tbl"); md.ViewQuery != want {
+		t.Errorf("v_gen_ai_metrics query = %q, want %q", md.ViewQuery, want)
+	}
+	if !strings.Contains(md.ViewQuery, "FROM `proj.ds.metrics_tbl_dedup`") {
+		t.Errorf("v_gen_ai_metrics must read the metric dedup view, got %q", md.ViewQuery)
+	}
+	if md.UseLegacySQL || md.Schema != nil || md.TimePartitioning != nil || md.Clustering != nil {
+		t.Errorf("v_gen_ai_metrics must be a plain standard SQL view, got %+v", md)
+	}
+	for _, isSpans := range []bool{true, false} {
+		if _, ok := CompanionViewsMetadata("proj", "ds", "spans_tbl", "logs_tbl", isSpans)[GenAIMetricsViewName]; ok {
+			t.Errorf("CompanionViewsMetadata(isSpans=%v) must not include v_gen_ai_metrics", isSpans)
+		}
+	}
+}
+
 func TestReconcileAdditiveSchema(t *testing.T) {
 	want := SpansTableSchema()
 	fullBQ, err := ToBigQuery(want)

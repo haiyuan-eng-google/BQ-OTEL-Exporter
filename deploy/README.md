@@ -88,7 +88,7 @@ indexes needs more. Set `-var="grant_auto_create=true"` to grant it:
 | Permission | Scope | Purpose |
 |:---|:---|:---|
 | `bigquery.tables.create` | Dataset | `auto_create.tables` / `companion_views`: create missing tables and views |
-| `bigquery.tables.update` | Dataset | `auto_create.tables`: reconcile additive columns |
+| `bigquery.tables.update` | Dataset | `auto_create.tables` / `companion_views`: reconcile additive columns and stale view definitions |
 | `bigquery.tables.createIndex` | Dataset | `auto_create.search_indexes` |
 | `bigquery.jobs.create` | Project | `auto_create.search_indexes`: run the `CREATE SEARCH INDEX` job |
 
