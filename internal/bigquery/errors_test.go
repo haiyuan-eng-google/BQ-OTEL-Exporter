@@ -9,9 +9,19 @@ import (
 	"io"
 	"testing"
 
+	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+func mustStatusWithStorageError(t *testing.T, c codes.Code, msg string, seCode storagepb.StorageError_StorageErrorCode) error {
+	t.Helper()
+	st, err := status.New(c, msg).WithDetails(&storagepb.StorageError{Code: seCode})
+	if err != nil {
+		t.Fatalf("WithDetails: %v", err)
+	}
+	return st.Err()
+}
 
 // One row per line of the error matrix that Classify implements. Class and
 // owner together are the contract: two components retrying the same failure
@@ -79,6 +89,50 @@ func TestClassifyMatrix(t *testing.T) {
 		"plain invalid argument is permanent": {
 			status.Error(codes.InvalidArgument, "malformed row"),
 			Permanent, OwnerExporter, LabelInvalidArgument, false,
+		},
+		"structured StorageError SCHEMA_MISMATCH_EXTRA_FIELDS triggers recreate without schema wording": {
+			mustStatusWithStorageError(t, codes.InvalidArgument, "extra fields present", storagepb.StorageError_SCHEMA_MISMATCH_EXTRA_FIELDS),
+			Permanent, OwnerExporter, LabelSchemaMismatch, true,
+		},
+		"structured StorageError INVALID_STREAM_STATE triggers recreate": {
+			mustStatusWithStorageError(t, codes.FailedPrecondition, "bad state", storagepb.StorageError_INVALID_STREAM_STATE),
+			Permanent, OwnerExporter, LabelInvalidStream, true,
+		},
+		"structured StorageError STREAM_NOT_FOUND triggers recreate": {
+			mustStatusWithStorageError(t, codes.NotFound, "entity not found", storagepb.StorageError_STREAM_NOT_FOUND),
+			Permanent, OwnerExporter, LabelInvalidStream, true,
+		},
+		"structured StorageError STREAM_FINALIZED triggers recreate": {
+			mustStatusWithStorageError(t, codes.FailedPrecondition, "closed", storagepb.StorageError_STREAM_FINALIZED),
+			Permanent, OwnerExporter, LabelInvalidStream, true,
+		},
+		"structured StorageError TABLE_NOT_FOUND triggers recreate": {
+			mustStatusWithStorageError(t, codes.NotFound, "table missing", storagepb.StorageError_TABLE_NOT_FOUND),
+			Permanent, OwnerExporter, LabelInvalidStream, true,
+		},
+		"structured StorageError OFFSET_OUT_OF_RANGE overrides Schema mismatch message": {
+			mustStatusWithStorageError(t, codes.InvalidArgument, "Schema mismatch for field foo", storagepb.StorageError_OFFSET_OUT_OF_RANGE),
+			Permanent, OwnerExporter, LabelInvalidArgument, false,
+		},
+		"structured StorageError STREAM_NOT_FOUND overrides Internal status code": {
+			mustStatusWithStorageError(t, codes.Internal, "internal stream failure", storagepb.StorageError_STREAM_NOT_FOUND),
+			Permanent, OwnerExporter, LabelInvalidStream, true,
+		},
+		"structured StorageError STORAGE_ERROR_CODE_UNSPECIFIED falls through to message/code heuristic": {
+			mustStatusWithStorageError(t, codes.InvalidArgument, "Schema mismatch for field foo", storagepb.StorageError_STORAGE_ERROR_CODE_UNSPECIFIED),
+			Permanent, OwnerExporter, LabelSchemaMismatch, true,
+		},
+		"structured StorageError CMEK_NOT_PROVIDED is permanent invalid argument": {
+			mustStatusWithStorageError(t, codes.InvalidArgument, "cmek missing", storagepb.StorageError_CMEK_NOT_PROVIDED),
+			Permanent, OwnerExporter, LabelInvalidArgument, false,
+		},
+		"structured StorageError KMS_PERMISSION_DENIED is permanent permission": {
+			mustStatusWithStorageError(t, codes.PermissionDenied, "kms denied", storagepb.StorageError_KMS_PERMISSION_DENIED),
+			Permanent, OwnerExporter, LabelPermission, false,
+		},
+		"structured StorageError KMS_SERVICE_ERROR is retryable unavailable": {
+			mustStatusWithStorageError(t, codes.Internal, "kms transient", storagepb.StorageError_KMS_SERVICE_ERROR),
+			Retryable, OwnerExporterHelper, LabelUnavailable, false,
 		},
 		"connection close is retryable": {
 			io.EOF, Retryable, OwnerExporterHelper, LabelConnection, false,

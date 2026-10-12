@@ -1166,10 +1166,10 @@ func TestPrepareDestinationCreatesSearchIndexesWhenEnabled(t *testing.T) {
 			wantDDL:     fmt.Sprintf(schema.LogsSearchIndexDDL, "my-project", "otel", defaultLogsTable),
 		},
 		{
-			name:        "metrics skips search index",
+			name:        "metrics",
 			table:       defaultMetricsTable,
 			tableSchema: schema.MetricsTableSchema(),
-			wantDDL:     "",
+			wantDDL:     fmt.Sprintf(schema.MetricsSearchIndexDDL, "my-project", "otel", defaultMetricsTable),
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1182,16 +1182,196 @@ func TestPrepareDestinationCreatesSearchIndexesWhenEnabled(t *testing.T) {
 			if err := e.prepareDestination(context.Background(), admin); err != nil {
 				t.Fatalf("prepareDestination failed: %v", err)
 			}
-			if tc.wantDDL == "" {
-				if len(admin.ranDDLs) != 0 {
-					t.Fatalf("ranDDLs = %v, want none for %s", admin.ranDDLs, tc.name)
-				}
-				return
-			}
 			if !equalStrings(admin.ranDDLs, []string{tc.wantDDL}) {
 				t.Fatalf("ranDDLs = %v, want [%q]", admin.ranDDLs, tc.wantDDL)
 			}
 		})
+	}
+
+	t.Run("search index already exists is treated as idempotent", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.AutoCreate.Tables = true
+		cfg.AutoCreate.SearchIndexes = true
+		admin := &fakeDestinationAdmin{
+			datasetMetadata:  &bq.DatasetMetadata{},
+			tableMetadataErr: notFound(),
+			runDDLErr:        &googleapi.Error{Code: 400, Message: "Already exists: Search index idx_otel_metrics_search"},
+		}
+		e := newTestSignalExporter(cfg, defaultMetricsTable, schema.MetricsTableSchema())
+		if err := e.prepareDestination(context.Background(), admin); err != nil {
+			t.Fatalf("prepareDestination failed on idempotent search index error: %v", err)
+		}
+	})
+}
+
+func TestReconcileTableSchemaRetriesOnPreconditionFailedAndLogsWarningOnIncompatibleSchema(t *testing.T) {
+	fullSpans := mustBigQuerySchema(t, schema.SpansTableSchema())
+	var withoutPayloadRefs bq.Schema
+	for _, f := range fullSpans {
+		if f.Name == "payload_refs" {
+			continue
+		}
+		withoutPayloadRefs = append(withoutPayloadRefs, f)
+	}
+
+	t.Run("retries once on HTTP 412 Precondition Failed with refreshed ETag", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.AutoCreate.Tables = true
+		admin := &fakeDestinationAdmin{
+			datasetMetadata: &bq.DatasetMetadata{},
+			tableResponses: []fakeTableMetadataResponse{
+				{metadata: &bq.TableMetadata{Schema: withoutPayloadRefs, ETag: "etag-stale"}},
+				{metadata: &bq.TableMetadata{Schema: withoutPayloadRefs, ETag: "etag-fresh"}},
+			},
+			createViewErr: alreadyExists(),
+		}
+		var updateCalls int
+		admin.updateTableErr = &googleapi.Error{Code: stdhttp.StatusPreconditionFailed, Message: "Precondition Failed"}
+		e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+
+		// Wrap admin so first UpdateTable returns 412 and second succeeds.
+		retryingAdmin := &conditionalUpdateAdmin{
+			fakeDestinationAdmin: admin,
+			onUpdate: func(call int, etag string) error {
+				updateCalls = call
+				if call == 1 {
+					if etag != "etag-stale" {
+						t.Errorf("first UpdateTable etag = %q, want etag-stale", etag)
+					}
+					return &googleapi.Error{Code: stdhttp.StatusPreconditionFailed, Message: "Precondition Failed"}
+				}
+				if etag != "etag-fresh" {
+					t.Errorf("second UpdateTable etag = %q, want etag-fresh", etag)
+				}
+				return nil
+			},
+		}
+
+		if err := e.prepareDestination(context.Background(), retryingAdmin); err != nil {
+			t.Fatalf("prepareDestination failed after 412 retry: %v", err)
+		}
+		if updateCalls != 2 {
+			t.Fatalf("UpdateTable calls = %d, want 2", updateCalls)
+		}
+	})
+
+	t.Run("logs warning when additive schema reconciliation is skipped due to incompatible type", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.AutoCreate.Tables = true
+		incompatible := make(bq.Schema, len(withoutPayloadRefs))
+		for i, f := range withoutPayloadRefs {
+			cp := *f
+			incompatible[i] = &cp
+		}
+		incompatible[0].Type = bq.StringFieldType
+
+		core, recorded := observer.New(zap.WarnLevel)
+		set := component.TelemetrySettings{Logger: zap.New(core)}
+		e := newSignalExporter(set, cfg, cfg.Traces.Table, schema.SpansTableSchema())
+		admin := &fakeDestinationAdmin{
+			datasetMetadata: &bq.DatasetMetadata{},
+			tableMetadata:   &bq.TableMetadata{Schema: incompatible, ETag: "etag-1"},
+		}
+		if err := e.prepareDestination(context.Background(), admin); err == nil {
+			t.Fatal("expected error for incompatible schema")
+		}
+		if recorded.FilterMessage("additive schema reconciliation skipped due to incompatible existing schema").Len() != 1 {
+			t.Fatalf("expected warning log for skipped additive schema reconciliation, got %v", recorded.All())
+		}
+	})
+}
+
+type conditionalUpdateAdmin struct {
+	*fakeDestinationAdmin
+	calls    int
+	onUpdate func(call int, etag string) error
+}
+
+func (c *conditionalUpdateAdmin) UpdateTable(ctx context.Context, id string, md bq.TableMetadataToUpdate, etag string) error {
+	c.calls++
+	_ = c.fakeDestinationAdmin.UpdateTable(ctx, id, md, etag)
+	return c.onUpdate(c.calls, etag)
+}
+
+func TestPrepareDestinationAppliesGovernanceOptionsToDatasetTablesAndViews(t *testing.T) {
+	cfg := validConfig()
+	cfg.AutoCreate.Dataset = true
+	cfg.AutoCreate.Tables = true
+	cfg.AutoCreate.CompanionViews = true
+	cfg.Quarantine.Enabled = true
+	cfg.KMSKeyName = "projects/my-project/locations/us/keyRings/ring/cryptoKeys/default-key"
+	cfg.Labels = map[string]string{
+		"env":   "prod",
+		"owner": "platform",
+	}
+	cfg.Logs.KMSKeyName = "projects/my-project/locations/us/keyRings/ring/cryptoKeys/logs-key"
+	cfg.Logs.Labels = map[string]string{
+		"owner":  "observability",
+		"signal": "logs",
+	}
+	cfg.Logs.MaxStaleness = "15m"
+	cfg.Quarantine.Labels = map[string]string{
+		"tier": "quarantine",
+	}
+	cfg.Quarantine.MaxStaleness = "30m"
+
+	admin := &fakeDestinationAdmin{
+		datasetMetadataErr: notFound(),
+		tableMetadataErr:   notFound(),
+		tableMetadataByID: map[string]fakeTableMetadataResponse{
+			defaultSpansTable + "_dedup": {metadata: &bq.TableMetadata{ViewQuery: "SELECT 1"}},
+		},
+	}
+	e := newTestSignalExporter(cfg, cfg.Logs.Table, schema.LogsTableSchema())
+	if err := e.prepareDestination(context.Background(), admin); err != nil {
+		t.Fatalf("prepareDestination failed: %v", err)
+	}
+
+	if admin.createdDataset == nil || admin.createdDataset.DefaultEncryptionConfig == nil ||
+		admin.createdDataset.DefaultEncryptionConfig.KMSKeyName != cfg.KMSKeyName {
+		t.Fatalf("createdDataset DefaultEncryptionConfig = %#v, want KMSKeyName %q", admin.createdDataset, cfg.KMSKeyName)
+	}
+	if !maps.Equal(admin.createdDataset.Labels, cfg.Labels) {
+		t.Errorf("createdDataset.Labels = %v, want %v", admin.createdDataset.Labels, cfg.Labels)
+	}
+
+	logsMD := admin.createdTables[cfg.Logs.Table]
+	if logsMD == nil || logsMD.EncryptionConfig == nil || logsMD.EncryptionConfig.KMSKeyName != cfg.Logs.KMSKeyName {
+		t.Fatalf("logs table EncryptionConfig = %#v, want %q", logsMD, cfg.Logs.KMSKeyName)
+	}
+	wantLogsLabels := map[string]string{"env": "prod", "owner": "observability", "signal": "logs"}
+	if !maps.Equal(logsMD.Labels, wantLogsLabels) {
+		t.Errorf("logs table Labels = %v, want %v", logsMD.Labels, wantLogsLabels)
+	}
+	if logsMD.MaxStaleness == nil || *logsMD.MaxStaleness != *bq.IntervalValueFromDuration(15 * time.Minute) {
+		t.Errorf("logs table MaxStaleness = %v, want 15m", logsMD.MaxStaleness)
+	}
+
+	dedupMD := admin.createdTables[cfg.Logs.Table+"_dedup"]
+	if dedupMD == nil || !maps.Equal(dedupMD.Labels, wantLogsLabels) {
+		t.Errorf("dedup view Labels = %v, want %v", dedupMD, wantLogsLabels)
+	}
+	if dedupMD.EncryptionConfig != nil || dedupMD.MaxStaleness != nil {
+		t.Errorf("dedup view must not set EncryptionConfig (%v) or MaxStaleness (%v)", dedupMD.EncryptionConfig, dedupMD.MaxStaleness)
+	}
+	compMD := admin.createdTables[schema.GenAILogsViewName]
+	if compMD == nil || !maps.Equal(compMD.Labels, wantLogsLabels) {
+		t.Errorf("companion view Labels = %v, want %v", compMD, wantLogsLabels)
+	}
+	if compMD.EncryptionConfig != nil || compMD.MaxStaleness != nil {
+		t.Errorf("companion view must not set EncryptionConfig (%v) or MaxStaleness (%v)", compMD.EncryptionConfig, compMD.MaxStaleness)
+	}
+
+	qMD := admin.createdTables[cfg.Quarantine.Table]
+	if qMD == nil || qMD.EncryptionConfig == nil || qMD.EncryptionConfig.KMSKeyName != cfg.KMSKeyName {
+		t.Fatalf("quarantine table EncryptionConfig = %#v, want fallback %q", qMD, cfg.KMSKeyName)
+	}
+	wantQLabels := map[string]string{"env": "prod", "owner": "platform", "tier": "quarantine"}
+	if !maps.Equal(qMD.Labels, wantQLabels) {
+		t.Errorf("quarantine table Labels = %v, want %v", qMD.Labels, wantQLabels)
+	}
+	if qMD.MaxStaleness == nil || *qMD.MaxStaleness != *bq.IntervalValueFromDuration(30 * time.Minute) {
+		t.Errorf("quarantine table MaxStaleness = %v, want 30m", qMD.MaxStaleness)
 	}
 }
 

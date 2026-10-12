@@ -165,15 +165,16 @@ func TestLogDedupWindow(t *testing.T) {
 // index count silently produces %!s(MISSING) rather than failing.
 func TestDDLTemplatesFormatCleanly(t *testing.T) {
 	for name, tmpl := range map[string]string{
-		"spans":              SpansDDL,
-		"logs":               LogsDDL,
-		"metrics":            MetricsDDL,
-		"quarantine":         QuarantineDDL,
-		"spans_view":         SpansDedupViewDDL,
-		"logs_view":          LogsDedupViewDDL,
-		"metrics_view":       MetricsDedupViewDDL,
-		"spans_search_index": SpansSearchIndexDDL,
-		"logs_search_index":  LogsSearchIndexDDL,
+		"spans":                SpansDDL,
+		"logs":                 LogsDDL,
+		"metrics":              MetricsDDL,
+		"quarantine":           QuarantineDDL,
+		"spans_view":           SpansDedupViewDDL,
+		"logs_view":            LogsDedupViewDDL,
+		"metrics_view":         MetricsDedupViewDDL,
+		"spans_search_index":   SpansSearchIndexDDL,
+		"logs_search_index":    LogsSearchIndexDDL,
+		"metrics_search_index": MetricsSearchIndexDDL,
 	} {
 		got := fmt.Sprintf(tmpl, "proj", "ds", "tbl")
 		// fmt marks a missing operand as %!s(MISSING). Match "(MISSING)", not

@@ -93,6 +93,7 @@ type Server struct {
 	connections int
 	requests    int
 	ackedRows   int
+	etagSeq     int
 
 	datasets map[string]*bigqueryapi.Dataset
 	tables   map[string]map[string]*bigqueryapi.Table
@@ -1002,7 +1003,19 @@ func (s *Server) handleREST(w http.ResponseWriter, r *http.Request) {
 				writeRESTError(w, http.StatusNotFound, "Not found: Table "+dsKey+"."+tableID)
 				return
 			}
+			if ifMatch := r.Header.Get("If-Match"); ifMatch != "" && ifMatch != existing.Etag {
+				s.mu.Unlock()
+				writeRESTError(w, http.StatusPreconditionFailed, "Precondition Failed: etag mismatch")
+				return
+			}
 			if patch.Schema != nil {
+				if existing.Schema != nil {
+					if err := validateRESTSchemaUpdate(existing.Schema.Fields, patch.Schema.Fields); err != nil {
+						s.mu.Unlock()
+						writeRESTError(w, http.StatusBadRequest, err.Error())
+						return
+					}
+				}
 				existing.Schema = cloneJSON(patch.Schema)
 			}
 			if patch.View != nil {
@@ -1015,6 +1028,8 @@ func (s *Server) handleREST(w http.ResponseWriter, r *http.Request) {
 			if patch.Clustering != nil {
 				existing.Clustering = cloneJSON(patch.Clustering)
 			}
+			s.etagSeq++
+			existing.Etag = fmt.Sprintf("etag-%s-%d", tableID, s.etagSeq)
 			if existing.Schema != nil && len(existing.Schema.Fields) > 0 {
 				_ = s.registerTableSchemaLocked(tableID, fromRESTTableSchema(existing.Schema))
 			}
@@ -1034,6 +1049,53 @@ func (s *Server) handleREST(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeRESTError(w, http.StatusNotFound, "unsupported endpoint: "+r.URL.Path)
+}
+
+func validateRESTSchemaUpdate(existing, next []*bigqueryapi.TableFieldSchema) error {
+	nextByName := make(map[string]*bigqueryapi.TableFieldSchema, len(next))
+	for _, f := range next {
+		if f != nil {
+			nextByName[f.Name] = f
+		}
+	}
+	existingNames := make(map[string]bool, len(existing))
+	for _, oldF := range existing {
+		if oldF == nil {
+			continue
+		}
+		existingNames[oldF.Name] = true
+		newF, ok := nextByName[oldF.Name]
+		if !ok {
+			return fmt.Errorf("cannot remove existing column %q", oldF.Name)
+		}
+		if err := validateRESTSchemaUpdate(oldF.Fields, newF.Fields); err != nil {
+			return fmt.Errorf("column %q: %w", oldF.Name, err)
+		}
+	}
+	for _, newF := range next {
+		if newF == nil || existingNames[newF.Name] {
+			continue
+		}
+		if err := rejectNewRequiredFields(newF); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func rejectNewRequiredFields(f *bigqueryapi.TableFieldSchema) error {
+	if strings.EqualFold(f.Mode, "REQUIRED") {
+		return fmt.Errorf("cannot add REQUIRED column %q to an existing table", f.Name)
+	}
+	for _, child := range f.Fields {
+		if child == nil {
+			continue
+		}
+		if err := rejectNewRequiredFields(child); err != nil {
+			return fmt.Errorf("column %q: %w", f.Name, err)
+		}
+	}
+	return nil
 }
 
 func decodeJSONBody(r io.Reader, dst any) error {

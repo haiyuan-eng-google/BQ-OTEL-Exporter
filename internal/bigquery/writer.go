@@ -500,15 +500,16 @@ func (w *Writer) classifyAndRetire(
 	return verdict, attemptEnded
 }
 
-// deliveryRank orders verdict classes by what a batch still owes its rows:
+// deliveryRank orders verdicts by what a batch still owes its rows:
 // uncertain rows may already be applied and are replayed with duplicate
-// accounting, retryable rows certainly were not and are replayed, and only
-// permanently rejected rows may be dropped.
-func deliveryRank(c Class) int {
-	switch c {
-	case Uncertain:
+// accounting, retryable rows (including stream-recreation verdicts whose
+// unacknowledged rows must be replayed on a fresh stream) certainly were not
+// and are replayed, and only permanently rejected rows may be dropped.
+func deliveryRank(v Verdict) int {
+	switch {
+	case v.Class == Uncertain:
 		return 2
-	case Retryable:
+	case v.Class == Retryable || v.StreamRecreate:
 		return 1
 	default:
 		return 0
@@ -618,7 +619,7 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 			out.Verdict = v
 			return
 		}
-		if deliveryRank(v.Class) > deliveryRank(out.Verdict.Class) {
+		if deliveryRank(v) > deliveryRank(out.Verdict) {
 			out.Verdict = v
 		}
 	}
@@ -626,7 +627,7 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 	// only send those rows twice. Until then, a permanent rejection of one
 	// request does not keep the others from being sent.
 	replayOwed := func() bool {
-		return out.Err != nil && out.Verdict.Class != Permanent
+		return out.Err != nil && (out.Verdict.Class != Permanent || out.Verdict.StreamRecreate)
 	}
 	drainOne := func(p pending) {
 		if _, rerr := p.res.GetResult(ctx); rerr != nil {

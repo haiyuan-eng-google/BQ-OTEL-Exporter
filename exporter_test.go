@@ -17,6 +17,7 @@ import (
 	"time"
 
 	bq "cloud.google.com/go/bigquery"
+	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/component/componentstatus"
@@ -2387,6 +2388,34 @@ func metricInt64SumOrZero(t *testing.T, reader *sdkmetric.ManualReader, name str
 	return 0
 }
 
+func metricInt64ByAttr(t *testing.T, reader *sdkmetric.ManualReader, name, attrKey string) map[string]int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	out := make(map[string]int64)
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != name {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok {
+				t.Fatalf("metric %s data = %T, want int64 sum", name, m.Data)
+			}
+			for _, point := range sum.DataPoints {
+				for _, kv := range point.Attributes.ToSlice() {
+					if string(kv.Key) == attrKey {
+						out[kv.Value.AsString()] += point.Value
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
 // slowQuarantineStore is a payload store whose every upload outlasts a 10 ms
 // quarantine budget, and that counts the uploads it was asked for.
 func slowQuarantineStore(calls *atomic.Int32) funcBlobStore {
@@ -2652,5 +2681,127 @@ func TestPushMetricsPreservesRetryIdentityWhenEarlierOrdinalPeerDroppedByEncodeR
 	}
 	if len(secondPushRows) != 2 {
 		t.Fatalf("second push sent %d rows, want 2 (points 1 and 2; point 0 dropped by encoder)", len(secondPushRows))
+	}
+}
+
+func TestPushDeduplicatesDuplicateRowErrorIndicesForSameRecord(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+	tel, err := metadata.NewTelemetry(mp)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	e, _ := newTestTracesExporter(t, bqi.AppendOutcome{
+		RowErrors: []bqi.RowError{
+			{Index: 0, Code: "FIELDS_ERROR", Message: "field a invalid"},
+			{Index: 0, Code: "FIELDS_ERROR", Message: "field b invalid"},
+		},
+	})
+	e.tel = tel
+	quarantined, qStream := withQuarantine(t, e.signalExporter, bqi.AppendOutcome{AcknowledgedRows: 1})
+
+	err = e.pushTraceData(context.Background(), newTestTraces(2))
+	if err == nil || consumererror.IsPermanent(err) {
+		t.Fatalf("pushTraceData error = %v, want retryable subset error for span 1", err)
+	}
+	if qStream.gotRows != 1 || len(quarantined.rows) != 1 {
+		t.Fatalf("quarantined rows = %d (stream got %d), want 1 (duplicate RowError index 0 deduplicated)", len(quarantined.rows), qStream.gotRows)
+	}
+	if got := metricInt64SumOrZero(t, reader, "otelcol_exporter_bigquery_rejected_rows"); got != 1 {
+		t.Errorf("rejected_rows = %d, want 1", got)
+	}
+}
+
+func TestPushStreamRecreateVerdictReturnsRetryableWithoutQuarantining(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+	tel, err := metadata.NewTelemetry(mp)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := status.New(codes.InvalidArgument, "schema mismatch").WithDetails(&storagepb.StorageError{
+		Code:   storagepb.StorageError_SCHEMA_MISMATCH_EXTRA_FIELDS,
+		Entity: "projects/my-project/datasets/otel/tables/otel_spans/streams/_default",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recreateErr := st.Err()
+
+	e, _ := newTestTracesExporter(t, bqi.AppendOutcome{
+		Verdict: bqi.Classify(recreateErr),
+		Err:     recreateErr,
+	})
+	e.tel = tel
+	host := &fakeStatusHost{}
+	e.host = host
+	quarantined, qStream := withQuarantine(t, e.signalExporter, bqi.AppendOutcome{})
+
+	pushErr := e.pushTraceData(context.Background(), newTestTraces(2))
+	if pushErr == nil || consumererror.IsPermanent(pushErr) {
+		t.Fatalf("pushTraceData error = %v, want retryable error when StreamRecreate is true", pushErr)
+	}
+	var traceErr consumererror.Traces
+	if !errors.As(pushErr, &traceErr) || traceErr.Data().SpanCount() != 2 {
+		t.Fatalf("retryable spans = %v, want consumererror.Traces carrying 2 spans", pushErr)
+	}
+	if qStream.appended != 0 || len(quarantined.rows) != 0 {
+		t.Errorf("quarantined rows = %d, want 0 on stream recreation", len(quarantined.rows))
+	}
+	if got := metricInt64SumOrZero(t, reader, "otelcol_exporter_bigquery_retries"); got != 1 {
+		t.Errorf("retries = %d, want 1", got)
+	}
+	if got := metricInt64SumOrZero(t, reader, "otelcol_exporter_bigquery_rejected_rows"); got != 0 {
+		t.Errorf("rejected_rows = %d, want 0", got)
+	}
+	if len(host.events) != 1 || host.events[0].Status() != componentstatus.StatusRecoverableError {
+		t.Errorf("reported statuses = %v, want [StatusRecoverableError]", host.events)
+	}
+}
+
+func TestPushPermanentRequestLevelFailureQuarantinesAndRecordsRejected(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+	tel, err := metadata.NewTelemetry(mp)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	permErr := status.Error(codes.PermissionDenied, "iam permission denied on table")
+	e, _ := newTestTracesExporter(t, bqi.AppendOutcome{
+		Verdict: bqi.Classify(permErr),
+		Err:     permErr,
+	})
+	e.tel = tel
+	quarantined, qStream := withQuarantine(t, e.signalExporter, bqi.AppendOutcome{
+		AcknowledgedRows: 2,
+		AckedRanges:      [][2]int{{0, 2}},
+	})
+
+	pushErr := e.pushTraceData(context.Background(), newTestTraces(2))
+	if !consumererror.IsPermanent(pushErr) {
+		t.Fatalf("pushTraceData error = %v, want permanent error", pushErr)
+	}
+	if qStream.gotRows != 2 || len(quarantined.rows) != 2 {
+		t.Fatalf("quarantined rows = %d (stream got %d), want 2", len(quarantined.rows), qStream.gotRows)
+	}
+	for i, row := range quarantined.rows {
+		if row["error_code"] != "REQUEST_PERMANENT" {
+			t.Errorf("quarantined.rows[%d][\"error_code\"] = %v, want REQUEST_PERMANENT", i, row["error_code"])
+		}
+		if msg, _ := row["error_message"].(string); !strings.Contains(msg, "request_permanent: permission_denied:") {
+			t.Errorf("quarantined.rows[%d][\"error_message\"] = %q, want prefix \"request_permanent: permission_denied:\"", i, msg)
+		}
+	}
+	if got := metricInt64ByAttr(t, reader, "otelcol_exporter_bigquery_rejected_rows", "reason")["request_permanent"]; got != 2 {
+		t.Errorf("rejected_rows{reason=request_permanent} = %d, want 2", got)
+	}
+	if got := metricInt64ByAttr(t, reader, "otelcol_exporter_bigquery_quarantined_rows", "reason")["request_permanent"]; got != 2 {
+		t.Errorf("quarantined_rows{reason=request_permanent} = %d, want 2", got)
 	}
 }

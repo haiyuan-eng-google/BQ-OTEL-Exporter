@@ -11,6 +11,8 @@ import (
 	stdhttp "net/http"
 	"reflect"
 	"slices"
+	"strings"
+	"time"
 
 	bq "cloud.google.com/go/bigquery"
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
@@ -141,22 +143,63 @@ func (e *signalExporter) prepareDestination(ctx context.Context, admin destinati
 	return e.prepareQuarantineTable(ctx, admin)
 }
 
+func (e *signalExporter) effectiveKMSKeyName(override string) string {
+	if override != "" {
+		return override
+	}
+	return e.cfg.KMSKeyName
+}
+
+func (e *signalExporter) effectiveLabels(override map[string]string) map[string]string {
+	return mergeLabels(e.cfg.Labels, override)
+}
+
+func mergeLabels(base, override map[string]string) map[string]string {
+	if len(base) == 0 && len(override) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(base)+len(override))
+	maps.Copy(out, base)
+	maps.Copy(out, override)
+	return out
+}
+
+func mustParseDurationOrZero(raw string) time.Duration {
+	if raw == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0
+	}
+	return d
+}
+
 func (e *signalExporter) destinationOptions() schema.DestinationOptions {
 	switch {
 	case proto.Equal(e.schema, schema.SpansTableSchema()):
 		return schema.DestinationOptions{
 			PartitionExpirationDays: e.cfg.Traces.PartitionExpirationDays,
 			RequirePartitionFilter:  e.cfg.Traces.RequirePartitionFilter,
+			KMSKeyName:              e.effectiveKMSKeyName(e.cfg.Traces.KMSKeyName),
+			Labels:                  e.effectiveLabels(e.cfg.Traces.Labels),
+			MaxStaleness:            mustParseDurationOrZero(e.cfg.Traces.MaxStaleness),
 		}
 	case proto.Equal(e.schema, schema.LogsTableSchema()):
 		return schema.DestinationOptions{
 			PartitionExpirationDays: e.cfg.Logs.PartitionExpirationDays,
 			RequirePartitionFilter:  e.cfg.Logs.RequirePartitionFilter,
+			KMSKeyName:              e.effectiveKMSKeyName(e.cfg.Logs.KMSKeyName),
+			Labels:                  e.effectiveLabels(e.cfg.Logs.Labels),
+			MaxStaleness:            mustParseDurationOrZero(e.cfg.Logs.MaxStaleness),
 		}
 	case proto.Equal(e.schema, schema.MetricsTableSchema()):
 		return schema.DestinationOptions{
 			PartitionExpirationDays: e.cfg.Metrics.PartitionExpirationDays,
 			RequirePartitionFilter:  e.cfg.Metrics.RequirePartitionFilter,
+			KMSKeyName:              e.effectiveKMSKeyName(e.cfg.Metrics.KMSKeyName),
+			Labels:                  e.effectiveLabels(e.cfg.Metrics.Labels),
+			MaxStaleness:            mustParseDurationOrZero(e.cfg.Metrics.MaxStaleness),
 		}
 	default:
 		return schema.DestinationOptions{}
@@ -242,20 +285,47 @@ func (e *signalExporter) reconcileTableSchema(
 	if md == nil {
 		return nil, nil
 	}
-	merged, changed, err := schema.ReconcileAdditiveSchema(md.Schema, want)
-	if err != nil || !changed {
-		return md, nil
-	}
-	haveMerged, err := schema.FromBigQuery(merged)
-	if err != nil || len(schema.CompatibilityDifferences(want, haveMerged)) > 0 {
-		return md, nil
-	}
-	if err := admin.UpdateTable(ctx, table, bq.TableMetadataToUpdate{Schema: merged}, md.ETag); err != nil {
+	for attempt := range 2 {
+		merged, changed, err := schema.ReconcileAdditiveSchema(md.Schema, want)
+		if err != nil {
+			e.logger.Warn("additive schema reconciliation skipped due to incompatible existing schema",
+				zap.String("table", table), zap.Error(err))
+			return md, nil
+		}
+		if !changed {
+			return md, nil
+		}
+		haveMerged, err := schema.FromBigQuery(merged)
+		if err != nil {
+			e.logger.Warn("additive schema reconciliation skipped due to incompatible existing schema",
+				zap.String("table", table), zap.Error(err))
+			return md, nil
+		}
+		if diffs := schema.CompatibilityDifferences(want, haveMerged); len(diffs) > 0 {
+			e.logger.Warn("additive schema reconciliation skipped due to incompatible existing schema",
+				zap.String("table", table), zap.Strings("differences", diffs))
+			return md, nil
+		}
+		err = admin.UpdateTable(ctx, table, bq.TableMetadataToUpdate{Schema: merged}, md.ETag)
+		if err == nil {
+			updated := *md
+			updated.Schema = merged
+			return &updated, nil
+		}
+		if attempt == 0 && isPreconditionFailed(err) {
+			freshMD, readErr := admin.TableMetadata(ctx, table)
+			if readErr != nil {
+				return nil, fmt.Errorf("re-reading %s metadata after ETag precondition failure: %w", subject, readErr)
+			}
+			if freshMD == nil {
+				return nil, fmt.Errorf("re-reading %s metadata after ETag precondition failure returned nil metadata", subject)
+			}
+			md = freshMD
+			continue
+		}
 		return nil, fmt.Errorf("updating %s schema: %w", subject, err)
 	}
-	updated := *md
-	updated.Schema = merged
-	return &updated, nil
+	return md, nil
 }
 
 func (e *signalExporter) createSearchIndex(ctx context.Context, admin destinationAdmin) error {
@@ -265,10 +335,15 @@ func (e *signalExporter) createSearchIndex(ctx context.Context, admin destinatio
 		ddl = fmt.Sprintf(schema.SpansSearchIndexDDL, e.cfg.Project, e.cfg.Dataset, e.table)
 	case proto.Equal(e.schema, schema.LogsTableSchema()):
 		ddl = fmt.Sprintf(schema.LogsSearchIndexDDL, e.cfg.Project, e.cfg.Dataset, e.table)
+	case proto.Equal(e.schema, schema.MetricsTableSchema()):
+		ddl = fmt.Sprintf(schema.MetricsSearchIndexDDL, e.cfg.Project, e.cfg.Dataset, e.table)
 	default:
 		return nil
 	}
 	if err := admin.RunDDL(ctx, ddl); err != nil {
+		if isSearchIndexAlreadyExists(err) {
+			return nil
+		}
 		return fmt.Errorf("creating search index on %s: %w", e.tableID(), err)
 	}
 	return nil
@@ -289,7 +364,14 @@ func (e *signalExporter) ensureDataset(ctx context.Context, admin destinationAdm
 				"destination dataset %s.%s does not exist; create it or enable auto_create.dataset",
 				e.cfg.Project, e.cfg.Dataset)
 		}
-		if err := admin.CreateDataset(ctx, &bq.DatasetMetadata{Location: e.cfg.Location}); err != nil && !isAlreadyExists(err) {
+		dsMD := &bq.DatasetMetadata{Location: e.cfg.Location}
+		if e.cfg.KMSKeyName != "" {
+			dsMD.DefaultEncryptionConfig = &bq.EncryptionConfig{KMSKeyName: e.cfg.KMSKeyName}
+		}
+		if len(e.cfg.Labels) > 0 {
+			dsMD.Labels = maps.Clone(e.cfg.Labels)
+		}
+		if err := admin.CreateDataset(ctx, dsMD); err != nil && !isAlreadyExists(err) {
 			return fmt.Errorf("creating destination dataset %s.%s: %w", e.cfg.Project, e.cfg.Dataset, err)
 		}
 		return nil
@@ -326,6 +408,9 @@ func (e *signalExporter) createDedupView(
 ) error {
 	viewID := e.table + "_dedup"
 	md := &bq.TableMetadata{ViewQuery: query, UseLegacySQL: false}
+	if labels := e.destinationOptions().Labels; len(labels) > 0 {
+		md.Labels = maps.Clone(labels)
+	}
 	err := admin.CreateTable(ctx, viewID, md)
 	if err == nil || isAlreadyExists(err) {
 		return nil
@@ -360,6 +445,7 @@ func (e *signalExporter) createCompanionViews(ctx context.Context, admin destina
 	}
 
 	views := schema.CompanionViewsMetadata(e.cfg.Project, e.cfg.Dataset, spansTable, logsTable, isSpans)
+	signalLabels := e.destinationOptions().Labels
 	order := slices.Sorted(maps.Keys(views))
 	if isSpans {
 		order = schema.SpanCompanionViewOrder
@@ -369,6 +455,9 @@ func (e *signalExporter) createCompanionViews(ctx context.Context, admin destina
 		md, ok := views[id]
 		if !ok {
 			continue
+		}
+		if len(signalLabels) > 0 {
+			md.Labels = maps.Clone(signalLabels)
 		}
 		err := admin.CreateTable(ctx, id, md)
 		if isAlreadyExists(err) {
@@ -393,8 +482,13 @@ func (e *signalExporter) createCompanionViews(ctx context.Context, admin destina
 			return err
 		}
 		logViews := schema.CompanionViewsMetadata(e.cfg.Project, e.cfg.Dataset, spansTable, logsTable, false)
+		logLabels := e.effectiveLabels(e.cfg.Logs.Labels)
 		for _, id := range slices.Sorted(maps.Keys(logViews)) {
-			if err := admin.CreateTable(ctx, id, logViews[id]); err != nil && !isAlreadyExists(err) {
+			md := logViews[id]
+			if len(logLabels) > 0 {
+				md.Labels = maps.Clone(logLabels)
+			}
+			if err := admin.CreateTable(ctx, id, md); err != nil && !isAlreadyExists(err) {
 				return fmt.Errorf("creating companion view %s.%s.%s: %w",
 					e.cfg.Project, e.cfg.Dataset, id, err)
 			}
@@ -476,6 +570,9 @@ func (e *signalExporter) prepareQuarantineTable(ctx context.Context, admin desti
 	createMD, err := schema.QuarantineDestinationMetadataWithOptions(schema.DestinationOptions{
 		PartitionExpirationDays: e.cfg.Quarantine.PartitionExpirationDays,
 		RequirePartitionFilter:  e.cfg.Quarantine.RequirePartitionFilter,
+		KMSKeyName:              e.effectiveKMSKeyName(e.cfg.Quarantine.KMSKeyName),
+		Labels:                  e.effectiveLabels(e.cfg.Quarantine.Labels),
+		MaxStaleness:            mustParseDurationOrZero(e.cfg.Quarantine.MaxStaleness),
 	})
 	if err != nil {
 		return fmt.Errorf("deriving quarantine table metadata: %w", err)
@@ -521,6 +618,21 @@ func isNotFound(err error) bool {
 
 func isAlreadyExists(err error) bool {
 	return errorCodeIs(err, stdhttp.StatusConflict, codes.AlreadyExists)
+}
+
+func isPreconditionFailed(err error) bool {
+	return errorCodeIs(err, stdhttp.StatusPreconditionFailed, codes.FailedPrecondition)
+}
+
+func isSearchIndexAlreadyExists(err error) bool {
+	if isAlreadyExists(err) {
+		return true
+	}
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "already exists") || strings.Contains(msg, "duplicate search index")
 }
 
 func errorCodeIs(err error, httpCode int, grpcCode codes.Code) bool {

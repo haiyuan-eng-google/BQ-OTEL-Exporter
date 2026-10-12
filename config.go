@@ -6,9 +6,11 @@ package bigqueryexporter // import "github.com/haiyuan-eng-google/BQ-OTEL-Export
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -28,8 +30,20 @@ const apiRequestLimitBytes = 10 * 1000 * 1000
 var (
 	// Dataset and table IDs accept letters, numbers and underscores.
 	idPattern = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
-	// Project IDs are lowercase letters, digits and hyphens.
-	projectPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{4,28}[a-z0-9]$`)
+	// Project IDs are lowercase letters, digits and hyphens, with an optional
+	// organization domain prefix (e.g. "example.com:my-project").
+	projectPattern = regexp.MustCompile(`^(?:[a-z0-9.-]+\.[a-z]{2,}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$`)
+	// KMSKeyName must be a Cloud KMS CryptoKey resource path.
+	kmsKeyPattern = regexp.MustCompile(`^projects/[^/\s]+/locations/[^/\s]+/keyRings/[^/\s]+/cryptoKeys/[^/\s]+$`)
+	// BigQuery label keys and values follow Google Cloud resource label rules.
+	labelKeyPattern   = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,62}$`)
+	labelValuePattern = regexp.MustCompile(`^[a-z0-9_-]{0,63}$`)
+)
+
+const (
+	maxBigQueryLabels = 64
+	minTableStaleness = time.Second
+	maxTableStaleness = 7 * 24 * time.Hour
 )
 
 // Config defines configuration for the BigQuery exporter.
@@ -49,6 +63,13 @@ type Config struct {
 	// Location is the dataset location. Required only when creating a
 	// dataset; otherwise it is informational.
 	Location string `mapstructure:"location"`
+	// KMSKeyName is the default Cloud KMS key resource name
+	// (projects/{p}/locations/{l}/keyRings/{r}/cryptoKeys/{k}) applied to
+	// auto-created datasets and tables unless overridden per table.
+	KMSKeyName string `mapstructure:"kms_key_name"`
+	// Labels are default Google Cloud resource labels applied to auto-created
+	// datasets, tables, and views, merged with any per-table labels.
+	Labels map[string]string `mapstructure:"labels"`
 
 	// Traces, Logs, and Metrics configure the three signal pipelines.
 	Traces  SignalConfig `mapstructure:"traces"`
@@ -81,18 +102,25 @@ type Config struct {
 	Offload OffloadConfig `mapstructure:"offload"`
 }
 
-// SignalConfig is the per-signal destination and partition lifecycle policy.
+// SignalConfig is the per-signal destination, partition lifecycle, and
+// governance policy.
 type SignalConfig struct {
-	Table                   string `mapstructure:"table"`
-	PartitionExpirationDays int    `mapstructure:"partition_expiration_days"`
-	RequirePartitionFilter  bool   `mapstructure:"require_partition_filter"`
+	Table                   string            `mapstructure:"table"`
+	PartitionExpirationDays int               `mapstructure:"partition_expiration_days"`
+	RequirePartitionFilter  bool              `mapstructure:"require_partition_filter"`
+	KMSKeyName              string            `mapstructure:"kms_key_name"`
+	Labels                  map[string]string `mapstructure:"labels"`
+	MaxStaleness            string            `mapstructure:"max_staleness"`
 }
 
 // LogsConfig adds the log-only record identity settings.
 type LogsConfig struct {
-	Table                   string `mapstructure:"table"`
-	PartitionExpirationDays int    `mapstructure:"partition_expiration_days"`
-	RequirePartitionFilter  bool   `mapstructure:"require_partition_filter"`
+	Table                   string            `mapstructure:"table"`
+	PartitionExpirationDays int               `mapstructure:"partition_expiration_days"`
+	RequirePartitionFilter  bool              `mapstructure:"require_partition_filter"`
+	KMSKeyName              string            `mapstructure:"kms_key_name"`
+	Labels                  map[string]string `mapstructure:"labels"`
+	MaxStaleness            string            `mapstructure:"max_staleness"`
 
 	// LogNameAttribute names a string log record attribute that carries the
 	// log_name column. When unset, or absent on a record, log_name falls back
@@ -169,8 +197,8 @@ type AutoCreateConfig struct {
 	// v_gen_ai_logs with the logs table once the traces dedup view exists.
 	// Requires tables.
 	CompanionViews bool `mapstructure:"companion_views"`
-	// SearchIndexes runs CREATE SEARCH INDEX IF NOT EXISTS on trace/span
-	// lookup columns at startup. Requires tables and bigquery.jobs.create.
+	// SearchIndexes runs CREATE SEARCH INDEX IF NOT EXISTS on signal tables
+	// at startup. Requires tables and bigquery.jobs.create.
 	SearchIndexes bool `mapstructure:"search_indexes"`
 }
 
@@ -243,9 +271,12 @@ func (l LimitsConfig) toTransform() transform.Limits {
 type QuarantineConfig struct {
 	Enabled bool `mapstructure:"enabled"`
 	// Table is the quarantine table ID in the destination dataset.
-	Table                   string `mapstructure:"table"`
-	PartitionExpirationDays int    `mapstructure:"partition_expiration_days"`
-	RequirePartitionFilter  bool   `mapstructure:"require_partition_filter"`
+	Table                   string            `mapstructure:"table"`
+	PartitionExpirationDays int               `mapstructure:"partition_expiration_days"`
+	RequirePartitionFilter  bool              `mapstructure:"require_partition_filter"`
+	KMSKeyName              string            `mapstructure:"kms_key_name"`
+	Labels                  map[string]string `mapstructure:"labels"`
+	MaxStaleness            string            `mapstructure:"max_staleness"`
 	// MetadataOnly omits raw_payload, raw_attributes, and payload_ref from
 	// quarantine rows when enabled, writing only metadata columns.
 	MetadataOnly bool `mapstructure:"metadata_only"`
@@ -298,6 +329,10 @@ func (cfg *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("dataset %q must contain only letters, numbers and underscores", cfg.Dataset))
 	}
 
+	if cfg.Location != "" && (strings.TrimSpace(cfg.Location) == "" || strings.ContainsAny(cfg.Location, " \t\r\n")) {
+		errs = append(errs, fmt.Errorf("location %q must not be blank or contain whitespace", cfg.Location))
+	}
+
 	for name, table := range map[string]string{
 		"traces.table":  cfg.Traces.Table,
 		"logs.table":    cfg.Logs.Table,
@@ -321,6 +356,7 @@ func (cfg *Config) Validate() error {
 		}
 	}
 
+	errs = append(errs, cfg.validateGovernance()...)
 	errs = append(errs, cfg.validateWrite()...)
 	errs = append(errs, cfg.validateCredentials()...)
 	errs = append(errs, cfg.validateEndpoint()...)
@@ -368,6 +404,97 @@ func (cfg *Config) Validate() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+func (cfg *Config) validateGovernance() []error {
+	var errs []error
+	for _, item := range []struct {
+		field string
+		value string
+	}{
+		{"kms_key_name", cfg.KMSKeyName},
+		{"traces.kms_key_name", cfg.Traces.KMSKeyName},
+		{"logs.kms_key_name", cfg.Logs.KMSKeyName},
+		{"metrics.kms_key_name", cfg.Metrics.KMSKeyName},
+		{"quarantine.kms_key_name", cfg.Quarantine.KMSKeyName},
+	} {
+		if item.value != "" && !kmsKeyPattern.MatchString(item.value) {
+			errs = append(errs, fmt.Errorf(
+				"%s %q must match projects/{project}/locations/{location}/keyRings/{keyRing}/cryptoKeys/{cryptoKey}",
+				item.field, item.value))
+		}
+	}
+
+	for _, item := range []struct {
+		field  string
+		labels map[string]string
+	}{
+		{"labels", cfg.Labels},
+		{"traces.labels", cfg.Traces.Labels},
+		{"logs.labels", cfg.Logs.Labels},
+		{"metrics.labels", cfg.Metrics.Labels},
+		{"quarantine.labels", cfg.Quarantine.Labels},
+	} {
+		if err := validateLabelsMap(item.field, item.labels); err != nil {
+			errs = append(errs, err)
+		}
+		if item.field != "labels" && len(cfg.Labels) > 0 && len(item.labels) > 0 {
+			if merged := mergeLabels(cfg.Labels, item.labels); len(merged) > maxBigQueryLabels {
+				errs = append(errs, fmt.Errorf(
+					"merged labels and %s have %d entries; BigQuery allows at most %d labels",
+					item.field, len(merged), maxBigQueryLabels))
+			}
+		}
+	}
+
+	for _, item := range []struct {
+		field string
+		value string
+	}{
+		{"traces.max_staleness", cfg.Traces.MaxStaleness},
+		{"logs.max_staleness", cfg.Logs.MaxStaleness},
+		{"metrics.max_staleness", cfg.Metrics.MaxStaleness},
+		{"quarantine.max_staleness", cfg.Quarantine.MaxStaleness},
+	} {
+		if _, err := parseMaxStaleness(item.field, item.value); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errs
+}
+
+func validateLabelsMap(field string, m map[string]string) error {
+	if len(m) > maxBigQueryLabels {
+		return fmt.Errorf("%s has %d entries; BigQuery allows at most %d labels", field, len(m), maxBigQueryLabels)
+	}
+	for _, k := range slices.Sorted(maps.Keys(m)) {
+		v := m[k]
+		if !labelKeyPattern.MatchString(k) {
+			return fmt.Errorf(
+				"%s key %q must start with a lowercase letter and contain at most 63 lowercase letters, digits, underscores, or hyphens",
+				field, k)
+		}
+		if !labelValuePattern.MatchString(v) {
+			return fmt.Errorf(
+				"%s[%q] value %q must contain at most 63 lowercase letters, digits, underscores, or hyphens",
+				field, k, v)
+		}
+	}
+	return nil
+}
+
+func parseMaxStaleness(field, raw string) (time.Duration, error) {
+	if raw == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s %q is not a valid duration: %w", field, raw, err)
+	}
+	if d < minTableStaleness || d > maxTableStaleness {
+		return 0, fmt.Errorf("%s (%v) must be between %v and %v", field, d, minTableStaleness, maxTableStaleness)
+	}
+	return d, nil
 }
 
 func (cfg *Config) validateWrite() []error {

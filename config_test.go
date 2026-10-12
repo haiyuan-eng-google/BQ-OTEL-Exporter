@@ -443,6 +443,57 @@ func TestValidateOffloadAndQuarantineHardening(t *testing.T) {
 			},
 			"offload.max_concurrency must be positive",
 		},
+		"blank location": {
+			func(c *Config) { c.Location = "   " },
+			"location \"   \" must not be blank or contain whitespace",
+		},
+		"location with whitespace": {
+			func(c *Config) { c.Location = "US EAST1" },
+			"location \"US EAST1\" must not be blank or contain whitespace",
+		},
+		"invalid top-level kms_key_name": {
+			func(c *Config) { c.KMSKeyName = "projects/my-project/cryptoKeys/bad" },
+			"kms_key_name \"projects/my-project/cryptoKeys/bad\" must match projects/{project}/locations/{location}/keyRings/{keyRing}/cryptoKeys/{cryptoKey}",
+		},
+		"invalid signal kms_key_name": {
+			func(c *Config) { c.Traces.KMSKeyName = "bad-kms-key" },
+			"traces.kms_key_name \"bad-kms-key\" must match projects/{project}/locations/{location}/keyRings/{keyRing}/cryptoKeys/{cryptoKey}",
+		},
+		"kms_key_name with cryptoKeyVersions rejected": {
+			func(c *Config) {
+				c.Traces.KMSKeyName = "projects/my-project/locations/us-central1/keyRings/otel-ring/cryptoKeys/traces-key/cryptoKeyVersions/1"
+			},
+			"traces.kms_key_name \"projects/my-project/locations/us-central1/keyRings/otel-ring/cryptoKeys/traces-key/cryptoKeyVersions/1\" must match projects/{project}/locations/{location}/keyRings/{keyRing}/cryptoKeys/{cryptoKey}",
+		},
+		"invalid label key": {
+			func(c *Config) { c.Labels = map[string]string{"InvalidUpper": "ok"} },
+			"labels key \"InvalidUpper\" must start with a lowercase letter and contain at most 63",
+		},
+		"invalid label value": {
+			func(c *Config) { c.Logs.Labels = map[string]string{"env": "Prod!"} },
+			"logs.labels[\"env\"] value \"Prod!\" must contain at most 63",
+		},
+		"too many labels": {
+			func(c *Config) {
+				c.Metrics.Labels = make(map[string]string, 65)
+				for i := range 65 {
+					c.Metrics.Labels[fmt.Sprintf("k%d", i)] = "v"
+				}
+			},
+			"metrics.labels has 65 entries; BigQuery allows at most 64 labels",
+		},
+		"max_staleness below 1s": {
+			func(c *Config) { c.Traces.MaxStaleness = "500ms" },
+			"traces.max_staleness (500ms) must be between 1s and 168h0m0s",
+		},
+		"max_staleness above 168h": {
+			func(c *Config) { c.Quarantine.MaxStaleness = "169h" },
+			"quarantine.max_staleness (169h0m0s) must be between 1s and 168h0m0s",
+		},
+		"max_staleness invalid duration": {
+			func(c *Config) { c.Logs.MaxStaleness = "not-a-duration" },
+			"logs.max_staleness \"not-a-duration\" is not a valid duration",
+		},
 	}
 
 	for name, tc := range rejects {
@@ -454,5 +505,25 @@ func TestValidateOffloadAndQuarantineHardening(t *testing.T) {
 				t.Fatalf("Validate() = %v, want error containing %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestConfigValidateAcceptsDomainPrefixedProjectAndGovernanceOptions(t *testing.T) {
+	c := validConfig()
+	c.Project = "google.com:my-project-123"
+	c.Location = "us-central1"
+	c.KMSKeyName = "projects/my-project/locations/us-central1/keyRings/otel-ring/cryptoKeys/otel-key"
+	c.Labels = map[string]string{
+		"env":  "prod",
+		"team": "observability_1",
+	}
+	c.Traces.KMSKeyName = "projects/my-project/locations/us-central1/keyRings/otel-ring/cryptoKeys/traces-key"
+	c.Traces.Labels = map[string]string{"signal": "traces"}
+	c.Traces.MaxStaleness = "15m"
+	c.Logs.MaxStaleness = "1h"
+	c.Metrics.MaxStaleness = "168h"
+	c.Quarantine.MaxStaleness = "5m"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate() unexpected error: %v", err)
 	}
 }

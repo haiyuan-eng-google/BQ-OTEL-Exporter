@@ -445,6 +445,14 @@ CREATE SEARCH INDEX IF NOT EXISTS ` + "`%[3]s_trace_lookup_idx`" + `
 ON ` + "`%[1]s.%[2]s.%[3]s`" + ` (trace_id, span_id) OPTIONS (analyzer = 'NO_OP_ANALYZER');
 `
 
+// MetricsSearchIndexDDL creates a search index across all columns on the
+// metrics table to accelerate point lookups by exemplar trace_id, span_id, and
+// JSON attributes across partitions when auto_create.search_indexes is enabled.
+const MetricsSearchIndexDDL = `
+CREATE SEARCH INDEX IF NOT EXISTS ` + "`%[3]s_trace_lookup_idx`" + `
+ON ` + "`%[1]s.%[2]s.%[3]s`" + ` (ALL COLUMNS) OPTIONS (analyzer = 'NO_OP_ANALYZER');
+`
+
 // Companion view names. The companion views are optional conveniences over
 // the dedup views, created only when auto_create.companion_views is enabled.
 // Their names are fixed rather than derived from the table names, so one

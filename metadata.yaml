@@ -236,6 +236,7 @@ attributes:
       - collection_size
       - value_size
       - serialization
+      - request_permanent
       - row_bytes
       - row_error
       - invalid_id

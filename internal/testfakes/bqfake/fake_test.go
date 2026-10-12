@@ -5,6 +5,7 @@ package bqfake
 
 import (
 	"context"
+	"errors"
 	"maps"
 	"slices"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	bq "cloud.google.com/go/bigquery"
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -700,4 +702,76 @@ func TestConcurrentTableGetAndPatch(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestRESTTableUpdateEnforcesIfMatchETagAndAdditiveSchema(t *testing.T) {
+	srv := NewServer(t)
+	ctx := context.Background()
+
+	httpClient, httpBase := srv.NewHTTPClient()
+	t.Cleanup(func() { httpBase.CloseIdleConnections() })
+
+	client, err := bq.NewClient(ctx, "test-project", option.WithHTTPClient(httpClient))
+	if err != nil {
+		t.Fatalf("bq.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	ds := client.Dataset("etag_ds")
+	if err := ds.Create(ctx, &bq.DatasetMetadata{Location: "US"}); err != nil {
+		t.Fatalf("Dataset.Create: %v", err)
+	}
+	tbl := ds.Table("otel_spans")
+	initialSchema := bq.Schema{
+		{Name: "trace_id", Type: bq.StringFieldType, Required: true},
+	}
+	if err := tbl.Create(ctx, &bq.TableMetadata{Schema: initialSchema}); err != nil {
+		t.Fatalf("Table.Create: %v", err)
+	}
+	md1, err := tbl.Metadata(ctx)
+	if err != nil || md1.ETag == "" {
+		t.Fatalf("Table.Metadata = (%#v, %v), want non-empty ETag", md1, err)
+	}
+
+	// 1. Stale ETag must fail with HTTP 412 Precondition Failed.
+	additiveSchema := bq.Schema{
+		{Name: "trace_id", Type: bq.StringFieldType, Required: true},
+		{Name: "payload_refs", Type: bq.StringFieldType, Required: false},
+	}
+	_, err = tbl.Update(ctx, bq.TableMetadataToUpdate{Schema: additiveSchema}, "stale-etag")
+	var gerr *googleapi.Error
+	if !errors.As(err, &gerr) || gerr.Code != 412 {
+		t.Fatalf("Table.Update with stale ETag err = %v, want googleapi.Error with HTTP 412", err)
+	}
+
+	// 2. Matching ETag succeeds and advances ETag without inflating AppendRows request count.
+	md2, err := tbl.Update(ctx, bq.TableMetadataToUpdate{Schema: additiveSchema}, md1.ETag)
+	if err != nil {
+		t.Fatalf("Table.Update with matching ETag failed: %v", err)
+	}
+	if md2.ETag == "" || md2.ETag == md1.ETag {
+		t.Errorf("updated ETag = %q, want distinct non-empty ETag from %q", md2.ETag, md1.ETag)
+	}
+	if _, reqs, _ := srv.Counts(); reqs != 0 {
+		t.Errorf("srv.Counts() requests = %d after REST PATCH, want 0", reqs)
+	}
+
+	// 3. Removing an existing column fails with HTTP 400 Bad Request.
+	_, err = tbl.Update(ctx, bq.TableMetadataToUpdate{Schema: initialSchema}, md2.ETag)
+	gerr = nil
+	if !errors.As(err, &gerr) || gerr.Code != 400 {
+		t.Fatalf("Table.Update removing payload_refs err = %v, want googleapi.Error with HTTP 400", err)
+	}
+
+	// 4. Adding a new REQUIRED column fails with HTTP 400 Bad Request.
+	withNewRequired := bq.Schema{
+		{Name: "trace_id", Type: bq.StringFieldType, Required: true},
+		{Name: "payload_refs", Type: bq.StringFieldType, Required: false},
+		{Name: "must_fail", Type: bq.StringFieldType, Required: true},
+	}
+	_, err = tbl.Update(ctx, bq.TableMetadataToUpdate{Schema: withNewRequired}, md2.ETag)
+	gerr = nil
+	if !errors.As(err, &gerr) || gerr.Code != 400 {
+		t.Fatalf("Table.Update adding new REQUIRED column err = %v, want googleapi.Error with HTTP 400", err)
+	}
 }

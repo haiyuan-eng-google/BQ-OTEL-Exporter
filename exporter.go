@@ -680,13 +680,14 @@ func (e *signalExporter) appendEncoded(
 		if pos < 0 || pos >= len(keptIndex) {
 			continue
 		}
-		if !invalid[pos] {
-			rowErrors = append(rowErrors, transform.QuarantineEntry{
-				Rejection: transform.Rejection{Index: keptIndex[pos], Reason: transform.ReasonRowError},
-				Detail:    rowErrorDetail(re),
-			})
+		if invalid[pos] {
+			continue
 		}
 		invalid[pos] = true
+		rowErrors = append(rowErrors, transform.QuarantineEntry{
+			Rejection: transform.Rejection{Index: keptIndex[pos], Reason: transform.ReasonRowError},
+			Detail:    rowErrorDetail(re),
+		})
 		e.tel.RecordRejected(ctx, string(transform.ReasonRowError), 1)
 		e.logger.Debug("service rejected a row",
 			diag.RowError(e.tableID(), opID, re.Index, re.Code, re.Message)...)
@@ -701,18 +702,18 @@ func (e *signalExporter) appendEncoded(
 
 	if out.Err != nil {
 		v := out.Verdict
-		switch v.Class {
-		case bqi.Uncertain:
+		switch {
+		case v.Class == bqi.Uncertain:
 			// The append may have been applied. Replaying can duplicate,
 			// which the at-least-once contract permits and the dedup SQL
 			// resolves.
 			e.tel.RecordUncertainAckReplay(ctx)
 			e.tel.RecordRetry(ctx, v.Label)
 			componentstatus.ReportStatus(e.host, componentstatus.NewRecoverableErrorEvent(out.Err))
-		case bqi.Retryable:
+		case v.Class == bqi.Retryable || v.StreamRecreate:
 			e.tel.RecordRetry(ctx, v.Label)
 			componentstatus.ReportStatus(e.host, componentstatus.NewRecoverableErrorEvent(out.Err))
-		case bqi.Permanent:
+		case v.Class == bqi.Permanent:
 			componentstatus.ReportStatus(e.host, componentstatus.NewPermanentErrorEvent(out.Err))
 		}
 
@@ -729,12 +730,25 @@ func (e *signalExporter) appendEncoded(
 				)...)
 		}
 
-		// A permanent verdict means every request that failed outright was
-		// rejected permanently. A request refused for row errors appended none
-		// of its rows, though, and still owes its valid ones, so only a batch
-		// without row errors is dropped.
-		if v.Class == bqi.Permanent && len(out.RowErrors) == 0 {
-			return appendDecision{err: out.Err, permanent: true}
+		// A permanent verdict that does not trigger stream recreation means
+		// every request that failed outright was rejected permanently. A
+		// request refused for row errors appended none of its rows, though,
+		// and still owes its valid ones, so only a batch without row errors
+		// is dropped. When StreamRecreate is true, Writer.Append has already
+		// retired the dead stream, so exporterhelper retries the
+		// unacknowledged rows on a freshly opened stream.
+		if v.Class == bqi.Permanent && !v.StreamRecreate && len(out.RowErrors) == 0 {
+			if len(retryable) > 0 {
+				e.tel.RecordRejected(ctx, string(transform.ReasonRequestPermanent), len(retryable))
+				detail := v.Label + ": " + out.Err.Error()
+				for _, origIdx := range retryable {
+					rowErrors = append(rowErrors, transform.QuarantineEntry{
+						Rejection: transform.Rejection{Index: origIdx, Reason: transform.ReasonRequestPermanent},
+						Detail:    detail,
+					})
+				}
+			}
+			return appendDecision{err: out.Err, permanent: true, rowErrors: rowErrors}
 		}
 		if len(retryable) == 0 {
 			return appendDecision{rowErrors: rowErrors}
@@ -859,6 +873,8 @@ func quarantineRowReason(row transform.Row) string {
 		return string(transform.ReasonSerialization)
 	case "ROW_ERROR":
 		return string(transform.ReasonRowError)
+	case "REQUEST_PERMANENT":
+		return string(transform.ReasonRequestPermanent)
 	case "TIMESTAMP_OVERFLOW":
 		return string(transform.ReasonTimestampOverflow)
 	default:
