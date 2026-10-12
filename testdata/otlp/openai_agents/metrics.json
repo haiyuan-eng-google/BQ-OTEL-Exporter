@@ -1,0 +1,116 @@
+{
+  "resourceMetrics": [
+    {
+      "resource": {
+        "attributes": [
+          {"key": "service.name", "value": {"stringValue": "openai-triage-agent"}},
+          {"key": "service.version", "value": {"stringValue": "0.20.0"}}
+        ]
+      },
+      "scopeMetrics": [
+        {
+          "scope": {
+            "name": "opentelemetry.instrumentation.openai_agents",
+            "version": "1.0b0"
+          },
+          "metrics": [
+            {
+              "name": "gen_ai.client.token.usage",
+              "description": "Measures number of input and output tokens used.",
+              "unit": "{token}",
+              "histogram": {
+                "aggregationTemporality": 1,
+                "dataPoints": [
+                  {
+                    "startTimeUnixNano": "1723420830000000000",
+                    "timeUnixNano": "1723420830900000000",
+                    "count": "1",
+                    "sum": 512,
+                    "min": 512,
+                    "max": 512,
+                    "explicitBounds": [1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864],
+                    "bucketCounts": ["0", "0", "0", "0", "0", "1", "0", "0", "0", "0", "0", "0", "0", "0", "0"],
+                    "attributes": [
+                      {"key": "gen_ai.provider.name", "value": {"stringValue": "openai"}},
+                      {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                      {"key": "gen_ai.token.type", "value": {"stringValue": "input"}},
+                      {"key": "gen_ai.request.model", "value": {"stringValue": "gpt-4o"}},
+                      {"key": "gen_ai.response.model", "value": {"stringValue": "gpt-4o-2024-08-06"}}
+                    ],
+                    "exemplars": [
+                      {
+                        "timeUnixNano": "1723420830900000000",
+                        "asDouble": 512,
+                        "traceId": "440102030405060708090a0b0c0d0e04",
+                        "spanId": "4401020304050601"
+                      }
+                    ]
+                  },
+                  {
+                    "startTimeUnixNano": "1723420830000000000",
+                    "timeUnixNano": "1723420830900000000",
+                    "count": "1",
+                    "sum": 128,
+                    "min": 128,
+                    "max": 128,
+                    "explicitBounds": [1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864],
+                    "bucketCounts": ["0", "0", "0", "0", "1", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0"],
+                    "attributes": [
+                      {"key": "gen_ai.provider.name", "value": {"stringValue": "openai"}},
+                      {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                      {"key": "gen_ai.token.type", "value": {"stringValue": "output"}},
+                      {"key": "gen_ai.request.model", "value": {"stringValue": "gpt-4o"}},
+                      {"key": "gen_ai.response.model", "value": {"stringValue": "gpt-4o-2024-08-06"}}
+                    ],
+                    "exemplars": [
+                      {
+                        "timeUnixNano": "1723420830900000000",
+                        "asDouble": 128,
+                        "traceId": "440102030405060708090a0b0c0d0e04",
+                        "spanId": "4401020304050601"
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "gen_ai.client.operation.duration",
+              "description": "GenAI operation duration.",
+              "unit": "s",
+              "histogram": {
+                "aggregationTemporality": 1,
+                "dataPoints": [
+                  {
+                    "startTimeUnixNano": "1723420830000000000",
+                    "timeUnixNano": "1723420830900000000",
+                    "count": "1",
+                    "sum": 0.9,
+                    "min": 0.9,
+                    "max": 0.9,
+                    "explicitBounds": [0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96, 81.92],
+                    "bucketCounts": ["0", "0", "0", "0", "0", "0", "0", "1", "0", "0", "0", "0", "0", "0", "0"],
+                    "attributes": [
+                      {"key": "gen_ai.provider.name", "value": {"stringValue": "openai"}},
+                      {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                      {"key": "gen_ai.request.model", "value": {"stringValue": "gpt-4o"}},
+                      {"key": "gen_ai.response.model", "value": {"stringValue": "gpt-4o-2024-08-06"}}
+                    ],
+                    "exemplars": [
+                      {
+                        "timeUnixNano": "1723420830900000000",
+                        "asDouble": 0.9,
+                        "traceId": "440102030405060708090a0b0c0d0e04",
+                        "spanId": "4401020304050601"
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

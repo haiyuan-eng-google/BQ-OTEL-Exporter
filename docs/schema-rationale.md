@@ -107,7 +107,9 @@ identity.
 - **Spans** are identified by `(start_time, service_name, trace_id, span_id)`.
   Every retry of a span carries the same start time and service, so this is the
   span identity plus the partitioning column and the leading clustering columns.
-  A filter on any of them can be pushed below the window function, so a query
+  The window also partitions on `name`, the last clustering column: it is fixed
+  for a span, so it never splits the retries of one. A filter on any of them
+  can be pushed below the window function, so a query
   over the view still prunes partitions and clusters. Among copies, the one
   with the latest `end_time_unix_nano` wins, then the latest
   `receive_time_unix_nano`. Ordering uses the raw nanoseconds because the
@@ -116,7 +118,14 @@ identity.
   `(timestamp, time_unix_nano, service_name, log_name, insert_id)`. The
   partitioning column and leading clustering column come first for the same
   pruning reason, and `time_unix_nano` keeps apart records that share a
-  microsecond. The most recently received copy wins.
+  microsecond. The window also partitions on `trace_id`, `span_id`, and
+  `severity_number`, the remaining clustering and search-index columns. The
+  record fingerprint covers them, so retries of one record agree on them. The
+  most recently received copy wins.
+- **Metrics** are identified by
+  `(timestamp, time_unix_nano, service_name, metric_name, point_fingerprint)`.
+  The window also partitions on `metric_type`, the last clustering column, which
+  the fingerprint covers. The most recently received copy wins.
 
 The promise is deliberately narrow: **the views remove retry duplicates**.
 

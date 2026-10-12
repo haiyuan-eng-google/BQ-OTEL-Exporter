@@ -40,6 +40,8 @@ jobs:
             target: FuzzLogRows
           - pkg: ./internal/transform
             target: FuzzLogFingerprint
+          - pkg: ./internal/transform
+            target: FuzzMetricRows
           - pkg: ./internal/protoenc
             target: FuzzProtoEncRoundTrip
           - pkg: ./internal/bigquery

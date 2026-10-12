@@ -49,8 +49,8 @@ make collector-check
 For the Docker Compose path, choose a dataset name and an ADC file. Compose
 builds the same distribution into a non-root image with
 [`example/Dockerfile`](example/Dockerfile). The example opts into creating the
-dataset, the active trace/log tables, and their create-only deduplication
-views, so the identity needs the creation permissions listed under [IAM](#iam).
+dataset, the active trace/log tables, and their deduplication views, so the
+identity needs the creation permissions listed under [IAM](#iam).
 
 ```bash
 export BQ_PROJECT=my-project
@@ -233,8 +233,8 @@ as log events rather than span attributes.
 | `endpoint.insecure`             | `false`               | Disables TLS. Refused unless `endpoint.url` is loopback. |
 | `endpoint.without_authentication` | `false`             | Sends no credentials. Refused unless the endpoint is loopback. |
 | `auto_create.dataset`           | `false`               | Create the dataset if absent. Requires `location`. |
-| `auto_create.tables`            | `false`               | Create the active signal's destination table (plus `quarantine.table` when enabled) and `_dedup` view if absent, and reconcile additive nullable columns on existing tables (`ReconcileAdditiveSchema`). Views are create-only: an existing view is left as it is. |
-| `auto_create.companion_views`   | `false`               | Create the companion views if absent; existing ones are left as they are (`otel_spans_as_allspans`, `v_gen_ai_spans`, `v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_gen_ai_tool_usage`, `v_gen_ai_logs`). Requires `auto_create.tables`. |
+| `auto_create.tables`            | `false`               | Create the active signal's destination table (plus `quarantine.table` when enabled) and `_dedup` view if absent, and reconcile additive nullable columns on existing tables (`ReconcileAdditiveSchema`). An existing `_dedup` view is reconciled to the current definition (the query only, best effort), which needs `bigquery.tables.update`. |
+| `auto_create.companion_views`   | `false`               | Create the companion views if absent and reconcile existing ones to the current definition (the query only, best effort): `otel_spans_as_allspans`, `v_gen_ai_spans`, `v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_gen_ai_tool_usage`, `v_gen_ai_logs`, and `v_gen_ai_metrics` for the metrics signal. Requires `auto_create.tables`. |
 | `auto_create.search_indexes`    | `false`               | Execute `CREATE SEARCH INDEX IF NOT EXISTS ... OPTIONS (analyzer = 'NO_OP_ANALYZER')` on `(trace_id, span_id)` for `otel_spans` and `otel_logs` and on `(ALL COLUMNS)` for `otel_metrics`. Requires `auto_create.tables` and `bigquery.jobs.create`. |
 | `write.max_request_bytes`       | `8388608` (8 MiB)     | Our request-size headroom threshold, enforced after protobuf serialization and before `AppendRows`. Distinct from, and below, the API's own per-request limit. |
 | `write.max_row_bytes`           | `1048576` (1 MiB)     | Rejects individual serialized signal rows above this size and bounds quarantine rows by truncating `raw_payload`. |
@@ -400,30 +400,98 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
     `gen_ai_agent_name`, `gen_ai_agent_id`, `gen_ai_conversation_id`,
     `gen_ai_usage_input_tokens`, `gen_ai_usage_output_tokens`,
     `gen_ai_usage_cache_read_input_tokens`, `gen_ai_usage_cache_creation_input_tokens`,
+    `gen_ai_usage_reasoning_tokens`,
     `gen_ai_request_temperature`, `gen_ai_request_top_p`, `gen_ai_request_max_tokens`,
     `gen_ai_response_finish_reason`, `gen_ai_tool_name`, `gen_ai_tool_call_id`,
     `gen_ai_tool_type`, `gen_ai_tool_description`, `gen_ai_data_source_id`,
     `gen_ai_output_type`, `error_type`, `adk_event_id`,
     `adk_session_id`, `adk_invocation_id`, `adk_user_id`) into top-level columns.
-  - `v_gen_ai_model_costs`: hourly token, cache-read/write, latency (`APPROX_QUANTILES`),
-    and error-rate rollups over `v_gen_ai_spans` grouped by
-    `(hour_bucket, service_name, gen_ai_system, gen_ai_operation_name, model)`.
-  - `v_gen_ai_sessions`: session/conversation rollups over `v_gen_ai_spans`
-    grouped by `(service_name, session_id)` (`COALESCE(gen_ai_conversation_id, adk_session_id)`).
+    `gen_ai_usage_reasoning_tokens` reads the current
+    `gen_ai.usage.reasoning.output_tokens` attribute first and the earlier
+    `gen_ai.usage.reasoning_tokens` spelling second; `error_type` is the
+    `error.type` attribute.
+  - `v_gen_ai_model_costs`: hourly token, cache-read/write, reasoning, latency
+    (`APPROX_QUANTILES`), and error-count rollups over `v_gen_ai_spans` grouped
+    by `(usage_hour, service_name, gen_ai_agent_name, provider, model)`. Each
+    LLM call is counted once: a span with a direct child span that reports input
+    or output tokens is taken to report the sum of its children and is left out,
+    and so is an agent or tool span that reports no tokens of its own. An agent
+    span that names a request model and reports tokens, with no child that
+    reports tokens, is still counted, as one call. Only direct children are
+    examined, so tokens that a grandparent span sums over a deeper descendant
+    are not removed. A parent is matched with its children only when they share
+    a trace, a service name, and a usage hour: a pair that straddles an hour
+    boundary, or whose spans carry different service names, is not matched, so
+    both spans count and the parent's tokens are added to its children's. An
+    agent or tool span that reports tokens but names no request model is not an
+    inference span, so it is not counted as a call, and its tokens are not in
+    this view, although `v_gen_ai_sessions` still adds them to the session
+    totals.
+  - `v_gen_ai_sessions`: session/conversation rollups over `v_gen_ai_spans`,
+    one row per `(service_name, session_start_date, session_id)`, where
+    `session_id` is `COALESCE(adk_session_id, gen_ai_conversation_id)` and
+    `session_start_date` is the UTC date of the span start time. A session that
+    runs across midnight UTC therefore has one row for each date it touches.
+    Token totals leave out any span that has a direct child span reporting
+    tokens, so a parent that reports the sum of its children is not counted with
+    them. Only spans that carry a session id take part, and a parent is matched
+    with its children only within one service name, UTC date, session, and
+    trace. A child without a session id is therefore not seen: its parent keeps
+    its own tokens, which already include the child's, and the child is not
+    counted. A pair split by midnight UTC or by service name is not matched, so
+    both spans count. The token totals cover every span that has no
+    token-reporting child, not only LLM calls, so an `invoke_agent` span that
+    reports tokens but names no request model adds to them without being
+    counted in `llm_call_count` or in `v_gen_ai_model_costs`. `llm_call_count`
+    counts LLM calls by the same rule as `v_gen_ai_model_costs`, and
+    `agent_invocation_count` counts `invoke_agent` spans. `session_start_date`,
+    `total_cache_creation_input_tokens`, `llm_call_count`, and
+    `agent_invocation_count` are the last four columns, so every earlier column
+    keeps its position.
   - `v_gen_ai_tool_usage`: hourly tool invocation count, error rate, and latency
     rollups over `v_gen_ai_spans` grouped by `(hour_bucket, service_name, gen_ai_agent_name, gen_ai_tool_name, gen_ai_tool_type)`.
   - `v_gen_ai_logs`: filters `otel_logs_dedup` to GenAI/agent log events and
-    joins `otel_spans_dedup` on `(service_name, trace_id, span_id)` to promote
-    `gen_ai.*` and `gcp.vertex.agent.*` correlation columns.
-- **Additive schema evolution and create-only views (`auto_create.tables`).**
+    left-joins `otel_spans_dedup` on `(trace_id, span_id)` and a null-safe
+    `service_name` match, within the window described under *Time-bounded
+    `v_gen_ai_logs` span enrichment* below, to promote `gen_ai.*` and
+    `gcp.vertex.agent.*` correlation columns. A value the log record carries
+    wins over the same attribute on its span, and the agent name, session ID,
+    and user ID are coalesced over the same attribute keys, in the same order,
+    as the columns of `v_gen_ai_spans`. A filter on `timestamp` can narrow the
+    scan of `otel_logs`, but not the span side of the join, and `v_gen_ai_logs`
+    cannot be queried when `traces.require_partition_filter` is `true`.
+  - `v_gen_ai_metrics`: filters `otel_metrics_dedup` to metric names matching
+    `LIKE 'gen_ai.%'` (for example `gen_ai.client.token.usage` and
+    `gen_ai.client.operation.duration`) and promotes
+    `gen_ai_operation_name`, `gen_ai_system` (from `gen_ai.system`, then
+    `gen_ai.provider.name`), `gen_ai_provider_name`, `gen_ai_request_model`,
+    `gen_ai_response_model`, `gen_ai_token_type`, and `error_type` next to every
+    point-value column, including the `exemplars` whose `trace_id` and
+    `span_id` link a point back to a trace.
+  - The two rollup views, `v_gen_ai_model_costs` and `v_gen_ai_sessions`, read
+    `v_gen_ai_spans` once. A window function over that read finds the parents
+    that report the sum of their children's tokens, and each view computes one
+    column of its own before the window, so a filter on `usage_hour` (model
+    costs) or on `session_start_date` (sessions) narrows the scan of
+    `otel_spans` to the partitions it keeps. A filter on `service_name`, or on
+    `session_id`, alone does not. See *Filtering the GenAI views by time* below.
+- **Additive schema evolution and view reconciliation (`auto_create.tables`).**
   When `auto_create.tables` is `true`, startup reconciles existing tables that
   are missing newly introduced `NULLABLE` or `REPEATED` columns (at top level or
   inside nested `RECORD` fields) via `UpdateTable` with optimistic `ETag`
-  concurrency. Incompatible type or mode drift is always rejected. The `_dedup`
-  and companion views are create-only: startup creates a missing view and leaves
-  an existing one as it is, so it needs no `bigquery.tables.update` and never
-  reverts an operator's edit. When an upgrade changes a view's SQL, drop the view
-  (or replace it with the new definition) and restart to pick it up.
+  concurrency. Incompatible type or mode drift is always rejected. Startup also
+  keeps the `_dedup` views, and with `auto_create.companion_views` the
+  companion views, in step with the exporter: a missing view is created, and an
+  existing view whose SQL differs from the exporter's current definition (other
+  than in whitespace) is updated in place through `UpdateTable`, so an upgrade
+  that changes a view's SQL needs no manual step. Only the view query is
+  reconciled; labels and other view properties are left alone. These views have
+  fixed names and belong to the exporter: a customized definition under one of
+  those names is replaced at the next start, so keep a variation under another
+  name. Reconciliation is best effort. A view that cannot be read or updated,
+  for example because the identity lacks `bigquery.tables.update`, is kept as it
+  is and logged as a warning, and export continues; a context cancellation or
+  timeout still fails startup.
 - **Opt-in quarantine dead-letter table (`otel_quarantine`).** When
   `quarantine.enabled` is `true`, spans, log records, and metric data points
   that fail validation, breach structural limits, exceed `write.max_row_bytes`,
@@ -502,15 +570,42 @@ ON `my-project.otel.otel_logs` (trace_id, span_id) OPTIONS (analyzer = 'NO_OP_AN
   records at the same timestamp. Multi-tenant collectors accepting untrusted
   OTLP input should strip or namespace those attributes in a processor before
   export.
-- **Time-bounded `v_gen_ai_logs` queries.** `v_gen_ai_logs` left-joins
+- **Filtering the GenAI views by time.** A filter on `start_time` reaches the
+  scan of `otel_spans` through `otel_spans_dedup` and `v_gen_ai_spans`. The
+  rollup views read `v_gen_ai_spans` once and expose the column to filter on:
+  `usage_hour` for `v_gen_ai_model_costs` and `session_start_date` for
+  `v_gen_ai_sessions`. In BigQuery dry runs over a small test table of 48
+  hourly partitions, the estimated bytes for one `usage_hour` were 1/48 of the
+  estimate with no filter, and for one of the table's two UTC dates, 1/2; adding
+  a filter on `service_name` to either, or filtering on `service_name` or
+  `session_id` alone, did not change the estimate. A dry run estimates an upper
+  bound and does not show the benefit of clustering. When
+  `traces.require_partition_filter` is `true`, BigQuery rejects a query over a
+  rollup that has no filter on `usage_hour` (or `session_start_date`), and one
+  that filters only on `service_name` or `session_id`. A parent is matched with
+  its children only within one `PARTITION BY` partition of the rollup's window
+  (see the notes under each rollup above), so a pair that straddles the
+  boundary of a partition counts both spans.
+- **Time-bounded `v_gen_ai_logs` span enrichment.** `v_gen_ai_logs` left-joins
   `otel_logs_dedup` (`PARTITION BY DATE(timestamp)`) with `otel_spans_dedup`
-  (`PARTITION BY TIMESTAMP_TRUNC(start_time, HOUR)`) using
-  `(service_name, trace_id, span_id)`. Filtering `v_gen_ai_logs` on `timestamp`
-  prunes daily partitions on `otel_logs`, but because the view join does not
-  constrain `otel_spans.start_time` (and does not project `start_time`), queries
-  that need hourly partition pruning on `otel_spans` over large tables should
+  (`PARTITION BY TIMESTAMP_TRUNC(start_time, HOUR)`) on `(trace_id, span_id)`
+  and on `service_name`, compared null-safely so that a log record and a span
+  that both lack a service name still match. The join also carries a range
+  predicate on `otel_spans.start_time`: only a span that started from 24 hours
+  before to 1 hour after the log record's `timestamp` enriches the record. A
+  record whose span started outside that window is still returned with its own
+  attributes, but without the columns that come from the span. The predicate
+  compares `otel_spans.start_time` with each log row's `timestamp`, and BigQuery
+  does not use such a predicate to skip span partitions. In dry runs over ten
+  daily partitions of test log rows, a one-day filter on `timestamp` cut the
+  part of the estimate that comes from `otel_logs` to a tenth, so the filter
+  prunes daily partitions there, and left the part that comes from `otel_spans`
+  unchanged. No filter that BigQuery can use for partition elimination reaches
+  the span scan, so a query over `v_gen_ai_logs` is rejected when
+  `traces.require_partition_filter` is `true`, with or without a filter on
+  `timestamp`. Leave that option off for a deployment that queries the view, or
   join `otel_logs_dedup` against a `start_time`-bounded `otel_spans_dedup`
-  subquery directly.
+  subquery directly, which also lets a query choose its own window.
 
 ## Delivery semantics
 
@@ -537,6 +632,17 @@ read time:
 The repo ships `otel_spans_dedup`, `otel_logs_dedup`, and `otel_metrics_dedup`
 **logical views** so the default object an analyst touches is already
 deduplicated. See [`internal/schema`](internal/schema/schema.go).
+
+Each view's window function partitions on the row identity and also on every
+column its base table is partitioned, clustered, or search-indexed on (the span
+`name`, the log `trace_id`, `span_id`, and `severity_number`, and the metric
+`metric_type`). Those columns are fixed for a record, so they never split the
+retries of one, and a filter on any of them can be pushed below the window
+function, so partition and cluster pruning can still apply through the view.
+In BigQuery dry runs over a small test table, a filter on `start_time` cut the
+estimate for `otel_spans_dedup` to the hourly partitions the filter kept. A dry
+run does not show the benefit of clustering, and this repository has not
+measured how many bytes pruning saves on a table of production size.
 
 > **Known limit, stated rather than hidden:** for logs without an explicit
 > upstream `insert_id` attribute, `insert_id` falls back to `record_fingerprint`,

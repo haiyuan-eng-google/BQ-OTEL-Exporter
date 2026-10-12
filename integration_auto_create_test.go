@@ -105,8 +105,9 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 		t.Fatalf("write log: %v", err)
 	}
 
-	// A second pair of exporters exercises dataset, table, and create-only view
-	// AlreadyExists paths against the real metadata API.
+	// A second pair of exporters exercises the dataset and table AlreadyExists
+	// paths and the reconciliation of existing views against the real metadata
+	// API.
 	secondTraces, err := newTracesExporter(settings, cfg)
 	if err != nil {
 		t.Fatal(err)

@@ -1,0 +1,141 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {"key": "service.name", "value": {"stringValue": "hierarchy-trip-agent"}},
+          {"key": "service.version", "value": {"stringValue": "1.0.0"}}
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "synthetic.gen_ai.hierarchy",
+            "version": "1.0.0"
+          },
+          "spans": [
+            {
+              "traceId": "880102030405060708090a0b0c0d0e08",
+              "spanId": "8801020304050601",
+              "name": "invoke_agent travel_planner",
+              "kind": 1,
+              "startTimeUnixNano": "1723420870000000000",
+              "endTimeUnixNano": "1723420873200000000",
+              "attributes": [
+                {"key": "gen_ai.provider.name", "value": {"stringValue": "openai"}},
+                {"key": "gen_ai.operation.name", "value": {"stringValue": "invoke_agent"}},
+                {"key": "gen_ai.agent.id", "value": {"stringValue": "agent-hier-01"}},
+                {"key": "gen_ai.agent.name", "value": {"stringValue": "travel_planner"}},
+                {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-hier-501"}},
+                {"key": "user.id", "value": {"stringValue": "user-hier-42"}},
+                {"key": "gen_ai.request.model", "value": {"stringValue": "gpt-4o"}},
+                {"key": "gen_ai.usage.input_tokens", "value": {"intValue": "920"}},
+                {"key": "gen_ai.usage.output_tokens", "value": {"intValue": "250"}},
+                {"key": "gen_ai.usage.cache_read.input_tokens", "value": {"intValue": "128"}},
+                {"key": "gen_ai.usage.reasoning.output_tokens", "value": {"intValue": "40"}}
+              ],
+              "status": {"code": 1}
+            },
+            {
+              "traceId": "880102030405060708090a0b0c0d0e08",
+              "spanId": "8801020304050602",
+              "parentSpanId": "8801020304050601",
+              "name": "chat gpt-4o",
+              "kind": 3,
+              "startTimeUnixNano": "1723420870100000000",
+              "endTimeUnixNano": "1723420871300000000",
+              "attributes": [
+                {"key": "gen_ai.provider.name", "value": {"stringValue": "openai"}},
+                {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                {"key": "gen_ai.agent.name", "value": {"stringValue": "travel_planner"}},
+                {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-hier-501"}},
+                {"key": "gen_ai.request.model", "value": {"stringValue": "gpt-4o"}},
+                {"key": "gen_ai.response.model", "value": {"stringValue": "gpt-4o-2024-08-06"}},
+                {"key": "gen_ai.usage.input_tokens", "value": {"intValue": "400"}},
+                {"key": "gen_ai.usage.output_tokens", "value": {"intValue": "90"}},
+                {"key": "gen_ai.usage.cache_read.input_tokens", "value": {"intValue": "128"}},
+                {"key": "gen_ai.response.finish_reasons", "value": {"arrayValue": {"values": [{"stringValue": "tool_calls"}]}}}
+              ],
+              "status": {"code": 1}
+            },
+            {
+              "traceId": "880102030405060708090a0b0c0d0e08",
+              "spanId": "8801020304050603",
+              "parentSpanId": "8801020304050601",
+              "name": "execute_tool search_flights",
+              "kind": 1,
+              "startTimeUnixNano": "1723420871300000000",
+              "endTimeUnixNano": "1723420872000000000",
+              "attributes": [
+                {"key": "gen_ai.provider.name", "value": {"stringValue": "openai"}},
+                {"key": "gen_ai.operation.name", "value": {"stringValue": "execute_tool"}},
+                {"key": "gen_ai.agent.name", "value": {"stringValue": "travel_planner"}},
+                {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-hier-501"}},
+                {"key": "gen_ai.tool.name", "value": {"stringValue": "search_flights"}},
+                {"key": "gen_ai.tool.call.id", "value": {"stringValue": "call-hier-7"}}
+              ],
+              "status": {"code": 1}
+            },
+            {
+              "traceId": "880102030405060708090a0b0c0d0e08",
+              "spanId": "8801020304050604",
+              "parentSpanId": "8801020304050601",
+              "name": "chat gpt-4o",
+              "kind": 3,
+              "startTimeUnixNano": "1723420872000000000",
+              "endTimeUnixNano": "1723420873100000000",
+              "attributes": [
+                {"key": "gen_ai.provider.name", "value": {"stringValue": "openai"}},
+                {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                {"key": "gen_ai.agent.name", "value": {"stringValue": "travel_planner"}},
+                {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-hier-501"}},
+                {"key": "gen_ai.request.model", "value": {"stringValue": "gpt-4o"}},
+                {"key": "gen_ai.response.model", "value": {"stringValue": "gpt-4o-2024-08-06"}},
+                {"key": "gen_ai.usage.input_tokens", "value": {"intValue": "520"}},
+                {"key": "gen_ai.usage.output_tokens", "value": {"intValue": "160"}},
+                {"key": "gen_ai.usage.reasoning.output_tokens", "value": {"intValue": "40"}},
+                {"key": "gen_ai.response.finish_reasons", "value": {"arrayValue": {"values": [{"stringValue": "stop"}]}}}
+              ],
+              "status": {"code": 1}
+            },
+            {
+              "traceId": "880102030405060708090a0b0c0d0e09",
+              "spanId": "8801020304050611",
+              "name": "invoke_agent travel_planner",
+              "kind": 1,
+              "startTimeUnixNano": "1723420900000000000",
+              "endTimeUnixNano": "1723420901500000000",
+              "attributes": [
+                {"key": "gen_ai.provider.name", "value": {"stringValue": "openai"}},
+                {"key": "gen_ai.operation.name", "value": {"stringValue": "invoke_agent"}},
+                {"key": "gen_ai.agent.id", "value": {"stringValue": "agent-hier-01"}},
+                {"key": "gen_ai.agent.name", "value": {"stringValue": "travel_planner"}},
+                {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-hier-501"}},
+                {"key": "user.id", "value": {"stringValue": "user-hier-42"}}
+              ],
+              "status": {"code": 1}
+            },
+            {
+              "traceId": "880102030405060708090a0b0c0d0e09",
+              "spanId": "8801020304050612",
+              "parentSpanId": "8801020304050611",
+              "name": "chat gpt-4o-mini",
+              "kind": 3,
+              "startTimeUnixNano": "1723420900200000000",
+              "endTimeUnixNano": "1723420901400000000",
+              "attributes": [
+                {"key": "gen_ai.provider.name", "value": {"stringValue": "openai"}},
+                {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                {"key": "gen_ai.agent.name", "value": {"stringValue": "travel_planner"}},
+                {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-hier-501"}},
+                {"key": "gen_ai.request.model", "value": {"stringValue": "gpt-4o-mini"}},
+                {"key": "error.type", "value": {"stringValue": "rate_limit_exceeded"}}
+              ],
+              "status": {"code": 2, "message": "rate limit exceeded"}
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

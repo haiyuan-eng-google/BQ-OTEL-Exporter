@@ -6,14 +6,18 @@ package bigqueryexporter
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/otel/metric/noop"
 	"go.uber.org/zap"
@@ -38,6 +42,7 @@ type sdkManifestEntry struct {
 	GenAISystem      string   `yaml:"gen_ai_system"`
 	TracesFile       string   `yaml:"traces_file"`
 	LogsFile         string   `yaml:"logs_file"`
+	MetricsFile      string   `yaml:"metrics_file"`
 	// LogsOutsideGenAIView marks a framework whose log events carry no
 	// gen_ai.* attributes, so v_gen_ai_logs does not select them and they are
 	// queried from otel_logs instead.
@@ -86,6 +91,182 @@ func TestSDKManifestDocVersionParity(t *testing.T) {
 	}
 }
 
+// The GenAI client metrics of every framework are two delta histograms, one
+// point to the call: token usage (an input point and an output point) and
+// operation duration. A fixture that drifted from that shape, such as a bucket
+// count that no longer matches its value, would still load and would make the
+// end-to-end checks below meaningless, so the shape is pinned on its own.
+func TestSDKMetricsFixtureShapes(t *testing.T) {
+	m := loadSDKManifest(t)
+	var unmarshaler pmetric.JSONUnmarshaler
+	for _, fw := range m.Frameworks {
+		t.Run(fw.ID, func(t *testing.T) {
+			if !slices.Contains(fw.Signals, "metrics") || fw.MetricsFile == "" {
+				t.Fatalf("framework %s must list the metrics signal and a metrics_file", fw.ID)
+			}
+			path := filepath.Join("testdata", "otlp", fw.MetricsFile)
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read %s: %v", path, err)
+			}
+			md, err := unmarshaler.UnmarshalMetrics(raw)
+			if err != nil {
+				t.Fatalf("UnmarshalMetrics(%s): %v", path, err)
+			}
+			if md.ResourceMetrics().Len() != 1 || md.ResourceMetrics().At(0).ScopeMetrics().Len() != 1 {
+				t.Fatalf("%s must hold one resource with one scope", path)
+			}
+			metrics := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics()
+			if metrics.Len() != 2 {
+				t.Fatalf("%s holds %d metrics, want 2", path, metrics.Len())
+			}
+
+			wantUnit := map[string]string{
+				"gen_ai.client.token.usage":        "{token}",
+				"gen_ai.client.operation.duration": "s",
+			}
+			seen := make(map[string]int)
+			for _, mt := range metrics.All() {
+				unit, known := wantUnit[mt.Name()]
+				if !known {
+					t.Fatalf("unexpected metric %q in %s", mt.Name(), path)
+				}
+				if mt.Unit() != unit {
+					t.Errorf("%s unit = %q, want %q", mt.Name(), mt.Unit(), unit)
+				}
+				if mt.Type() != pmetric.MetricTypeHistogram {
+					t.Fatalf("%s type = %v, want a histogram", mt.Name(), mt.Type())
+				}
+				if got := mt.Histogram().AggregationTemporality(); got != pmetric.AggregationTemporalityDelta {
+					t.Errorf("%s temporality = %v, want delta", mt.Name(), got)
+				}
+				for _, dp := range mt.Histogram().DataPoints().All() {
+					requireOneCallHistogramPoint(t, mt.Name(), dp)
+					key := mt.Name()
+					if tokenType, ok := dp.Attributes().Get("gen_ai.token.type"); ok {
+						key += "/" + tokenType.Str()
+					}
+					seen[key]++
+				}
+			}
+			for _, key := range []string{
+				"gen_ai.client.token.usage/input",
+				"gen_ai.client.token.usage/output",
+				"gen_ai.client.operation.duration",
+			} {
+				if seen[key] != 1 {
+					t.Errorf("%s holds %d %s points, want 1", path, seen[key], key)
+				}
+			}
+			if len(seen) != 3 {
+				t.Errorf("%s holds points of kinds %v, want exactly the three above", path, seen)
+			}
+		})
+	}
+}
+
+// requireOneCallHistogramPoint checks a histogram point that records exactly
+// one call: its single observation is the sum, the minimum and the maximum,
+// it falls in exactly one bucket, that bucket is the one the explicit bounds
+// assign it, and one exemplar carries the same value, a trace and a span ID,
+// and a timestamp inside the point's interval.
+func requireOneCallHistogramPoint(t *testing.T, name string, dp pmetric.HistogramDataPoint) {
+	t.Helper()
+	if dp.Count() != 1 {
+		t.Errorf("%s count = %d, want 1", name, dp.Count())
+	}
+	if !dp.HasSum() || !dp.HasMin() || !dp.HasMax() || dp.Sum() != dp.Min() || dp.Sum() != dp.Max() {
+		t.Errorf("%s sum, min and max = %v, %v, %v, want one value", name, dp.Sum(), dp.Min(), dp.Max())
+	}
+	bounds := dp.ExplicitBounds().AsRaw()
+	counts := dp.BucketCounts().AsRaw()
+	if len(counts) != len(bounds)+1 {
+		t.Fatalf("%s holds %d bucket counts for %d bounds, want one more than the bounds", name, len(counts), len(bounds))
+	}
+	for i := 1; i < len(bounds); i++ {
+		if bounds[i] <= bounds[i-1] {
+			t.Fatalf("%s explicit bounds are not strictly increasing: %v", name, bounds)
+		}
+	}
+	// A value belongs to the first bucket whose upper bound it does not exceed.
+	wantBucket := sort.SearchFloat64s(bounds, dp.Sum())
+	for i, c := range counts {
+		want := uint64(0)
+		if i == wantBucket {
+			want = 1
+		}
+		if c != want {
+			t.Errorf("%s bucket %d holds %d, want %d for the value %v", name, i, c, want, dp.Sum())
+		}
+	}
+	if dp.Exemplars().Len() != 1 {
+		t.Fatalf("%s holds %d exemplars, want 1", name, dp.Exemplars().Len())
+	}
+	ex := dp.Exemplars().At(0)
+	if ex.ValueType() != pmetric.ExemplarValueTypeDouble || ex.DoubleValue() != dp.Sum() {
+		t.Errorf("%s exemplar value = %v, want the point's value %v", name, ex.DoubleValue(), dp.Sum())
+	}
+	if ex.TraceID().IsEmpty() || ex.SpanID().IsEmpty() {
+		t.Errorf("%s exemplar must carry a trace ID and a span ID", name)
+	}
+	if ex.Timestamp() < dp.StartTimestamp() || ex.Timestamp() > dp.Timestamp() {
+		t.Errorf("%s exemplar timestamp %v lies outside the point's interval [%v, %v]",
+			name, ex.Timestamp(), dp.StartTimestamp(), dp.Timestamp())
+	}
+}
+
+// metricPointCount counts the data points of one metric, whatever its type.
+func metricPointCount(m pmetric.Metric) int {
+	switch m.Type() {
+	case pmetric.MetricTypeGauge:
+		return m.Gauge().DataPoints().Len()
+	case pmetric.MetricTypeSum:
+		return m.Sum().DataPoints().Len()
+	case pmetric.MetricTypeHistogram:
+		return m.Histogram().DataPoints().Len()
+	case pmetric.MetricTypeExponentialHistogram:
+		return m.ExponentialHistogram().DataPoints().Len()
+	case pmetric.MetricTypeSummary:
+		return m.Summary().DataPoints().Len()
+	default:
+		return 0
+	}
+}
+
+// decodeAttributes decodes the plain-JSON attributes column of a row.
+func decodeAttributes(t *testing.T, row map[string]any) map[string]any {
+	t.Helper()
+	raw, _ := row["attributes"].(string)
+	var attrs map[string]any
+	if err := json.Unmarshal([]byte(raw), &attrs); err != nil {
+		t.Fatalf("unmarshal attributes JSON %q: %v", raw, err)
+	}
+	return attrs
+}
+
+// spanTokenCount reads the token count of the given type ("input" or
+// "output") off a span's attributes: the GenAI attribute, or the
+// OpenInference one that CrewAI's instrumentation emits instead. The
+// attributes column writes an int attribute as a decimal string and a double
+// as a JSON number.
+func spanTokenCount(attrs map[string]any, tokenType string) (float64, bool) {
+	keys := map[string][]string{
+		"input":  {"gen_ai.usage.input_tokens", "llm.token_count.prompt"},
+		"output": {"gen_ai.usage.output_tokens", "llm.token_count.completion"},
+	}[tokenType]
+	for _, key := range keys {
+		switch v := attrs[key].(type) {
+		case float64:
+			return v, true
+		case string:
+			if n, err := strconv.ParseFloat(v, 64); err == nil {
+				return n, true
+			}
+		}
+	}
+	return 0, false
+}
+
 func TestAllSevenAgentFrameworkGoldenFixturesEndToEnd(t *testing.T) {
 	m := loadSDKManifest(t)
 	srv := bqfake.NewServer(t)
@@ -110,6 +291,10 @@ func TestAllSevenAgentFrameworkGoldenFixturesEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newLogsExporter: %v", err)
 	}
+	metricsExp, err := newMetricsExporter(settings, cfg)
+	if err != nil {
+		t.Fatalf("newMetricsExporter: %v", err)
+	}
 
 	ctx := context.Background()
 	if err := tracesExp.start(ctx, nil); err != nil {
@@ -120,16 +305,23 @@ func TestAllSevenAgentFrameworkGoldenFixturesEndToEnd(t *testing.T) {
 		t.Fatalf("logsExp.start: %v", err)
 	}
 	t.Cleanup(func() { _ = logsExp.shutdown(context.Background()) })
+	if err := metricsExp.start(ctx, nil); err != nil {
+		t.Fatalf("metricsExp.start: %v", err)
+	}
+	t.Cleanup(func() { _ = metricsExp.shutdown(context.Background()) })
 
 	var traceUnmarshaler ptrace.JSONUnmarshaler
 	var logUnmarshaler plog.JSONUnmarshaler
+	var metricUnmarshaler pmetric.JSONUnmarshaler
 
 	totalExpectedSpans := 0
 	totalExpectedLogs := 0
+	totalExpectedPoints := 0
 	// Every fixture uses a service.name of its own, so the rows each one
 	// produced can be counted separately.
 	wantSpansByService := make(map[string]int)
 	wantLogsByService := make(map[string]int)
+	wantPointsByService := make(map[string]int)
 	logsOutsideView := make(map[string]bool)
 
 	for _, fw := range m.Frameworks {
@@ -182,47 +374,84 @@ func TestAllSevenAgentFrameworkGoldenFixturesEndToEnd(t *testing.T) {
 					t.Fatalf("pushLogData(%s): %v", fw.ID, err)
 				}
 			}
+
+			if slices.Contains(fw.Signals, "metrics") && fw.MetricsFile != "" {
+				metricsPath := filepath.Join("testdata", "otlp", fw.MetricsFile)
+				metricsRaw, err := os.ReadFile(metricsPath)
+				if err != nil {
+					t.Fatalf("read %s: %v", metricsPath, err)
+				}
+				md, err := metricUnmarshaler.UnmarshalMetrics(metricsRaw)
+				if err != nil {
+					t.Fatalf("UnmarshalMetrics(%s): %v", metricsPath, err)
+				}
+				totalExpectedPoints += md.DataPointCount()
+				for _, rm := range md.ResourceMetrics().All() {
+					svc, _ := rm.Resource().Attributes().Get("service.name")
+					for _, sm := range rm.ScopeMetrics().All() {
+						for _, mt := range sm.Metrics().All() {
+							wantPointsByService[svc.Str()] += metricPointCount(mt)
+						}
+					}
+				}
+
+				if err := metricsExp.pushMetricsData(ctx, md); err != nil {
+					t.Fatalf("pushMetricsData(%s): %v", fw.ID, err)
+				}
+			}
 		})
 	}
 
 	spanRows := srv.Rows("otel_spans")
 	logRows := srv.Rows("otel_logs")
+	metricRows := srv.Rows("otel_metrics")
 	if len(spanRows) != totalExpectedSpans {
 		t.Fatalf("expected exactly %d span rows across all frameworks, got %d", totalExpectedSpans, len(spanRows))
 	}
 	if len(logRows) != totalExpectedLogs {
 		t.Fatalf("expected exactly %d log rows across all frameworks, got %d", totalExpectedLogs, len(logRows))
 	}
-	for name, rows := range map[string][]map[string]any{"span": spanRows, "log": logRows} {
-		want := wantSpansByService
-		if name == "log" {
-			want = wantLogsByService
-		}
+	if len(metricRows) != totalExpectedPoints {
+		t.Fatalf("expected exactly %d metric rows across all frameworks, got %d", totalExpectedPoints, len(metricRows))
+	}
+	for _, sig := range []struct {
+		name string
+		rows []map[string]any
+		want map[string]int
+	}{
+		{"span", spanRows, wantSpansByService},
+		{"log", logRows, wantLogsByService},
+		{"metric", metricRows, wantPointsByService},
+	} {
 		got := make(map[string]int)
-		for _, r := range rows {
+		for _, r := range sig.rows {
 			svc, _ := r["service_name"].(string)
 			got[svc]++
 		}
-		for svc, n := range want {
+		for svc, n := range sig.want {
 			if got[svc] != n {
-				t.Errorf("%s rows for fixture service %q = %d, want %d", name, svc, got[svc], n)
+				t.Errorf("%s rows for fixture service %q = %d, want %d", sig.name, svc, got[svc], n)
 			}
 		}
 		for svc, n := range got {
-			if _, ok := want[svc]; !ok {
-				t.Errorf("%d %s rows for service %q, which no fixture sends", n, name, svc)
+			if _, ok := sig.want[svc]; !ok {
+				t.Errorf("%d %s rows for service %q, which no fixture sends", n, sig.name, svc)
 			}
 		}
 	}
 
-	// Index decoded spans by (service_name, trace_id, span_id) to simulate the
-	// v_gen_ai_logs LEFT JOIN v_gen_ai_spans USING (service_name, trace_id, span_id).
+	// Index decoded spans by (service_name, trace_id, span_id), which is how an
+	// exemplar names the span it was recorded under.
 	type joinKey struct {
 		serviceName string
 		traceID     string
 		spanID      string
 	}
-	spansByKey := make(map[joinKey]map[string]any)
+	type spanFixture struct {
+		row   map[string]any
+		attrs map[string]any
+	}
+	spansByKey := make(map[joinKey]spanFixture)
 	systemsSeenInSpans := make(map[string]bool)
 
 	for _, r := range spanRows {
@@ -238,7 +467,7 @@ func TestAllSevenAgentFrameworkGoldenFixturesEndToEnd(t *testing.T) {
 		svc, _ := r["service_name"].(string)
 		tid, _ := r["trace_id"].(string)
 		sid, _ := r["span_id"].(string)
-		spansByKey[joinKey{serviceName: svc, traceID: tid, spanID: sid}] = attrs
+		spansByKey[joinKey{serviceName: svc, traceID: tid, spanID: sid}] = spanFixture{row: r, attrs: attrs}
 
 		opName, _ := attrs["gen_ai.operation.name"].(string)
 		sysName, _ := attrs["gen_ai.system"].(string)
@@ -330,10 +559,20 @@ func TestAllSevenAgentFrameworkGoldenFixturesEndToEnd(t *testing.T) {
 			systemsSeenInLogs[lSys] = true
 		}
 
+		// v_gen_ai_logs left-joins the log dedup view to the span dedup view
+		// on trace_id, span_id, a NULL-safe service_name, and a span start
+		// within the bounded window around the record's timestamp.
 		tid, _ := l["trace_id"].(string)
 		sid, _ := l["span_id"].(string)
-		if _, ok := spansByKey[joinKey{serviceName: svc, traceID: tid, spanID: sid}]; !ok {
-			t.Errorf("log row (service=%q, trace=%q, span=%q) did not join to any span in v_gen_ai_spans", svc, tid, sid)
+		joined := false
+		for _, s := range spanRows {
+			if logJoinsSpan(l, s) {
+				joined = true
+				break
+			}
+		}
+		if !joined {
+			t.Errorf("log row (service=%q, trace=%q, span=%q) did not join to any span in otel_spans_dedup", svc, tid, sid)
 		}
 	}
 
@@ -344,6 +583,79 @@ func TestAllSevenAgentFrameworkGoldenFixturesEndToEnd(t *testing.T) {
 		if slices.Contains(fw.Signals, "logs") && fw.GenAISystem != "" && !fw.LogsOutsideGenAIView {
 			if !systemsSeenInLogs[fw.GenAISystem] {
 				t.Errorf("framework %s (gen_ai.system=%q) was not observed in v_gen_ai_logs rows", fw.ID, fw.GenAISystem)
+			}
+		}
+	}
+
+	// Every metrics.json describes the one span its exemplars link to: the token
+	// sums and the duration equal that span's, and the provider, operation and
+	// request model the span names are the ones the metric names. A span that
+	// carries no gen_ai.* attributes, such as CrewAI's, is held to the token sums
+	// and the duration alone.
+	pointsByKind := make(map[string]int)
+	for _, r := range metricRows {
+		if r["schema_version"] != schema.Version {
+			t.Fatalf("metric schema_version = %v, want %q", r["schema_version"], schema.Version)
+		}
+		svc, _ := r["service_name"].(string)
+		name, _ := r["metric_name"].(string)
+		if !sqlLike(genAIMetricNamePattern, name) {
+			t.Errorf("metric %q of %q fails the v_gen_ai_metrics WHERE predicate", name, svc)
+		}
+		mAttrs := decodeAttributes(t, r)
+		exemplars, _ := r["exemplars"].([]map[string]any)
+		if len(exemplars) != 1 {
+			t.Errorf("%s point of %q carries %d exemplars, want 1", name, svc, len(exemplars))
+			continue
+		}
+		tid, _ := exemplars[0]["trace_id"].(string)
+		sid, _ := exemplars[0]["span_id"].(string)
+		sp, ok := spansByKey[joinKey{serviceName: svc, traceID: tid, spanID: sid}]
+		if !ok {
+			t.Errorf("exemplar of a %s point of %q links trace %q span %q, which is not a span row of that service", name, svc, tid, sid)
+			continue
+		}
+
+		sum, _ := r["sum"].(float64)
+		switch name {
+		case "gen_ai.client.token.usage":
+			tokenType, _ := mAttrs["gen_ai.token.type"].(string)
+			want, found := spanTokenCount(sp.attrs, tokenType)
+			if !found {
+				t.Errorf("%s %q point of %q: its span reports no token count of that type", name, tokenType, svc)
+			} else if sum != want {
+				t.Errorf("%s %q point of %q sums to %v, but its span reports %v", name, tokenType, svc, sum, want)
+			}
+			pointsByKind[svc+"/"+name+"/"+tokenType]++
+		case "gen_ai.client.operation.duration":
+			ns, _ := sp.row["duration_nano"].(int64)
+			if math.Abs(sum-float64(ns)/1e9) > 1e-9 {
+				t.Errorf("%s point of %q sums to %vs, but its span lasted %vs", name, svc, sum, float64(ns)/1e9)
+			}
+			pointsByKind[svc+"/"+name]++
+		default:
+			t.Errorf("unexpected metric %q of %q", name, svc)
+		}
+
+		for _, key := range []string{"gen_ai.operation.name", "gen_ai.system", "gen_ai.provider.name", "gen_ai.request.model"} {
+			want, onSpan := sp.attrs[key]
+			if !onSpan {
+				continue
+			}
+			if got := mAttrs[key]; got != want {
+				t.Errorf("%s point of %q has %s = %v, but its span has %v", name, svc, key, got, want)
+			}
+		}
+	}
+	for svc := range wantPointsByService {
+		for _, kind := range []string{
+			"gen_ai.client.token.usage/input",
+			"gen_ai.client.token.usage/output",
+			"gen_ai.client.operation.duration",
+		} {
+			key := svc + "/" + kind
+			if pointsByKind[key] != 1 {
+				t.Errorf("service %q has %d %s points, want 1", svc, pointsByKind[key], kind)
 			}
 		}
 	}

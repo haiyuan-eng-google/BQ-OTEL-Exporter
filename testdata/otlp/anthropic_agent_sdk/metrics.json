@@ -1,0 +1,116 @@
+{
+  "resourceMetrics": [
+    {
+      "resource": {
+        "attributes": [
+          {"key": "service.name", "value": {"stringValue": "anthropic-agent-cli"}},
+          {"key": "service.version", "value": {"stringValue": "2.1.229"}}
+        ]
+      },
+      "scopeMetrics": [
+        {
+          "scope": {
+            "name": "com.anthropic.agent.sdk",
+            "version": "2.1.229"
+          },
+          "metrics": [
+            {
+              "name": "gen_ai.client.token.usage",
+              "description": "Measures number of input and output tokens used.",
+              "unit": "{token}",
+              "histogram": {
+                "aggregationTemporality": 1,
+                "dataPoints": [
+                  {
+                    "startTimeUnixNano": "1723420800000000000",
+                    "timeUnixNano": "1723420801250000000",
+                    "count": "1",
+                    "sum": 1420,
+                    "min": 1420,
+                    "max": 1420,
+                    "explicitBounds": [1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864],
+                    "bucketCounts": ["0", "0", "0", "0", "0", "0", "1", "0", "0", "0", "0", "0", "0", "0", "0"],
+                    "attributes": [
+                      {"key": "gen_ai.system", "value": {"stringValue": "anthropic"}},
+                      {"key": "gen_ai.operation.name", "value": {"stringValue": "invoke_agent"}},
+                      {"key": "gen_ai.token.type", "value": {"stringValue": "input"}},
+                      {"key": "gen_ai.request.model", "value": {"stringValue": "anthropic-v4-default"}},
+                      {"key": "gen_ai.response.model", "value": {"stringValue": "anthropic-v4-default-20260514"}}
+                    ],
+                    "exemplars": [
+                      {
+                        "timeUnixNano": "1723420801250000000",
+                        "asDouble": 1420,
+                        "traceId": "110102030405060708090a0b0c0d0e01",
+                        "spanId": "1101020304050601"
+                      }
+                    ]
+                  },
+                  {
+                    "startTimeUnixNano": "1723420800000000000",
+                    "timeUnixNano": "1723420801250000000",
+                    "count": "1",
+                    "sum": 380,
+                    "min": 380,
+                    "max": 380,
+                    "explicitBounds": [1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864],
+                    "bucketCounts": ["0", "0", "0", "0", "0", "1", "0", "0", "0", "0", "0", "0", "0", "0", "0"],
+                    "attributes": [
+                      {"key": "gen_ai.system", "value": {"stringValue": "anthropic"}},
+                      {"key": "gen_ai.operation.name", "value": {"stringValue": "invoke_agent"}},
+                      {"key": "gen_ai.token.type", "value": {"stringValue": "output"}},
+                      {"key": "gen_ai.request.model", "value": {"stringValue": "anthropic-v4-default"}},
+                      {"key": "gen_ai.response.model", "value": {"stringValue": "anthropic-v4-default-20260514"}}
+                    ],
+                    "exemplars": [
+                      {
+                        "timeUnixNano": "1723420801250000000",
+                        "asDouble": 380,
+                        "traceId": "110102030405060708090a0b0c0d0e01",
+                        "spanId": "1101020304050601"
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "gen_ai.client.operation.duration",
+              "description": "GenAI operation duration.",
+              "unit": "s",
+              "histogram": {
+                "aggregationTemporality": 1,
+                "dataPoints": [
+                  {
+                    "startTimeUnixNano": "1723420800000000000",
+                    "timeUnixNano": "1723420801250000000",
+                    "count": "1",
+                    "sum": 1.25,
+                    "min": 1.25,
+                    "max": 1.25,
+                    "explicitBounds": [0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96, 81.92],
+                    "bucketCounts": ["0", "0", "0", "0", "0", "0", "0", "1", "0", "0", "0", "0", "0", "0", "0"],
+                    "attributes": [
+                      {"key": "gen_ai.system", "value": {"stringValue": "anthropic"}},
+                      {"key": "gen_ai.operation.name", "value": {"stringValue": "invoke_agent"}},
+                      {"key": "gen_ai.request.model", "value": {"stringValue": "anthropic-v4-default"}},
+                      {"key": "gen_ai.response.model", "value": {"stringValue": "anthropic-v4-default-20260514"}}
+                    ],
+                    "exemplars": [
+                      {
+                        "timeUnixNano": "1723420801250000000",
+                        "asDouble": 1.25,
+                        "traceId": "110102030405060708090a0b0c0d0e01",
+                        "spanId": "1101020304050601"
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

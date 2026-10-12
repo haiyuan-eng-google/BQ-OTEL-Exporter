@@ -1,0 +1,116 @@
+{
+  "resourceMetrics": [
+    {
+      "resource": {
+        "attributes": [
+          {"key": "service.name", "value": {"stringValue": "bedrock-converse-worker"}},
+          {"key": "service.version", "value": {"stringValue": "0.65b0"}}
+        ]
+      },
+      "scopeMetrics": [
+        {
+          "scope": {
+            "name": "opentelemetry.instrumentation.botocore.bedrock-runtime",
+            "version": "0.65b0"
+          },
+          "metrics": [
+            {
+              "name": "gen_ai.client.token.usage",
+              "description": "Measures number of input and output tokens used.",
+              "unit": "{token}",
+              "histogram": {
+                "aggregationTemporality": 1,
+                "dataPoints": [
+                  {
+                    "startTimeUnixNano": "1723420850000000000",
+                    "timeUnixNano": "1723420851100000000",
+                    "count": "1",
+                    "sum": 350,
+                    "min": 350,
+                    "max": 350,
+                    "explicitBounds": [1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864],
+                    "bucketCounts": ["0", "0", "0", "0", "0", "1", "0", "0", "0", "0", "0", "0", "0", "0", "0"],
+                    "attributes": [
+                      {"key": "gen_ai.system", "value": {"stringValue": "aws.bedrock"}},
+                      {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                      {"key": "gen_ai.token.type", "value": {"stringValue": "input"}},
+                      {"key": "gen_ai.request.model", "value": {"stringValue": "amazon.nova-pro-v1:0"}},
+                      {"key": "gen_ai.response.model", "value": {"stringValue": "amazon.nova-pro-v1:0"}}
+                    ],
+                    "exemplars": [
+                      {
+                        "timeUnixNano": "1723420851100000000",
+                        "asDouble": 350,
+                        "traceId": "660102030405060708090a0b0c0d0e06",
+                        "spanId": "6601020304050601"
+                      }
+                    ]
+                  },
+                  {
+                    "startTimeUnixNano": "1723420850000000000",
+                    "timeUnixNano": "1723420851100000000",
+                    "count": "1",
+                    "sum": 140,
+                    "min": 140,
+                    "max": 140,
+                    "explicitBounds": [1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864],
+                    "bucketCounts": ["0", "0", "0", "0", "1", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0"],
+                    "attributes": [
+                      {"key": "gen_ai.system", "value": {"stringValue": "aws.bedrock"}},
+                      {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                      {"key": "gen_ai.token.type", "value": {"stringValue": "output"}},
+                      {"key": "gen_ai.request.model", "value": {"stringValue": "amazon.nova-pro-v1:0"}},
+                      {"key": "gen_ai.response.model", "value": {"stringValue": "amazon.nova-pro-v1:0"}}
+                    ],
+                    "exemplars": [
+                      {
+                        "timeUnixNano": "1723420851100000000",
+                        "asDouble": 140,
+                        "traceId": "660102030405060708090a0b0c0d0e06",
+                        "spanId": "6601020304050601"
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "gen_ai.client.operation.duration",
+              "description": "GenAI operation duration.",
+              "unit": "s",
+              "histogram": {
+                "aggregationTemporality": 1,
+                "dataPoints": [
+                  {
+                    "startTimeUnixNano": "1723420850000000000",
+                    "timeUnixNano": "1723420851100000000",
+                    "count": "1",
+                    "sum": 1.1,
+                    "min": 1.1,
+                    "max": 1.1,
+                    "explicitBounds": [0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96, 81.92],
+                    "bucketCounts": ["0", "0", "0", "0", "0", "0", "0", "1", "0", "0", "0", "0", "0", "0", "0"],
+                    "attributes": [
+                      {"key": "gen_ai.system", "value": {"stringValue": "aws.bedrock"}},
+                      {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                      {"key": "gen_ai.request.model", "value": {"stringValue": "amazon.nova-pro-v1:0"}},
+                      {"key": "gen_ai.response.model", "value": {"stringValue": "amazon.nova-pro-v1:0"}}
+                    ],
+                    "exemplars": [
+                      {
+                        "timeUnixNano": "1723420851100000000",
+                        "asDouble": 1.1,
+                        "traceId": "660102030405060708090a0b0c0d0e06",
+                        "spanId": "6601020304050601"
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

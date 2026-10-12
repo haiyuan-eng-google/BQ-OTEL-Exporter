@@ -2,58 +2,80 @@
 # attribute names and event names recorded for each verified framework version
 # in docs/agent-frameworks.md and issue #1. They are not captures from those
 # runs, so their timestamps, IDs and values are illustrative.
+#
+# The metrics.json fixtures are less grounded still. Most of the verified setups
+# in docs/agent-frameworks.md run with OTEL_METRICS_EXPORTER=none, so no metrics
+# were recorded for them. Each metrics.json is an illustrative rendering of the
+# OpenTelemetry GenAI client metrics (gen_ai.client.token.usage and
+# gen_ai.client.operation.duration, as delta histograms with an exemplar) for the
+# one span of that framework's traces.json: the token sums and the duration
+# equal the span's, and the exemplar carries the span's trace and span IDs.
+# CrewAI is instrumented through OpenInference and emits no gen_ai.* attributes
+# at all, so its metrics.json shows the shape a GenAI metrics bridge would add
+# rather than anything the framework emits.
+#
+# testdata/otlp/hierarchy/traces.json is not a framework. It holds the two-level
+# agent/model-call span trees that view_conformance_test.go loads directly to
+# check that the rollup views count each model call once.
 schema_version: v0alpha2
 provenance: synthetic
 frameworks:
   - id: anthropic_agent_sdk
     version: "2.1.229"
     tier: T1
-    signals: [traces, logs]
+    signals: [traces, logs, metrics]
     gen_ai_system: anthropic
     traces_file: anthropic_agent_sdk/traces.json
     logs_file: anthropic_agent_sdk/logs.json
+    metrics_file: anthropic_agent_sdk/metrics.json
     # Claude Code's cost event (claude_code.api_request) carries no gen_ai.*
     # attribute, so v_gen_ai_logs does not select it; query otel_logs.
     logs_outside_gen_ai_view: true
   - id: google_adk
     version: "2.6.3"
     tier: T1
-    signals: [traces, logs]
+    signals: [traces, logs, metrics]
     gen_ai_system: gcp.vertex.agent
     traces_file: google_adk/traces.json
     logs_file: google_adk/logs.json
+    metrics_file: google_adk/metrics.json
   - id: langgraph
     version: "1.2.x"
     companion_version: "0.10.18"
     tier: T1
-    signals: [traces]
+    signals: [traces, metrics]
     gen_ai_system: langsmith
     traces_file: langgraph/traces.json
+    metrics_file: langgraph/metrics.json
   - id: openai_agents
     version: "0.20.0"
     companion_version: "1.0b0"
     tier: T2
-    signals: [traces, logs]
+    signals: [traces, logs, metrics]
     gen_ai_system: openai
     traces_file: openai_agents/traces.json
     logs_file: openai_agents/logs.json
+    metrics_file: openai_agents/metrics.json
   - id: crewai
     version: "1.15.15"
     companion_version: "1.1.12"
     tier: T2
-    signals: [traces]
+    signals: [traces, metrics]
     traces_file: crewai/traces.json
+    metrics_file: crewai/metrics.json
   - id: aws_bedrock
     version: "0.65b0"
     tier: T2
-    signals: [traces, logs]
+    signals: [traces, logs, metrics]
     gen_ai_system: aws.bedrock
     traces_file: aws_bedrock/traces.json
     logs_file: aws_bedrock/logs.json
+    metrics_file: aws_bedrock/metrics.json
   - id: microsoft_agent_framework
     version: "1.11.0–1.13.0"
     tier: T2
-    signals: [traces, logs]
+    signals: [traces, logs, metrics]
     gen_ai_system: microsoft.agent_framework
     traces_file: microsoft_agent_framework/traces.json
     logs_file: microsoft_agent_framework/logs.json
+    metrics_file: microsoft_agent_framework/metrics.json

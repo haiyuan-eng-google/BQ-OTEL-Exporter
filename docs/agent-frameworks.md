@@ -285,3 +285,12 @@ view DDL in [`internal/schema`](../internal/schema/schema.go)), `v_gen_ai_spans`
 and `v_gen_ai_logs` coalesce the common `gen_ai.*` and `gcp.vertex.agent.*`
 attribute variants into typed top-level columns over `otel_spans_dedup` and
 `otel_logs_dedup` while keeping the raw transport tables schema-pure.
+`v_gen_ai_metrics` does the same for the `gen_ai.*` metric points over
+`otel_metrics_dedup`. For reasoning tokens, `v_gen_ai_spans` reads
+`gen_ai.usage.reasoning.output_tokens` first and the earlier
+`gen_ai.usage.reasoning_tokens` spelling second.
+
+Some frameworks report the same tokens on an agent span and again on the model
+call spans beneath it. `v_gen_ai_model_costs` and `v_gen_ai_sessions` leave out
+a span that has a direct child reporting tokens, so each model call is counted
+once; the [README](../README.md) states the rule and its limits.
