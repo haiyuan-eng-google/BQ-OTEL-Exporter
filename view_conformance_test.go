@@ -397,33 +397,93 @@ func genAISpansView(t testing.TB, rawSpans []map[string]any) []map[string]any {
 	return out
 }
 
-// spanRef names a span within its trace.
-type spanRef struct{ trace, span string }
+// rollupWindow is the window that v_gen_ai_model_costs and v_gen_ai_sessions
+// run over their one read of v_gen_ai_spans to find the token parents. A span
+// is a token parent when a span that reports input or output tokens, in the
+// same partition of the window, names it as its parent. keys are the PARTITION
+// BY columns.
+type rollupWindow struct {
+	keys []string
+}
 
-// tokenParents is the token_parents CTE: every span that has a direct child
-// reporting input or output tokens.
-func tokenParents(spans []map[string]any) map[spanRef]bool {
-	parents := make(map[spanRef]bool)
+var (
+	// costsWindow partitions by usage hour, service and trace.
+	costsWindow = rollupWindow{keys: []string{"usage_hour", "service_name", "trace_id"}}
+	// sessionsWindow partitions by service, UTC date, session and trace. A span
+	// that has no session id falls in a partition whose session is NULL, and no
+	// span that has a session id is in that partition, so such a span neither
+	// reports tokens to its parent nor hides the parent. The view drops those
+	// spans before the window runs so that the window reads fewer rows. That
+	// changes no row, so the model needs no filter of its own: the SQL text
+	// checks pin it.
+	sessionsWindow = rollupWindow{keys: []string{"service_name", "session_start_date", "session_id", "trace_id"}}
+)
+
+// sessionID is COALESCE(adk_session_id, gen_ai_conversation_id).
+func sessionID(s map[string]any) (string, bool) {
+	if id, ok := colString(s, "adk_session_id"); ok {
+		return id, true
+	}
+	return colString(s, "gen_ai_conversation_id")
+}
+
+// windowKey is the value of one PARTITION BY column for a span, NULL as nil.
+func windowKey(s map[string]any, key string) any {
+	switch key {
+	case "usage_hour":
+		start, _ := colInt(s, "start_time")
+		return start - start%time.Hour.Microseconds()
+	case "session_start_date":
+		start, _ := colInt(s, "start_time")
+		return utcDate(start)
+	case "session_id":
+		id, ok := sessionID(s)
+		return nilUnless(ok, id)
+	}
+	return s[key]
+}
+
+// partition renders the PARTITION BY values of a span as one key. A NULL is a
+// value of its own, as it is in a window.
+func (w rollupWindow) partition(s map[string]any) string {
+	vals := make([]any, len(w.keys))
+	for i, key := range w.keys {
+		vals[i] = windowKey(s, key)
+	}
+	return groupKey(vals...)
+}
+
+// tokenParentKey is a span ID within one partition of a rollup window.
+type tokenParentKey struct{ partition, span string }
+
+// tokenParents is the ARRAY_AGG window: for each partition, the parent_span_id
+// of every span that has a parent and reports input or output tokens.
+func (w rollupWindow) tokenParents(spans []map[string]any) map[tokenParentKey]bool {
+	parents := make(map[tokenParentKey]bool)
 	for _, s := range spans {
 		parent, hasParent := colString(s, "parent_span_id")
 		_, hasIn := colInt(s, "gen_ai_usage_input_tokens")
 		_, hasOut := colInt(s, "gen_ai_usage_output_tokens")
 		if hasParent && (hasIn || hasOut) {
-			trace, _ := colString(s, "trace_id")
-			parents[spanRef{trace, parent}] = true
+			parents[tokenParentKey{w.partition(s), parent}] = true
 		}
 	}
 	return parents
 }
 
-// isLLMCall is the predicate the rollup views share: a span is one LLM call
-// when no direct child reports tokens, it is an inference span (an inference
-// operation or a request model), and it is not an agent or tool span unless it
-// reports tokens itself.
-func isLLMCall(s map[string]any, parents map[spanRef]bool) bool {
-	trace, _ := colString(s, "trace_id")
+// tokenLeaf is the token leaf test: no span that reports tokens names the span
+// as its parent from within the span's own partition.
+func (w rollupWindow) tokenLeaf(s map[string]any, parents map[tokenParentKey]bool) bool {
 	span, _ := colString(s, "span_id")
-	if parents[spanRef{trace, span}] {
+	return !parents[tokenParentKey{w.partition(s), span}]
+}
+
+// isLLMCall is the predicate the rollup views share: a span is one LLM call
+// when it is a token leaf, it is an inference span (an inference operation or
+// a request model), and it is not an agent or tool span unless it reports
+// tokens itself.
+func isLLMCall(s map[string]any, tokenLeaf bool) bool {
+	if !tokenLeaf {
 		return false
 	}
 	op, hasOp := colString(s, "gen_ai_operation_name")
@@ -457,11 +517,11 @@ func groupKey(vals ...any) string {
 // modelCostsView is v_gen_ai_model_costs over the rows of v_gen_ai_spans,
 // without its percentile columns.
 func modelCostsView(spans []map[string]any) []map[string]any {
-	parents := tokenParents(spans)
+	parents := costsWindow.tokenParents(spans)
 	groups := make(map[string]map[string]any)
 	var order []string
 	for _, s := range spans {
-		if !isLLMCall(s, parents) {
+		if !isLLMCall(s, costsWindow.tokenLeaf(s, parents)) {
 			continue
 		}
 		start, _ := colInt(s, "start_time")
@@ -534,7 +594,7 @@ func utcDate(micros int64) string {
 // the sorted set of values ANY_VALUE may pick, in user_id_candidates and
 // agent_name_candidates.
 func sessionsView(spans []map[string]any) []map[string]any {
-	parents := tokenParents(spans)
+	parents := sessionsWindow.tokenParents(spans)
 	type acc struct {
 		row                   map[string]any
 		traces, invocations   map[string]bool
@@ -546,10 +606,7 @@ func sessionsView(spans []map[string]any) []map[string]any {
 	groups := make(map[string]*acc)
 	var order []string
 	for _, s := range spans {
-		session, hasSession := colString(s, "adk_session_id")
-		if !hasSession {
-			session, hasSession = colString(s, "gen_ai_conversation_id")
-		}
+		session, hasSession := sessionID(s)
 		if !hasSession {
 			continue
 		}
@@ -601,9 +658,8 @@ func sessionsView(spans []map[string]any) []map[string]any {
 		if code, _ := colInt(s, "status_code"); code == 2 {
 			g.errorCount++
 		}
-		trace, _ := colString(s, "trace_id")
-		span, _ := colString(s, "span_id")
-		if !parents[spanRef{trace, span}] { // is_token_leaf
+		leaf := sessionsWindow.tokenLeaf(s, parents)
+		if leaf { // is_token_leaf
 			for col, src := range map[string]string{
 				"total_input_tokens":                "gen_ai_usage_input_tokens",
 				"total_output_tokens":               "gen_ai_usage_output_tokens",
@@ -614,7 +670,7 @@ func sessionsView(spans []map[string]any) []map[string]any {
 				g.row[col] = g.row[col].(int64) + intOrZero(s, src)
 			}
 		}
-		if isLLMCall(s, parents) {
+		if isLLMCall(s, leaf) {
 			g.row["llm_call_count"] = g.row["llm_call_count"].(int64) + 1
 		}
 		if hasOp && op == "invoke_agent" {
@@ -795,13 +851,34 @@ func quoteList(vals []string) string {
 }
 
 // The rollup views' shared SQL, rendered from the model's own tables.
-func tokenParentsSQL() string {
-	return "token_parents AS ( SELECT DISTINCT trace_id, parent_span_id AS span_id FROM `" + confProject + "." + confDataset +
-		".v_gen_ai_spans` WHERE parent_span_id IS NOT NULL AND (gen_ai_usage_input_tokens IS NOT NULL OR gen_ai_usage_output_tokens IS NOT NULL) )"
+
+// tokenParentsAggSQL is the window aggregate that collects the parent of every
+// span that reports tokens. It keeps the NULLs: BigQuery's analytic ARRAY_AGG
+// takes neither IGNORE NULLS nor DISTINCT.
+func tokenParentsAggSQL() string {
+	return "ARRAY_AGG( IF( s.parent_span_id IS NOT NULL" +
+		" AND (s.gen_ai_usage_input_tokens IS NOT NULL OR s.gen_ai_usage_output_tokens IS NOT NULL)," +
+		" s.parent_span_id, NULL ) )"
+}
+
+// sql renders the aggregate over the partitions of the window.
+func (w rollupWindow) sql() string {
+	keys := make([]string, len(w.keys))
+	for i, key := range w.keys {
+		keys[i] = "s." + key
+	}
+	return tokenParentsAggSQL() + " OVER ( PARTITION BY " + strings.Join(keys, ", ") + " ) AS token_parent_span_ids"
+}
+
+// tokenLeafSQL is true for a span that no token-reporting span of its
+// partition names as its parent.
+func tokenLeafSQL() string {
+	return "NOT EXISTS ( SELECT 1 FROM UNNEST(s.token_parent_span_ids) AS token_parent_span_id" +
+		" WHERE token_parent_span_id = s.span_id )"
 }
 
 func llmCallPredicateSQL() string {
-	return "tp.span_id IS NULL AND ( s.gen_ai_operation_name IN (" + quoteList(inferenceOps) + ") OR s.gen_ai_request_model IS NOT NULL )" +
+	return tokenLeafSQL() + " AND ( s.gen_ai_operation_name IN (" + quoteList(inferenceOps) + ") OR s.gen_ai_request_model IS NOT NULL )" +
 		" AND ( COALESCE(s.gen_ai_operation_name, '') NOT IN (" + quoteList(agentToolOps) + ")" +
 		" OR s.gen_ai_usage_input_tokens IS NOT NULL OR s.gen_ai_usage_output_tokens IS NOT NULL )"
 }
@@ -855,11 +932,14 @@ func TestViewModelMatchesViewSQL(t *testing.T) {
 	}
 	requireSQL(t, "v_gen_ai_metrics", render(schema.GenAIMetricsViewQuery, confProject, confDataset, confMetrics), metricFragments...)
 
+	// Both rollups read v_gen_ai_spans once, and a window over that read finds the
+	// token parents; the window's PARTITION BY list is the matching rule.
+	spansRead := "FROM `" + confProject + "." + confDataset + ".v_gen_ai_spans` AS s"
 	requireSQL(t, "v_gen_ai_model_costs", render(schema.GenAIModelCostsViewQuery, confProject, confDataset),
-		"WITH "+tokenParentsSQL(),
-		"FROM `"+confProject+"."+confDataset+".v_gen_ai_spans` AS s LEFT JOIN token_parents AS tp ON tp.trace_id = s.trace_id AND tp.span_id = s.span_id",
-		"WHERE "+llmCallPredicateSQL(),
-		"TIMESTAMP_TRUNC(s.start_time, HOUR) AS usage_hour, s.service_name, s.gen_ai_agent_name,"+
+		"WITH cost_spans AS ( SELECT TIMESTAMP_TRUNC(s.start_time, HOUR) AS usage_hour, s.service_name, s.trace_id, s.span_id, s.parent_span_id,",
+		spansRead+" ), cost_windows AS ( SELECT s.*, "+costsWindow.sql()+" FROM cost_spans AS s )",
+		"FROM cost_windows AS s WHERE "+llmCallPredicateSQL(),
+		"SELECT s.usage_hour, s.service_name, s.gen_ai_agent_name,"+
 			" COALESCE(s.gen_ai_provider_name, s.gen_ai_system) AS provider,"+
 			" COALESCE(s.gen_ai_response_model, s.gen_ai_request_model) AS model,",
 		"GROUP BY 1, 2, 3, 4, 5",
@@ -873,13 +953,16 @@ func TestViewModelMatchesViewSQL(t *testing.T) {
 	)
 
 	requireSQL(t, "v_gen_ai_sessions", render(schema.GenAISessionsViewQuery, confProject, confDataset),
-		"WITH "+tokenParentsSQL()+", session_spans AS (",
-		"tp.span_id IS NULL AS is_token_leaf",
-		"COALESCE("+llmCallPredicateSQL()+", FALSE) AS is_llm_call",
+		"WITH session_spans AS (",
 		"DATE(s.start_time) AS session_start_date",
 		"COALESCE(s.adk_session_id, s.gen_ai_conversation_id) AS session_id",
-		"FROM `"+confProject+"."+confDataset+".v_gen_ai_spans` AS s LEFT JOIN token_parents AS tp ON tp.trace_id = s.trace_id AND tp.span_id = s.span_id",
-		"WHERE COALESCE(s.adk_session_id, s.gen_ai_conversation_id) IS NOT NULL",
+		spansRead+" WHERE COALESCE(s.adk_session_id, s.gen_ai_conversation_id) IS NOT NULL ),",
+		"session_windows AS ( SELECT s.*, "+sessionsWindow.sql()+" FROM session_spans AS s ),",
+		"session_calls AS ( SELECT s.*,",
+		tokenLeafSQL()+" AS is_token_leaf",
+		"COALESCE("+llmCallPredicateSQL()+", FALSE) AS is_llm_call",
+		"FROM session_windows AS s )",
+		"FROM session_calls GROUP BY service_name, session_start_date, session_id",
 		"MIN(start_time) AS session_start_time",
 		"MAX(end_time) AS session_end_time",
 		"TIMESTAMP_DIFF(MAX(end_time), MIN(start_time), MILLISECOND) AS session_duration_ms",
@@ -1227,12 +1310,12 @@ func TestRollupViewsCountEachModelCallOnce(t *testing.T) {
 	}
 	naiveCalls := 0
 	for _, s := range spans {
-		if isLLMCall(s, nil) {
+		if isLLMCall(s, true) {
 			naiveCalls++
 		}
 	}
 	if naiveCalls != 4 {
-		t.Fatalf("without the token_parents exclusion %d spans count as LLM calls, want 4", naiveCalls)
+		t.Fatalf("without the token parent exclusion %d spans count as LLM calls, want 4", naiveCalls)
 	}
 
 	costs := modelCostsView(spans)
@@ -1294,6 +1377,152 @@ func TestRollupViewsCountEachModelCallOnce(t *testing.T) {
 	if got, want := sumCol(costs, "total_input_tokens"), sumCol(sessions, "total_input_tokens"); got != want {
 		t.Errorf("model costs sum %d input tokens, sessions %d", got, want)
 	}
+}
+
+// A parent that reports the sum of its children is left out of a rollup only
+// when it and the children share a partition of the rollup's window: one
+// service and trace in one usage hour for v_gen_ai_model_costs, and one
+// service, session, UTC date and trace for v_gen_ai_sessions. The cases below
+// pin what each view does inside a partition, at the edges of one, and for a
+// child that carries no session id.
+//
+// A pair that straddles an hour, a date or a service is not matched, so both
+// of its spans count and the rollup holds their tokens twice. That is a limit
+// of the matching, pinned here so that a change to it is deliberate.
+func TestRollupViewsMatchTokenParentsWithinTheirWindow(t *testing.T) {
+	rig := newConformanceRig(t)
+	at := func(day, hour, minute, second int) time.Time {
+		return time.Date(2024, 8, day, hour, minute, second, 0, time.UTC)
+	}
+	// span is one model-naming span: a parent of 0 makes it a root, and an
+	// empty session leaves it without a session id.
+	span := func(trace, id, parent int, op, agent, session string, start time.Time, in, out int64) specSpan {
+		attrs := map[string]any{
+			"gen_ai.operation.name":      op,
+			"gen_ai.provider.name":       "openai",
+			"gen_ai.request.model":       "m",
+			"gen_ai.agent.name":          agent,
+			"gen_ai.usage.input_tokens":  in,
+			"gen_ai.usage.output_tokens": out,
+		}
+		if session != "" {
+			attrs["gen_ai.conversation.id"] = session
+		}
+		sp := specSpan{
+			trace: traceHex(trace), id: spanHex(id), name: op + " m",
+			start: start, end: start.Add(time.Second), attrs: attrs,
+		}
+		if parent != 0 {
+			sp.parent = spanHex(parent)
+		}
+		return sp
+	}
+	rig.pushTraces(t, buildTraces(t, "window-agent",
+		// An agent span reports the sum of its two chat calls.
+		span(1, 1, 0, "invoke_agent", "hier", "conv-hier", at(12, 10, 0, 0), 100, 50),
+		span(1, 2, 1, "chat", "hier", "conv-hier", at(12, 10, 0, 1), 40, 20),
+		span(1, 3, 1, "chat", "hier", "conv-hier", at(12, 10, 0, 2), 60, 30),
+		// The chat child carries no session id.
+		span(2, 4, 0, "invoke_agent", "nosession_child", "conv-nosession", at(12, 10, 0, 0), 100, 50),
+		span(2, 5, 4, "chat", "nosession_child", "", at(12, 10, 0, 1), 100, 50),
+		// The child starts in the next hour of the same UTC date.
+		span(3, 6, 0, "invoke_agent", "crosshour", "conv-crosshour", at(12, 10, 59, 59), 80, 40),
+		span(3, 7, 6, "chat", "crosshour", "conv-crosshour", at(12, 11, 0, 1), 80, 40),
+		// The child starts after midnight UTC.
+		span(4, 8, 0, "invoke_agent", "crossdate", "conv-crossdate", at(12, 23, 59, 59), 80, 40),
+		span(4, 9, 8, "chat", "crossdate", "conv-crossdate", at(13, 0, 0, 1), 80, 40),
+		// The child is pushed below, under another service name.
+		span(5, 10, 0, "invoke_agent", "crossservice", "conv-crossservice", at(12, 10, 0, 0), 80, 40),
+		// A chat call with no parent and no child.
+		span(7, 14, 0, "chat", "loner", "conv-loner", at(12, 10, 0, 0), 7, 3),
+	))
+	rig.pushTraces(t, buildTraces(t, "window-agent-b",
+		span(5, 11, 10, "chat", "crossservice", "conv-crossservice", at(12, 10, 0, 1), 80, 40),
+	))
+	// Neither span has a service name, which is a value of its own.
+	rig.pushTraces(t, buildTraces(t, "",
+		span(6, 12, 0, "invoke_agent", "noservice", "conv-noservice", at(12, 10, 0, 0), 80, 40),
+		span(6, 13, 12, "chat", "noservice", "conv-noservice", at(12, 10, 0, 1), 80, 40),
+	))
+
+	spans := genAISpansView(t, rig.srv.Rows(confSpans))
+	if len(spans) != 14 {
+		t.Fatalf("v_gen_ai_spans holds %d rows, want 14", len(spans))
+	}
+	costs := modelCostsView(spans)
+	sessions := sessionsView(spans)
+
+	// rollup is what a case adds up to in one view: rows and the sums of their
+	// call counts and tokens.
+	type rollup struct {
+		rows           int
+		calls, in, out int64
+	}
+	for _, tc := range []struct {
+		name, agent, session string
+		costs, sessions      rollup
+	}{
+		{
+			name: "parent and children in one partition", agent: "hier", session: "conv-hier",
+			costs: rollup{1, 2, 100, 50}, sessions: rollup{1, 2, 100, 50},
+		},
+		{
+			// The child has no session id, so the sessions view does not pair it
+			// with its parent, which has one: the parent keeps its tokens and
+			// the totals are not 0. v_gen_ai_model_costs pairs them and leaves
+			// the parent out.
+			name: "child without a session id", agent: "nosession_child", session: "conv-nosession",
+			costs: rollup{1, 1, 100, 50}, sessions: rollup{1, 1, 100, 50},
+		},
+		{
+			// The hours differ, so the model costs count both spans. The UTC date
+			// is the same, so the sessions view matches them.
+			name: "child in the next hour", agent: "crosshour", session: "conv-crosshour",
+			costs: rollup{2, 2, 160, 80}, sessions: rollup{1, 1, 80, 40},
+		},
+		{
+			name: "child after midnight UTC", agent: "crossdate", session: "conv-crossdate",
+			costs: rollup{2, 2, 160, 80}, sessions: rollup{2, 2, 160, 80},
+		},
+		{
+			name: "child under another service name", agent: "crossservice", session: "conv-crossservice",
+			costs: rollup{2, 2, 160, 80}, sessions: rollup{2, 2, 160, 80},
+		},
+		{
+			name: "no service name on either span", agent: "noservice", session: "conv-noservice",
+			costs: rollup{1, 1, 80, 40}, sessions: rollup{1, 1, 80, 40},
+		},
+		{
+			name: "no parent and no child", agent: "loner", session: "conv-loner",
+			costs: rollup{1, 1, 7, 3}, sessions: rollup{1, 1, 7, 3},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			costRows := rowsWhere(costs, "gen_ai_agent_name", tc.agent)
+			if got := (rollup{len(costRows), sumCol(costRows, "call_count"), sumCol(costRows, "total_input_tokens"), sumCol(costRows, "total_output_tokens")}); got != tc.costs {
+				t.Errorf("v_gen_ai_model_costs for agent %q holds %+v, want %+v: %v", tc.agent, got, tc.costs, costRows)
+			}
+			sessionRows := rowsWhere(sessions, "session_id", tc.session)
+			if got := (rollup{len(sessionRows), sumCol(sessionRows, "llm_call_count"), sumCol(sessionRows, "total_input_tokens"), sumCol(sessionRows, "total_output_tokens")}); got != tc.sessions {
+				t.Errorf("v_gen_ai_sessions for session %q holds %+v, want %+v: %v", tc.session, got, tc.sessions, sessionRows)
+			}
+		})
+	}
+	if len(costs) != 10 || len(sessions) != 9 {
+		t.Errorf("v_gen_ai_model_costs has %d rows and v_gen_ai_sessions %d, want 10 and 9", len(costs), len(sessions))
+	}
+
+	// At midnight the parent stays with its own date and the child with its
+	// own, and across an hour the one session row holds only the child's tokens.
+	requireCols(t, "session of the date before midnight", onlyRow(t, "sessions", rowsWhere(sessions, "session_id", "conv-crossdate"), "session_start_date", "2024-08-12"), map[string]any{
+		"total_input_tokens": int64(80), "llm_call_count": int64(1), "agent_invocation_count": int64(1),
+	})
+	requireCols(t, "session of the date after midnight", onlyRow(t, "sessions", rowsWhere(sessions, "session_id", "conv-crossdate"), "session_start_date", "2024-08-13"), map[string]any{
+		"total_input_tokens": int64(80), "llm_call_count": int64(1), "agent_invocation_count": int64(0),
+	})
+	requireCols(t, "session across the hour", onlyRow(t, "sessions", sessions, "session_id", "conv-crosshour"), map[string]any{
+		"total_input_tokens": int64(80), "llm_call_count": int64(1), "agent_invocation_count": int64(1),
+	})
 }
 
 // frameworkEntry is the manifest entry of a framework.
@@ -1954,10 +2183,10 @@ func TestLLMCallPredicate(t *testing.T) {
 	if len(spans) != len(cases) {
 		t.Fatalf("v_gen_ai_spans has %d rows, want %d", len(spans), len(cases))
 	}
-	parents := tokenParents(spans)
+	parents := costsWindow.tokenParents(spans)
 	for i, c := range cases {
 		row := onlyRow(t, c.name, spans, "span_id", spanHex(i+1))
-		if got := isLLMCall(row, parents); got != c.call {
+		if got := isLLMCall(row, costsWindow.tokenLeaf(row, parents)); got != c.call {
 			t.Errorf("%s: counted as an LLM call = %v, want %v", c.name, got, c.call)
 		}
 	}

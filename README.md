@@ -419,7 +419,14 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
     span that names a request model and reports tokens, with no child that
     reports tokens, is still counted, as one call. Only direct children are
     examined, so tokens that a grandparent span sums over a deeper descendant
-    are not removed.
+    are not removed. A parent is matched with its children only when they share
+    a trace, a service name, and a usage hour: a pair that straddles an hour
+    boundary, or whose spans carry different service names, is not matched, so
+    both spans count and the parent's tokens are added to its children's. An
+    agent or tool span that reports tokens but names no request model is not an
+    inference span, so it is not counted as a call, and its tokens are not in
+    this view, although `v_gen_ai_sessions` still adds them to the session
+    totals.
   - `v_gen_ai_sessions`: session/conversation rollups over `v_gen_ai_spans`,
     one row per `(service_name, session_start_date, session_id)`, where
     `session_id` is `COALESCE(adk_session_id, gen_ai_conversation_id)` and
@@ -427,11 +434,20 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
     runs across midnight UTC therefore has one row for each date it touches.
     Token totals leave out any span that has a direct child span reporting
     tokens, so a parent that reports the sum of its children is not counted with
-    them. `llm_call_count` counts LLM calls by the same rule as
-    `v_gen_ai_model_costs`, and `agent_invocation_count` counts `invoke_agent`
-    spans. `session_start_date`, `total_cache_creation_input_tokens`,
-    `llm_call_count`, and `agent_invocation_count` are the last four columns, so
-    every earlier column keeps its position.
+    them. Only spans that carry a session id take part, and a parent is matched
+    with its children only within one service name, UTC date, session, and
+    trace. A child without a session id is therefore not seen: its parent keeps
+    its own tokens, which already include the child's, and the child is not
+    counted. A pair split by midnight UTC or by service name is not matched, so
+    both spans count. The token totals cover every span that has no
+    token-reporting child, not only LLM calls, so an `invoke_agent` span that
+    reports tokens but names no request model adds to them without being
+    counted in `llm_call_count` or in `v_gen_ai_model_costs`. `llm_call_count`
+    counts LLM calls by the same rule as `v_gen_ai_model_costs`, and
+    `agent_invocation_count` counts `invoke_agent` spans. `session_start_date`,
+    `total_cache_creation_input_tokens`, `llm_call_count`, and
+    `agent_invocation_count` are the last four columns, so every earlier column
+    keeps its position.
   - `v_gen_ai_tool_usage`: hourly tool invocation count, error rate, and latency
     rollups over `v_gen_ai_spans` grouped by `(hour_bucket, service_name, gen_ai_agent_name, gen_ai_tool_name, gen_ai_tool_type)`.
   - `v_gen_ai_logs`: filters `otel_logs_dedup` to GenAI/agent log events and
@@ -441,7 +457,9 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
     `gcp.vertex.agent.*` correlation columns. A value the log record carries
     wins over the same attribute on its span, and the agent name, session ID,
     and user ID are coalesced over the same attribute keys, in the same order,
-    as the columns of `v_gen_ai_spans`.
+    as the columns of `v_gen_ai_spans`. A filter on `timestamp` can narrow the
+    scan of `otel_logs`, but not the span side of the join, and `v_gen_ai_logs`
+    cannot be queried when `traces.require_partition_filter` is `true`.
   - `v_gen_ai_metrics`: filters `otel_metrics_dedup` to metric names matching
     `LIKE 'gen_ai.%'` (for example `gen_ai.client.token.usage` and
     `gen_ai.client.operation.duration`) and promotes
@@ -450,11 +468,13 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
     `gen_ai_response_model`, `gen_ai_token_type`, and `error_type` next to every
     point-value column, including the `exemplars` whose `trace_id` and
     `span_id` link a point back to a trace.
-  - The two rollup views, `v_gen_ai_model_costs` and `v_gen_ai_sessions`, scan
-    `v_gen_ai_spans` twice: once for the spans and once to find the parents that
-    report the sum of their children's tokens. A filter on a rollup does not
-    narrow that second scan, so they cost more to query than a single pass over
-    the span view.
+  - The two rollup views, `v_gen_ai_model_costs` and `v_gen_ai_sessions`, read
+    `v_gen_ai_spans` once. A window function over that read finds the parents
+    that report the sum of their children's tokens, and each view computes one
+    column of its own before the window, so a filter on `usage_hour` (model
+    costs) or on `session_start_date` (sessions) narrows the scan of
+    `otel_spans` to the partitions it keeps. A filter on `service_name`, or on
+    `session_id`, alone does not. See *Filtering the GenAI views by time* below.
 - **Additive schema evolution and view reconciliation (`auto_create.tables`).**
   When `auto_create.tables` is `true`, startup reconciles existing tables that
   are missing newly introduced `NULLABLE` or `REPEATED` columns (at top level or
@@ -550,6 +570,22 @@ ON `my-project.otel.otel_logs` (trace_id, span_id) OPTIONS (analyzer = 'NO_OP_AN
   records at the same timestamp. Multi-tenant collectors accepting untrusted
   OTLP input should strip or namespace those attributes in a processor before
   export.
+- **Filtering the GenAI views by time.** A filter on `start_time` reaches the
+  scan of `otel_spans` through `otel_spans_dedup` and `v_gen_ai_spans`. The
+  rollup views read `v_gen_ai_spans` once and expose the column to filter on:
+  `usage_hour` for `v_gen_ai_model_costs` and `session_start_date` for
+  `v_gen_ai_sessions`. In BigQuery dry runs over a small test table of 48
+  hourly partitions, the estimated bytes for one `usage_hour` were 1/48 of the
+  estimate with no filter, and for one of the table's two UTC dates, 1/2; adding
+  a filter on `service_name` to either, or filtering on `service_name` or
+  `session_id` alone, did not change the estimate. A dry run estimates an upper
+  bound and does not show the benefit of clustering. When
+  `traces.require_partition_filter` is `true`, BigQuery rejects a query over a
+  rollup that has no filter on `usage_hour` (or `session_start_date`), and one
+  that filters only on `service_name` or `session_id`. A parent is matched with
+  its children only within one `PARTITION BY` partition of the rollup's window
+  (see the notes under each rollup above), so a pair that straddles the
+  boundary of a partition counts both spans.
 - **Time-bounded `v_gen_ai_logs` span enrichment.** `v_gen_ai_logs` left-joins
   `otel_logs_dedup` (`PARTITION BY DATE(timestamp)`) with `otel_spans_dedup`
   (`PARTITION BY TIMESTAMP_TRUNC(start_time, HOUR)`) on `(trace_id, span_id)`
@@ -558,13 +594,18 @@ ON `my-project.otel.otel_logs` (trace_id, span_id) OPTIONS (analyzer = 'NO_OP_AN
   predicate on `otel_spans.start_time`: only a span that started from 24 hours
   before to 1 hour after the log record's `timestamp` enriches the record. A
   record whose span started outside that window is still returned with its own
-  attributes, but without the columns that come from the span. The predicate is
-  written on the span table's partitioning column so the engine can skip span
-  partitions; this repository has not measured whether it does or how many
-  bytes it saves. Filtering `v_gen_ai_logs` on `timestamp` prunes daily
-  partitions on `otel_logs`. Queries that need another window, or a measured
-  scan cost, should join `otel_logs_dedup` against a `start_time`-bounded
-  `otel_spans_dedup` subquery directly.
+  attributes, but without the columns that come from the span. The predicate
+  compares `otel_spans.start_time` with each log row's `timestamp`, and BigQuery
+  does not use such a predicate to skip span partitions. In dry runs over ten
+  daily partitions of test log rows, a one-day filter on `timestamp` cut the
+  part of the estimate that comes from `otel_logs` to a tenth, so the filter
+  prunes daily partitions there, and left the part that comes from `otel_spans`
+  unchanged. No filter that BigQuery can use for partition elimination reaches
+  the span scan, so a query over `v_gen_ai_logs` is rejected when
+  `traces.require_partition_filter` is `true`, with or without a filter on
+  `timestamp`. Leave that option off for a deployment that queries the view, or
+  join `otel_logs_dedup` against a `start_time`-bounded `otel_spans_dedup`
+  subquery directly, which also lets a query choose its own window.
 
 ## Delivery semantics
 
@@ -598,7 +639,10 @@ column its base table is partitioned, clustered, or search-indexed on (the span
 `metric_type`). Those columns are fixed for a record, so they never split the
 retries of one, and a filter on any of them can be pushed below the window
 function, so partition and cluster pruning can still apply through the view.
-This repository has not measured how many bytes that saves.
+In BigQuery dry runs over a small test table, a filter on `start_time` cut the
+estimate for `otel_spans_dedup` to the hourly partitions the filter kept. A dry
+run does not show the benefit of clustering, and this repository has not
+measured how many bytes pruning saves on a table of production size.
 
 > **Known limit, stated rather than hidden:** for logs without an explicit
 > upstream `insert_id` attribute, `insert_id` falls back to `record_fingerprint`,

@@ -673,29 +673,142 @@ func TestGenAILogsViewAlignsWithGenAISpansView(t *testing.T) {
 // and which spans have token-reporting children, by one rule. Otherwise the
 // call counts of the two views disagree.
 func TestRollupViewsShareTheTokenParentsRule(t *testing.T) {
-	cte := normalizeSQL(fmt.Sprintf(genAITokenParentsCTE, "proj", "ds"))
+	agg := normalizeSQL(genAITokenParentsAgg)
+	leaf := normalizeSQL(genAITokenLeaf)
+	predicate := normalizeSQL(genAILLMCallPredicate)
 	for _, tc := range []struct {
 		name  string
 		query string
+		want  []string
 	}{
-		{"gen_ai_model_costs", GenAIModelCostsViewQuery},
-		{"gen_ai_sessions", GenAISessionsViewQuery},
+		{"gen_ai_model_costs", GenAIModelCostsViewQuery, []string{
+			agg + " OVER (",
+			"WHERE " + predicate,
+		}},
+		{"gen_ai_sessions", GenAISessionsViewQuery, []string{
+			agg + " OVER (",
+			leaf + " AS is_token_leaf",
+			"COALESCE(" + predicate + ", FALSE) AS is_llm_call",
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			query := normalizeSQL(fmt.Sprintf(tc.query, "proj", "ds"))
-			if !strings.HasPrefix(query, "WITH "+cte) {
-				t.Errorf("query must open with the shared token_parents CTE:\n%s\nwant prefix\nWITH %s", query, cte)
-			}
-			if !strings.Contains(query, normalizeSQL(genAILLMCallPredicate)) {
-				t.Errorf("query must apply the shared LLM call predicate:\n%s", query)
-			}
-			if !strings.Contains(query, "LEFT JOIN token_parents AS tp ON tp.trace_id = s.trace_id AND tp.span_id = s.span_id") {
-				t.Errorf("query must left-join the token parents on trace_id and span_id:\n%s", query)
+			for _, want := range tc.want {
+				if !strings.Contains(query, want) {
+					t.Errorf("query must contain the shared rule %q, got:\n%s", want, query)
+				}
 			}
 		})
 	}
-	if !strings.HasPrefix(cte, "token_parents AS ( SELECT DISTINCT trace_id, parent_span_id AS span_id FROM `proj.ds.v_gen_ai_spans`") {
-		t.Errorf("token_parents must list the parents of spans in v_gen_ai_spans, got %q", cte)
+	if !strings.HasPrefix(predicate, leaf+" AND ") {
+		t.Errorf("the LLM call predicate must open with the token leaf test, got %q", predicate)
+	}
+	if want := "s.parent_span_id IS NOT NULL AND (s.gen_ai_usage_input_tokens IS NOT NULL OR s.gen_ai_usage_output_tokens IS NOT NULL), s.parent_span_id, NULL"; !strings.Contains(agg, want) {
+		t.Errorf("the token parent aggregate must collect the parent of every span reporting tokens, got %q", agg)
+	}
+	if want := "NOT EXISTS ( SELECT 1 FROM UNNEST(s.token_parent_span_ids) AS token_parent_span_id WHERE token_parent_span_id = s.span_id )"; leaf != want {
+		t.Errorf("the token leaf test = %q, want %q", leaf, want)
+	}
+}
+
+// windowPartitionRE captures the PARTITION BY list of a window in normalized
+// SQL, and plainWindowKeyRE matches a key that is a column of the CTE the
+// window reads.
+var (
+	windowPartitionRE = regexp.MustCompile(`OVER \( PARTITION BY ([^()]+) \)`)
+	plainWindowKeyRE  = regexp.MustCompile(`^s\.[a-z_]+$`)
+)
+
+// The rollup views read v_gen_ai_spans once. A second read, whether by a join
+// or by a subquery, cannot be narrowed by a filter on the rollup, so each
+// query scans every span partition and fails under require_partition_filter.
+// The window that finds the token parents runs over that one read, and its
+// PARTITION BY list is the matching rule: it must hold the column a time filter
+// binds to, so that filter can reach the span scan, and service_name, so a
+// parent and a child match within one service.
+func TestRollupViewsReadSpansOnceAndWindowOnTheirGrain(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		query     string
+		timeKey   string // the grouping column a time filter on the view binds to
+		timeExpr  string // how the lower CTE defines that column
+		partition []string
+		before    string // text that must come before the window, or empty
+	}{
+		{
+			name:      "gen_ai_model_costs",
+			query:     GenAIModelCostsViewQuery,
+			timeKey:   "usage_hour",
+			timeExpr:  "TIMESTAMP_TRUNC(s.start_time, HOUR) AS usage_hour",
+			partition: []string{"s.usage_hour", "s.service_name", "s.trace_id"},
+		},
+		{
+			name:      "gen_ai_sessions",
+			query:     GenAISessionsViewQuery,
+			timeKey:   "session_start_date",
+			timeExpr:  "DATE(s.start_time) AS session_start_date",
+			partition: []string{"s.service_name", "s.session_start_date", "s.session_id", "s.trace_id"},
+			// Spans without a session id leave before the window runs, so
+			// they never take part in the matching.
+			before: "WHERE COALESCE(s.adk_session_id, s.gen_ai_conversation_id) IS NOT NULL",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			query := normalizeSQL(fmt.Sprintf(tc.query, "proj", "ds"))
+			if n := strings.Count(query, "`proj.ds.v_gen_ai_spans`"); n != 1 {
+				t.Errorf("query reads v_gen_ai_spans %d times, want once:\n%s", n, query)
+			}
+			if strings.Contains(query, " JOIN ") {
+				t.Errorf("query joins, which reads a table twice:\n%s", query)
+			}
+			if n := strings.Count(query, " OVER ("); n != 1 {
+				t.Fatalf("query has %d windows, want one:\n%s", n, query)
+			}
+			m := windowPartitionRE.FindStringSubmatch(query)
+			if m == nil {
+				t.Fatalf("the window has no PARTITION BY list:\n%s", query)
+			}
+			got := strings.Split(m[1], ", ")
+			if !slices.Contains(got, "s."+tc.timeKey) {
+				t.Errorf("window partitions by %v, which lacks %s: a filter on it could not reach the span scan", got, tc.timeKey)
+			}
+			if !slices.Contains(got, "s.service_name") {
+				t.Errorf("window partitions by %v, which lacks service_name", got)
+			}
+			if !slices.Equal(got, tc.partition) {
+				t.Errorf("window partitions by %v, want %v", got, tc.partition)
+			}
+			// A key must be a plain column of the CTE the window reads. An
+			// expression written inline in PARTITION BY showed no narrowing
+			// of the span scan in BigQuery dry runs.
+			for _, key := range got {
+				if !plainWindowKeyRE.MatchString(key) {
+					t.Errorf("window key %q is not a plain column of the CTE it reads", key)
+				}
+			}
+			window := strings.Index(query, " OVER (")
+			if def := strings.Index(query, tc.timeExpr); def < 0 || def > window {
+				t.Errorf("%q must be defined before the window that partitions by it, got:\n%s", tc.timeExpr, query)
+			}
+			if tc.before != "" {
+				if at := strings.Index(query, tc.before); at < 0 || at > window {
+					t.Errorf("%q must come before the window, got:\n%s", tc.before, query)
+				}
+			}
+		})
+	}
+}
+
+// BigQuery rejects IGNORE NULLS, RESPECT NULLS and DISTINCT on the analytic
+// form of ARRAY_AGG, and an ORDER BY inside its arguments. It accepts a
+// CREATE VIEW statement that uses one and reports the error only when the view
+// is queried, so no check that stops short of running the query would catch it.
+func TestTokenParentsAggUsesOnlyWhatTheAnalyticFormAccepts(t *testing.T) {
+	agg := strings.ToUpper(genAITokenParentsAgg)
+	for _, option := range []string{"IGNORE NULLS", "RESPECT NULLS", "DISTINCT", "ORDER BY"} {
+		if strings.Contains(agg, option) {
+			t.Errorf("the token parent aggregate uses %s, which BigQuery rejects in a window:\n%s", option, genAITokenParentsAgg)
+		}
 	}
 }
 

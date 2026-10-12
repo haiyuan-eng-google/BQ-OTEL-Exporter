@@ -670,10 +670,16 @@ CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAILogsViewName + "`" + ` AS
 // still match, which a plain equality or a USING clause would not do. The join
 // also carries a range predicate on the span table's partitioning column: only
 // a span that started from 24 hours before to 1 hour after the record's
-// timestamp enriches the record. The range is expressed on start_time so the
-// engine may use it to skip span partitions; the view's results do not depend
-// on whether it does. A span outside that window (a span that began more than
-// a day before one of its log records, or more than an hour after it) does not
+// timestamp enriches the record. The range compares start_time with each
+// record's own timestamp, which is not known when the query starts, and
+// BigQuery does not use such a predicate to skip span partitions: in dry runs,
+// a filter on timestamp left the estimated bytes of the span side as large as
+// with no filter at all, and a query over this view is rejected when the span
+// table requires a partition filter. The predicate says which spans enrich a
+// record; it does not bound what the query scans. A query that has to bound the
+// span scan should join the log dedup view to a start_time-bounded span dedup
+// subquery directly. A span outside that window (a span that began more than a
+// day before one of its log records, or more than an hour after it) does not
 // enrich the record, whose own attributes are still projected. The LIKE
 // pattern's percent sign is doubled because every template here goes through
 // fmt.Sprintf.
@@ -804,39 +810,63 @@ WHERE metric_name LIKE 'gen_ai.%%'
 // latency rollup per service, agent, provider, and model over v_gen_ai_spans.
 // Each LLM call is counted once: a span whose direct children report token
 // usage is assumed to report their sum and is left out, and so is an agent or
-// tool span that reports no tokens of its own. See genAILLMCallPredicate for
-// the exact rule.
+// tool span that reports no tokens of its own. A span is matched with its
+// children only within one trace, service, and usage hour; see
+// genAITokenParentsAgg. See genAILLMCallPredicate for the exact rule.
 const GenAIModelCostsViewDDL = `
 CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAIModelCostsViewName + "`" + ` AS
 ` + GenAIModelCostsViewQuery + `;
 `
 
-// genAITokenParentsCTE is the token_parents common table expression shared by
-// the two rollup views. It lists the (trace_id, span_id) of every span in
-// v_gen_ai_spans that has at least one direct child span reporting input or
-// output tokens. A span with such a child is taken to report the sum of its
+// genAITokenParentsAgg is the window aggregate the two rollup views share to
+// find the spans that report the sum of their children's tokens. Over one
+// window partition it collects the parent_span_id of every span that has a
+// parent and reports input or output tokens, so a span is such a parent when
+// its span_id is in the array. A parent is taken to report the sum of its
 // children's tokens, so the rollups leave its own tokens out instead of
-// counting the same tokens twice. It takes (project, dataset) and carries no
-// WITH keyword, so a query can follow it with further CTEs.
+// counting the same tokens twice. It reads the span as s. It takes the place of
+// a second read of v_gen_ai_spans: the window runs over the rows the view
+// already scans, so a filter on a column of its PARTITION BY list narrows that
+// one scan.
 //
-// Only direct children are visible: a span is listed when one of its own
-// children carries tokens, not when a deeper descendant does, and a child that
-// is not in v_gen_ai_spans takes no part. The rollups read v_gen_ai_spans a
-// second time through this CTE, and a filter on a rollup does not narrow that
-// second read.
-const genAITokenParentsCTE = `token_parents AS (
-  SELECT DISTINCT trace_id, parent_span_id AS span_id
-  FROM ` + "`%[1]s.%[2]s." + GenAISpansViewName + "`" + `
-  WHERE parent_span_id IS NOT NULL
-    AND (gen_ai_usage_input_tokens IS NOT NULL OR gen_ai_usage_output_tokens IS NOT NULL)
-)`
+// Spans see each other only inside a partition, which makes the PARTITION BY
+// list the matching rule. A parent and its child are matched only when both
+// fall in the same partition: the same trace_id, service_name, and usage hour
+// for v_gen_ai_model_costs, and the same trace_id, service_name, UTC date, and
+// session for v_gen_ai_sessions. A pair split across an hour or a date
+// boundary, or across two service names, is not matched, and the parent's
+// tokens are counted along with its child's. Only direct children are visible:
+// a span is listed when one of its own children carries tokens, not when a
+// deeper descendant does.
+//
+// BigQuery's analytic ARRAY_AGG accepts neither IGNORE NULLS nor DISTINCT, so
+// the array also holds a NULL for every span that is not a token-reporting
+// child. genAITokenLeaf compares by equality, which a NULL never satisfies.
+// The array has one element for each span of its partition, so a partition
+// with an unusually large number of spans costs more than a typical trace.
+const genAITokenParentsAgg = `ARRAY_AGG(
+      IF(
+        s.parent_span_id IS NOT NULL
+        AND (s.gen_ai_usage_input_tokens IS NOT NULL OR s.gen_ai_usage_output_tokens IS NOT NULL),
+        s.parent_span_id,
+        NULL
+      )
+    )`
+
+// genAITokenLeaf is true for a span that no token-reporting span of its window
+// partition names as its parent: s.span_id is not among the elements of the
+// s.token_parent_span_ids array that genAITokenParentsAgg computed.
+const genAITokenLeaf = `NOT EXISTS (
+    SELECT 1 FROM UNNEST(s.token_parent_span_ids) AS token_parent_span_id
+    WHERE token_parent_span_id = s.span_id
+  )`
 
 // genAILLMCallPredicate is the condition that selects the spans a rollup view
-// counts as one LLM call each. It refers to v_gen_ai_spans as s and to
-// genAITokenParentsCTE as tp, left-joined on trace_id and span_id, and it holds
+// counts as one LLM call each. It reads the span as s, needs the
+// token_parent_span_ids column that genAITokenParentsAgg computes, and holds
 // for a span that:
-//   - has no direct child reporting tokens, so a parent that reports the sum of
-//     its children is skipped;
+//   - has no direct child reporting tokens (genAITokenLeaf), so a parent that
+//     reports the sum of its children is skipped;
 //   - is an inference span: it has an inference operation name or a request
 //     model; and
 //   - is not an agent or tool span, unless it reports tokens itself, so an
@@ -844,7 +874,7 @@ const genAITokenParentsCTE = `token_parents AS (
 //     framework to carry tokens still contributes them. An invocation span
 //     that reports tokens but names no request model is not an inference span,
 //     so it is not counted as a call.
-const genAILLMCallPredicate = `tp.span_id IS NULL
+const genAILLMCallPredicate = genAITokenLeaf + `
   AND (
     s.gen_ai_operation_name IN ('chat', 'generate_content', 'text_completion', 'embeddings')
     OR s.gen_ai_request_model IS NOT NULL
@@ -855,13 +885,46 @@ const genAILLMCallPredicate = `tp.span_id IS NULL
     OR s.gen_ai_usage_output_tokens IS NOT NULL
   )`
 
-// GenAIModelCostsViewQuery is shared by operator-run DDL and metadata-API
-// view creation. It takes (project, dataset) and reads v_gen_ai_spans, twice:
-// once for the spans and once through genAITokenParentsCTE.
+// GenAIModelCostsViewQuery is shared by operator-run DDL and metadata-API view
+// creation. It takes (project, dataset) and reads v_gen_ai_spans once, in
+// cost_spans, which also computes usage_hour as a column of its own. The window
+// in cost_windows partitions by that column, trace_id, and service_name, so a
+// filter on usage_hour reaches the span scan and a query over a few hours reads
+// a few hourly partitions. In BigQuery dry runs, writing the same expression
+// inline in PARTITION BY showed no such narrowing.
 const GenAIModelCostsViewQuery = `
-WITH ` + genAITokenParentsCTE + `
+WITH cost_spans AS (
+  SELECT
+    TIMESTAMP_TRUNC(s.start_time, HOUR) AS usage_hour,
+    s.service_name,
+    s.trace_id,
+    s.span_id,
+    s.parent_span_id,
+    s.gen_ai_agent_name,
+    s.gen_ai_provider_name,
+    s.gen_ai_system,
+    s.gen_ai_request_model,
+    s.gen_ai_response_model,
+    s.gen_ai_operation_name,
+    s.status_code,
+    s.duration_ms,
+    s.gen_ai_usage_input_tokens,
+    s.gen_ai_usage_output_tokens,
+    s.gen_ai_usage_cache_read_input_tokens,
+    s.gen_ai_usage_cache_creation_input_tokens,
+    s.gen_ai_usage_reasoning_tokens
+  FROM ` + "`%[1]s.%[2]s." + GenAISpansViewName + "`" + ` AS s
+),
+cost_windows AS (
+  SELECT
+    s.*,
+    ` + genAITokenParentsAgg + ` OVER (
+      PARTITION BY s.usage_hour, s.service_name, s.trace_id
+    ) AS token_parent_span_ids
+  FROM cost_spans AS s
+)
 SELECT
-  TIMESTAMP_TRUNC(s.start_time, HOUR) AS usage_hour,
+  s.usage_hour,
   s.service_name,
   s.gen_ai_agent_name,
   COALESCE(s.gen_ai_provider_name, s.gen_ai_system) AS provider,
@@ -876,10 +939,7 @@ SELECT
   APPROX_QUANTILES(s.duration_ms, 100)[OFFSET(50)] AS p50_duration_ms,
   APPROX_QUANTILES(s.duration_ms, 100)[OFFSET(95)] AS p95_duration_ms,
   APPROX_QUANTILES(s.duration_ms, 100)[OFFSET(99)] AS p99_duration_ms
-FROM ` + "`%[1]s.%[2]s." + GenAISpansViewName + "`" + ` AS s
-LEFT JOIN token_parents AS tp
-  ON tp.trace_id = s.trace_id
-  AND tp.span_id = s.span_id
+FROM cost_windows AS s
 WHERE ` + genAILLMCallPredicate + `
 GROUP BY 1, 2, 3, 4, 5
 `
@@ -891,7 +951,14 @@ GROUP BY 1, 2, 3, 4, 5
 // date, and a filter on service_name or session_start_date applies to grouping
 // keys. The token totals sum only the spans whose direct children report no
 // tokens, so a parent span that reports the sum of its children is not counted
-// with them. llm_call_count counts the LLM calls by the same rule as
+// with them. Only spans that carry a session id take part, and a span is
+// matched with its children only within one session, trace, service, and UTC
+// date (see genAITokenParentsAgg): a child without a session id is not seen, so
+// its session-bearing parent keeps its own tokens. The totals cover every span
+// without a token-reporting child, not only LLM calls, so a span that reports
+// tokens but is not an LLM call, such as an invoke_agent span that names no
+// request model, adds to them and is not counted by v_gen_ai_model_costs.
+// llm_call_count counts the LLM calls by the same rule as
 // v_gen_ai_model_costs, and agent_invocation_count counts the invoke_agent
 // spans separately. session_start_date, total_cache_creation_input_tokens,
 // llm_call_count and agent_invocation_count are the last four columns, so the
@@ -902,13 +969,16 @@ CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAISessionsViewName + "`" + ` AS
 `
 
 // GenAISessionsViewQuery is shared by operator-run DDL and metadata-API view
-// creation. It takes (project, dataset) and reads v_gen_ai_spans, twice: once
-// for the spans and once through genAITokenParentsCTE. The session_spans CTE
-// marks each span once, as is_token_leaf (no direct child reports tokens) and
-// as is_llm_call (genAILLMCallPredicate), and the outer query only aggregates.
+// creation. It takes (project, dataset) and reads v_gen_ai_spans once, in
+// session_spans, which keeps only the spans that have a session id before the
+// window runs and computes service_name, session_start_date, and session_id as
+// columns of their own, so a filter on session_start_date reaches the span scan
+// (see GenAIModelCostsViewQuery). session_windows runs the genAITokenParentsAgg
+// window over each session of a trace. session_calls marks each span once, as
+// is_token_leaf (no direct child reports tokens) and as is_llm_call
+// (genAILLMCallPredicate), and the outer query only aggregates.
 const GenAISessionsViewQuery = `
-WITH ` + genAITokenParentsCTE + `,
-session_spans AS (
+WITH session_spans AS (
   SELECT
     s.service_name,
     DATE(s.start_time) AS session_start_date,
@@ -918,22 +988,35 @@ session_spans AS (
     s.start_time,
     s.end_time,
     s.trace_id,
+    s.span_id,
+    s.parent_span_id,
     s.adk_invocation_id,
     s.gen_ai_operation_name,
     s.gen_ai_tool_name,
+    s.gen_ai_request_model,
     s.status_code,
     s.gen_ai_usage_input_tokens,
     s.gen_ai_usage_output_tokens,
     s.gen_ai_usage_cache_read_input_tokens,
     s.gen_ai_usage_cache_creation_input_tokens,
-    s.gen_ai_usage_reasoning_tokens,
-    tp.span_id IS NULL AS is_token_leaf,
-    COALESCE(` + genAILLMCallPredicate + `, FALSE) AS is_llm_call
+    s.gen_ai_usage_reasoning_tokens
   FROM ` + "`%[1]s.%[2]s." + GenAISpansViewName + "`" + ` AS s
-  LEFT JOIN token_parents AS tp
-    ON tp.trace_id = s.trace_id
-    AND tp.span_id = s.span_id
   WHERE COALESCE(s.adk_session_id, s.gen_ai_conversation_id) IS NOT NULL
+),
+session_windows AS (
+  SELECT
+    s.*,
+    ` + genAITokenParentsAgg + ` OVER (
+      PARTITION BY s.service_name, s.session_start_date, s.session_id, s.trace_id
+    ) AS token_parent_span_ids
+  FROM session_spans AS s
+),
+session_calls AS (
+  SELECT
+    s.*,
+    ` + genAITokenLeaf + ` AS is_token_leaf,
+    COALESCE(` + genAILLMCallPredicate + `, FALSE) AS is_llm_call
+  FROM session_windows AS s
 )
 SELECT
   session_id,
@@ -955,7 +1038,7 @@ SELECT
   SUM(IF(is_token_leaf, COALESCE(gen_ai_usage_cache_creation_input_tokens, 0), 0)) AS total_cache_creation_input_tokens,
   COUNTIF(is_llm_call) AS llm_call_count,
   COUNTIF(gen_ai_operation_name = 'invoke_agent') AS agent_invocation_count
-FROM session_spans
+FROM session_calls
 GROUP BY service_name, session_start_date, session_id
 `
 
