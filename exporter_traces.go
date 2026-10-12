@@ -50,14 +50,12 @@ func (e *tracesExporter) pushTraceData(ctx context.Context, td ptrace.Traces) er
 	opID := diag.OperationID()
 
 	var offloadFailedIndices []int
-	var offloadErr error
+	var offloadFailures []offloadFailure
 	opts := e.opts
 	opts.Context = ctx
 	opts.OnOffloadError = func(index int, err error) {
 		offloadFailedIndices = append(offloadFailedIndices, index)
-		if offloadErr == nil {
-			offloadErr = err
-		}
+		offloadFailures = append(offloadFailures, offloadFailure{index: index, err: err})
 	}
 
 	rows, rejects := transform.SpanRows(td, opts)
@@ -74,6 +72,7 @@ func (e *tracesExporter) pushTraceData(ctx context.Context, td ptrace.Traces) er
 	}
 
 	decision := e.appendEncoded(ctx, encoded, spanIndex, opID)
+	decision, _ = e.mergeOutcomeWithOffloadFailures(ctx, decision, offloadFailures, opID)
 	if e.quarantine != nil {
 		entries := quarantineEntries(rejects, drops, rowToSpan, decision.rowErrors)
 		if len(entries) > 0 {
@@ -84,7 +83,6 @@ func (e *tracesExporter) pushTraceData(ctx context.Context, td ptrace.Traces) er
 			cancel()
 		}
 	}
-	decision = e.mergeOutcomeWithOffloadFailures(decision, offloadFailedIndices, offloadErr, opID)
 	if decision.err == nil {
 		return nil
 	}

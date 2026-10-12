@@ -37,6 +37,7 @@ const (
 	defaultOffloadMinBytes       = 256 * 1024
 	defaultOffloadMaxObjectBytes = 64 * 1024 * 1024
 	defaultOffloadMaxConcurrency = 8
+	defaultOffloadCacheSize      = 4096
 	defaultOffloadTimeout        = 10 * time.Second
 
 	// defaultMaxRequestBytes leaves headroom under the Storage Write API
@@ -121,6 +122,7 @@ func createDefaultConfig() component.Config {
 			MinBytes:       defaultOffloadMinBytes,
 			MaxObjectBytes: defaultOffloadMaxObjectBytes,
 			MaxConcurrency: defaultOffloadMaxConcurrency,
+			CacheSize:      defaultOffloadCacheSize,
 			Timeout:        defaultOffloadTimeout,
 		},
 		Redaction: RedactionConfig{

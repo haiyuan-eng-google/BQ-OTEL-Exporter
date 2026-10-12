@@ -57,9 +57,14 @@ func TestCLIRun(t *testing.T) {
 	// Dry-run from stdin
 	stdout.Reset()
 	stderr.Reset()
-	code = run([]string{"-dry-run"}, strings.NewReader(line), &stdout, &stderr)
-	if code != 0 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "replayed_spans=1") {
+	code = run([]string{"-dry-run", "-signal", "traces,metrics"}, strings.NewReader(line), &stdout, &stderr)
+	if code != 0 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "replayed_spans=1") || !strings.Contains(stderr.String(), "replayed_metrics=0") {
 		t.Errorf("dry-run code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+
+	// Invalid -signal flag returns 2
+	if got := run([]string{"-signal", "unknown"}, strings.NewReader(""), &stdout, &stderr); got != 2 {
+		t.Errorf("bad -signal flag returned %d, want 2", got)
 	}
 
 	// Invalid timestamp flag returns 2

@@ -669,3 +669,19 @@ func TestRedactionConfigKeys(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateOffloadCacheSize(t *testing.T) {
+	cfg := validConfig()
+	if cfg.Offload.CacheSize != 4096 {
+		t.Fatalf("default Offload.CacheSize = %d, want 4096", cfg.Offload.CacheSize)
+	}
+	cfg.Offload.CacheSize = 0
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Offload.CacheSize = 0 should validate (disables cross-batch cache), got %v", err)
+	}
+	cfg.Offload.CacheSize = -1
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "offload.cache_size must not be negative") {
+		t.Fatalf("Offload.CacheSize = -1 error = %v, want offload.cache_size must not be negative", err)
+	}
+}

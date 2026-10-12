@@ -42,14 +42,12 @@ func (e *logsExporter) pushLogData(ctx context.Context, ld plog.Logs) error {
 	opID := diag.OperationID()
 
 	var offloadFailedIndices []int
-	var offloadErr error
+	var offloadFailures []offloadFailure
 	opts := e.opts
 	opts.Context = ctx
 	opts.OnOffloadError = func(index int, err error) {
 		offloadFailedIndices = append(offloadFailedIndices, index)
-		if offloadErr == nil {
-			offloadErr = err
-		}
+		offloadFailures = append(offloadFailures, offloadFailure{index: index, err: err})
 	}
 
 	rows, rejects := transform.LogRows(ld, opts)
@@ -64,6 +62,7 @@ func (e *logsExporter) pushLogData(ctx context.Context, ld plog.Logs) error {
 	}
 
 	decision := e.appendEncoded(ctx, encoded, recordIndex, opID)
+	decision, retryableOffloadIndices := e.mergeOutcomeWithOffloadFailures(ctx, decision, offloadFailures, opID)
 	if e.quarantine != nil {
 		entries := quarantineEntries(rejects, drops, rowToRecord, decision.rowErrors)
 		if len(entries) > 0 {
@@ -74,7 +73,6 @@ func (e *logsExporter) pushLogData(ctx context.Context, ld plog.Logs) error {
 			cancel()
 		}
 	}
-	decision = e.mergeOutcomeWithOffloadFailures(decision, offloadFailedIndices, offloadErr, opID)
 	if decision.err == nil {
 		return nil
 	}
@@ -90,8 +88,8 @@ func (e *logsExporter) pushLogData(ctx context.Context, ld plog.Logs) error {
 	// and with it its insert_id, only if the identical records ahead of it
 	// travel along.
 	candidates := validRecordIndices(rowToRecord, decision.rowErrors)
-	if len(offloadFailedIndices) > 0 {
-		candidates = mergeSortedIndices(candidates, offloadFailedIndices)
+	if len(retryableOffloadIndices) > 0 {
+		candidates = mergeSortedIndices(candidates, retryableOffloadIndices)
 	}
 	retry := transform.PreserveLogOrdinalPeers(ld, candidates, decision.retryableIndices)
 	return consumererror.NewLogs(decision.err, transform.SelectLogs(ld, retry))

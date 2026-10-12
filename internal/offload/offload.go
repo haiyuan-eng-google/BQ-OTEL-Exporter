@@ -8,6 +8,7 @@ package offload // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/intern
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -41,6 +42,73 @@ const (
 	gcsReadWriteScope     = "https://www.googleapis.com/auth/devstorage.read_write"
 	storageModeGCS        = "gcs_object_ref"
 )
+
+// GCSHTTPError is returned by GCSBlobStore when a GCS HTTP request returns a
+// non-2xx status code.
+type GCSHTTPError struct {
+	StatusCode int
+	Status     string
+	Body       string
+}
+
+func (e *GCSHTTPError) Error() string {
+	msg := strings.TrimSpace(e.Body)
+	if msg != "" {
+		if len(msg) > 256 {
+			msg = msg[:256]
+		}
+		return fmt.Sprintf("GCS HTTP %d: %s", e.StatusCode, msg)
+	}
+	return fmt.Sprintf("GCS HTTP %d (%s)", e.StatusCode, e.Status)
+}
+
+// ClassifyOffloadError maps an offload upload error to a bounded telemetry
+// error class label and reports whether the failure is permanent (meaning
+// retrying the same upload will deterministically fail and the record should
+// be routed to quarantine rather than retried).
+func ClassifyOffloadError(err error) (errorCode string, permanent bool) {
+	if err == nil {
+		return "", false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return "request_canceled", false
+	}
+	var httpErr *GCSHTTPError
+	if errors.As(err, &httpErr) {
+		switch httpErr.StatusCode {
+		case http.StatusBadRequest:
+			return "http_400", true
+		case http.StatusUnauthorized:
+			return "http_401", true
+		case http.StatusForbidden:
+			return "http_403", true
+		case http.StatusNotFound:
+			return "http_404", true
+		case http.StatusRequestTimeout:
+			return "http_408", false
+		case http.StatusTooManyRequests:
+			return "http_429", false
+		default:
+			if httpErr.StatusCode >= 400 && httpErr.StatusCode < 500 {
+				return "http_4xx", true
+			}
+			if httpErr.StatusCode >= 500 && httpErr.StatusCode < 600 {
+				return "http_5xx", false
+			}
+		}
+	}
+	return "unknown", false
+}
+
+// IsPermanentOffloadError reports whether err is a permanent offload failure
+// that should route the affected record to quarantine rather than retry.
+func IsPermanentOffloadError(err error) bool {
+	if err == nil {
+		return false
+	}
+	_, permanent := ClassifyOffloadError(err)
+	return permanent
+}
 
 // BlobStore writes an object to cloud object storage and returns its storage
 // version/generation identifier (if any).
@@ -118,7 +186,11 @@ func (s *GCSBlobStore) WriteObject(
 		return s.fetchExistingGeneration(ctx, bucket, object, int64(len(data)))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("GCS upload returned HTTP %d", resp.StatusCode)
+		return "", &GCSHTTPError{
+			StatusCode: resp.StatusCode,
+			Status:     resp.Status,
+			Body:       string(body),
+		}
 	}
 
 	var meta struct {
@@ -149,7 +221,11 @@ func (s *GCSBlobStore) fetchExistingGeneration(
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("GCS metadata lookup after HTTP 412 returned HTTP %d", resp.StatusCode)
+		return "", fmt.Errorf("GCS metadata lookup after HTTP 412: %w", &GCSHTTPError{
+			StatusCode: resp.StatusCode,
+			Status:     resp.Status,
+			Body:       string(body),
+		})
 	}
 	var meta struct {
 		Generation string `json:"generation"`
@@ -257,6 +333,73 @@ func (m *MemoryBlobStore) Count() int {
 	return len(m.objects)
 }
 
+type lruItem struct {
+	key        string
+	generation string
+}
+
+type generationCache struct {
+	mu    sync.Mutex
+	cap   int
+	ll    *list.List
+	items map[string]*list.Element
+}
+
+func newGenerationCache(capacity int) *generationCache {
+	if capacity <= 0 {
+		return nil
+	}
+	return &generationCache{
+		cap:   capacity,
+		ll:    list.New(),
+		items: make(map[string]*list.Element, min(capacity, 256)),
+	}
+}
+
+func (c *generationCache) get(key string) (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if el, ok := c.items[key]; ok {
+		c.ll.MoveToFront(el)
+		return el.Value.(lruItem).generation, true
+	}
+	return "", false
+}
+
+func (c *generationCache) put(key, generation string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if el, ok := c.items[key]; ok {
+		c.ll.MoveToFront(el)
+		el.Value = lruItem{key: key, generation: generation}
+		return
+	}
+	if c.ll.Len() >= c.cap {
+		if tail := c.ll.Back(); tail != nil {
+			c.ll.Remove(tail)
+			delete(c.items, tail.Value.(lruItem).key)
+		}
+	}
+	el := c.ll.PushFront(lruItem{key: key, generation: generation})
+	c.items[key] = el
+}
+
+func (c *generationCache) clear() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ll.Init()
+	clear(c.items)
+}
+
 // Options configures an Offloader.
 type Options struct {
 	Bucket         string
@@ -265,9 +408,11 @@ type Options struct {
 	MinBytes       int
 	MaxObjectBytes int
 	MaxConcurrency int
+	CacheSize      int
 	Timeout        time.Duration
 	Now            func() time.Time
 	OnOffload      func(payloads int, bytes int64, errClass string)
+	OnDedupHit     func()
 }
 
 // Offloader offloads large span/log attributes, log bodies, and quarantine
@@ -281,10 +426,12 @@ type Offloader struct {
 	minBytes       int
 	maxObjectBytes int
 	maxConcurrency int
+	cache          *generationCache
 	sem            chan struct{}
 	timeout        time.Duration
 	now            func() time.Time
 	onOffload      func(payloads int, bytes int64, errClass string)
+	onDedupHit     func()
 }
 
 // New constructs an Offloader for the given BlobStore and options.
@@ -299,6 +446,9 @@ func New(store BlobStore, opts Options) (*Offloader, error) {
 	if opts.MaxObjectBytes < opts.MinBytes {
 		return nil, fmt.Errorf("offload max_object_bytes (%d) must be at least min_bytes (%d)",
 			opts.MaxObjectBytes, opts.MinBytes)
+	}
+	if opts.CacheSize < 0 {
+		return nil, fmt.Errorf("offload cache_size must be non-negative, got %d", opts.CacheSize)
 	}
 	prefix := strings.Trim(opts.Prefix, "/")
 	if opts.Prefix == "" {
@@ -324,10 +474,12 @@ func New(store BlobStore, opts Options) (*Offloader, error) {
 		minBytes:       opts.MinBytes,
 		maxObjectBytes: opts.MaxObjectBytes,
 		maxConcurrency: maxConcurrency,
+		cache:          newGenerationCache(opts.CacheSize),
 		sem:            make(chan struct{}, maxConcurrency),
 		timeout:        timeout,
 		now:            nowFn,
 		onOffload:      opts.OnOffload,
+		onDedupHit:     opts.OnDedupHit,
 	}, nil
 }
 
@@ -337,11 +489,13 @@ func (o *Offloader) MaxConcurrency() int {
 	return o.maxConcurrency
 }
 
-// SetStore replaces the underlying BlobStore in a thread-safe manner.
+// SetStore replaces the underlying BlobStore in a thread-safe manner and clears
+// any cached object generations from the previous store.
 func (o *Offloader) SetStore(store BlobStore) {
 	o.mu.Lock()
-	defer o.mu.Unlock()
 	o.store = store
+	o.mu.Unlock()
+	o.cache.clear()
 }
 
 // Store returns the currently configured BlobStore.
@@ -554,31 +708,55 @@ func (o *Offloader) upload(
 	}
 
 	cacheKey := o.bucket + "/" + objectKey
-	version, err := transform.BatchUploadCacheFromContext(ctx).Do(ctx, cacheKey, func() (string, error) {
+	uploadTimeout := o.timeout
+	if dl, ok := ctx.Deadline(); ok {
+		if rem := time.Until(dl); rem < uploadTimeout {
+			uploadTimeout = max(rem, 0)
+		}
+	}
+
+	var lruHit bool
+	version, shared, err := transform.BatchUploadCacheFromContext(ctx).Do(ctx, cacheKey, func(leaderCtx context.Context) (string, error) {
+		if gen, ok := o.cache.get(cacheKey); ok {
+			lruHit = true
+			return gen, nil
+		}
+		uploadCtx, cancel := context.WithTimeout(leaderCtx, uploadTimeout)
+		defer cancel()
 		if o.sem != nil {
 			select {
 			case o.sem <- struct{}{}:
 				defer func() { <-o.sem }()
-			case <-ctx.Done():
-				return "", ctx.Err()
+			case <-uploadCtx.Done():
+				err := uploadCtx.Err()
+				if o.onOffload != nil {
+					errClass, _ := ClassifyOffloadError(err)
+					o.onOffload(0, 0, errClass)
+				}
+				return "", err
 			}
 		}
-		uploadCtx, cancel := context.WithTimeout(ctx, o.timeout)
-		defer cancel()
-		return store.WriteObject(uploadCtx, o.bucket, objectKey, contentType, data)
+		ver, werr := store.WriteObject(uploadCtx, o.bucket, objectKey, contentType, data)
+		if werr != nil {
+			if o.onOffload != nil {
+				errClass, _ := ClassifyOffloadError(werr)
+				o.onOffload(0, 0, errClass)
+			}
+			return "", werr
+		}
+		o.cache.put(cacheKey, ver)
+		if o.onOffload != nil {
+			o.onOffload(1, int64(len(data)), "")
+		}
+		return ver, nil
 	})
 	if err != nil {
-		if o.onOffload != nil {
-			errClass := "unknown"
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				errClass = "request_canceled"
-			}
-			o.onOffload(0, 0, errClass)
-		}
 		return transform.PayloadRef{}, err
 	}
-	if o.onOffload != nil {
-		o.onOffload(1, int64(len(data)), "")
+	if shared || lruHit {
+		if o.onDedupHit != nil {
+			o.onDedupHit()
+		}
 	}
 
 	uri := fmt.Sprintf("gs://%s/%s", o.bucket, objectKey)

@@ -177,35 +177,50 @@ func BatchUploadCacheFromContext(ctx context.Context) *BatchUploadCache {
 }
 
 // Do executes fn at most once per key for successful uploads within this
-// BatchUploadCache, coalescing concurrent callers for the same key.
-func (c *BatchUploadCache) Do(ctx context.Context, key string, fn func() (string, error)) (string, error) {
+// BatchUploadCache, coalescing concurrent callers for the same key. The leader
+// executes fn with a context detached from the first caller's cancellation
+// (via context.WithoutCancel(ctx)) so a single waiter's cancel cannot fail
+// every shared follower; every caller still selects on its own ctx.Done().
+// shared is true when the caller joined an existing or completed entry rather
+// than starting the upload itself.
+func (c *BatchUploadCache) Do(ctx context.Context, key string, fn func(context.Context) (string, error)) (version string, shared bool, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if c == nil {
-		return fn()
+		ver, err := fn(ctx)
+		return ver, false, err
 	}
 	c.mu.Lock()
-	if e, ok := c.entries[key]; ok {
-		c.mu.Unlock()
-		select {
-		case <-e.done:
-			return e.version, e.err
-		case <-ctx.Done():
-			return "", ctx.Err()
+	e, existed := c.entries[key]
+	if !existed {
+		if err := ctx.Err(); err != nil {
+			c.mu.Unlock()
+			return "", false, err
 		}
+		e = &batchUploadEntry{done: make(chan struct{})}
+		c.entries[key] = e
+		leaderCtx := context.WithoutCancel(ctx)
+		go func() {
+			ver, err := fn(leaderCtx)
+			c.mu.Lock()
+			e.version = ver
+			e.err = err
+			if err != nil {
+				delete(c.entries, key)
+			}
+			close(e.done)
+			c.mu.Unlock()
+		}()
 	}
-	e := &batchUploadEntry{done: make(chan struct{})}
-	c.entries[key] = e
 	c.mu.Unlock()
 
-	ver, err := fn()
-	c.mu.Lock()
-	e.version = ver
-	e.err = err
-	if err != nil {
-		delete(c.entries, key)
+	select {
+	case <-e.done:
+		return e.version, existed, e.err
+	case <-ctx.Done():
+		return "", existed, ctx.Err()
 	}
-	close(e.done)
-	c.mu.Unlock()
-	return ver, err
 }
 
 // ObjectRef is the Go representation of the BigQuery ObjectRef STRUCT
@@ -1198,21 +1213,26 @@ func SpanQuarantineRows(td ptrace.Traces, entries []QuarantineEntry, opts Option
 		return nil
 	}
 	byIndex := entriesByIndex(entries)
-	ingest := opts.now().UnixMicro()
+	builder := newQuarantineRowBuilder(opts, len(entries))
 	marshaler := &ptrace.JSONMarshaler{}
-	var rows []Row
 	idx := -1
 
 	for _, rs := range td.ResourceSpans().All() {
+		if builder.opts.context().Err() != nil {
+			break
+		}
 		for _, ss := range rs.ScopeSpans().All() {
+			if builder.opts.context().Err() != nil {
+				break
+			}
 			for _, span := range ss.Spans().All() {
+				if builder.opts.context().Err() != nil {
+					break
+				}
 				idx++
 				group := byIndex[idx]
 				if len(group) == 0 {
 					continue
-				}
-				if err := opts.context().Err(); err != nil {
-					return rows
 				}
 				// The span is serialized alone with its own resource and
 				// scope, so an untruncated raw_payload is a complete OTLP/JSON
@@ -1229,7 +1249,7 @@ func SpanQuarantineRows(td ptrace.Traces, entries []QuarantineEntry, opts Option
 				// it is marshaled, offloaded, or mined for raw_attributes. The
 				// matches were already counted when the batch went through
 				// SpanRows, so this does not report telemetry.
-				opts.Redactor.RedactTraces(one)
+				builder.opts.Redactor.RedactTraces(one)
 				oneSpan := oss.Spans().At(0)
 				payload, err := marshaler.MarshalTraces(one)
 				if err != nil {
@@ -1243,16 +1263,13 @@ func SpanQuarantineRows(td ptrace.Traces, entries []QuarantineEntry, opts Option
 					payload: payload,
 					attrs:   oneSpan.Attributes(),
 				}
-				for _, e := range group {
-					if err := opts.context().Err(); err != nil {
-						return rows
-					}
-					rows = append(rows, rec.row(e, ingest, opts))
+				if !builder.add(rec, group) {
+					return builder.rows()
 				}
 			}
 		}
 	}
-	return rows
+	return builder.rows()
 }
 
 // LogQuarantineRows builds the quarantine rows for log records that will not
@@ -1266,21 +1283,26 @@ func LogQuarantineRows(ld plog.Logs, entries []QuarantineEntry, opts Options) []
 		return nil
 	}
 	byIndex := entriesByIndex(entries)
-	ingest := opts.now().UnixMicro()
+	builder := newQuarantineRowBuilder(opts, len(entries))
 	marshaler := &plog.JSONMarshaler{}
-	var rows []Row
 	idx := -1
 
 	for _, rl := range ld.ResourceLogs().All() {
+		if builder.opts.context().Err() != nil {
+			break
+		}
 		for _, sl := range rl.ScopeLogs().All() {
+			if builder.opts.context().Err() != nil {
+				break
+			}
 			for _, lr := range sl.LogRecords().All() {
+				if builder.opts.context().Err() != nil {
+					break
+				}
 				idx++
 				group := byIndex[idx]
 				if len(group) == 0 {
 					continue
-				}
-				if err := opts.context().Err(); err != nil {
-					return rows
 				}
 				one := plog.NewLogs()
 				orl := one.ResourceLogs().AppendEmpty()
@@ -1291,7 +1313,7 @@ func LogQuarantineRows(ld plog.Logs, entries []QuarantineEntry, opts Options) []
 				osl.SetSchemaUrl(sl.SchemaUrl())
 				lr.CopyTo(osl.LogRecords().AppendEmpty())
 				// Step 0 for the quarantine path; see SpanQuarantineRows.
-				opts.Redactor.RedactLogs(one)
+				builder.opts.Redactor.RedactLogs(one)
 				oneLR := osl.LogRecords().At(0)
 				payload, err := marshaler.MarshalLogs(one)
 				if err != nil {
@@ -1305,22 +1327,151 @@ func LogQuarantineRows(ld plog.Logs, entries []QuarantineEntry, opts Options) []
 					payload: payload,
 					attrs:   oneLR.Attributes(),
 				}
-				for _, e := range group {
-					if err := opts.context().Err(); err != nil {
-						return rows
-					}
-					rows = append(rows, rec.row(e, ingest, opts))
+				if !builder.add(rec, group) {
+					return builder.rows()
 				}
 			}
 		}
 	}
-	return rows
+	return builder.rows()
 }
 
 func entriesByIndex(entries []QuarantineEntry) map[int][]QuarantineEntry {
 	out := make(map[int][]QuarantineEntry, len(entries))
 	for _, e := range entries {
 		out[e.Index] = append(out[e.Index], e)
+	}
+	return out
+}
+
+func quarantineOffloadConcurrency(opts Options, numEntries int) int {
+	if opts.QuarantinePayloadOffloader == nil || opts.QuarantineMetadataOnly || numEntries <= 1 {
+		return 1
+	}
+	if opts.PayloadOffloader != nil {
+		return offloadConcurrency(opts.PayloadOffloader)
+	}
+	return min(4, numEntries)
+}
+
+func inlineQuarantinePayloadLimit(opts Options) int {
+	limit := math.MaxInt
+	if opts.MaxQuarantinePayloadBytes > 0 && opts.MaxQuarantinePayloadBytes < limit {
+		limit = opts.MaxQuarantinePayloadBytes
+	}
+	if opts.MaxRowBytes > 0 {
+		if rowLimit := opts.MaxRowBytes - quarantineRowOverhead; rowLimit < limit {
+			limit = max(rowLimit, 0)
+		}
+	}
+	return limit
+}
+
+type quarantineSlot struct {
+	rec        quarantinedRecord
+	group      []QuarantineEntry
+	inlineRows []Row
+	deferred   bool
+}
+
+type quarantineRowBuilder struct {
+	opts         Options
+	ingest       int64
+	conc         int
+	inlineLimit  int
+	slots        []quarantineSlot
+	deferredIdxs []int
+}
+
+func newQuarantineRowBuilder(opts Options, numEntries int) *quarantineRowBuilder {
+	opts.Context = WithBatchUploadCache(opts.context())
+	return &quarantineRowBuilder{
+		opts:        opts,
+		ingest:      opts.now().UnixMicro(),
+		conc:        quarantineOffloadConcurrency(opts, numEntries),
+		inlineLimit: inlineQuarantinePayloadLimit(opts),
+		slots:       make([]quarantineSlot, 0, numEntries),
+	}
+}
+
+func (b *quarantineRowBuilder) add(rec quarantinedRecord, group []QuarantineEntry) bool {
+	if b.opts.context().Err() != nil {
+		return false
+	}
+	if b.conc > 1 && len(rec.payload) > b.inlineLimit {
+		slotIdx := len(b.slots)
+		b.slots = append(b.slots, quarantineSlot{
+			rec:      rec,
+			group:    group,
+			deferred: true,
+		})
+		b.deferredIdxs = append(b.deferredIdxs, slotIdx)
+		return true
+	}
+	inlineRows := make([]Row, 0, len(group))
+	for _, e := range group {
+		if b.opts.context().Err() != nil {
+			if len(inlineRows) > 0 {
+				b.slots = append(b.slots, quarantineSlot{inlineRows: inlineRows})
+			}
+			return false
+		}
+		inlineRows = append(inlineRows, rec.row(e, b.ingest, b.opts))
+	}
+	b.slots = append(b.slots, quarantineSlot{inlineRows: inlineRows})
+	return b.opts.context().Err() == nil
+}
+
+func (b *quarantineRowBuilder) rows() []Row {
+	if len(b.deferredIdxs) > 0 && b.opts.context().Err() == nil {
+		if len(b.deferredIdxs) == 1 {
+			si := b.deferredIdxs[0]
+			rec := &b.slots[si].rec
+			rec.offloaded = b.opts.QuarantinePayloadOffloader(b.opts.context(), rec.signal, rec.payload).ToRow()
+			rec.hasPreOffload = true
+		} else {
+			workers := min(b.conc, len(b.deferredIdxs))
+			jobs := make(chan int, len(b.deferredIdxs))
+			for _, si := range b.deferredIdxs {
+				jobs <- si
+			}
+			close(jobs)
+
+			var wg sync.WaitGroup
+			wg.Add(workers)
+			for range workers {
+				go func() {
+					defer wg.Done()
+					for si := range jobs {
+						if b.opts.context().Err() != nil {
+							return
+						}
+						rec := &b.slots[si].rec
+						rec.offloaded = b.opts.QuarantinePayloadOffloader(b.opts.context(), rec.signal, rec.payload).ToRow()
+						rec.hasPreOffload = true
+					}
+				}()
+			}
+			wg.Wait()
+		}
+	}
+
+	var out []Row
+	for i := range b.slots {
+		slot := &b.slots[i]
+		if !slot.deferred {
+			out = append(out, slot.inlineRows...)
+			continue
+		}
+		if !slot.rec.hasPreOffload {
+			return out
+		}
+		for _, e := range slot.group {
+			if b.opts.context().Err() != nil {
+				return out
+			}
+			out = append(out, slot.rec.row(e, b.ingest, b.opts))
+		}
 	}
 	return out
 }
@@ -1332,11 +1483,13 @@ type quarantinedRecord struct {
 	traceID, spanID string
 	// payload is the record alone as OTLP JSON, or nil if it could not be
 	// serialized.
-	payload []byte
-	attrs   pcommon.Map
+	payload       []byte
+	attrs         pcommon.Map
+	offloaded     Row
+	hasPreOffload bool
 }
 
-func (q quarantinedRecord) row(e QuarantineEntry, ingest int64, opts Options) Row {
+func (q *quarantinedRecord) row(e QuarantineEntry, ingest int64, opts Options) Row {
 	r := Row{
 		"ingest_time":    ingest,
 		"signal":         q.signal,
@@ -1370,15 +1523,15 @@ func (q quarantinedRecord) row(e QuarantineEntry, ingest int64, opts Options) Ro
 		}
 	}
 	if q.payload != nil {
-		var offloaded Row
-		if opts.QuarantinePayloadOffloader != nil {
+		if !q.hasPreOffload && opts.QuarantinePayloadOffloader != nil {
 			if err := opts.context().Err(); err != nil {
 				return r
 			}
-			offloaded = opts.QuarantinePayloadOffloader(opts.context(), q.signal, q.payload).ToRow()
+			q.offloaded = opts.QuarantinePayloadOffloader(opts.context(), q.signal, q.payload).ToRow()
+			q.hasPreOffload = true
 		}
-		if offloaded != nil {
-			r["payload_ref"] = offloaded
+		if q.offloaded != nil {
+			r["payload_ref"] = q.offloaded
 		} else {
 			payload := sanitize(string(q.payload))
 			payloadBudget := budget
@@ -1424,6 +1577,8 @@ func quarantineErrorCode(r Rejection) string {
 		return "OVERSIZE_ROW"
 	case r.Reason == ReasonRequestPermanent:
 		return "REQUEST_PERMANENT"
+	case r.Reason == ReasonOffloadPermanent:
+		return "OFFLOAD_PERMANENT"
 	}
 	return strings.ToUpper(string(r.Reason))
 }

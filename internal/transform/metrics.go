@@ -854,24 +854,30 @@ func MetricQuarantineRows(md pmetric.Metrics, entries []QuarantineEntry, opts Op
 		return nil
 	}
 	byIndex := entriesByIndex(entries)
-	ingest := opts.now().UnixMicro()
+	builder := newQuarantineRowBuilder(opts, len(entries))
 	marshaler := &pmetric.JSONMarshaler{}
-	var rows []Row
 	idx := -1
 
 	for _, rm := range md.ResourceMetrics().All() {
+		if builder.opts.context().Err() != nil {
+			break
+		}
 		for _, sm := range rm.ScopeMetrics().All() {
+			if builder.opts.context().Err() != nil {
+				break
+			}
 			for _, m := range sm.Metrics().All() {
-				visitMetricPoints(m, func(_ int, copyInto func(pmetric.Metric), _ pcommon.Map, _ pmetric.ExemplarSlice) {
+				if builder.opts.context().Err() != nil {
+					break
+				}
+				cont := visitMetricPoints(m, func(_ int, pt metricPointRef) bool {
+					if builder.opts.context().Err() != nil {
+						return false
+					}
 					idx++
 					group := byIndex[idx]
 					if len(group) == 0 {
-						return
-					}
-					// The visitor cannot stop the walk, so once the quarantine
-					// budget runs out every remaining point is skipped here.
-					if opts.context().Err() != nil {
-						return
+						return true
 					}
 					one := pmetric.NewMetrics()
 					orm := one.ResourceMetrics().AppendEmpty()
@@ -882,11 +888,11 @@ func MetricQuarantineRows(md pmetric.Metrics, entries []QuarantineEntry, opts Op
 					osm.SetSchemaUrl(sm.SchemaUrl())
 					om := osm.Metrics().AppendEmpty()
 					copyMetricHeader(m, om)
-					copyInto(om)
+					pt.copyInto(om)
 					// Step 0 for the quarantine path; see SpanQuarantineRows.
 					// Attributes and exemplars are read back from the redacted
 					// copy, never from the visitor's view of the original.
-					opts.Redactor.RedactMetrics(one)
+					builder.opts.Redactor.RedactMetrics(one)
 					attrs, exemplars := singleMetricPoint(om)
 
 					payload, err := marshaler.MarshalMetrics(one)
@@ -910,17 +916,15 @@ func MetricQuarantineRows(md pmetric.Metrics, entries []QuarantineEntry, opts Op
 						payload: payload,
 						attrs:   attrs,
 					}
-					for _, e := range group {
-						if opts.context().Err() != nil {
-							return
-						}
-						rows = append(rows, rec.row(e, ingest, opts))
-					}
+					return builder.add(rec, group)
 				})
+				if !cont {
+					break
+				}
 			}
 		}
 	}
-	return rows
+	return builder.rows()
 }
 
 // singleMetricPoint returns the attributes and exemplars of the only data
@@ -971,10 +975,10 @@ func SelectMetrics(md pmetric.Metrics, indices []int) pmetric.Metrics {
 				var destM pmetric.Metric
 				mStarted := false
 
-				visitMetricPoints(m, func(_ int, copyInto func(pmetric.Metric), _ pcommon.Map, _ pmetric.ExemplarSlice) {
+				visitMetricPoints(m, func(_ int, pt metricPointRef) bool {
 					idx++
 					if !keep[idx] {
-						return
+						return true
 					}
 					if !rmStarted {
 						destRM = out.ResourceMetrics().AppendEmpty()
@@ -993,7 +997,8 @@ func SelectMetrics(md pmetric.Metrics, indices []int) pmetric.Metrics {
 						copyMetricHeader(m, destM)
 						mStarted = true
 					}
-					copyInto(destM)
+					pt.copyInto(destM)
+					return true
 				})
 			}
 		}
@@ -1024,50 +1029,87 @@ func copyMetricHeader(src, dst pmetric.Metric) {
 	}
 }
 
+type metricPointRef struct {
+	copyInto  func(pmetric.Metric)
+	attrs     pcommon.Map
+	exemplars pmetric.ExemplarSlice
+}
+
 func visitMetricPoints(
 	m pmetric.Metric,
-	fn func(pointIdx int, copyInto func(pmetric.Metric), attrs pcommon.Map, exemplars pmetric.ExemplarSlice),
-) {
+	fn func(pointIdx int, item metricPointRef) bool,
+) bool {
 	switch m.Type() {
 	case pmetric.MetricTypeGauge:
 		dps := m.Gauge().DataPoints()
 		for i := 0; i < dps.Len(); i++ {
 			dp := dps.At(i)
-			fn(i, func(dst pmetric.Metric) {
-				dp.CopyTo(dst.Gauge().DataPoints().AppendEmpty())
-			}, dp.Attributes(), dp.Exemplars())
+			if !fn(i, metricPointRef{
+				copyInto: func(dst pmetric.Metric) {
+					dp.CopyTo(dst.Gauge().DataPoints().AppendEmpty())
+				},
+				attrs:     dp.Attributes(),
+				exemplars: dp.Exemplars(),
+			}) {
+				return false
+			}
 		}
 	case pmetric.MetricTypeSum:
 		dps := m.Sum().DataPoints()
 		for i := 0; i < dps.Len(); i++ {
 			dp := dps.At(i)
-			fn(i, func(dst pmetric.Metric) {
-				dp.CopyTo(dst.Sum().DataPoints().AppendEmpty())
-			}, dp.Attributes(), dp.Exemplars())
+			if !fn(i, metricPointRef{
+				copyInto: func(dst pmetric.Metric) {
+					dp.CopyTo(dst.Sum().DataPoints().AppendEmpty())
+				},
+				attrs:     dp.Attributes(),
+				exemplars: dp.Exemplars(),
+			}) {
+				return false
+			}
 		}
 	case pmetric.MetricTypeHistogram:
 		dps := m.Histogram().DataPoints()
 		for i := 0; i < dps.Len(); i++ {
 			dp := dps.At(i)
-			fn(i, func(dst pmetric.Metric) {
-				dp.CopyTo(dst.Histogram().DataPoints().AppendEmpty())
-			}, dp.Attributes(), dp.Exemplars())
+			if !fn(i, metricPointRef{
+				copyInto: func(dst pmetric.Metric) {
+					dp.CopyTo(dst.Histogram().DataPoints().AppendEmpty())
+				},
+				attrs:     dp.Attributes(),
+				exemplars: dp.Exemplars(),
+			}) {
+				return false
+			}
 		}
 	case pmetric.MetricTypeExponentialHistogram:
 		dps := m.ExponentialHistogram().DataPoints()
 		for i := 0; i < dps.Len(); i++ {
 			dp := dps.At(i)
-			fn(i, func(dst pmetric.Metric) {
-				dp.CopyTo(dst.ExponentialHistogram().DataPoints().AppendEmpty())
-			}, dp.Attributes(), dp.Exemplars())
+			if !fn(i, metricPointRef{
+				copyInto: func(dst pmetric.Metric) {
+					dp.CopyTo(dst.ExponentialHistogram().DataPoints().AppendEmpty())
+				},
+				attrs:     dp.Attributes(),
+				exemplars: dp.Exemplars(),
+			}) {
+				return false
+			}
 		}
 	case pmetric.MetricTypeSummary:
 		dps := m.Summary().DataPoints()
 		for i := 0; i < dps.Len(); i++ {
 			dp := dps.At(i)
-			fn(i, func(dst pmetric.Metric) {
-				dp.CopyTo(dst.Summary().DataPoints().AppendEmpty())
-			}, dp.Attributes(), pmetric.NewExemplarSlice())
+			if !fn(i, metricPointRef{
+				copyInto: func(dst pmetric.Metric) {
+					dp.CopyTo(dst.Summary().DataPoints().AppendEmpty())
+				},
+				attrs:     dp.Attributes(),
+				exemplars: pmetric.NewExemplarSlice(),
+			}) {
+				return false
+			}
 		}
 	}
+	return true
 }

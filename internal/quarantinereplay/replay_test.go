@@ -15,6 +15,7 @@ import (
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"google.golang.org/api/option"
 )
@@ -307,11 +308,112 @@ func TestParsedIngestTimeAndEdgeCases(t *testing.T) {
 	badRecords := strings.Join([]string{
 		`{"signal":"spans","error_code":"ROW_ERROR","raw_payload":"{not-valid-otlp"}`,
 		`{"signal":"logs","error_code":"ROW_ERROR","raw_payload":"{not-valid-otlp"}`,
-		`{"signal":"metrics","error_code":"ROW_ERROR","raw_payload":"{}"}`,
+		`{"signal":"metrics","error_code":"ROW_ERROR","raw_payload":"{not-valid-otlp"}`,
+		`{"signal":"unknown","error_code":"ROW_ERROR","raw_payload":"{}"}`,
 		`{"signal":"spans","error_code":"ROW_ERROR","payload_ref":{"uri":"gs://b/k"}}`,
 	}, "\n")
 	sum, err := Replay(context.Background(), strings.NewReader(badRecords), NewNopSink(), Options{})
-	if err == nil || sum.FailedUnmarshal != 4 {
-		t.Errorf("Replay(badRecords) = (%+v, %v), want FailedUnmarshal=4 and joined error", sum, err)
+	if err == nil || sum.FailedUnmarshal != 5 {
+		t.Errorf("Replay(badRecords) = (%+v, %v), want FailedUnmarshal=5 and joined error", sum, err)
+	}
+}
+
+func sampleMetricJSON(t *testing.T, name string) string {
+	t.Helper()
+	md := pmetric.NewMetrics()
+	rm := md.ResourceMetrics().AppendEmpty()
+	rm.Resource().Attributes().PutStr("service.name", "billing")
+	m := rm.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	m.SetName(name)
+	dp := m.SetEmptyGauge().DataPoints().AppendEmpty()
+	dp.SetTimestamp(pcommon.Timestamp(1760184000000000000))
+	dp.SetDoubleValue(42.5)
+	raw, err := (&pmetric.JSONMarshaler{}).MarshalMetrics(md)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}
+
+func TestReplayMetricsAndSignalFilterAndBadTimestamp(t *testing.T) {
+	inlineMetric := sampleMetricJSON(t, "inline.gauge")
+	offloadedMetric := sampleMetricJSON(t, "offloaded.gauge")
+	inlineSpan := sampleSpanJSON(t, "trace-span")
+	inlineLog := sampleLogJSON(t, "skip-log")
+
+	records := []Record{
+		{
+			IngestTime: "2026-10-11T10:00:00Z",
+			Signal:     "metrics",
+			ErrorCode:  "ROW_ERROR",
+			RawPayload: inlineMetric,
+		},
+		{
+			IngestTime: "2026-10-11T10:01:00Z",
+			Signal:     "otel_metrics",
+			ErrorCode:  "OVERSIZE_ROW",
+			PayloadRef: &ObjectRef{URI: "gs://q-bucket/metrics/m1.json", Version: "101"},
+		},
+		{
+			IngestTime: "2026-10-11T10:02:00Z",
+			Signal:     "spans",
+			ErrorCode:  "ROW_ERROR",
+			RawPayload: inlineSpan,
+		},
+		{
+			IngestTime: "2026-10-11T10:03:00Z",
+			Signal:     "logs",
+			ErrorCode:  "ROW_ERROR",
+			RawPayload: inlineLog,
+		},
+		{
+			IngestTime: "corrupt-timestamp",
+			Signal:     "metrics",
+			ErrorCode:  "ROW_ERROR",
+			RawPayload: inlineMetric,
+		},
+	}
+
+	var jsonl bytes.Buffer
+	for _, r := range records {
+		b, err := json.Marshal(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		jsonl.Write(b)
+		jsonl.WriteByte('\n')
+	}
+
+	sink := NewMemorySink()
+	since, _ := time.Parse(time.RFC3339, "2026-10-11T09:00:00Z")
+	sum, err := Replay(context.Background(), &jsonl, sink, Options{
+		Filter: Filter{
+			Signal: "traces,metrics",
+			Since:  since,
+		},
+		ObjectFetcher: func(_ context.Context, uri string) ([]byte, error) {
+			if strings.Contains(uri, "metrics/m1.json") {
+				return []byte(offloadedMetric), nil
+			}
+			return nil, context.DeadlineExceeded
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error for corrupt ingest_time when Since is set")
+	}
+	if sum.TotalRead != 5 || sum.ReplayedMetrics != 2 || sum.ReplayedSpans != 1 || sum.SkippedFiltered != 1 || sum.FailedUnmarshal != 1 {
+		t.Fatalf("Summary = %+v, want TotalRead=5 ReplayedMetrics=2 ReplayedSpans=1 SkippedFiltered=1 FailedUnmarshal=1", sum)
+	}
+	if len(sink.Metrics) != 2 {
+		t.Fatalf("len(sink.Metrics) = %d, want 2", len(sink.Metrics))
+	}
+
+	var outBuf bytes.Buffer
+	jw := NewJSONWriterSink(&outBuf)
+	if err := jw.ExportMetrics(context.Background(), sink.Metrics[0]); err != nil {
+		t.Fatalf("JSONWriterSink.ExportMetrics() error = %v", err)
+	}
+	if !strings.Contains(outBuf.String(), `"signal":"metrics"`) || !strings.Contains(outBuf.String(), "inline.gauge") {
+		t.Errorf("JSONWriterSink output = %s", outBuf.String())
 	}
 }

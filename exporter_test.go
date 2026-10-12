@@ -1395,10 +1395,10 @@ func TestPushTracesOffloadsOversizedPayloadEndToEnd(t *testing.T) {
 		t.Errorf("offloaded_bytes = %d, want %d", got, len(largePrompt))
 	}
 
-	// Simulate an offload upload failure and verify offload_errors increments.
+	// Simulate an offload upload failure on an uncached payload and verify offload_errors increments.
 	memStore.SetError(errors.New("gcs write error"))
 	tdFail := newTestTraces(1)
-	tdFail.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Attributes().PutStr("gen_ai.prompt", largePrompt)
+	tdFail.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Attributes().PutStr("gen_ai.prompt", strings.Repeat("Q", 512*1024))
 	_ = e.pushTraceData(context.Background(), tdFail)
 	if got := metricInt64Sum(t, reader, "otelcol_exporter_bigquery_offload_errors"); got != 1 {
 		t.Errorf("offload_errors = %d, want 1", got)
@@ -3024,4 +3024,178 @@ func metricInt64SumWithAttr(t *testing.T, reader *sdkmetric.ManualReader, name, 
 		}
 	}
 	return total
+}
+
+func TestPermanentOffloadErrorRoutesToQuarantineWithoutRetry(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+	cfg := validConfig()
+	cfg.Offload.Enabled = true
+	cfg.Offload.Bucket = "offload-bucket"
+	cfg.Offload.MinBytes = 64
+	cfg.Offload.MaxConcurrency = 1
+	cfg.Quarantine.Enabled = true
+
+	e, err := newTracesExporter(component.TelemetrySettings{Logger: zap.NewNop(), MeterProvider: mp}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var callNum atomic.Int32
+	e.offloader.SetStore(&funcBlobStore{
+		writeFn: func(_ context.Context, _, object, _ string, _ []byte) (string, error) {
+			n := callNum.Add(1)
+			// First span offload succeeds; second span offload fails permanently with HTTP 403;
+			// quarantine offload for the second span also returns HTTP 403 and falls back to inline raw_payload.
+			if n == 1 && !strings.Contains(object, "quarantine/") {
+				return "gen-1", nil
+			}
+			return "", &offload.GCSHTTPError{
+				StatusCode: 403,
+				Status:     "403 Forbidden",
+				Body:       "storage.objects.create access denied",
+			}
+		},
+	})
+	enc, err := protoenc.New(schema.SpansTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.enc = enc
+	primary := &fakeAppender{outcome: bqi.AppendOutcome{AcknowledgedRows: 1}}
+	e.writer = primary
+	quarantined, _ := withQuarantine(t, e.signalExporter, bqi.AppendOutcome{AcknowledgedRows: 1})
+
+	td := newTestTraces(2)
+	spans := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+	spans.At(0).Attributes().PutStr("large", strings.Repeat("A", 256))
+	spans.At(1).Attributes().PutStr("large", strings.Repeat("B", 256))
+
+	if err := e.pushTraceData(context.Background(), td); err != nil {
+		t.Fatalf("pushTraceData returned %v, want nil (permanent offload error must quarantine rather than retry)", err)
+	}
+	if primary.appended != 1 {
+		t.Fatalf("primary appends = %d, want 1", primary.appended)
+	}
+	if len(quarantined.rows) != 1 {
+		t.Fatalf("quarantine rows = %d, want 1", len(quarantined.rows))
+	}
+	if got := quarantined.rows[0]["error_code"]; got != "OFFLOAD_PERMANENT" {
+		t.Errorf("quarantine error_code = %v, want OFFLOAD_PERMANENT", got)
+	}
+	if got := metricInt64SumWithAttr(t, reader, "otelcol_exporter_bigquery_rejected_rows", "reason", "offload_permanent"); got != 1 {
+		t.Errorf("rejected_rows{reason=offload_permanent} = %d, want 1", got)
+	}
+	if got := metricInt64SumWithAttr(t, reader, "otelcol_exporter_bigquery_offload_errors", "class", "http_403"); got < 1 {
+		t.Errorf("offload_errors{class=http_403} = %d, want >= 1", got)
+	}
+	if got := metricInt64SumWithAttr(t, reader, "otelcol_exporter_bigquery_quarantined_rows", "reason", "offload_permanent"); got != 1 {
+		t.Errorf("quarantined_rows{reason=offload_permanent} = %d, want 1", got)
+	}
+}
+
+func TestQuarantineOversizedPayloadsOffloadConcurrently(t *testing.T) {
+	cfg := validConfig()
+	cfg.Offload.Enabled = true
+	cfg.Offload.Bucket = "offload-bucket"
+	cfg.Offload.MinBytes = 64
+	cfg.Offload.MaxConcurrency = 4
+	cfg.Quarantine.Enabled = true
+	cfg.Quarantine.MaxRawPayloadBytes = 512
+
+	e, err := newTracesExporter(component.TelemetrySettings{Logger: zap.NewNop(), MeterProvider: noop.NewMeterProvider()}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var inFlight, maxInFlight atomic.Int32
+	e.offloader.SetStore(&funcBlobStore{
+		writeFn: func(_ context.Context, _, _, _ string, _ []byte) (string, error) {
+			cur := inFlight.Add(1)
+			for {
+				prev := maxInFlight.Load()
+				if cur <= prev || maxInFlight.CompareAndSwap(prev, cur) {
+					break
+				}
+			}
+			time.Sleep(25 * time.Millisecond)
+			inFlight.Add(-1)
+			return "gen-q", nil
+		},
+	})
+	enc, err := protoenc.New(schema.SpansTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.enc = enc
+	e.writer = &fakeAppender{}
+	quarantined, _ := withQuarantine(t, e.signalExporter, bqi.AppendOutcome{AcknowledgedRows: 4})
+
+	td := newTestTraces(4)
+	spans := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+	for i := range 4 {
+		spans.At(i).SetEndTimestamp(0)
+		spans.At(i).Attributes().PutStr("payload", strings.Repeat(string(rune('A'+i)), 1024))
+	}
+
+	if err := e.pushTraceData(context.Background(), td); err != nil {
+		t.Fatalf("pushTraceData: %v", err)
+	}
+	if peak := maxInFlight.Load(); peak < 2 {
+		t.Errorf("peak concurrent quarantine offload uploads = %d, want >= 2", peak)
+	}
+	if len(quarantined.rows) != 4 {
+		t.Fatalf("quarantine rows = %d, want 4", len(quarantined.rows))
+	}
+	for i, row := range quarantined.rows {
+		if row["payload_ref"] == nil {
+			t.Errorf("quarantine row %d missing payload_ref", i)
+		}
+	}
+}
+
+func TestOffloadDedupHitsSelfTelemetry(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+	cfg := validConfig()
+	cfg.Offload.Enabled = true
+	cfg.Offload.Bucket = "offload-bucket"
+	cfg.Offload.MinBytes = 64
+	cfg.Offload.CacheSize = 16
+
+	e, err := newTracesExporter(component.TelemetrySettings{Logger: zap.NewNop(), MeterProvider: mp}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.offloader.SetStore(offload.NewMemoryBlobStore())
+	enc, err := protoenc.New(schema.SpansTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.enc = enc
+	e.writer = &fakeAppender{outcome: bqi.AppendOutcome{AcknowledgedRows: 2}}
+
+	sharedPayload := strings.Repeat("D", 512)
+	td1 := newTestTraces(2)
+	spans1 := td1.ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+	spans1.At(0).Attributes().PutStr("blob", sharedPayload)
+	spans1.At(1).Attributes().PutStr("blob", sharedPayload)
+	if err := e.pushTraceData(context.Background(), td1); err != nil {
+		t.Fatal(err)
+	}
+
+	e.writer = &fakeAppender{outcome: bqi.AppendOutcome{AcknowledgedRows: 1}}
+	td2 := newTestTraces(1)
+	td2.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Attributes().PutStr("blob", sharedPayload)
+	if err := e.pushTraceData(context.Background(), td2); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := metricInt64SumOrZero(t, reader, "otelcol_exporter_bigquery_offloaded_payloads"); got != 1 {
+		t.Errorf("offloaded_payloads = %d, want 1", got)
+	}
+	if got := metricInt64SumWithAttr(t, reader, "otelcol_exporter_bigquery_offload_dedup_hits", "signal", "spans"); got != 2 {
+		t.Errorf("offload_dedup_hits{signal=spans} = %d, want 2 (1 intra-batch + 1 cross-batch)", got)
+	}
 }
