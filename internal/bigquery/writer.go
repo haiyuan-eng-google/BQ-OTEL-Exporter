@@ -19,6 +19,7 @@ import (
 	"cloud.google.com/go/bigquery/storage/managedwriter"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/types/descriptorpb"
 )
 
@@ -550,6 +551,9 @@ type RowError struct {
 type AppendOutcome struct {
 	// AcknowledgedRows counts rows the service confirmed.
 	AcknowledgedRows int
+	// AckedRanges records the half-open [start, end) batch row index intervals
+	// of sub-requests that the service acknowledged.
+	AckedRanges [][2]int
 	// RowErrors lists rows the service rejected, indexed within the batch
 	// passed to Append.
 	RowErrors []RowError
@@ -559,6 +563,17 @@ type AppendOutcome struct {
 	Verdict Verdict
 	// Err is the first transport-level error, kept for diagnosis.
 	Err error
+}
+
+// IsAcked reports whether rowIndex (in the batch passed to Append) belongs to a
+// sub-request that the service acknowledged.
+func (o AppendOutcome) IsAcked(rowIndex int) bool {
+	for _, r := range o.AckedRanges {
+		if rowIndex >= r[0] && rowIndex < r[1] {
+			return true
+		}
+	}
+	return false
 }
 
 // Append splits rows into requests under the size threshold and sends them,
@@ -635,6 +650,7 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 		}
 		w.finishResult(gen, p.dispatched)
 		out.AcknowledgedRows += p.count
+		out.AckedRanges = append(out.AckedRanges, [2]int{p.start, p.start + p.count})
 	}
 
 	offset := 0
@@ -739,8 +755,8 @@ func isTeardown(err error) bool {
 // extractRowErrors pulls per-row failures out of a response, translating
 // request-local indices into batch-local ones.
 func extractRowErrors(ctx context.Context, res appendResult, base int) []RowError {
-	resp, err := res.FullResponse(ctx)
-	if err != nil || resp == nil {
+	resp, _ := res.FullResponse(ctx)
+	if resp == nil {
 		return nil
 	}
 	var out []RowError
@@ -754,28 +770,41 @@ func extractRowErrors(ctx context.Context, res appendResult, base int) []RowErro
 	return out
 }
 
+// requestEnvelopeOverheadBytes reserves space in each AppendRows request for
+// outer protobuf framing outside ProtoRows.serialized_rows.
+const requestEnvelopeOverheadBytes = 64
+
+// rowWireBytes returns the protobuf wire size of one serialized row inside
+// ProtoRows.serialized_rows (1-byte field tag + varint length prefix + payload).
+func rowWireBytes(row []byte) int {
+	return 1 + protowire.SizeVarint(uint64(len(row))) + len(row)
+}
+
 // SplitRequests groups serialized rows into requests that stay under the size
-// threshold.
+// threshold, accounting for per-row ProtoRows wire framing and a fixed
+// per-request envelope reserve.
 //
-// The threshold is our own headroom below the API's per-request limit, which
-// absorbs the protobuf framing overhead the caller cannot see. A row larger
-// than the threshold on its own is emitted as a single-row request: the caller
-// is responsible for rejecting oversized rows before this point, and silently
-// dropping one here would lose data without a count.
+// A row larger than the threshold on its own is emitted as a single-row
+// request: the caller is responsible for rejecting oversized rows before this
+// point, and silently dropping one here would lose data without a count.
 func SplitRequests(rows [][]byte, maxBytes int) [][][]byte {
 	if maxBytes <= 0 {
 		return [][][]byte{rows}
 	}
+	envelope := requestEnvelopeOverheadBytes
+	if maxBytes <= envelope {
+		envelope = 0
+	}
 	var (
 		out     [][][]byte
 		current [][]byte
-		size    int
+		size    = envelope
 	)
 	for _, row := range rows {
-		n := len(row)
+		n := rowWireBytes(row)
 		if len(current) > 0 && size+n > maxBytes {
 			out = append(out, current)
-			current, size = nil, 0
+			current, size = nil, envelope
 		}
 		current = append(current, row)
 		size += n

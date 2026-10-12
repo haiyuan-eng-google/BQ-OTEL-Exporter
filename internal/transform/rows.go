@@ -4,9 +4,11 @@
 package transform // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -39,7 +41,10 @@ type Rejection struct {
 
 // Options configures row construction.
 type Options struct {
-	Limits Limits
+	// Context is forwarded to PayloadOffloader and QuarantinePayloadOffloader.
+	// Nil defaults to context.Background().
+	Context context.Context
+	Limits  Limits
 	// LogNameAttribute names a string log record attribute that carries the
 	// record's log_name. A record without it falls back to the well-known log
 	// name attributes, then to its service name, then to "default".
@@ -59,19 +64,38 @@ type Options struct {
 	// rows are fitted to it, by truncating raw_payload; a signal row over it
 	// is rejected by the caller. Zero or less means no cap.
 	MaxRowBytes int
+	// QuarantineMetadataOnly omits raw_payload, raw_attributes, and
+	// payload_ref from quarantine rows when true, preserving only metadata
+	// columns so sensitive telemetry content is never written to the DLQ.
+	QuarantineMetadataOnly bool
+	// MaxQuarantinePayloadBytes bounds the UTF-8 byte length of raw_payload in
+	// quarantine rows before any row-size cap is applied. Zero or less means
+	// no separate payload cap beyond MaxRowBytes.
+	MaxQuarantinePayloadBytes int
 	// PayloadOffloader optionally offloads large attributes, events, links,
 	// or log bodies before row construction and returns the payload_refs
 	// metadata to record on the row. When nil, payloads stay inline and
 	// payload_refs stays NULL.
 	PayloadOffloader PayloadOffloader
+	// OnOffloadError is invoked when PayloadOffloader returns an upload error
+	// for the record at index. A record whose offload fails is skipped from
+	// both rows and rejections so the caller can return it for retry.
+	OnOffloadError func(index int, err error)
 	// QuarantinePayloadOffloader optionally offloads the serialized OTLP JSON
 	// of a quarantined record to object storage and returns an ObjectRef for
 	// the payload_ref column. When nil or when it returns a zero ObjectRef,
 	// raw_payload is written inline and payload_ref stays NULL.
-	QuarantinePayloadOffloader func(signal string, payload []byte) ObjectRef
+	QuarantinePayloadOffloader func(ctx context.Context, signal string, payload []byte) ObjectRef
 	// Now supplies the exporter receive time stamped on every row.
 	// Injectable so tests are deterministic.
 	Now func() time.Time
+}
+
+func (o Options) context() context.Context {
+	if o.Context != nil {
+		return o.Context
+	}
+	return context.Background()
 }
 
 func (o Options) now() time.Time {
@@ -83,10 +107,97 @@ func (o Options) now() time.Time {
 
 // PayloadOffloader inspects or mutates a span or log record before inline JSON
 // encoding and returns the payload_refs entries describing any values moved to
-// object storage.
+// object storage, or an error when an object-store upload fails.
 type PayloadOffloader interface {
-	OffloadSpan(span ptrace.Span, resource pcommon.Resource, scope pcommon.InstrumentationScope) []PayloadRef
-	OffloadLog(lr plog.LogRecord, resource pcommon.Resource, scope pcommon.InstrumentationScope) []PayloadRef
+	OffloadSpan(ctx context.Context, span ptrace.Span, resource pcommon.Resource, scope pcommon.InstrumentationScope) ([]PayloadRef, error)
+	OffloadLog(ctx context.Context, lr plog.LogRecord, resource pcommon.Resource, scope pcommon.InstrumentationScope) ([]PayloadRef, error)
+}
+
+// ConcurrentPayloadOffloader is an optional interface implemented by
+// PayloadOffloader implementations that support concurrent batch offloading.
+type ConcurrentPayloadOffloader interface {
+	PayloadOffloader
+	MaxConcurrency() int
+}
+
+func offloadConcurrency(p PayloadOffloader) int {
+	if cp, ok := p.(ConcurrentPayloadOffloader); ok {
+		if n := cp.MaxConcurrency(); n > 1 {
+			return n
+		}
+	}
+	return 1
+}
+
+type batchUploadCacheKey struct{}
+
+// BatchUploadCache coalesces and caches content-addressed object uploads
+// within a single batch (or single OffloadSpan/OffloadLog call) so repeated
+// identical payloads in the same push only upload once.
+type BatchUploadCache struct {
+	mu      sync.Mutex
+	entries map[string]*batchUploadEntry
+}
+
+type batchUploadEntry struct {
+	done    chan struct{}
+	version string
+	err     error
+}
+
+// WithBatchUploadCache returns a context carrying a BatchUploadCache if ctx
+// does not already carry one.
+func WithBatchUploadCache(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if BatchUploadCacheFromContext(ctx) != nil {
+		return ctx
+	}
+	return context.WithValue(ctx, batchUploadCacheKey{}, &BatchUploadCache{
+		entries: make(map[string]*batchUploadEntry),
+	})
+}
+
+// BatchUploadCacheFromContext extracts the BatchUploadCache from ctx, or nil.
+func BatchUploadCacheFromContext(ctx context.Context) *BatchUploadCache {
+	if ctx == nil {
+		return nil
+	}
+	c, _ := ctx.Value(batchUploadCacheKey{}).(*BatchUploadCache)
+	return c
+}
+
+// Do executes fn at most once per key for successful uploads within this
+// BatchUploadCache, coalescing concurrent callers for the same key.
+func (c *BatchUploadCache) Do(ctx context.Context, key string, fn func() (string, error)) (string, error) {
+	if c == nil {
+		return fn()
+	}
+	c.mu.Lock()
+	if e, ok := c.entries[key]; ok {
+		c.mu.Unlock()
+		select {
+		case <-e.done:
+			return e.version, e.err
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	e := &batchUploadEntry{done: make(chan struct{})}
+	c.entries[key] = e
+	c.mu.Unlock()
+
+	ver, err := fn()
+	c.mu.Lock()
+	e.version = ver
+	e.err = err
+	if err != nil {
+		delete(c.entries, key)
+	}
+	close(e.done)
+	c.mu.Unlock()
+	return ver, err
 }
 
 // ObjectRef is the Go representation of the BigQuery ObjectRef STRUCT
@@ -209,11 +320,20 @@ var (
 // Index in a rejection is the position of the span in a flattened walk of the
 // batch, which is the same order the caller sees.
 func SpanRows(td ptrace.Traces, opts Options) ([]Row, []Rejection) {
+	ctx := WithBatchUploadCache(opts.context())
 	received := opts.now()
-	rows := make([]Row, 0, td.SpanCount())
+	spanCount := td.SpanCount()
+	rows := make([]Row, 0, spanCount)
 	var rejects []Rejection
-	idx := -1
 
+	var pre []preOffloadedSpan
+	if opts.PayloadOffloader != nil && spanCount > 1 {
+		if conc := offloadConcurrency(opts.PayloadOffloader); conc > 1 {
+			pre = preOffloadSpans(ctx, td, opts, conc)
+		}
+	}
+
+	idx := -1
 	for _, rs := range td.ResourceSpans().All() {
 		resource := rs.Resource()
 		res := encodeBag(resource.Attributes(), resource.DroppedAttributesCount())
@@ -229,17 +349,42 @@ func SpanRows(td ptrace.Traces, opts Options) ([]Row, []Rejection) {
 
 			for _, span := range ss.Spans().All() {
 				idx++
-				if bad := checkSpan(span, resource, scope, opts.Limits); bad != nil {
-					rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
-					continue
-				}
 				rowSpan, rowRes, rowScope := span, res, sc
 				var refs []PayloadRef
 				if opts.PayloadOffloader != nil {
-					workSpan := cloneSpanForOffload(span)
-					workRes := cloneResourceForOffload(resource)
-					workScope := cloneScopeForOffload(scope)
-					refs = opts.PayloadOffloader.OffloadSpan(workSpan, workRes, workScope)
+					var (
+						preBad     *Violation
+						workSpan   ptrace.Span
+						workRes    pcommon.Resource
+						workScope  pcommon.InstrumentationScope
+						offloadErr error
+					)
+					if pre != nil {
+						p := pre[idx]
+						preBad, workSpan, workRes, workScope, refs, offloadErr = p.preBad, p.workSpan, p.workRes, p.workScope, p.refs, p.err
+					} else {
+						preBad = checkSpanPreOffload(span, resource, scope, opts.Limits)
+						if preBad == nil {
+							workSpan = cloneSpanForOffload(span)
+							workRes = cloneResourceForOffload(resource)
+							workScope = cloneScopeForOffload(scope)
+							refs, offloadErr = opts.PayloadOffloader.OffloadSpan(ctx, workSpan, workRes, workScope)
+						}
+					}
+					if preBad != nil {
+						rejects = append(rejects, Rejection{idx, preBad.Reason, preBad.FieldPath, preBad.Limit, preBad.Actual})
+						continue
+					}
+					if offloadErr != nil {
+						if opts.OnOffloadError != nil {
+							opts.OnOffloadError(idx, offloadErr)
+						}
+						continue
+					}
+					if bad := checkSpan(workSpan, workRes, workScope, opts.Limits); bad != nil {
+						rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
+						continue
+					}
 					rowSpan = workSpan
 					rowRes = encodeBag(workRes.Attributes(), workRes.DroppedAttributesCount())
 					rowScope = encodedScope{
@@ -247,6 +392,9 @@ func SpanRows(td ptrace.Traces, opts Options) ([]Row, []Rejection) {
 						version: sanitize(workScope.Version()),
 						bag:     encodeBag(workScope.Attributes(), workScope.DroppedAttributesCount()),
 					}
+				} else if bad := checkSpan(span, resource, scope, opts.Limits); bad != nil {
+					rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
+					continue
 				}
 				rows = append(rows, spanRow(rowSpan, rs.SchemaUrl(), ss.SchemaUrl(), rowRes, rowScope, svc, received, refs))
 			}
@@ -255,17 +403,84 @@ func SpanRows(td ptrace.Traces, opts Options) ([]Row, []Rejection) {
 	return rows, rejects
 }
 
+type preOffloadedSpan struct {
+	preBad    *Violation
+	workSpan  ptrace.Span
+	workRes   pcommon.Resource
+	workScope pcommon.InstrumentationScope
+	refs      []PayloadRef
+	err       error
+}
+
+func preOffloadSpans(ctx context.Context, td ptrace.Traces, opts Options, conc int) []preOffloadedSpan {
+	out := make([]preOffloadedSpan, td.SpanCount())
+	validIdx := make([]int, 0, len(out))
+	idx := -1
+	for _, rs := range td.ResourceSpans().All() {
+		resource := rs.Resource()
+		for _, ss := range rs.ScopeSpans().All() {
+			scope := ss.Scope()
+			for _, span := range ss.Spans().All() {
+				idx++
+				if bad := checkSpanPreOffload(span, resource, scope, opts.Limits); bad != nil {
+					out[idx].preBad = bad
+					continue
+				}
+				out[idx].workSpan = cloneSpanForOffload(span)
+				out[idx].workRes = cloneResourceForOffload(resource)
+				out[idx].workScope = cloneScopeForOffload(scope)
+				validIdx = append(validIdx, idx)
+			}
+		}
+	}
+	if len(validIdx) == 0 {
+		return out
+	}
+	if len(validIdx) == 1 {
+		i := validIdx[0]
+		out[i].refs, out[i].err = opts.PayloadOffloader.OffloadSpan(ctx, out[i].workSpan, out[i].workRes, out[i].workScope)
+		return out
+	}
+	workers := min(conc, len(validIdx))
+	jobs := make(chan int, len(validIdx))
+	for _, i := range validIdx {
+		jobs <- i
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				out[i].refs, out[i].err = opts.PayloadOffloader.OffloadSpan(ctx, out[i].workSpan, out[i].workRes, out[i].workScope)
+			}
+		}()
+	}
+	wg.Wait()
+	return out
+}
+
 func checkSpan(span ptrace.Span, resource pcommon.Resource, scope pcommon.InstrumentationScope, l Limits) *Violation {
+	return checkSpanMode(span, resource, scope, l, true)
+}
+
+func checkSpanPreOffload(span ptrace.Span, resource pcommon.Resource, scope pcommon.InstrumentationScope, l Limits) *Violation {
+	return checkSpanMode(span, resource, scope, l, false)
+}
+
+func checkSpanMode(span ptrace.Span, resource pcommon.Resource, scope pcommon.InstrumentationScope, l Limits, checkValueBytes bool) *Violation {
 	if bad := validateSpan(span); bad != nil {
 		return bad
 	}
-	if bad := l.checkMap(resource.Attributes(), "resource.attributes"); bad != nil {
+	if bad := l.checkMapMode(resource.Attributes(), "resource.attributes", checkValueBytes); bad != nil {
 		return bad
 	}
-	if bad := l.checkMap(scope.Attributes(), "instrumentation_scope.attributes"); bad != nil {
+	if bad := l.checkMapMode(scope.Attributes(), "instrumentation_scope.attributes", checkValueBytes); bad != nil {
 		return bad
 	}
-	if bad := l.checkMap(span.Attributes(), "attributes"); bad != nil {
+	if bad := l.checkMapMode(span.Attributes(), "attributes", checkValueBytes); bad != nil {
 		return bad
 	}
 	if n := span.Events().Len(); n > l.MaxEventCount {
@@ -280,12 +495,12 @@ func checkSpan(span ptrace.Span, resource pcommon.Resource, scope pcommon.Instru
 		if overflowsInt64(e.Timestamp()) {
 			return &Violation{Reason: ReasonTimestampOverflow, FieldPath: "events.time_unix_nano"}
 		}
-		if bad := l.checkMap(e.Attributes(), "events.attributes"); bad != nil {
+		if bad := l.checkMapMode(e.Attributes(), "events.attributes", checkValueBytes); bad != nil {
 			return bad
 		}
 	}
 	for _, lk := range span.Links().All() {
-		if bad := l.checkMap(lk.Attributes(), "links.attributes"); bad != nil {
+		if bad := l.checkMapMode(lk.Attributes(), "links.attributes", checkValueBytes); bad != nil {
 			return bad
 		}
 	}
@@ -508,12 +723,21 @@ func sanitize(s string) string {
 // the batch, which is the same order the caller sees. Fingerprints are
 // assigned in the same walk, so a retry of the batch reproduces them.
 func LogRows(ld plog.Logs, opts Options) ([]Row, []Rejection) {
+	ctx := WithBatchUploadCache(opts.context())
 	received := opts.now()
-	rows := make([]Row, 0, ld.LogRecordCount())
+	logCount := ld.LogRecordCount()
+	rows := make([]Row, 0, logCount)
 	var rejects []Rejection
 	fingerprints := fingerprinter{}
-	idx := -1
 
+	var pre []preOffloadedLog
+	if opts.PayloadOffloader != nil && logCount > 1 {
+		if conc := offloadConcurrency(opts.PayloadOffloader); conc > 1 {
+			pre = preOffloadLogs(ctx, ld, opts, conc)
+		}
+	}
+
+	idx := -1
 	for _, rl := range ld.ResourceLogs().All() {
 		resource := rl.Resource()
 		res := encodeBag(resource.Attributes(), resource.DroppedAttributesCount())
@@ -537,34 +761,146 @@ func LogRows(ld plog.Logs, opts Options) ([]Row, []Rejection) {
 
 			for _, lr := range sl.LogRecords().All() {
 				idx++
-				if bad := checkLog(lr, resource, scope, opts.Limits); bad != nil {
+				rowLR := lr
+				rowRes := origin.res
+				rowScope := origin.scope
+				var refs []PayloadRef
+				if opts.PayloadOffloader != nil {
+					var (
+						preBad     *Violation
+						workLR     plog.LogRecord
+						workRes    pcommon.Resource
+						workScope  pcommon.InstrumentationScope
+						offloadErr error
+					)
+					if pre != nil {
+						p := pre[idx]
+						preBad, workLR, workRes, workScope, refs, offloadErr = p.preBad, p.workLR, p.workRes, p.workScope, p.refs, p.err
+					} else {
+						preBad = checkLogPreOffload(lr, resource, scope, opts.Limits)
+						if preBad == nil {
+							workLR = cloneLogRecordForOffload(lr)
+							workRes = cloneResourceForOffload(resource)
+							workScope = cloneScopeForOffload(scope)
+							refs, offloadErr = opts.PayloadOffloader.OffloadLog(ctx, workLR, workRes, workScope)
+						}
+					}
+					if preBad != nil {
+						rejects = append(rejects, Rejection{idx, preBad.Reason, preBad.FieldPath, preBad.Limit, preBad.Actual})
+						continue
+					}
+					if offloadErr != nil {
+						if opts.OnOffloadError != nil {
+							opts.OnOffloadError(idx, offloadErr)
+						}
+						continue
+					}
+					if bad := checkLog(workLR, workRes, workScope, opts.Limits); bad != nil {
+						rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
+						continue
+					}
+					rowLR = workLR
+					rowRes = encodeBag(workRes.Attributes(), workRes.DroppedAttributesCount())
+					rowScope = encodedScope{
+						name:    sanitize(workScope.Name()),
+						version: sanitize(workScope.Version()),
+						bag:     encodeBag(workScope.Attributes(), workScope.DroppedAttributesCount()),
+					}
+				} else if bad := checkLog(lr, resource, scope, opts.Limits); bad != nil {
 					rejects = append(rejects, Rejection{idx, bad.Reason, bad.FieldPath, bad.Limit, bad.Actual})
 					continue
 				}
 				// Only kept records consume an intra_batch_ordinal. A rejected
 				// record is rejected again on every retry, so the ordinals of
 				// the others still repeat.
-				rows = append(rows, logRow(lr, resource, scope, origin, fingerprints, received, opts))
+				rows = append(rows, logRow(lr, rowLR, rowRes, rowScope, refs, origin, fingerprints, received, opts))
 			}
 		}
 	}
 	return rows, rejects
 }
 
+type preOffloadedLog struct {
+	preBad    *Violation
+	workLR    plog.LogRecord
+	workRes   pcommon.Resource
+	workScope pcommon.InstrumentationScope
+	refs      []PayloadRef
+	err       error
+}
+
+func preOffloadLogs(ctx context.Context, ld plog.Logs, opts Options, conc int) []preOffloadedLog {
+	out := make([]preOffloadedLog, ld.LogRecordCount())
+	validIdx := make([]int, 0, len(out))
+	idx := -1
+	for _, rl := range ld.ResourceLogs().All() {
+		resource := rl.Resource()
+		for _, sl := range rl.ScopeLogs().All() {
+			scope := sl.Scope()
+			for _, lr := range sl.LogRecords().All() {
+				idx++
+				if bad := checkLogPreOffload(lr, resource, scope, opts.Limits); bad != nil {
+					out[idx].preBad = bad
+					continue
+				}
+				out[idx].workLR = cloneLogRecordForOffload(lr)
+				out[idx].workRes = cloneResourceForOffload(resource)
+				out[idx].workScope = cloneScopeForOffload(scope)
+				validIdx = append(validIdx, idx)
+			}
+		}
+	}
+	if len(validIdx) == 0 {
+		return out
+	}
+	if len(validIdx) == 1 {
+		i := validIdx[0]
+		out[i].refs, out[i].err = opts.PayloadOffloader.OffloadLog(ctx, out[i].workLR, out[i].workRes, out[i].workScope)
+		return out
+	}
+	workers := min(conc, len(validIdx))
+	jobs := make(chan int, len(validIdx))
+	for _, i := range validIdx {
+		jobs <- i
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				out[i].refs, out[i].err = opts.PayloadOffloader.OffloadLog(ctx, out[i].workLR, out[i].workRes, out[i].workScope)
+			}
+		}()
+	}
+	wg.Wait()
+	return out
+}
+
 func checkLog(lr plog.LogRecord, resource pcommon.Resource, scope pcommon.InstrumentationScope, l Limits) *Violation {
+	return checkLogMode(lr, resource, scope, l, true)
+}
+
+func checkLogPreOffload(lr plog.LogRecord, resource pcommon.Resource, scope pcommon.InstrumentationScope, l Limits) *Violation {
+	return checkLogMode(lr, resource, scope, l, false)
+}
+
+func checkLogMode(lr plog.LogRecord, resource pcommon.Resource, scope pcommon.InstrumentationScope, l Limits, checkValueBytes bool) *Violation {
 	if bad := validateLog(lr); bad != nil {
 		return bad
 	}
-	if bad := l.checkMap(resource.Attributes(), "resource.attributes"); bad != nil {
+	if bad := l.checkMapMode(resource.Attributes(), "resource.attributes", checkValueBytes); bad != nil {
 		return bad
 	}
-	if bad := l.checkMap(scope.Attributes(), "instrumentation_scope.attributes"); bad != nil {
+	if bad := l.checkMapMode(scope.Attributes(), "instrumentation_scope.attributes", checkValueBytes); bad != nil {
 		return bad
 	}
-	if bad := l.checkMap(lr.Attributes(), "attributes"); bad != nil {
+	if bad := l.checkMapMode(lr.Attributes(), "attributes", checkValueBytes); bad != nil {
 		return bad
 	}
-	return l.checkValue(lr.Body(), "body", 1)
+	return l.checkValueMode(lr.Body(), "body", 1, checkValueBytes)
 }
 
 // validateLog enforces the INT64 columns of the log contract before any row is
@@ -595,9 +931,11 @@ type logOrigin struct {
 }
 
 func logRow(
-	lr plog.LogRecord,
-	resource pcommon.Resource,
-	scope pcommon.InstrumentationScope,
+	origLR plog.LogRecord,
+	rowLR plog.LogRecord,
+	rowRes encodedBag,
+	rowScope encodedScope,
+	refs []PayloadRef,
 	origin logOrigin,
 	fingerprints fingerprinter,
 	received time.Time,
@@ -607,31 +945,18 @@ func logRow(
 	// insert_id, event_name) is always computed from the original un-offloaded
 	// OTLP record so offloading large values never collapses distinct records
 	// or strips identity attributes.
-	attrs := encodeBag(lr.Attributes(), lr.DroppedAttributesCount())
-	body, bodySchema := otlpjson.EncodePlainValueWithSchema(lr.Body())
-	fingerprint := fingerprints.next(canonicalLogRecord(lr, attrs, body, bodySchema, origin.canonical))
-	resolvedLogName := logName(lr.Attributes(), origin.svc, opts.LogNameAttribute)
-	resolvedInsertID := insertID(lr.Attributes(), fingerprint, opts.InsertIDAttribute)
-	resolvedEventName := eventName(lr)
+	origAttrs := encodeBag(origLR.Attributes(), origLR.DroppedAttributesCount())
+	origBody, origBodySchema := otlpjson.EncodePlainValueWithSchema(origLR.Body())
+	fingerprint := fingerprints.next(canonicalLogRecord(origLR, origAttrs, origBody, origBodySchema, origin.canonical))
+	resolvedLogName := logName(origLR.Attributes(), origin.svc, opts.LogNameAttribute)
+	resolvedInsertID := insertID(origLR.Attributes(), fingerprint, opts.InsertIDAttribute)
+	resolvedEventName := eventName(origLR)
 
-	rowLR := lr
-	rowRes := origin.res
-	rowScope := origin.scope
-	var refs []PayloadRef
+	attrs := origAttrs
+	body := origBody
 	if opts.PayloadOffloader != nil {
-		workLR := cloneLogRecordForOffload(lr)
-		workRes := cloneResourceForOffload(resource)
-		workScope := cloneScopeForOffload(scope)
-		refs = opts.PayloadOffloader.OffloadLog(workLR, workRes, workScope)
-		rowLR = workLR
-		attrs = encodeBag(workLR.Attributes(), workLR.DroppedAttributesCount())
-		body, _ = otlpjson.EncodePlainValueWithSchema(workLR.Body())
-		rowRes = encodeBag(workRes.Attributes(), workRes.DroppedAttributesCount())
-		rowScope = encodedScope{
-			name:    sanitize(workScope.Name()),
-			version: sanitize(workScope.Version()),
-			bag:     encodeBag(workScope.Attributes(), workScope.DroppedAttributesCount()),
-		}
+		attrs = encodeBag(rowLR.Attributes(), rowLR.DroppedAttributesCount())
+		body, _ = otlpjson.EncodePlainValueWithSchema(rowLR.Body())
 	}
 
 	// The partition key falls back through event time, observed time, then
@@ -854,6 +1179,9 @@ func SpanQuarantineRows(td ptrace.Traces, entries []QuarantineEntry, opts Option
 	if len(entries) == 0 {
 		return nil
 	}
+	if err := opts.context().Err(); err != nil {
+		return nil
+	}
 	byIndex := entriesByIndex(entries)
 	ingest := opts.now().UnixMicro()
 	marshaler := &ptrace.JSONMarshaler{}
@@ -868,6 +1196,9 @@ func SpanQuarantineRows(td ptrace.Traces, entries []QuarantineEntry, opts Option
 				group := byIndex[idx]
 				if len(group) == 0 {
 					continue
+				}
+				if err := opts.context().Err(); err != nil {
+					return rows
 				}
 				// The span is serialized alone with its own resource and
 				// scope, so an untruncated raw_payload is a complete OTLP/JSON
@@ -893,6 +1224,9 @@ func SpanQuarantineRows(td ptrace.Traces, entries []QuarantineEntry, opts Option
 					attrs:   span.Attributes(),
 				}
 				for _, e := range group {
+					if err := opts.context().Err(); err != nil {
+						return rows
+					}
 					rows = append(rows, rec.row(e, ingest, opts))
 				}
 			}
@@ -906,6 +1240,9 @@ func SpanQuarantineRows(td ptrace.Traces, entries []QuarantineEntry, opts Option
 // Index matches no record is ignored.
 func LogQuarantineRows(ld plog.Logs, entries []QuarantineEntry, opts Options) []Row {
 	if len(entries) == 0 {
+		return nil
+	}
+	if err := opts.context().Err(); err != nil {
 		return nil
 	}
 	byIndex := entriesByIndex(entries)
@@ -922,6 +1259,9 @@ func LogQuarantineRows(ld plog.Logs, entries []QuarantineEntry, opts Options) []
 				group := byIndex[idx]
 				if len(group) == 0 {
 					continue
+				}
+				if err := opts.context().Err(); err != nil {
+					return rows
 				}
 				one := plog.NewLogs()
 				orl := one.ResourceLogs().AppendEmpty()
@@ -944,6 +1284,9 @@ func LogQuarantineRows(ld plog.Logs, entries []QuarantineEntry, opts Options) []
 					attrs:   lr.Attributes(),
 				}
 				for _, e := range group {
+					if err := opts.context().Err(); err != nil {
+						return rows
+					}
 					rows = append(rows, rec.row(e, ingest, opts))
 				}
 			}
@@ -982,6 +1325,14 @@ func (q quarantinedRecord) row(e QuarantineEntry, ingest int64, opts Options) Ro
 	putStrIfSet(r, "trace_id", q.traceID)
 	putStrIfSet(r, "span_id", q.spanID)
 	putStrIfSet(r, "exporter_instance", truncateUTF8(sanitize(opts.ExporterInstance), quarantineLabelBytes))
+
+	if opts.QuarantineMetadataOnly {
+		// Strip e.Detail in metadata-only mode so raw encoder or service error
+		// strings cannot leak sensitive telemetry content into error_message.
+		r["error_message"] = quarantineMessage(QuarantineEntry{Rejection: e.Rejection})
+		return r
+	}
+
 	message := quarantineMessage(e)
 
 	// raw_payload is the record itself, so it gets the row size budget
@@ -999,14 +1350,21 @@ func (q quarantinedRecord) row(e QuarantineEntry, ingest int64, opts Options) Ro
 	if q.payload != nil {
 		var offloaded Row
 		if opts.QuarantinePayloadOffloader != nil {
-			offloaded = opts.QuarantinePayloadOffloader(q.signal, q.payload).ToRow()
+			if err := opts.context().Err(); err != nil {
+				return r
+			}
+			offloaded = opts.QuarantinePayloadOffloader(opts.context(), q.signal, q.payload).ToRow()
 		}
 		if offloaded != nil {
 			r["payload_ref"] = offloaded
 		} else {
 			payload := sanitize(string(q.payload))
-			if len(payload) > budget {
-				kept := truncateUTF8(payload, max(budget, 0))
+			payloadBudget := budget
+			if opts.MaxQuarantinePayloadBytes > 0 && opts.MaxQuarantinePayloadBytes < payloadBudget {
+				payloadBudget = opts.MaxQuarantinePayloadBytes
+			}
+			if len(payload) > payloadBudget {
+				kept := truncateUTF8(payload, max(payloadBudget, 0))
 				message += fmt.Sprintf(" (raw_payload truncated to %d of %d bytes)", len(kept), len(payload))
 				payload = kept
 				budget = 0

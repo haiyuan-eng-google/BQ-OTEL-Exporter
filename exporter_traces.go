@@ -49,7 +49,18 @@ func (e *tracesExporter) shutdown(ctx context.Context) error {
 func (e *tracesExporter) pushTraceData(ctx context.Context, td ptrace.Traces) error {
 	opID := diag.OperationID()
 
-	rows, rejects := transform.SpanRows(td, e.opts)
+	var offloadFailedIndices []int
+	var offloadErr error
+	opts := e.opts
+	opts.Context = ctx
+	opts.OnOffloadError = func(index int, err error) {
+		offloadFailedIndices = append(offloadFailedIndices, index)
+		if offloadErr == nil {
+			offloadErr = err
+		}
+	}
+
+	rows, rejects := transform.SpanRows(td, opts)
 	e.recordRejections(ctx, rejects, opID)
 
 	encoded, keptIndex, drops := e.encodeRows(ctx, rows, opID)
@@ -57,7 +68,7 @@ func (e *tracesExporter) pushTraceData(ctx context.Context, td ptrace.Traces) er
 	// keptIndex is expressed in row positions; map it back to span positions
 	// so a retry payload can be rebuilt from the original batch.
 	spanIndex := make([]int, len(keptIndex))
-	rowToSpan := rowPositionToRecordIndex(len(rows), rejects)
+	rowToSpan := rowPositionToRecordIndex(len(rows), rejects, offloadFailedIndices...)
 	for i, ri := range keptIndex {
 		spanIndex[i] = rowToSpan[ri]
 	}
@@ -65,8 +76,15 @@ func (e *tracesExporter) pushTraceData(ctx context.Context, td ptrace.Traces) er
 	decision := e.appendEncoded(ctx, encoded, spanIndex, opID)
 	if e.quarantine != nil {
 		entries := quarantineEntries(rejects, drops, rowToSpan, decision.rowErrors)
-		e.quarantineRows(ctx, transform.SpanQuarantineRows(td, entries, e.opts), opID)
+		if len(entries) > 0 {
+			qCtx, cancel := e.quarantineContext(ctx)
+			qOpts := e.opts
+			qOpts.Context = qCtx
+			e.writeQuarantine(qCtx, entries, transform.SpanQuarantineRows(td, entries, qOpts), opID)
+			cancel()
+		}
 	}
+	decision = e.mergeOutcomeWithOffloadFailures(decision, offloadFailedIndices, offloadErr, opID)
 	if decision.err == nil {
 		return nil
 	}

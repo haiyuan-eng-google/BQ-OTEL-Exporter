@@ -35,6 +35,10 @@ func TestRequiredColumns(t *testing.T) {
 		"receive_time", "receive_time_unix_nano",
 		"log_name", "insert_id", "schema_version",
 	}
+	metrics := []string{
+		"timestamp", "time_unix_nano", "receive_time", "receive_time_unix_nano",
+		"metric_name", "metric_type", "point_fingerprint", "schema_version",
+	}
 	quarantine := []string{
 		"ingest_time", "signal", "error_code", "error_message", "schema_version",
 	}
@@ -46,6 +50,7 @@ func TestRequiredColumns(t *testing.T) {
 	}{
 		{"spans", SpansDDL, spans},
 		{"logs", LogsDDL, logs},
+		{"metrics", MetricsDDL, metrics},
 		{"quarantine", QuarantineDDL, quarantine},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -77,13 +82,16 @@ func TestPartitioning(t *testing.T) {
 	if !strings.Contains(LogsDDL, "PARTITION BY DATE(timestamp)") {
 		t.Error("logs must be day-partitioned on timestamp")
 	}
+	if !strings.Contains(MetricsDDL, "PARTITION BY DATE(timestamp)") {
+		t.Error("metrics must be day-partitioned on timestamp")
+	}
 	if !strings.Contains(QuarantineDDL, "PARTITION BY DATE(ingest_time)") {
 		t.Error("quarantine must be day-partitioned on ingest_time")
 	}
 	if !strings.Contains(QuarantineDDL, "OPTIONS (\n  partition_expiration_days = 30\n);") {
 		t.Error("quarantine partitions must expire after 30 days")
 	}
-	for name, ddl := range map[string]string{"spans": SpansDDL, "logs": LogsDDL} {
+	for name, ddl := range map[string]string{"spans": SpansDDL, "logs": LogsDDL, "metrics": MetricsDDL} {
 		if strings.Contains(ddl, "partition_expiration_days") {
 			t.Errorf("%s must not expire partitions; retention is the operator's call", name)
 		}
@@ -93,14 +101,18 @@ func TestPartitioning(t *testing.T) {
 // Spans cluster on (service_name, trace_id, name), so per-service scans and
 // whole-trace lookups both prune. Logs cluster on (service_name, trace_id,
 // severity_number), so per-service scans, trace correlation and severity
-// filters prune. Quarantine clusters on (signal, error_code, service_name),
-// so "what is failing, and where" queries prune.
+// filters prune. Metrics cluster on (service_name, metric_name, metric_type).
+// Quarantine clusters on (signal, error_code, service_name), so "what is
+// failing, and where" queries prune.
 func TestClustering(t *testing.T) {
 	if !strings.Contains(SpansDDL, "CLUSTER BY service_name, trace_id, name;") {
 		t.Error("spans must cluster on service_name, trace_id, name")
 	}
 	if !strings.Contains(LogsDDL, "CLUSTER BY service_name, trace_id, severity_number;") {
 		t.Error("logs must cluster on service_name, trace_id, severity_number")
+	}
+	if !strings.Contains(MetricsDDL, "CLUSTER BY service_name, metric_name, metric_type;") {
+		t.Error("metrics must cluster on service_name, metric_name, metric_type")
 	}
 	if !strings.Contains(QuarantineDDL, "\nCLUSTER BY signal, error_code, service_name\nOPTIONS (") {
 		t.Error("quarantine must cluster on signal, error_code, service_name")
@@ -155,9 +167,11 @@ func TestDDLTemplatesFormatCleanly(t *testing.T) {
 	for name, tmpl := range map[string]string{
 		"spans":              SpansDDL,
 		"logs":               LogsDDL,
+		"metrics":            MetricsDDL,
 		"quarantine":         QuarantineDDL,
 		"spans_view":         SpansDedupViewDDL,
 		"logs_view":          LogsDedupViewDDL,
+		"metrics_view":       MetricsDedupViewDDL,
 		"spans_search_index": SpansSearchIndexDDL,
 		"logs_search_index":  LogsSearchIndexDDL,
 	} {
@@ -181,6 +195,7 @@ func TestDedupQueriesAreBodiesAndDDLsAreStatements(t *testing.T) {
 	}{
 		{name: "spans", query: SpansDedupViewQuery, ddl: SpansDedupViewDDL},
 		{name: "logs", query: LogsDedupViewQuery, ddl: LogsDedupViewDDL},
+		{name: "metrics", query: MetricsDedupViewQuery, ddl: MetricsDedupViewDDL},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			query := strings.TrimSpace(fmt.Sprintf(tc.query, "proj", "ds", "tbl"))
@@ -226,6 +241,15 @@ func TestDedupViewsMatchPublishedContract(t *testing.T) {
 			table: "otel_logs",
 			wantQuery: "SELECT * FROM `proj.ds.otel_logs` QUALIFY ROW_NUMBER() OVER ( " +
 				"PARTITION BY timestamp, time_unix_nano, service_name, log_name, insert_id " +
+				"ORDER BY receive_time_unix_nano DESC ) = 1",
+		},
+		{
+			name:  "metrics",
+			query: MetricsDedupViewQuery,
+			ddl:   MetricsDedupViewDDL,
+			table: "otel_metrics",
+			wantQuery: "SELECT * FROM `proj.ds.otel_metrics` QUALIFY ROW_NUMBER() OVER ( " +
+				"PARTITION BY timestamp, time_unix_nano, service_name, metric_name, point_fingerprint " +
 				"ORDER BY receive_time_unix_nano DESC ) = 1",
 		},
 	} {
@@ -319,6 +343,30 @@ func TestCompanionViewTemplates(t *testing.T) {
 				"LEFT JOIN `proj.ds.spans_tbl_dedup` s USING (service_name, trace_id, span_id)",
 			},
 		},
+		{
+			name:    "gen_ai_model_costs",
+			view:    "v_gen_ai_model_costs",
+			query:   GenAIModelCostsViewQuery,
+			ddl:     GenAIModelCostsViewDDL,
+			args:    []any{"proj", "ds"},
+			sources: []string{"FROM `proj.ds.v_gen_ai_spans`"},
+		},
+		{
+			name:    "gen_ai_sessions",
+			view:    "v_gen_ai_sessions",
+			query:   GenAISessionsViewQuery,
+			ddl:     GenAISessionsViewDDL,
+			args:    []any{"proj", "ds"},
+			sources: []string{"FROM `proj.ds.v_gen_ai_spans`"},
+		},
+		{
+			name:    "gen_ai_tool_usage",
+			view:    "v_gen_ai_tool_usage",
+			query:   GenAIToolUsageViewQuery,
+			ddl:     GenAIToolUsageViewDDL,
+			args:    []any{"proj", "ds"},
+			sources: []string{"FROM `proj.ds.v_gen_ai_spans`"},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			query := strings.TrimSpace(fmt.Sprintf(tc.query, tc.args...))
@@ -396,8 +444,9 @@ func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 			query:    GenAISpansViewQuery,
 			args:     []any{"proj", "ds", "spans"},
 			contract: SpansTableSchema(),
-			// 29 identity, timing and promoted columns, then the six raw
-			// columns kept for anything not promoted.
+			// 29 identity, timing and promoted columns, the six raw columns
+			// kept for anything not promoted, then the 15 OTel GenAI
+			// v1.37+/v1.40+ promoted columns.
 			want: []string{
 				"start_time", "end_time", "duration_nano", "duration_ms",
 				"trace_id", "span_id", "parent_span_id", "service_name",
@@ -408,6 +457,12 @@ func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 				"gen_ai_response_finish_reason", "gen_ai_tool_name", "gen_ai_tool_call_id",
 				"adk_event_id", "adk_session_id", "adk_invocation_id", "adk_user_id",
 				"payload_refs", "attributes", "resource", "instrumentation_scope", "events", "links",
+				"gen_ai_provider_name", "gen_ai_usage_cache_read_input_tokens",
+				"gen_ai_usage_cache_creation_input_tokens", "gen_ai_usage_reasoning_tokens",
+				"gen_ai_request_top_p", "gen_ai_request_top_k", "gen_ai_request_max_tokens",
+				"gen_ai_output_type", "gen_ai_tool_type", "gen_ai_tool_description",
+				"gen_ai_agent_description", "gen_ai_agent_parent_id", "gen_ai_data_source_id",
+				"gen_ai_evaluation_name", "gen_ai_evaluation_score",
 			},
 		},
 		{
@@ -544,6 +599,7 @@ func TestDDLAndTableSchemaAgree(t *testing.T) {
 	}{
 		{"spans", SpansDDL, FieldNames(SpansTableSchema())},
 		{"logs", LogsDDL, FieldNames(LogsTableSchema())},
+		{"metrics", MetricsDDL, FieldNames(MetricsTableSchema())},
 		{"quarantine", QuarantineDDL, FieldNames(QuarantineTableSchema())},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -574,6 +630,7 @@ func TestDDLMatchesTableSchema(t *testing.T) {
 	}{
 		{"spans", SpansDDL, SpansTableSchema()},
 		{"logs", LogsDDL, LogsTableSchema()},
+		{"metrics", MetricsDDL, MetricsTableSchema()},
 		{"quarantine", QuarantineDDL, QuarantineTableSchema()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -699,20 +756,24 @@ func TestQuarantineTableSchemaColumns(t *testing.T) {
 	if got := FieldNames(QuarantineTableSchema()); !slices.Equal(got, want) {
 		t.Fatalf("quarantine columns = %v, want %v", got, want)
 	}
-	if SignalSpans != "spans" || SignalLogs != "logs" {
-		t.Fatalf("signal values = %q, %q; the DDL documents 'spans' | 'logs'", SignalSpans, SignalLogs)
+	if SignalSpans != "spans" || SignalLogs != "logs" || SignalMetrics != "metrics" {
+		t.Fatalf("signal values = %q, %q, %q; the DDL documents 'spans' | 'logs' | 'metrics'",
+			SignalSpans, SignalLogs, SignalMetrics)
 	}
 }
 
 // parseDDL reads the column list of a CREATE TABLE statement laid out one
-// field per line, as SpansDDL, LogsDDL and QuarantineDDL are. It accepts
-// exactly the shapes those DDLs use: "name TYPE" with an optional NOT NULL,
-// "name STRUCT<" and "name ARRAY<STRUCT<" openers, and lines that start with
-// the matching ">" closers. A -- comment, whole-line or trailing, is ignored.
+// field per line, as SpansDDL, LogsDDL, MetricsDDL and QuarantineDDL are. It
+// accepts exactly the shapes those DDLs use: "name TYPE" with an optional NOT
+// NULL, "name ARRAY<TYPE>", "name STRUCT<" and "name ARRAY<STRUCT<" openers,
+// and lines that start with the matching ">" closers. A -- comment, whole-line
+// or trailing, is ignored.
 func parseDDL(ddl string) (*storagepb.TableSchema, error) {
 	types := map[string]storagepb.TableFieldSchema_Type{
 		"STRING":    storagepb.TableFieldSchema_STRING,
 		"INT64":     storagepb.TableFieldSchema_INT64,
+		"FLOAT64":   storagepb.TableFieldSchema_DOUBLE,
+		"BOOL":      storagepb.TableFieldSchema_BOOL,
 		"TIMESTAMP": storagepb.TableFieldSchema_TIMESTAMP,
 		"JSON":      storagepb.TableFieldSchema_JSON,
 	}
@@ -767,6 +828,16 @@ func parseDDL(ddl string) (*storagepb.TableSchema, error) {
 			fld.Mode = storagepb.TableFieldSchema_REPEATED
 			stack = append(stack, frame{fld, 2})
 		default:
+			if strings.HasPrefix(parts[1], "ARRAY<") && strings.HasSuffix(parts[1], ">") && len(parts) == 2 {
+				elem := strings.TrimSuffix(strings.TrimPrefix(parts[1], "ARRAY<"), ">")
+				typ, ok := types[elem]
+				if !ok {
+					return nil, fmt.Errorf("unsupported column definition %q", line)
+				}
+				fld.Type = typ
+				fld.Mode = storagepb.TableFieldSchema_REPEATED
+				continue
+			}
 			typ, ok := types[parts[1]]
 			switch {
 			case !ok:

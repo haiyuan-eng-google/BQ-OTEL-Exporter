@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"maps"
 	stdhttp "net/http"
+	"reflect"
 	"slices"
 
 	bq "cloud.google.com/go/bigquery"
@@ -33,6 +34,8 @@ type destinationAdmin interface {
 	CreateDataset(context.Context, *bq.DatasetMetadata) error
 	TableMetadata(context.Context, string) (*bq.TableMetadata, error)
 	CreateTable(context.Context, string, *bq.TableMetadata) error
+	UpdateTable(context.Context, string, bq.TableMetadataToUpdate, string) error
+	RunDDL(context.Context, string) error
 	Close() error
 }
 
@@ -56,6 +59,25 @@ func (a *bigQueryDestinationAdmin) TableMetadata(ctx context.Context, id string)
 
 func (a *bigQueryDestinationAdmin) CreateTable(ctx context.Context, id string, md *bq.TableMetadata) error {
 	return a.dataset.Table(id).Create(ctx, md)
+}
+
+func (a *bigQueryDestinationAdmin) UpdateTable(
+	ctx context.Context, id string, md bq.TableMetadataToUpdate, etag string,
+) error {
+	_, err := a.dataset.Table(id).Update(ctx, md, etag)
+	return err
+}
+
+func (a *bigQueryDestinationAdmin) RunDDL(ctx context.Context, sql string) error {
+	job, err := a.client.Query(sql).Run(ctx)
+	if err != nil {
+		return err
+	}
+	st, err := job.Wait(ctx)
+	if err != nil {
+		return err
+	}
+	return st.Err()
 }
 
 func (a *bigQueryDestinationAdmin) Close() error {
@@ -87,7 +109,16 @@ var newDestinationAdmin = func(
 	if err != nil {
 		return nil, err
 	}
-	client, err := bq.NewClient(ctx, project, option.WithHTTPClient(httpClient))
+	bqOpts := []option.ClientOption{option.WithHTTPClient(httpClient)}
+	for _, opt := range opts {
+		if rt := reflect.TypeOf(opt); rt != nil {
+			name := rt.Name()
+			if name == "withEndpoint" || name == "withUniverseDomain" {
+				bqOpts = append(bqOpts, opt)
+			}
+		}
+	}
+	client, err := bq.NewClient(ctx, project, bqOpts...)
 	if err != nil {
 		httpBase.CloseIdleConnections()
 		return nil, err
@@ -110,6 +141,28 @@ func (e *signalExporter) prepareDestination(ctx context.Context, admin destinati
 	return e.prepareQuarantineTable(ctx, admin)
 }
 
+func (e *signalExporter) destinationOptions() schema.DestinationOptions {
+	switch {
+	case proto.Equal(e.schema, schema.SpansTableSchema()):
+		return schema.DestinationOptions{
+			PartitionExpirationDays: e.cfg.Traces.PartitionExpirationDays,
+			RequirePartitionFilter:  e.cfg.Traces.RequirePartitionFilter,
+		}
+	case proto.Equal(e.schema, schema.LogsTableSchema()):
+		return schema.DestinationOptions{
+			PartitionExpirationDays: e.cfg.Logs.PartitionExpirationDays,
+			RequirePartitionFilter:  e.cfg.Logs.RequirePartitionFilter,
+		}
+	case proto.Equal(e.schema, schema.MetricsTableSchema()):
+		return schema.DestinationOptions{
+			PartitionExpirationDays: e.cfg.Metrics.PartitionExpirationDays,
+			RequirePartitionFilter:  e.cfg.Metrics.RequirePartitionFilter,
+		}
+	default:
+		return schema.DestinationOptions{}
+	}
+}
+
 func (e *signalExporter) prepareSignalDestination(ctx context.Context, admin destinationAdmin) error {
 	if err := e.ensureDataset(ctx, admin); err != nil {
 		return err
@@ -122,6 +175,13 @@ func (e *signalExporter) prepareSignalDestination(ctx context.Context, admin des
 	createTable := false
 	switch {
 	case tableErr == nil:
+		if e.cfg.AutoCreate.Tables {
+			reconciled, err := e.reconcileTableSchema(ctx, admin, e.table, tableMD, e.schema, "destination table "+e.tableID())
+			if err != nil {
+				return err
+			}
+			tableMD = reconciled
+		}
 		if err := e.validateTableMetadata(tableMD); err != nil {
 			return err
 		}
@@ -147,8 +207,8 @@ func (e *signalExporter) prepareSignalDestination(ctx context.Context, admin des
 		return nil
 	}
 
-	createMD, viewQuery, err := schema.DestinationMetadata(
-		e.schema, e.cfg.Project, e.cfg.Dataset, e.table)
+	createMD, viewQuery, err := schema.DestinationMetadataWithOptions(
+		e.schema, e.cfg.Project, e.cfg.Dataset, e.table, e.destinationOptions())
 	if err != nil {
 		return fmt.Errorf("deriving destination metadata: %w", err)
 	}
@@ -160,10 +220,58 @@ func (e *signalExporter) prepareSignalDestination(ctx context.Context, admin des
 	if err := e.createDedupView(ctx, admin, viewQuery); err != nil {
 		return err
 	}
+	if e.cfg.AutoCreate.SearchIndexes {
+		if err := e.createSearchIndex(ctx, admin); err != nil {
+			return err
+		}
+	}
 	if !e.cfg.AutoCreate.CompanionViews {
 		return nil
 	}
 	return e.createCompanionViews(ctx, admin)
+}
+
+func (e *signalExporter) reconcileTableSchema(
+	ctx context.Context,
+	admin destinationAdmin,
+	table string,
+	md *bq.TableMetadata,
+	want *storagepb.TableSchema,
+	subject string,
+) (*bq.TableMetadata, error) {
+	if md == nil {
+		return nil, nil
+	}
+	merged, changed, err := schema.ReconcileAdditiveSchema(md.Schema, want)
+	if err != nil || !changed {
+		return md, nil
+	}
+	haveMerged, err := schema.FromBigQuery(merged)
+	if err != nil || len(schema.CompatibilityDifferences(want, haveMerged)) > 0 {
+		return md, nil
+	}
+	if err := admin.UpdateTable(ctx, table, bq.TableMetadataToUpdate{Schema: merged}, md.ETag); err != nil {
+		return nil, fmt.Errorf("updating %s schema: %w", subject, err)
+	}
+	updated := *md
+	updated.Schema = merged
+	return &updated, nil
+}
+
+func (e *signalExporter) createSearchIndex(ctx context.Context, admin destinationAdmin) error {
+	var ddl string
+	switch {
+	case proto.Equal(e.schema, schema.SpansTableSchema()):
+		ddl = fmt.Sprintf(schema.SpansSearchIndexDDL, e.cfg.Project, e.cfg.Dataset, e.table)
+	case proto.Equal(e.schema, schema.LogsTableSchema()):
+		ddl = fmt.Sprintf(schema.LogsSearchIndexDDL, e.cfg.Project, e.cfg.Dataset, e.table)
+	default:
+		return nil
+	}
+	if err := admin.RunDDL(ctx, ddl); err != nil {
+		return fmt.Errorf("creating search index on %s: %w", e.tableID(), err)
+	}
+	return nil
 }
 
 func (e *signalExporter) ensureDataset(ctx context.Context, admin destinationAdmin) error {
@@ -218,18 +326,17 @@ func (e *signalExporter) createDedupView(
 ) error {
 	viewID := e.table + "_dedup"
 	md := &bq.TableMetadata{ViewQuery: query, UseLegacySQL: false}
-	// Table.Create is intentionally create-only. An existing view produces
-	// AlreadyExists and is never replaced or mutated by exporter startup.
-	if err := admin.CreateTable(ctx, viewID, md); err != nil && !isAlreadyExists(err) {
-		return fmt.Errorf("creating deduplication view %s.%s.%s: %w",
-			e.cfg.Project, e.cfg.Dataset, viewID, err)
+	err := admin.CreateTable(ctx, viewID, md)
+	if err == nil || isAlreadyExists(err) {
+		return nil
 	}
-	return nil
+	return fmt.Errorf("creating deduplication view %s.%s.%s: %w",
+		e.cfg.Project, e.cfg.Dataset, viewID, err)
 }
 
 // createCompanionViews creates the optional companion views of the active
-// signal. Like the dedup view they are create-only: an existing view produces
-// AlreadyExists and is left as it is.
+// signal when enabled. Like the dedup view they are create-only: an existing
+// view produces AlreadyExists and is left as it is.
 //
 // v_gen_ai_logs joins the log and span dedup views, which belong to separate
 // signal exporters, so whichever exporter starts second creates v_gen_ai_logs
@@ -239,6 +346,9 @@ func (e *signalExporter) createDedupView(
 // unreadable peer dedup view is skipped with a warning because companion views
 // are a convenience and must not block export.
 func (e *signalExporter) createCompanionViews(ctx context.Context, admin destinationAdmin) error {
+	if proto.Equal(e.schema, schema.MetricsTableSchema()) {
+		return nil
+	}
 	isSpans := proto.Equal(e.schema, schema.SpansTableSchema())
 	spansTable, logsTable := e.table, e.cfg.Logs.Table
 	if !isSpans {
@@ -250,8 +360,28 @@ func (e *signalExporter) createCompanionViews(ctx context.Context, admin destina
 	}
 
 	views := schema.CompanionViewsMetadata(e.cfg.Project, e.cfg.Dataset, spansTable, logsTable, isSpans)
-	for _, id := range slices.Sorted(maps.Keys(views)) {
-		if err := admin.CreateTable(ctx, id, views[id]); err != nil && !isAlreadyExists(err) {
+	order := slices.Sorted(maps.Keys(views))
+	if isSpans {
+		order = schema.SpanCompanionViewOrder
+	}
+	var companionViewsPreserved bool
+	for _, id := range order {
+		md, ok := views[id]
+		if !ok {
+			continue
+		}
+		err := admin.CreateTable(ctx, id, md)
+		if isAlreadyExists(err) {
+			companionViewsPreserved = true
+			continue
+		}
+		if err != nil {
+			if isRollupView(id) && companionViewsPreserved {
+				e.logger.Warn("skipping rollup view creation over preserved companion view",
+					zap.String("view", e.cfg.Project+"."+e.cfg.Dataset+"."+id),
+					zap.Error(err))
+				continue
+			}
 			return fmt.Errorf("creating companion view %s.%s.%s: %w",
 				e.cfg.Project, e.cfg.Dataset, id, err)
 		}
@@ -271,6 +401,17 @@ func (e *signalExporter) createCompanionViews(ctx context.Context, admin destina
 		}
 	}
 	return nil
+}
+
+func isRollupView(id string) bool {
+	switch id {
+	case schema.GenAIModelCostsViewName,
+		schema.GenAISessionsViewName,
+		schema.GenAIToolUsageViewName:
+		return true
+	default:
+		return false
+	}
 }
 
 func (e *signalExporter) probePeerDedupView(
@@ -298,8 +439,9 @@ func (e *signalExporter) probePeerDedupView(
 // auto_create.tables is enabled. The rules match the signal table's: a
 // missing table needs auto_create.tables, a table that cannot take quarantine
 // rows fails startup, and unreadable metadata defers to the first quarantine
-// append unless creation is enabled. Both exporters share the table, so a
-// concurrent creation by the other one is validated like any existing table.
+// append unless creation is enabled. All signal exporters share the table, so
+// a concurrent creation by another signal exporter is validated like any
+// existing table.
 func (e *signalExporter) prepareQuarantineTable(ctx context.Context, admin destinationAdmin) error {
 	table := e.cfg.Quarantine.Table
 	subject := "quarantine table " + e.quarantineTableID()
@@ -308,6 +450,12 @@ func (e *signalExporter) prepareQuarantineTable(ctx context.Context, admin desti
 	md, err := admin.TableMetadata(ctx, table)
 	switch {
 	case err == nil:
+		if e.cfg.AutoCreate.Tables {
+			md, err = e.reconcileTableSchema(ctx, admin, table, md, want, subject)
+			if err != nil {
+				return err
+			}
+		}
 		return validateSchemaOf(md, want, subject)
 	case isContextError(err):
 		return fmt.Errorf("reading %s metadata: %w", subject, err)
@@ -325,7 +473,10 @@ func (e *signalExporter) prepareQuarantineTable(ctx context.Context, admin desti
 			zap.String("destination", e.quarantineTableID()), zap.Error(err))
 	}
 
-	createMD, err := schema.QuarantineDestinationMetadata()
+	createMD, err := schema.QuarantineDestinationMetadataWithOptions(schema.DestinationOptions{
+		PartitionExpirationDays: e.cfg.Quarantine.PartitionExpirationDays,
+		RequirePartitionFilter:  e.cfg.Quarantine.RequirePartitionFilter,
+	})
 	if err != nil {
 		return fmt.Errorf("deriving quarantine table metadata: %w", err)
 	}

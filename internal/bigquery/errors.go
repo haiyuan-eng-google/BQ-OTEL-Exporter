@@ -99,13 +99,28 @@ const (
 )
 
 // throughputQuotaPrefix is the message prefix BigQuery uses for AppendRows
-// throughput exhaustion.
-//
-// Matching on the message text is fragile, but the service does not return a
-// structured quota failure for this case, so it is the only way to tell a
-// retryable throughput cap apart from a permanent resource-exhaustion error.
-// The Write API team's own Fluent Bit sink carries the same workaround.
+// throughput exhaustion. Kept for tests that reference the canonical message.
 const throughputQuotaPrefix = "Exceeds 'AppendRows throughput' quota"
+
+// oversizeResourceExhaustedSubstrings identify ResourceExhausted errors caused
+// by a single message or request exceeding a static size limit rather than
+// transient quota, concurrent-connection, or rate-limit contention.
+var oversizeResourceExhaustedSubstrings = []string{
+	"message larger than max",
+	"request payload size exceeds",
+	"exceeds 'appendrows request size'",
+	"request size limit",
+}
+
+func isOversizeResourceExhausted(msg string) bool {
+	lower := strings.ToLower(msg)
+	for _, sub := range oversizeResourceExhaustedSubstrings {
+		if strings.Contains(lower, sub) {
+			return true
+		}
+	}
+	return false
+}
 
 // schemaMismatchMarkers appear in INVALID_ARGUMENT messages when the row
 // descriptor no longer matches the destination table.
@@ -141,10 +156,13 @@ func Classify(err error) Verdict {
 
 	switch s.Code() {
 	case codes.ResourceExhausted:
-		if strings.HasPrefix(s.Message(), throughputQuotaPrefix) {
-			return Verdict{Retryable, OwnerExporterHelper, LabelQuota, false}
+		// Static message/request size overruns cannot succeed on retry with
+		// the same payload. All other ResourceExhausted statuses (throughput
+		// quota, concurrent connection quota, rate limits) are transient.
+		if isOversizeResourceExhausted(s.Message()) {
+			return Verdict{Permanent, OwnerExporter, LabelQuota, false}
 		}
-		return Verdict{Permanent, OwnerExporter, LabelQuota, false}
+		return Verdict{Retryable, OwnerExporterHelper, LabelQuota, false}
 
 	case codes.Unavailable:
 		return Verdict{Retryable, OwnerExporterHelper, LabelUnavailable, false}

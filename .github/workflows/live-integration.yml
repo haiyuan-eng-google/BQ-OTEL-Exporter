@@ -1,0 +1,34 @@
+name: Live BigQuery Integration
+
+on:
+  schedule:
+    - cron: '42 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  live-integration:
+    name: Live BigQuery Integration Suite
+    runs-on: ubuntu-latest
+    env:
+      REQUIRE_LIVE_BQ: "1"
+      BQ_PROJECT: ${{ vars.BQ_PROJECT }}
+      BQ_LOCATION: ${{ vars.BQ_LOCATION || 'US' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Authenticate to Google Cloud via Workload Identity Federation
+        if: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER != '' }}
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      - name: Run integration tests (fail-closed via REQUIRE_LIVE_BQ=1)
+        run: |
+          go test -v -race -tags=integration -count=1 -timeout=10m ./...

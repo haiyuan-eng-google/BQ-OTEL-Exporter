@@ -1,0 +1,77 @@
+# Default values for the BigQuery OTel Collector Helm chart.
+# Override these with --set or values.yaml overrides.
+
+image:
+  repository: ghcr.io/haiyuan-eng-google/bq-otel-collector
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+# BigQuery destination.
+bigquery:
+  project: ""
+  dataset: "otel"
+  location: "US"
+  tracesTable: "otel_spans"
+  logsTable: "otel_logs"
+  autoCreateDataset: false
+  autoCreateTables: false
+
+# Collector OTLP receivers.
+receivers:
+  grpc:
+    port: 4317
+  http:
+    port: 4318
+
+# Health check extension.
+healthCheck:
+  enabled: true
+  port: 13133
+
+# Persistent queue for crash-replay durability.
+persistentQueue:
+  enabled: false
+  storageClass: ""
+  size: 1Gi
+  mountPath: /var/lib/otel/queue
+
+# Resource limits.
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# Number of replicas.
+replicaCount: 1
+
+# Service account for Workload Identity Federation.
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # For Workload Identity Federation, set:
+  # annotations:
+  #   iam.gke.io/gcp-service-account: "otel-collector@my-project.iam.gserviceaccount.com"
+
+# Node selector, tolerations, affinity.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Security context.
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+# Pod-level security.
+podSecurityContext:
+  fsGroup: 65532

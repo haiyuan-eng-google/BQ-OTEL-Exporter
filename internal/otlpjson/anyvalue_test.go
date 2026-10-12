@@ -492,3 +492,33 @@ func checkSchemaMirrors(t *testing.T, path string, attrs, schema any) {
 		}
 	}
 }
+
+func BenchmarkEncodeMapWithSchema(b *testing.B) {
+	m := pcommon.NewMap()
+	m.PutStr("gen_ai.request.model", "gemini-2.5-pro")
+	m.PutStr("gen_ai.system", "vertex_ai")
+	m.PutInt("gen_ai.usage.input_tokens", 1024)
+	m.PutInt("gen_ai.usage.output_tokens", 512)
+	m.PutDouble("gen_ai.request.temperature", 0.2)
+	m.PutBool("cache.hit", true)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = EncodeMapWithSchema(m)
+	}
+}
+
+func BenchmarkEncodePlainMap(b *testing.B) {
+	m := pcommon.NewMap()
+	m.PutStr("service.name", "checkout")
+	m.PutStr("service.version", "1.4.2")
+	m.PutStr("deployment.environment", "prod")
+	m.PutInt("host.cpu.count", 16)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = EncodePlainMap(m)
+	}
+}

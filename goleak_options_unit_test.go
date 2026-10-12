@@ -44,5 +44,9 @@ func integrationGoleakOptions() []goleak.Option {
 		// certificate proxy client reads from its helper process for as long
 		// as the process lives, so it is not a leak this package can close.
 		goleak.IgnoreAnyFunction("net/rpc.(*Client).input"),
+		// managedwriter cancels a connection's previous context after a fixed
+		// 20 s grace period, including on the connection's first open. The
+		// goroutine ends on its own.
+		goleak.IgnoreAnyFunction("cloud.google.com/go/bigquery/storage/managedwriter.(*connection).getStream.func1"),
 	}
 }

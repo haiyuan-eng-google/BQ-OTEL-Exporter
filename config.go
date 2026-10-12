@@ -6,8 +6,13 @@ package bigqueryexporter // import "github.com/haiyuan-eng-google/BQ-OTEL-Export
 import (
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"regexp"
+	"strings"
+	"time"
 
+	"go.opentelemetry.io/collector/config/configopaque"
 	"go.opentelemetry.io/collector/config/configoptional"
 	"go.opentelemetry.io/collector/config/configretry"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
@@ -45,15 +50,15 @@ type Config struct {
 	// dataset; otherwise it is informational.
 	Location string `mapstructure:"location"`
 
-	// Traces and Logs configure the two signal pipelines.
-	Traces SignalConfig `mapstructure:"traces"`
-	Logs   LogsConfig   `mapstructure:"logs"`
+	// Traces, Logs, and Metrics configure the three signal pipelines.
+	Traces  SignalConfig `mapstructure:"traces"`
+	Logs    LogsConfig   `mapstructure:"logs"`
+	Metrics SignalConfig `mapstructure:"metrics"`
 
 	// Credentials selects how the exporter authenticates.
 	Credentials CredentialsConfig `mapstructure:"credentials"`
 
-	// Endpoint overrides the Storage Write API endpoint. Emulator and
-	// development use only.
+	// Endpoint overrides the Storage Write API and REST v2 control-plane endpoints.
 	Endpoint EndpointConfig `mapstructure:"endpoint"`
 
 	// AutoCreate governs dataset and table creation. Creation is a separate
@@ -70,16 +75,24 @@ type Config struct {
 	// Quarantine routes records the signal tables cannot take to an opt-in
 	// dead-letter table instead of only counting them.
 	Quarantine QuarantineConfig `mapstructure:"quarantine"`
+
+	// Offload routes oversized span/log values and quarantine payloads to
+	// Google Cloud Storage and records ObjectRef references in BigQuery.
+	Offload OffloadConfig `mapstructure:"offload"`
 }
 
-// SignalConfig is the per-signal destination.
+// SignalConfig is the per-signal destination and partition lifecycle policy.
 type SignalConfig struct {
-	Table string `mapstructure:"table"`
+	Table                   string `mapstructure:"table"`
+	PartitionExpirationDays int    `mapstructure:"partition_expiration_days"`
+	RequirePartitionFilter  bool   `mapstructure:"require_partition_filter"`
 }
 
 // LogsConfig adds the log-only record identity settings.
 type LogsConfig struct {
-	Table string `mapstructure:"table"`
+	Table                   string `mapstructure:"table"`
+	PartitionExpirationDays int    `mapstructure:"partition_expiration_days"`
+	RequirePartitionFilter  bool   `mapstructure:"require_partition_filter"`
 
 	// LogNameAttribute names a string log record attribute that carries the
 	// log_name column. When unset, or absent on a record, log_name falls back
@@ -98,27 +111,44 @@ type LogsConfig struct {
 	InsertIDAttribute string `mapstructure:"insert_id_attribute"`
 }
 
-// CredentialsConfig selects an authentication method. At most one may be set;
-// the default is application default credentials.
+// CredentialsConfig selects an authentication method and optional enterprise
+// project/domain overrides. At most one explicit credential source (file, json,
+// or impersonate_service_account) may be set; the default is application
+// default credentials.
 type CredentialsConfig struct {
 	// File is a path to a Google credentials JSON file. The file's type must be
 	// one of service_account, authorized_user, external_account,
-	// external_account_authorized_user or impersonated_service_account.
+	// external_account_authorized_user, or impersonated_service_account.
 	File string `mapstructure:"file"`
+	// JSON is an inline credential JSON payload, masked when formatted.
+	JSON configopaque.String `mapstructure:"json"`
 	// ImpersonateServiceAccount is the target principal for impersonation,
 	// using the ambient credentials as the source.
 	ImpersonateServiceAccount string `mapstructure:"impersonate_service_account"`
+	// ImpersonateDelegates is an optional chain of intermediate service
+	// account principals for delegated impersonation. Requires
+	// ImpersonateServiceAccount.
+	ImpersonateDelegates []string `mapstructure:"impersonate_delegates"`
+	// QuotaProject overrides the project billed and charged for API quota.
+	QuotaProject string `mapstructure:"quota_project"`
+	// UniverseDomain overrides the Google Cloud universe domain (default
+	// "googleapis.com") for Sovereign Cloud / Trusted Partner Cloud
+	// deployments.
+	UniverseDomain string `mapstructure:"universe_domain"`
 }
 
-// EndpointConfig overrides the service endpoint for emulator and development
-// use.
+// EndpointConfig overrides the service endpoints for emulator, Private Google
+// Access, Private Service Connect, and Sovereign Cloud use.
 //
 // Insecure transport and disabled authentication are separate explicit flags
 // rather than an inferred consequence of setting an endpoint. Someone pointing
 // at an internal proxy with real credentials should not silently lose TLS.
 type EndpointConfig struct {
-	// URL is the alternate Storage Write API endpoint.
+	// URL is the alternate Storage Write API gRPC endpoint.
 	URL string `mapstructure:"url"`
+	// AdminURL is the alternate BigQuery REST v2 control-plane endpoint
+	// used during startup metadata validation and DDL execution.
+	AdminURL string `mapstructure:"admin_url"`
 	// Insecure disables TLS. Refused unless the endpoint is a loopback
 	// address.
 	Insecure bool `mapstructure:"insecure"`
@@ -127,15 +157,21 @@ type EndpointConfig struct {
 	WithoutAuthentication bool `mapstructure:"without_authentication"`
 }
 
-// AutoCreateConfig controls creation of the destination dataset and tables.
+// AutoCreateConfig controls creation of the destination dataset, tables,
+// views, and search indexes.
 type AutoCreateConfig struct {
 	Dataset bool `mapstructure:"dataset"`
 	Tables  bool `mapstructure:"tables"`
-	// CompanionViews also creates the optional companion views over the
-	// dedup views: otel_spans_as_allspans and v_gen_ai_spans with the traces
-	// table, and v_gen_ai_logs with the logs table once the traces dedup view
-	// exists. Like the dedup views they are create-only. Requires tables.
+	// CompanionViews creates missing companion views over the dedup views
+	// if absent; existing views are left as they are:
+	// otel_spans_as_allspans, v_gen_ai_spans, v_gen_ai_model_costs,
+	// v_gen_ai_sessions, and v_gen_ai_tool_usage with the traces table, and
+	// v_gen_ai_logs with the logs table once the traces dedup view exists.
+	// Requires tables.
 	CompanionViews bool `mapstructure:"companion_views"`
+	// SearchIndexes runs CREATE SEARCH INDEX IF NOT EXISTS on trace/span
+	// lookup columns at startup. Requires tables and bigquery.jobs.create.
+	SearchIndexes bool `mapstructure:"search_indexes"`
 }
 
 // WriteConfig holds Storage Write API tuning knobs.
@@ -150,26 +186,49 @@ type WriteConfig struct {
 	MaxInflightRequests int `mapstructure:"max_inflight_requests"`
 	// MaxInflightBytes bounds the memory held by in-flight appends.
 	MaxInflightBytes int `mapstructure:"max_inflight_bytes"`
+	// EnableMultiplexing enables BigQuery Storage Write API connection
+	// sharing across default write streams.
+	EnableMultiplexing bool `mapstructure:"enable_multiplexing"`
+	// ConnectionPoolSize sets the gRPC connection pool size for the
+	// Storage Write client when multiplexing is enabled.
+	ConnectionPoolSize int `mapstructure:"connection_pool_size"`
+	// Compression selects the gRPC compressor for AppendRows calls ("" or "gzip").
+	Compression string `mapstructure:"compression"`
+	// Keepalive configures gRPC client keepalive parameters for Storage
+	// Write streams.
+	Keepalive KeepaliveConfig `mapstructure:"keepalive"`
+}
+
+// KeepaliveConfig configures gRPC client keepalive parameters.
+type KeepaliveConfig struct {
+	// Time is the idle duration after which the client pings the server.
+	Time time.Duration `mapstructure:"time"`
+	// Timeout is the duration the client waits for a keepalive ping ack.
+	Timeout time.Duration `mapstructure:"timeout"`
+	// PermitWithoutStream sends keepalive pings even with no active RPCs.
+	PermitWithoutStream bool `mapstructure:"permit_without_stream"`
 }
 
 // LimitsConfig mirrors transform.Limits in configuration.
 type LimitsConfig struct {
-	MaxAttributeCount int `mapstructure:"max_attribute_count"`
-	MaxEventCount     int `mapstructure:"max_event_count"`
-	MaxLinkCount      int `mapstructure:"max_link_count"`
-	MaxNestingDepth   int `mapstructure:"max_nesting_depth"`
-	MaxCollectionSize int `mapstructure:"max_collection_size"`
-	MaxValueBytes     int `mapstructure:"max_value_bytes"`
+	MaxAttributeCount    int `mapstructure:"max_attribute_count"`
+	MaxEventCount        int `mapstructure:"max_event_count"`
+	MaxLinkCount         int `mapstructure:"max_link_count"`
+	MaxNestingDepth      int `mapstructure:"max_nesting_depth"`
+	MaxCollectionSize    int `mapstructure:"max_collection_size"`
+	MaxAttributeKeyBytes int `mapstructure:"max_attribute_key_bytes"`
+	MaxValueBytes        int `mapstructure:"max_value_bytes"`
 }
 
 func (l LimitsConfig) toTransform() transform.Limits {
 	return transform.Limits{
-		MaxAttributeCount: l.MaxAttributeCount,
-		MaxEventCount:     l.MaxEventCount,
-		MaxLinkCount:      l.MaxLinkCount,
-		MaxNestingDepth:   l.MaxNestingDepth,
-		MaxCollectionSize: l.MaxCollectionSize,
-		MaxValueBytes:     l.MaxValueBytes,
+		MaxAttributeCount:    l.MaxAttributeCount,
+		MaxEventCount:        l.MaxEventCount,
+		MaxLinkCount:         l.MaxLinkCount,
+		MaxNestingDepth:      l.MaxNestingDepth,
+		MaxCollectionSize:    l.MaxCollectionSize,
+		MaxAttributeKeyBytes: l.MaxAttributeKeyBytes,
+		MaxValueBytes:        l.MaxValueBytes,
 	}
 }
 
@@ -184,7 +243,40 @@ func (l LimitsConfig) toTransform() transform.Limits {
 type QuarantineConfig struct {
 	Enabled bool `mapstructure:"enabled"`
 	// Table is the quarantine table ID in the destination dataset.
-	Table string `mapstructure:"table"`
+	Table                   string `mapstructure:"table"`
+	PartitionExpirationDays int    `mapstructure:"partition_expiration_days"`
+	RequirePartitionFilter  bool   `mapstructure:"require_partition_filter"`
+	// MetadataOnly omits raw_payload, raw_attributes, and payload_ref from
+	// quarantine rows when enabled, writing only metadata columns.
+	MetadataOnly bool `mapstructure:"metadata_only"`
+	// MaxRawPayloadBytes bounds the UTF-8 byte length of raw_payload in
+	// quarantine rows before any row-size cap is applied.
+	MaxRawPayloadBytes int `mapstructure:"max_raw_payload_bytes"`
+	// Timeout bounds each best-effort quarantine Append call on a context
+	// detached from the caller's export cancellation.
+	Timeout time.Duration `mapstructure:"timeout"`
+}
+
+// OffloadConfig configures optional large-payload offloading to Google Cloud
+// Storage with BigQuery ObjectRef references in payload_refs and quarantine
+// payload_ref.
+type OffloadConfig struct {
+	Enabled bool `mapstructure:"enabled"`
+	// Bucket is the destination GCS bucket name (without gs://).
+	Bucket string `mapstructure:"bucket"`
+	// Prefix is the object key prefix within Bucket.
+	Prefix string `mapstructure:"prefix"`
+	// Authorizer is the optional BigQuery connection resource name
+	// recorded in ObjectRef.authorizer.
+	Authorizer string `mapstructure:"authorizer"`
+	// MinBytes is the minimum byte length for a value to be offloaded.
+	MinBytes int `mapstructure:"min_bytes"`
+	// MaxObjectBytes is the maximum byte length eligible for offloading.
+	MaxObjectBytes int `mapstructure:"max_object_bytes"`
+	// MaxConcurrency bounds concurrent GCS uploads within an offload batch.
+	MaxConcurrency int `mapstructure:"max_concurrency"`
+	// Timeout bounds each object upload attempt.
+	Timeout time.Duration `mapstructure:"timeout"`
 }
 
 // Validate checks the configuration and fails fast at startup.
@@ -207,8 +299,9 @@ func (cfg *Config) Validate() error {
 	}
 
 	for name, table := range map[string]string{
-		"traces.table": cfg.Traces.Table,
-		"logs.table":   cfg.Logs.Table,
+		"traces.table":  cfg.Traces.Table,
+		"logs.table":    cfg.Logs.Table,
+		"metrics.table": cfg.Metrics.Table,
 	} {
 		if table == "" {
 			errs = append(errs, fmt.Errorf("%s must not be empty", name))
@@ -217,10 +310,22 @@ func (cfg *Config) Validate() error {
 		}
 	}
 
+	for name, days := range map[string]int{
+		"traces.partition_expiration_days":     cfg.Traces.PartitionExpirationDays,
+		"logs.partition_expiration_days":       cfg.Logs.PartitionExpirationDays,
+		"metrics.partition_expiration_days":    cfg.Metrics.PartitionExpirationDays,
+		"quarantine.partition_expiration_days": cfg.Quarantine.PartitionExpirationDays,
+	} {
+		if days < 0 {
+			errs = append(errs, fmt.Errorf("%s (%d) must not be negative", name, days))
+		}
+	}
+
 	errs = append(errs, cfg.validateWrite()...)
 	errs = append(errs, cfg.validateCredentials()...)
 	errs = append(errs, cfg.validateEndpoint()...)
 	errs = append(errs, cfg.validateQuarantine()...)
+	errs = append(errs, cfg.validateOffload()...)
 
 	if err := cfg.Limits.toTransform().Validate(); err != nil {
 		errs = append(errs, err)
@@ -232,6 +337,9 @@ func (cfg *Config) Validate() error {
 	if cfg.AutoCreate.CompanionViews && !cfg.AutoCreate.Tables {
 		errs = append(errs, errors.New("auto_create.companion_views requires auto_create.tables"))
 	}
+	if cfg.AutoCreate.SearchIndexes && !cfg.AutoCreate.Tables {
+		errs = append(errs, errors.New("auto_create.search_indexes requires auto_create.tables"))
+	}
 	if cfg.Endpoint.WithoutAuthentication {
 		if cfg.AutoCreate.Dataset {
 			errs = append(errs, errors.New(
@@ -240,6 +348,10 @@ func (cfg *Config) Validate() error {
 		if cfg.AutoCreate.Tables {
 			errs = append(errs, errors.New(
 				"auto_create.tables cannot be enabled with endpoint.without_authentication"))
+		}
+		if cfg.AutoCreate.SearchIndexes {
+			errs = append(errs, errors.New(
+				"auto_create.search_indexes cannot be enabled with endpoint.without_authentication"))
 		}
 	}
 
@@ -289,21 +401,64 @@ func (cfg *Config) validateWrite() []error {
 			"write.max_inflight_bytes (%d) is below write.max_request_bytes (%d): a single full request could never be sent",
 			w.MaxInflightBytes, w.MaxRequestBytes))
 	}
+	if w.ConnectionPoolSize < 0 {
+		errs = append(errs, errors.New("write.connection_pool_size must not be negative"))
+	} else if w.EnableMultiplexing && w.ConnectionPoolSize <= 0 {
+		errs = append(errs, errors.New("write.connection_pool_size must be positive when write.enable_multiplexing is enabled"))
+	}
+	if w.Compression != "" && w.Compression != "gzip" {
+		errs = append(errs, fmt.Errorf("write.compression %q must be empty or \"gzip\"", w.Compression))
+	}
+	if w.Keepalive.Time < 0 {
+		errs = append(errs, errors.New("write.keepalive.time must not be negative"))
+	}
+	if w.Keepalive.Timeout < 0 {
+		errs = append(errs, errors.New("write.keepalive.timeout must not be negative"))
+	}
 	return errs
 }
 
 func (cfg *Config) validateCredentials() []error {
+	var errs []error
 	c := cfg.Credentials
-	if c.File != "" && c.ImpersonateServiceAccount != "" {
-		return []error{errors.New(
-			"credentials.file and credentials.impersonate_service_account are mutually exclusive")}
+	if c.File != "" && c.JSON != "" {
+		errs = append(errs, errors.New(
+			"credentials.file and credentials.json are mutually exclusive"))
 	}
-	return nil
+	if c.File != "" && c.ImpersonateServiceAccount != "" {
+		errs = append(errs, errors.New(
+			"credentials.file and credentials.impersonate_service_account are mutually exclusive"))
+	}
+	if c.JSON != "" && c.ImpersonateServiceAccount != "" {
+		errs = append(errs, errors.New(
+			"credentials.json and credentials.impersonate_service_account are mutually exclusive"))
+	}
+	if len(c.ImpersonateDelegates) > 0 && c.ImpersonateServiceAccount == "" {
+		errs = append(errs, errors.New(
+			"credentials.impersonate_delegates requires credentials.impersonate_service_account"))
+	}
+	return errs
 }
 
 func (cfg *Config) validateEndpoint() []error {
 	var errs []error
 	e := cfg.Endpoint
+
+	// The metadata client always sends credentials, whatever
+	// without_authentication says about the Storage Write endpoint. Plain HTTP
+	// is therefore acceptable only to a loopback emulator; anywhere else it
+	// would put the bearer token on the wire in the clear.
+	if e.AdminURL != "" {
+		u, err := url.Parse(e.AdminURL)
+		switch {
+		case err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http"):
+			errs = append(errs, fmt.Errorf(
+				"endpoint.admin_url must be an absolute http(s):// URL, got %q", e.AdminURL))
+		case u.Scheme == "http" && !isLoopbackHost(u.Hostname()):
+			errs = append(errs, fmt.Errorf(
+				"endpoint.admin_url must use https:// unless it is a loopback address, got %q", e.AdminURL))
+		}
+	}
 
 	if e.URL == "" {
 		if e.Insecure {
@@ -337,17 +492,68 @@ func (cfg *Config) validateQuarantine() []error {
 		errs = append(errs, fmt.Errorf(
 			"quarantine.table %q must contain only letters, numbers and underscores", q.Table))
 	}
+	if q.MaxRawPayloadBytes < 0 {
+		errs = append(errs, errors.New("quarantine.max_raw_payload_bytes must not be negative"))
+	}
+	if q.Timeout < 0 {
+		errs = append(errs, errors.New("quarantine.timeout must not be negative"))
+	}
 	if !q.Enabled {
 		return errs
 	}
 	switch q.Table {
 	case "":
 		errs = append(errs, errors.New("quarantine.table must not be empty when quarantine.enabled is set"))
-	case cfg.Traces.Table, cfg.Logs.Table:
+	case cfg.Traces.Table, cfg.Logs.Table, cfg.Metrics.Table:
 		// The quarantine table has its own schema, so sharing a signal
 		// table could only ever fail schema validation at startup.
 		errs = append(errs, fmt.Errorf(
-			"quarantine.table %q must differ from traces.table and logs.table", q.Table))
+			"quarantine.table %q must differ from traces.table and logs.table (and metrics.table)", q.Table))
+	}
+	if q.MaxRawPayloadBytes <= 0 {
+		errs = append(errs, errors.New("quarantine.max_raw_payload_bytes must be positive when quarantine.enabled is set"))
+	}
+	if q.Timeout <= 0 {
+		errs = append(errs, errors.New("quarantine.timeout must be positive when quarantine.enabled is set"))
+	}
+	return errs
+}
+
+func (cfg *Config) validateOffload() []error {
+	var errs []error
+	o := cfg.Offload
+
+	if o.MinBytes < 0 {
+		errs = append(errs, errors.New("offload.min_bytes must not be negative"))
+	}
+	if o.MaxObjectBytes < 0 {
+		errs = append(errs, errors.New("offload.max_object_bytes must not be negative"))
+	}
+	if o.Timeout < 0 {
+		errs = append(errs, errors.New("offload.timeout must not be negative"))
+	}
+	if !o.Enabled {
+		return errs
+	}
+	bucket := strings.TrimSpace(o.Bucket)
+	if bucket == "" {
+		errs = append(errs, errors.New("offload.bucket must not be empty when offload.enabled is set"))
+	} else if strings.HasPrefix(bucket, "gs://") || strings.Contains(bucket, "/") {
+		errs = append(errs, fmt.Errorf("offload.bucket %q must be a bare bucket name without gs:// or slashes", o.Bucket))
+	}
+	if o.MinBytes <= 0 {
+		errs = append(errs, errors.New("offload.min_bytes must be positive when offload.enabled is set"))
+	}
+	if o.MaxObjectBytes < o.MinBytes {
+		errs = append(errs, fmt.Errorf(
+			"offload.max_object_bytes (%d) must be at least offload.min_bytes (%d)",
+			o.MaxObjectBytes, o.MinBytes))
+	}
+	if o.MaxConcurrency <= 0 {
+		errs = append(errs, errors.New("offload.max_concurrency must be positive when offload.enabled is set"))
+	}
+	if o.Timeout <= 0 {
+		errs = append(errs, errors.New("offload.timeout must be positive when offload.enabled is set"))
 	}
 	return errs
 }
@@ -361,14 +567,22 @@ func isLoopback(endpoint string) bool {
 	if i := indexByte(host, '/'); i >= 0 {
 		host = host[:i]
 	}
-	if i := lastIndexByte(host, ':'); i >= 0 {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	} else if i := lastIndexByte(host, ':'); i >= 0 && !strings.Contains(host, "]") {
 		host = host[:i]
 	}
-	switch host {
-	case "localhost", "127.0.0.1", "::1", "[::1]":
+	return isLoopbackHost(host)
+}
+
+func isLoopbackHost(host string) bool {
+	h := strings.Trim(host, "[]")
+	switch h {
+	case "localhost", "127.0.0.1", "::1":
 		return true
 	}
-	return false
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
 }
 
 func trimPrefix(s, prefix string) string {

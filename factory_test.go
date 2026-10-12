@@ -5,6 +5,7 @@ package bigqueryexporter
 
 import (
 	"context"
+	"slices"
 	"testing"
 
 	"go.opentelemetry.io/collector/exporter/exportertest"
@@ -28,6 +29,9 @@ func TestCreateExporters(t *testing.T) {
 	if _, err := f.CreateLogs(context.Background(), set, validConfig()); err != nil {
 		t.Fatalf("CreateLogs: %v", err)
 	}
+	if _, err := f.CreateMetrics(context.Background(), set, validConfig()); err != nil {
+		t.Fatalf("CreateMetrics: %v", err)
+	}
 }
 
 func TestDefaultQueueConcurrencyFitsManagedWriterWindow(t *testing.T) {
@@ -42,14 +46,13 @@ func TestDefaultQueueConcurrencyFitsManagedWriterWindow(t *testing.T) {
 	}
 }
 
-// Metrics are out of scope for v1. Asserting the absence keeps the decision
-// honest: if someone wires metrics up, this test makes them revisit the
-// decision record rather than slip it in.
-func TestMetricsNotSupported(t *testing.T) {
-	f := NewFactory()
-	set := exportertest.NewNopSettings(f.Type())
-	if _, err := f.CreateMetrics(context.Background(), set, validConfig()); err == nil {
-		t.Fatal("expected metrics creation to fail while metrics remain out of scope")
+func TestDefaultSignalAndQuarantineConfig(t *testing.T) {
+	cfg := createDefaultConfig().(*Config)
+	if cfg.Metrics.Table != "otel_metrics" {
+		t.Fatalf("default metrics.table = %q, want otel_metrics", cfg.Metrics.Table)
+	}
+	if cfg.Quarantine.PartitionExpirationDays != 30 {
+		t.Fatalf("default quarantine.partition_expiration_days = %d, want 30", cfg.Quarantine.PartitionExpirationDays)
 	}
 }
 
@@ -84,6 +87,34 @@ func TestRowPositionToRecordIndex(t *testing.T) {
 				if got[i] != tc.want[i] {
 					t.Fatalf("got %v, want %v", got, tc.want)
 				}
+			}
+		})
+	}
+}
+
+// validRecordIndices names the records a retry payload may carry: everything
+// sent that the service did not reject.
+func TestValidRecordIndices(t *testing.T) {
+	tests := []struct {
+		name        string
+		recordIndex []int
+		rejected    []int
+		want        []int
+	}{
+		{"nothing rejected", []int{0, 1, 3}, nil, []int{0, 1, 3}},
+		{"one rejected", []int{0, 1, 3}, []int{1}, []int{0, 3}},
+		{"every record rejected", []int{0, 1}, []int{0, 1}, []int{}},
+		{"a record that was not sent changes nothing", []int{0, 2}, []int{1}, []int{0, 2}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var rowErrors []transform.QuarantineEntry
+			for _, i := range tc.rejected {
+				rowErrors = append(rowErrors, transform.QuarantineEntry{Rejection: transform.Rejection{Index: i}})
+			}
+			if got := validRecordIndices(tc.recordIndex, rowErrors); !slices.Equal(got, tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
 			}
 		})
 	}

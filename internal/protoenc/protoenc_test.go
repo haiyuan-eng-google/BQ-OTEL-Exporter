@@ -4,6 +4,8 @@
 package protoenc
 
 import (
+	"context"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +13,7 @@ import (
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
@@ -731,12 +734,12 @@ type stubOffloader struct {
 	refs []transform.PayloadRef
 }
 
-func (s stubOffloader) OffloadSpan(_ ptrace.Span, _ pcommon.Resource, _ pcommon.InstrumentationScope) []transform.PayloadRef {
-	return s.refs
+func (s stubOffloader) OffloadSpan(_ context.Context, _ ptrace.Span, _ pcommon.Resource, _ pcommon.InstrumentationScope) ([]transform.PayloadRef, error) {
+	return s.refs, nil
 }
 
-func (s stubOffloader) OffloadLog(_ plog.LogRecord, _ pcommon.Resource, _ pcommon.InstrumentationScope) []transform.PayloadRef {
-	return s.refs
+func (s stubOffloader) OffloadLog(_ context.Context, _ plog.LogRecord, _ pcommon.Resource, _ pcommon.InstrumentationScope) ([]transform.PayloadRef, error) {
+	return s.refs, nil
 }
 
 func TestEncodeSpanAndLogRowsWithPayloadRefs(t *testing.T) {
@@ -819,7 +822,7 @@ func TestEncodeSpanAndLogRowsWithPayloadRefs(t *testing.T) {
 	}
 
 	qo := opts()
-	qo.QuarantinePayloadOffloader = func(_ string, _ []byte) transform.ObjectRef {
+	qo.QuarantinePayloadOffloader = func(_ context.Context, _ string, _ []byte) transform.ObjectRef {
 		return ref.ObjectRef
 	}
 	qRows := transform.SpanQuarantineRows(td, []transform.QuarantineEntry{{Rejection: transform.Rejection{Index: 0, Reason: transform.ReasonRowBytes, Limit: 10, Actual: 20}}}, qo)
@@ -837,5 +840,325 @@ func TestEncodeSpanAndLogRowsWithPayloadRefs(t *testing.T) {
 	}
 	if got := get(t, qNorm, "payload_ref.uri").String(); got != "gs://bucket/offload/prompt-1.json" {
 		t.Errorf("quarantine payload_ref.uri = %q", got)
+	}
+}
+
+func TestEncodeRepeatedScalarsAndStructSlices(t *testing.T) {
+	ts := &storagepb.TableSchema{
+		Fields: []*storagepb.TableFieldSchema{
+			{Name: "tags", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_REPEATED},
+			{Name: "counts", Type: storagepb.TableFieldSchema_INT64, Mode: storagepb.TableFieldSchema_REPEATED},
+			{Name: "scores", Type: storagepb.TableFieldSchema_DOUBLE, Mode: storagepb.TableFieldSchema_REPEATED},
+			{Name: "flags", Type: storagepb.TableFieldSchema_BOOL, Mode: storagepb.TableFieldSchema_REPEATED},
+			{Name: "blobs", Type: storagepb.TableFieldSchema_BYTES, Mode: storagepb.TableFieldSchema_REPEATED},
+			{Name: "mixed", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_REPEATED},
+			{Name: "empty_list", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_REPEATED},
+			{Name: "meta", Type: storagepb.TableFieldSchema_STRUCT, Mode: storagepb.TableFieldSchema_NULLABLE, Fields: []*storagepb.TableFieldSchema{
+				{Name: "k", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+			}},
+			{Name: "items", Type: storagepb.TableFieldSchema_STRUCT, Mode: storagepb.TableFieldSchema_REPEATED, Fields: []*storagepb.TableFieldSchema{
+				{Name: "id", Type: storagepb.TableFieldSchema_INT64, Mode: storagepb.TableFieldSchema_NULLABLE},
+			}},
+		},
+	}
+
+	enc, err := New(ts)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := ProtoDescriptorFor(ts); err != nil {
+		t.Fatalf("ProtoDescriptorFor: %v", err)
+	}
+
+	type customStringSlice []string
+	for _, tc := range []struct {
+		name string
+		row  transform.Row
+	}{
+		{
+			name: "typed slices and map[string]any structs",
+			row: transform.Row{
+				"tags":       []string{"alpha", "beta"},
+				"counts":     []int64{10, 20},
+				"scores":     []float64{1.5, 2.5},
+				"flags":      []bool{true, false},
+				"blobs":      [][]byte{{1, 2}, {3, 4}},
+				"mixed":      []any{"x", "y"},
+				"empty_list": nil,
+				"meta":       map[string]any{"k": "v"},
+				"items":      []map[string]any{{"id": 1}, {"id": int64(2)}},
+			},
+		},
+		{
+			name: "int slice and custom reflect slice",
+			row: transform.Row{
+				"tags":   customStringSlice{"custom1", "custom2"},
+				"counts": []int{3, 4},
+				"items":  nil,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, err := enc.Encode(tc.row)
+			if err != nil {
+				t.Fatalf("Encode: %v", err)
+			}
+			if len(b) == 0 {
+				t.Fatal("expected non-empty wire bytes")
+			}
+		})
+	}
+}
+
+func TestEncodeInt32FieldAndOverflowRejection(t *testing.T) {
+	// DATE maps to Proto2 int32 in adapt.StorageSchemaToProto2Descriptor.
+	ts := &storagepb.TableSchema{
+		Fields: []*storagepb.TableFieldSchema{
+			{Name: "day", Type: storagepb.TableFieldSchema_DATE, Mode: storagepb.TableFieldSchema_NULLABLE},
+			{Name: "days", Type: storagepb.TableFieldSchema_DATE, Mode: storagepb.TableFieldSchema_REPEATED},
+		},
+	}
+	enc, err := New(ts)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	for _, valid := range []transform.Row{
+		{"day": int32(19000), "days": []int32{1, 2}},
+		{"day": int64(19000)},
+		{"day": int(19000)},
+	} {
+		if _, err := enc.Encode(valid); err != nil {
+			t.Fatalf("Encode(%v) unexpected error: %v", valid, err)
+		}
+	}
+
+	for _, invalid := range []transform.Row{
+		{"day": int64(math.MaxInt32) + 1},
+		{"day": int64(math.MinInt32) - 1},
+		{"day": int(math.MaxInt32) + 1},
+		{"day": "not-an-int32"},
+		{"days": []int64{int64(math.MaxInt32) + 5}},
+		{"days": []int{int(math.MinInt32) - 5}},
+		{"days": []any{"bad-int32"}},
+	} {
+		if _, err := enc.Encode(invalid); err == nil {
+			t.Fatalf("Encode(%v) succeeded, want int32 error", invalid)
+		}
+	}
+}
+
+func TestEncodeValidationErrors(t *testing.T) {
+	if _, err := New(&storagepb.TableSchema{
+		Fields: []*storagepb.TableFieldSchema{{Name: "bad"}},
+	}); err == nil {
+		t.Fatal("expected error for schema field without type")
+	}
+	if _, err := ProtoDescriptorFor(&storagepb.TableSchema{
+		Fields: []*storagepb.TableFieldSchema{{Name: "bad"}},
+	}); err == nil {
+		t.Fatal("expected ProtoDescriptorFor error for schema field without type")
+	}
+
+	ts := &storagepb.TableSchema{
+		Fields: []*storagepb.TableFieldSchema{
+			{Name: "s", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+			{Name: "i", Type: storagepb.TableFieldSchema_INT64, Mode: storagepb.TableFieldSchema_NULLABLE},
+			{Name: "d", Type: storagepb.TableFieldSchema_DOUBLE, Mode: storagepb.TableFieldSchema_NULLABLE},
+			{Name: "b", Type: storagepb.TableFieldSchema_BOOL, Mode: storagepb.TableFieldSchema_NULLABLE},
+			{Name: "raw", Type: storagepb.TableFieldSchema_BYTES, Mode: storagepb.TableFieldSchema_NULLABLE},
+			{Name: "rep_s", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_REPEATED},
+			{Name: "rep_i", Type: storagepb.TableFieldSchema_INT64, Mode: storagepb.TableFieldSchema_REPEATED},
+			{Name: "rec", Type: storagepb.TableFieldSchema_STRUCT, Mode: storagepb.TableFieldSchema_NULLABLE, Fields: []*storagepb.TableFieldSchema{
+				{Name: "inner", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+			}},
+			{Name: "recs", Type: storagepb.TableFieldSchema_STRUCT, Mode: storagepb.TableFieldSchema_REPEATED, Fields: []*storagepb.TableFieldSchema{
+				{Name: "inner", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+			}},
+		},
+	}
+	enc, err := New(ts)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	for name, row := range map[string]transform.Row{
+		"wrong string type":        {"s": 123},
+		"wrong int64 type":         {"i": "123"},
+		"wrong double type":        {"d": "1.5"},
+		"wrong bool type":          {"b": "true"},
+		"wrong bytes type":         {"raw": "bytes"},
+		"non-slice repeated":       {"rep_s": 123},
+		"bad element in []any":     {"rep_s": []any{123}},
+		"bad element in []string":  {"rep_i": []string{"not-int"}},
+		"bad element in []int64":   {"rep_s": []int64{1}},
+		"bad element in []int":     {"rep_s": []int{1}},
+		"bad element in []int32":   {"rep_s": []int32{1}},
+		"bad element in []float64": {"rep_s": []float64{1.0}},
+		"bad element in []bool":    {"rep_s": []bool{true}},
+		"bad element in [][]byte":  {"rep_s": [][]byte{{1}}},
+		"bad element in reflect":   {"rep_i": []uint{1}},
+		"wrong singular struct":    {"rec": "not-a-row"},
+		"bad nested struct field":  {"rec": transform.Row{"inner": 999}},
+		"wrong repeated struct":    {"recs": "not-a-list"},
+		"bad repeated struct elem": {"recs": []transform.Row{{"inner": 999}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := enc.Encode(row); err == nil {
+				t.Fatalf("Encode(%v) succeeded, want error", row)
+			}
+		})
+	}
+}
+
+func BenchmarkEncodeSpanRow(b *testing.B) {
+	enc, err := New(schema.SpansTableSchema())
+	if err != nil {
+		b.Fatal(err)
+	}
+	td := ptrace.NewTraces()
+	rs := td.ResourceSpans().AppendEmpty()
+	rs.Resource().Attributes().PutStr("service.name", "checkout")
+	span := rs.ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	span.SetName("POST /v1/chat/completions")
+	span.SetTraceID(pcommon.TraceID{1, 2, 3})
+	span.SetSpanID(pcommon.SpanID{4, 5, 6})
+	span.SetStartTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+	span.SetEndTimestamp(pcommon.Timestamp(1_700_000_001_000_000_000))
+	span.Attributes().PutStr("gen_ai.request.model", "gpt-4o")
+	rows, _ := transform.SpanRows(td, opts())
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := enc.Encode(rows[0]); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestEncodeMetricRow(t *testing.T) {
+	enc, err := New(schema.MetricsTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	row := transform.Row{
+		"timestamp":               int64(1_700_000_000_000_000),
+		"time_unix_nano":          int64(1_700_000_000_000_000_000),
+		"receive_time":            int64(1_700_000_001_000_000),
+		"receive_time_unix_nano":  int64(1_700_000_001_000_000_000),
+		"service_name":            "checkout",
+		"metric_name":             "gen_ai.client.operation.duration",
+		"metric_type":             "HISTOGRAM",
+		"aggregation_temporality": "DELTA",
+		"is_monotonic":            true,
+		"flags":                   int64(0),
+		"attributes":              `{"gen_ai.provider.name":"gcp.vertex_ai"}`,
+		"attributes_schema":       `{"gen_ai.provider.name":"string"}`,
+		"count":                   int64(3),
+		"sum":                     1.75,
+		"explicit_bounds":         []float64{0.25, 0.5, 1.0},
+		"bucket_counts":           []int64{1, 1, 1, 0},
+		"exp_positive": transform.Row{
+			"offset":        int64(1),
+			"bucket_counts": []int64{2, 3},
+		},
+		"summary_quantiles": []transform.Row{
+			{"quantile": 0.95, "value": 0.9},
+		},
+		"exemplars": []transform.Row{
+			{
+				"time":                       int64(1_700_000_000_000_000),
+				"time_unix_nano":             int64(1_700_000_000_000_000_000),
+				"value_double":               0.42,
+				"trace_id":                   "0102030405060708090a0b0c0d0e0f10",
+				"span_id":                    "0102030405060708",
+				"filtered_attributes":        "{}",
+				"filtered_attributes_schema": "{}",
+			},
+		},
+		"resource": transform.Row{
+			"attributes":               `{"service.name":"checkout"}`,
+			"attributes_schema":        `{"service.name":"string"}`,
+			"dropped_attributes_count": int64(0),
+		},
+		"instrumentation_scope": transform.Row{
+			"name":                     "otel-genai",
+			"attributes":               "{}",
+			"attributes_schema":        "{}",
+			"dropped_attributes_count": int64(0),
+		},
+		"point_fingerprint": "fp1:0123456789abcdef",
+		"schema_version":    schema.Version,
+	}
+
+	b, err := enc.Encode(row)
+	if err != nil {
+		t.Fatalf("Encode metric row: %v", err)
+	}
+	norm := decodeNormalized(t, enc, b)
+	if got := get(t, norm, "metric_name").String(); got != "gen_ai.client.operation.duration" {
+		t.Errorf("metric_name = %q", got)
+	}
+	if got := get(t, norm, "is_monotonic").Bool(); !got {
+		t.Errorf("is_monotonic = %v, want true", got)
+	}
+	if bounds := norm.Get(norm.Descriptor().Fields().ByName("explicit_bounds")).List(); bounds.Len() != 3 {
+		t.Errorf("explicit_bounds len = %d, want 3", bounds.Len())
+	}
+	if buckets := norm.Get(norm.Descriptor().Fields().ByName("bucket_counts")).List(); buckets.Len() != 4 {
+		t.Errorf("bucket_counts len = %d, want 4", buckets.Len())
+	}
+}
+
+func TestEncodeMetricNonFiniteFloats(t *testing.T) {
+	enc, err := New(schema.MetricsTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const ts = pcommon.Timestamp(1_700_000_000_000_000_000)
+	md := pmetric.NewMetrics()
+	sm := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
+
+	gm := sm.Metrics().AppendEmpty()
+	gm.SetName("m.gauge.nonfinite")
+	g := gm.SetEmptyGauge()
+	for _, v := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		dp := g.DataPoints().AppendEmpty()
+		dp.SetTimestamp(ts)
+		dp.SetDoubleValue(v)
+		ex := dp.Exemplars().AppendEmpty()
+		ex.SetTimestamp(ts)
+		ex.SetDoubleValue(v)
+	}
+
+	rows, rejects := transform.MetricRows(md, opts())
+	if len(rejects) != 0 || len(rows) != 3 {
+		t.Fatalf("MetricRows() rows=%d rejects=%+v", len(rows), rejects)
+	}
+
+	checks := []func(float64) bool{
+		math.IsNaN,
+		func(v float64) bool { return math.IsInf(v, 1) },
+		func(v float64) bool { return math.IsInf(v, -1) },
+	}
+	for i, check := range checks {
+		b, err := enc.Encode(rows[i])
+		if err != nil {
+			t.Fatalf("Encode(rows[%d]) error = %v", i, err)
+		}
+		norm := decodeNormalized(t, enc, b)
+		if got := get(t, norm, "value_double").Float(); !check(got) {
+			t.Errorf("rows[%d] decoded value_double = %v", i, got)
+		}
+		exList := norm.Get(norm.Descriptor().Fields().ByName("exemplars")).List()
+		if exList.Len() != 1 {
+			t.Fatalf("rows[%d] exemplars len = %d, want 1", i, exList.Len())
+		}
+		if got := get(t, exList.Get(0).Message(), "value_double").Float(); !check(got) {
+			t.Errorf("rows[%d] decoded exemplars[0].value_double = %v", i, got)
+		}
 	}
 }

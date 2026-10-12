@@ -1,0 +1,41 @@
+{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          {"key": "service.name", "value": {"stringValue": "anthropic-agent-cli"}},
+          {"key": "service.version", "value": {"stringValue": "2.1.229"}}
+        ]
+      },
+      "scopeLogs": [
+        {
+          "scope": {
+            "name": "com.anthropic.agent.sdk",
+            "version": "2.1.229"
+          },
+          "logRecords": [
+            {
+              "timeUnixNano": "1723420801200000000",
+              "observedTimeUnixNano": "1723420801210000000",
+              "severityNumber": 9,
+              "severityText": "INFO",
+              "traceId": "110102030405060708090a0b0c0d0e01",
+              "spanId": "1101020304050601",
+              "body": {"stringValue": "claude_code.api_request"},
+              "attributes": [
+                {"key": "event.name", "value": {"stringValue": "api_request"}},
+                {"key": "event.timestamp", "value": {"stringValue": "2024-08-12T00:00:01.200Z"}},
+                {"key": "session.id", "value": {"stringValue": "sess-anth-001"}},
+                {"key": "model", "value": {"stringValue": "anthropic-v4-default"}},
+                {"key": "cost_usd", "value": {"doubleValue": 0.0184}},
+                {"key": "duration_ms", "value": {"intValue": "1250"}},
+                {"key": "input_tokens", "value": {"intValue": "1420"}},
+                {"key": "output_tokens", "value": {"intValue": "380"}}
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

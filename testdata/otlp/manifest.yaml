@@ -1,0 +1,59 @@
+# These fixtures are synthetic: hand-written OTLP/JSON shaped after the signals,
+# attribute names and event names recorded for each verified framework version
+# in docs/agent-frameworks.md and issue #1. They are not captures from those
+# runs, so their timestamps, IDs and values are illustrative.
+schema_version: v0alpha2
+provenance: synthetic
+frameworks:
+  - id: anthropic_agent_sdk
+    version: "2.1.229"
+    tier: T1
+    signals: [traces, logs]
+    gen_ai_system: anthropic
+    traces_file: anthropic_agent_sdk/traces.json
+    logs_file: anthropic_agent_sdk/logs.json
+    # Claude Code's cost event (claude_code.api_request) carries no gen_ai.*
+    # attribute, so v_gen_ai_logs does not select it; query otel_logs.
+    logs_outside_gen_ai_view: true
+  - id: google_adk
+    version: "2.6.3"
+    tier: T1
+    signals: [traces, logs]
+    gen_ai_system: gcp.vertex.agent
+    traces_file: google_adk/traces.json
+    logs_file: google_adk/logs.json
+  - id: langgraph
+    version: "1.2.x"
+    companion_version: "0.10.18"
+    tier: T1
+    signals: [traces]
+    gen_ai_system: langsmith
+    traces_file: langgraph/traces.json
+  - id: openai_agents
+    version: "0.20.0"
+    companion_version: "1.0b0"
+    tier: T2
+    signals: [traces, logs]
+    gen_ai_system: openai
+    traces_file: openai_agents/traces.json
+    logs_file: openai_agents/logs.json
+  - id: crewai
+    version: "1.15.15"
+    companion_version: "1.1.12"
+    tier: T2
+    signals: [traces]
+    traces_file: crewai/traces.json
+  - id: aws_bedrock
+    version: "0.65b0"
+    tier: T2
+    signals: [traces, logs]
+    gen_ai_system: aws.bedrock
+    traces_file: aws_bedrock/traces.json
+    logs_file: aws_bedrock/logs.json
+  - id: microsoft_agent_framework
+    version: "1.11.0–1.13.0"
+    tier: T2
+    signals: [traces, logs]
+    gen_ai_system: microsoft.agent_framework
+    traces_file: microsoft_agent_framework/traces.json
+    logs_file: microsoft_agent_framework/logs.json

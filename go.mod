@@ -6,6 +6,9 @@ require (
 	cloud.google.com/go/bigquery v1.79.1
 	github.com/googleapis/gax-go/v2 v2.23.0
 	go.opentelemetry.io/collector/component v1.64.0
+	go.opentelemetry.io/collector/component/componentstatus v0.158.0
+	go.opentelemetry.io/collector/component/componenttest v0.158.0
+	go.opentelemetry.io/collector/config/configopaque v1.64.0
 	go.opentelemetry.io/collector/config/configoptional v1.64.0
 	go.opentelemetry.io/collector/config/configretry v1.64.0
 	go.opentelemetry.io/collector/consumer/consumererror v0.158.0
@@ -24,6 +27,7 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260807164820-c8921c73eeea
 	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.12
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
@@ -65,7 +69,6 @@ require (
 	go.opencensus.io v0.24.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/collector/client v1.64.0 // indirect
-	go.opentelemetry.io/collector/component/componenttest v0.158.0 // indirect
 	go.opentelemetry.io/collector/confmap v1.64.0 // indirect
 	go.opentelemetry.io/collector/consumer v1.64.0 // indirect
 	go.opentelemetry.io/collector/consumer/consumertest v0.158.0 // indirect
@@ -100,5 +103,4 @@ require (
 	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da // indirect
 	google.golang.org/genproto v0.0.0-20260319201613-d00831a3d3e7 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260630182238-925bb5da69e7 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

@@ -1,0 +1,59 @@
+name: Benchmarks and Fuzzing
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: Benchmark Smoke & Budget
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run microbenchmarks
+        run: |
+          go test -run='^$' -bench=. -benchmem -benchtime=100ms ./internal/otlpjson ./internal/transform ./internal/protoenc ./internal/bigquery
+
+  fuzz:
+    name: Bounded Native Fuzzing
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pkg: ./internal/otlpjson
+            target: FuzzEncodeMapWithSchema
+          - pkg: ./internal/transform
+            target: FuzzSpanRows
+          - pkg: ./internal/transform
+            target: FuzzLogRows
+          - pkg: ./internal/transform
+            target: FuzzLogFingerprint
+          - pkg: ./internal/protoenc
+            target: FuzzProtoEncRoundTrip
+          - pkg: ./internal/bigquery
+            target: FuzzSplitRequests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run ${{ matrix.target }}
+        run: |
+          F_TIME="5s"
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            F_TIME="30s"
+          fi
+          go test "${{ matrix.pkg }}" -run="^${{ matrix.target }}$" -fuzz="^${{ matrix.target }}$" -fuzztime="${F_TIME}"

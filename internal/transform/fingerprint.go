@@ -12,6 +12,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/otlpjson"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 )
 
@@ -51,6 +52,100 @@ func (f fingerprinter) next(canonical string) string {
 		return first
 	}
 	return LogFingerprint(canonical, ordinal)
+}
+
+// PreserveLogOrdinalPeers widens the log records to retry so that retrying
+// them reproduces the fingerprints they had in the original batch.
+//
+// A record's fingerprint, and the insert_id that defaults to it, encodes its
+// intra_batch_ordinal: how many records of the same canonical form precede it
+// in the batch. LogRows fingerprints a retry payload from scratch, so leaving
+// out an acknowledged record that is identical to a retried one shifts the
+// retried record's ordinal down onto the acknowledged copy's. The retried
+// record would then be written under the acknowledged copy's insert_id, and
+// the dedup view would collapse two distinct records into one.
+//
+// candidateIndices lists every record of the batch that was sent and not
+// permanently rejected, and retryableIndices the ones among them that still
+// need delivering. Both are flattened positions in ld, the numbering SelectLogs
+// and the rejections of LogRows use. Candidates must be records LogRows kept,
+// since only those take part in the ordinal count.
+//
+// The result is, in ascending order, the retried records plus every other
+// candidate that shares a canonical form with one of them, so the identical
+// records ahead of a retried record travel with it. An acknowledged record
+// sent again this way keeps its ordinal, and with it its insert_id, so the
+// dedup view absorbs the extra copy. Candidates that share no canonical form
+// with a retried record are left out: they are not owed, and no retried
+// record's ordinal depends on them. A retried record that is missing from the
+// candidates is returned all the same, so a caller's mistake cannot lose it.
+// When there is nothing to widen, because no record is retried or every
+// candidate is, retryableIndices comes back as given.
+//
+// The walk and the canonical form mirror LogRows, and must change with it.
+func PreserveLogOrdinalPeers(ld plog.Logs, candidateIndices, retryableIndices []int) []int {
+	if len(retryableIndices) == 0 {
+		return nil
+	}
+	if len(candidateIndices) == 0 {
+		return retryableIndices
+	}
+	candidate := indexSet(candidateIndices)
+	retryable := indexSet(retryableIndices)
+
+	allCandidatesRetried := true
+	for _, c := range candidateIndices {
+		if !retryable[c] {
+			allCandidatesRetried = false
+			break
+		}
+	}
+	if allCandidatesRetried {
+		return retryableIndices
+	}
+
+	type member struct {
+		idx int
+		// group is the ordinal-0 fingerprint, the key the fingerprinter counts
+		// ordinals under.
+		group string
+	}
+	members := make([]member, 0, len(candidateIndices))
+	retried := make(map[string]bool)
+
+	idx := -1
+	for _, rl := range ld.ResourceLogs().All() {
+		resource := rl.Resource()
+		res := encodeBag(resource.Attributes(), resource.DroppedAttributesCount())
+
+		for _, sl := range rl.ScopeLogs().All() {
+			scope := sl.Scope()
+			scopeBag := encodeBag(scope.Attributes(), scope.DroppedAttributesCount())
+			origin := canonicalOrigin(res, rl.SchemaUrl(), scope, scopeBag, sl.SchemaUrl())
+
+			for _, lr := range sl.LogRecords().All() {
+				idx++
+				if !candidate[idx] && !retryable[idx] {
+					continue
+				}
+				attrs := encodeBag(lr.Attributes(), lr.DroppedAttributesCount())
+				body, bodySchema := otlpjson.EncodePlainValueWithSchema(lr.Body())
+				group := LogFingerprint(canonicalLogRecord(lr, attrs, body, bodySchema, origin), 0)
+				members = append(members, member{idx: idx, group: group})
+				if retryable[idx] {
+					retried[group] = true
+				}
+			}
+		}
+	}
+
+	out := make([]int, 0, len(members))
+	for _, m := range members {
+		if retryable[m.idx] || retried[m.group] {
+			out = append(out, m.idx)
+		}
+	}
+	return out
 }
 
 // canonicalLogRecord renders the part of a log record's canonical form that

@@ -7,7 +7,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
+	stdhttp "net/http"
 	"slices"
 	"strings"
 	"testing"
@@ -16,10 +18,12 @@ import (
 	bq "cloud.google.com/go/bigquery"
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/config/configopaque"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 	bigqueryapi "google.golang.org/api/bigquery/v2"
 	"google.golang.org/api/googleapi"
+	"google.golang.org/api/option"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -34,6 +38,8 @@ type fakeDestinationAdmin struct {
 	createDatasetErr   error
 	createTableErr     error
 	createViewErr      error
+	updateTableErr     error
+	runDDLErr          error
 	closeErr           error
 	blockDatasetRead   bool
 	// tableMetadataByID answers reads of the listed IDs ahead of, and
@@ -41,12 +47,18 @@ type fakeDestinationAdmin struct {
 	tableMetadataByID map[string]fakeTableMetadataResponse
 	// createErrByID overrides the creation result for the listed IDs.
 	createErrByID map[string]error
+	// updateErrByID overrides the update result for the listed IDs.
+	updateErrByID map[string]error
 
-	createdDataset *bq.DatasetMetadata
-	createdTables  map[string]*bq.TableMetadata
-	tableResponses []fakeTableMetadataResponse
-	tableReads     int
-	tableReadIDs   []string
+	createdDataset    *bq.DatasetMetadata
+	createdTables     map[string]*bq.TableMetadata
+	createdTableOrder []string
+	updatedTables     map[string]bq.TableMetadataToUpdate
+	updatedETags      map[string]string
+	ranDDLs           []string
+	tableResponses    []fakeTableMetadataResponse
+	tableReads        int
+	tableReadIDs      []string
 }
 
 type fakeTableMetadataResponse struct {
@@ -86,6 +98,7 @@ func (f *fakeDestinationAdmin) CreateTable(_ context.Context, id string, md *bq.
 		f.createdTables = make(map[string]*bq.TableMetadata)
 	}
 	f.createdTables[id] = md
+	f.createdTableOrder = append(f.createdTableOrder, id)
 	if err, ok := f.createErrByID[id]; ok {
 		return err
 	}
@@ -93,6 +106,26 @@ func (f *fakeDestinationAdmin) CreateTable(_ context.Context, id string, md *bq.
 		return f.createViewErr
 	}
 	return f.createTableErr
+}
+
+func (f *fakeDestinationAdmin) UpdateTable(_ context.Context, id string, md bq.TableMetadataToUpdate, etag string) error {
+	if f.updatedTables == nil {
+		f.updatedTables = make(map[string]bq.TableMetadataToUpdate)
+	}
+	if f.updatedETags == nil {
+		f.updatedETags = make(map[string]string)
+	}
+	f.updatedTables[id] = md
+	f.updatedETags[id] = etag
+	if err, ok := f.updateErrByID[id]; ok {
+		return err
+	}
+	return f.updateTableErr
+}
+
+func (f *fakeDestinationAdmin) RunDDL(_ context.Context, sql string) error {
+	f.ranDDLs = append(f.ranDDLs, sql)
+	return f.runDDLErr
 }
 
 func (f *fakeDestinationAdmin) Close() error { return f.closeErr }
@@ -213,6 +246,7 @@ func TestPrepareDestinationCreatesOnlyActiveSignalTableAndView(t *testing.T) {
 	}{
 		{"traces", defaultSpansTable, schema.SpansTableSchema(), defaultLogsTable, bq.HourPartitioningType, "start_time", []string{"service_name", "trace_id", "name"}},
 		{"logs", defaultLogsTable, schema.LogsTableSchema(), defaultSpansTable, bq.DayPartitioningType, "timestamp", []string{"service_name", "trace_id", "severity_number"}},
+		{"metrics", defaultMetricsTable, schema.MetricsTableSchema(), defaultSpansTable, bq.DayPartitioningType, "timestamp", []string{"service_name", "metric_name", "metric_type"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -260,6 +294,9 @@ func TestPrepareDestinationDoesNotReplaceExistingView(t *testing.T) {
 	}
 	if _, ok := admin.createdTables[cfg.Traces.Table]; ok {
 		t.Fatal("existing table must not be replaced")
+	}
+	if len(admin.updatedTables) > 0 {
+		t.Fatalf("existing views must not be modified, updated = %#v", admin.updatedTables)
 	}
 }
 
@@ -381,6 +418,7 @@ func TestPrepareDestinationCompanionViewsAreOptIn(t *testing.T) {
 	}{
 		{"traces", defaultSpansTable, schema.SpansTableSchema()},
 		{"logs", defaultLogsTable, schema.LogsTableSchema()},
+		{"metrics", defaultMetricsTable, schema.MetricsTableSchema()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := validConfig()
@@ -409,17 +447,25 @@ func TestPrepareDestinationCreatesSpanCompanionViews(t *testing.T) {
 	if err := e.prepareDestination(context.Background(), admin); err != nil {
 		t.Fatal(err)
 	}
-	for id, tmpl := range map[string]string{
-		"otel_spans_as_allspans": schema.SpansAsAllSpansViewQuery,
-		"v_gen_ai_spans":         schema.GenAISpansViewQuery,
+	for id, want := range map[string]string{
+		"otel_spans_as_allspans": fmt.Sprintf(schema.SpansAsAllSpansViewQuery, "my-project", "otel", cfg.Traces.Table),
+		"v_gen_ai_spans":         fmt.Sprintf(schema.GenAISpansViewQuery, "my-project", "otel", cfg.Traces.Table),
+		"v_gen_ai_model_costs":   fmt.Sprintf(schema.GenAIModelCostsViewQuery, "my-project", "otel"),
+		"v_gen_ai_sessions":      fmt.Sprintf(schema.GenAISessionsViewQuery, "my-project", "otel"),
+		"v_gen_ai_tool_usage":    fmt.Sprintf(schema.GenAIToolUsageViewQuery, "my-project", "otel"),
 	} {
-		want := fmt.Sprintf(tmpl, "my-project", "otel", cfg.Traces.Table)
 		if md := admin.createdTables[id]; md == nil || md.ViewQuery != want {
-			t.Errorf("companion view %s = %#v, want a view over the span dedup view", id, md)
+			t.Errorf("companion view %s = %#v, want expected view query", id, md)
 		}
 	}
-	if got := len(admin.createdTables); got != 4 {
-		t.Errorf("created %d tables and views, want the table, its dedup view and two companion views", got)
+	if got := len(admin.createdTables); got != 7 {
+		t.Errorf("created %d tables and views, want the table, its dedup view and five span companion views", got)
+	}
+	spansIdx := slices.Index(admin.createdTableOrder, "v_gen_ai_spans")
+	for _, rollup := range []string{"v_gen_ai_model_costs", "v_gen_ai_sessions", "v_gen_ai_tool_usage"} {
+		if idx := slices.Index(admin.createdTableOrder, rollup); spansIdx < 0 || idx < spansIdx {
+			t.Errorf("createdTableOrder = %v, want v_gen_ai_spans before %s", admin.createdTableOrder, rollup)
+		}
 	}
 	if !equalStrings(admin.tableReadIDs, []string{cfg.Traces.Table, cfg.Logs.Table + "_dedup"}) {
 		t.Errorf("table reads = %v, want the destination table probe and the log dedup view probe", admin.tableReadIDs)
@@ -470,8 +516,8 @@ func TestPrepareDestinationCreatesLogsCompanionViewWhenTracesStartsSecond(t *tes
 	if md := admin.createdTables["v_gen_ai_logs"]; md == nil || md.ViewQuery != want {
 		t.Fatalf("v_gen_ai_logs = %#v, want traces startup to create v_gen_ai_logs when log dedup view already exists", md)
 	}
-	if got := len(admin.createdTables); got != 5 {
-		t.Errorf("created %d tables and views, want the table, its dedup view, two span companion views, and v_gen_ai_logs", got)
+	if got := len(admin.createdTables); got != 8 {
+		t.Errorf("created %d tables and views, want the table, its dedup view, five span companion views, and v_gen_ai_logs", got)
 	}
 	if !slices.Contains(admin.tableReadIDs, cfg.Logs.Table+"_dedup") {
 		t.Errorf("table reads = %v, want a probe of the log dedup view", admin.tableReadIDs)
@@ -539,9 +585,8 @@ func TestPrepareDestinationLogsCompanionViewNeedsSpanDedupView(t *testing.T) {
 	}
 }
 
-// Like the dedup view, companion views are create-only: one that already
-// exists is left alone, and any other creation failure fails startup with the
-// view named.
+// Companion views that already exist are preserved as-is (create-only),
+// and any other creation failure fails startup with the view named.
 func TestPrepareDestinationCompanionViewCreationResults(t *testing.T) {
 	createErr := status.Error(codes.PermissionDenied, "cannot create view")
 	for _, tc := range []struct {
@@ -551,11 +596,21 @@ func TestPrepareDestinationCompanionViewCreationResults(t *testing.T) {
 		wantView   string
 	}{
 		{
-			name: "already exists",
+			name: "already exists preserved",
 			createErrs: map[string]error{
 				"otel_spans_as_allspans": alreadyExists(),
 				"v_gen_ai_spans":         status.Error(codes.AlreadyExists, "existing view"),
+				"v_gen_ai_model_costs":   alreadyExists(),
+				"v_gen_ai_sessions":      alreadyExists(),
+				"v_gen_ai_tool_usage":    alreadyExists(),
 				"v_gen_ai_logs":          alreadyExists(),
+			},
+		},
+		{
+			name: "preserved companion view allows rollup view failure",
+			createErrs: map[string]error{
+				"v_gen_ai_spans":       alreadyExists(),
+				"v_gen_ai_model_costs": status.Error(codes.InvalidArgument, "column not found in underlying view"),
 			},
 		},
 		{
@@ -587,6 +642,11 @@ func TestPrepareDestinationCompanionViewCreationResults(t *testing.T) {
 			}
 			if tc.wantErr != nil && !strings.Contains(err.Error(), tc.wantView) {
 				t.Errorf("error %q must name the companion view %q", err, tc.wantView)
+			}
+			if tc.wantErr == nil {
+				if len(admin.updatedTables) > 0 {
+					t.Errorf("existing companion views must not be modified in place, updated = %#v", admin.updatedTables)
+				}
 			}
 		})
 	}
@@ -919,8 +979,8 @@ func TestClientOptionsSeparateMetadataFromStorageEndpoint(t *testing.T) {
 	if len(metadataOpts) != 2 {
 		t.Fatalf("metadata options = %d, want configured credential and explicit scope", len(metadataOpts))
 	}
-	if len(writerOpts) != 4 {
-		t.Fatalf("writer options = %d, want credential, explicit scope, endpoint, and transport", len(writerOpts))
+	if len(writerOpts) != 8 {
+		t.Fatalf("writer options = %d, want credential, explicit scope, endpoint, transport, multiplexing, default inflight requests/bytes, and pool size", len(writerOpts))
 	}
 }
 
@@ -936,8 +996,8 @@ func TestAuthenticationOptionsApplyScopesToADC(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(metadataOpts) != 1 || len(writerOpts) != 1 {
-		t.Fatalf("ADC options metadata=%d writer=%d, want one explicit scope for each", len(metadataOpts), len(writerOpts))
+	if len(metadataOpts) != 1 || len(writerOpts) != 5 {
+		t.Fatalf("ADC options metadata=%d writer=%d, want 1 metadata scope and 5 writer options (scope, multiplexing, default inflight requests/bytes, pool)", len(metadataOpts), len(writerOpts))
 	}
 }
 
@@ -953,8 +1013,30 @@ func TestWriterClientOptionsWithoutAuthenticationSkipAuthOptions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(opts) != 7 {
+		t.Fatalf("no-auth writer options = %d, want endpoint, transport, WithoutAuthentication, multiplexing, default inflight requests/bytes, and pool size", len(opts))
+	}
+}
+
+func TestWriterClientOptionsMultiplexingKeepaliveAndCompression(t *testing.T) {
+	cfg := validConfig()
+	cfg.Write.EnableMultiplexing = false
+	cfg.Write.ConnectionPoolSize = 0
+	cfg.Write.Compression = "gzip"
+	cfg.Write.Keepalive = KeepaliveConfig{
+		Time:                30 * time.Second,
+		Timeout:             10 * time.Second,
+		PermitWithoutStream: true,
+	}
+	e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+
+	opts, err := e.writerClientOptions(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 1 ADC scope + 1 keepalive dial option + 1 gzip compressor dial option = 3.
 	if len(opts) != 3 {
-		t.Fatalf("no-auth writer options = %d, want only endpoint, transport, and WithoutAuthentication", len(opts))
+		t.Fatalf("writer options = %d, want 3 (ADC scope, keepalive, gzip)", len(opts))
 	}
 }
 
@@ -974,6 +1056,207 @@ func TestMetadataScopesAreLeastPrivilege(t *testing.T) {
 	if got := e.metadataScopes(); !equalStrings(got, []string{bigqueryapi.BigqueryScope}) {
 		t.Fatalf("table creation scopes = %v, want admin", got)
 	}
+	cfg.AutoCreate.Tables = false
+	cfg.AutoCreate.SearchIndexes = true
+	if got := e.metadataScopes(); !equalStrings(got, []string{bigqueryapi.BigqueryScope}) {
+		t.Fatalf("search index creation scopes = %v, want admin", got)
+	}
+}
+
+func TestPrepareDestinationAppliesPartitionLifecycleOptions(t *testing.T) {
+	cfg := validConfig()
+	cfg.AutoCreate.Tables = true
+	cfg.Traces.PartitionExpirationDays = 14
+	cfg.Traces.RequirePartitionFilter = true
+	cfg.Quarantine.Enabled = true
+	cfg.Quarantine.PartitionExpirationDays = 7
+	cfg.Quarantine.RequirePartitionFilter = true
+	admin := &fakeDestinationAdmin{datasetMetadata: &bq.DatasetMetadata{}, tableMetadataErr: notFound()}
+	e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+
+	if err := e.prepareDestination(context.Background(), admin); err != nil {
+		t.Fatal(err)
+	}
+	spansMD := admin.createdTables[cfg.Traces.Table]
+	if spansMD == nil || spansMD.TimePartitioning == nil {
+		t.Fatalf("spans table metadata = %#v, want TimePartitioning", spansMD)
+	}
+	if spansMD.TimePartitioning.Expiration != 14*24*time.Hour || !spansMD.RequirePartitionFilter {
+		t.Errorf("spans TimePartitioning = %#v, RequirePartitionFilter = %v, want 14d expiration and true", spansMD.TimePartitioning, spansMD.RequirePartitionFilter)
+	}
+	quarantineMD := admin.createdTables[cfg.Quarantine.Table]
+	if quarantineMD == nil || quarantineMD.TimePartitioning == nil {
+		t.Fatalf("quarantine table metadata = %#v, want TimePartitioning", quarantineMD)
+	}
+	if quarantineMD.TimePartitioning.Expiration != 7*24*time.Hour || !quarantineMD.RequirePartitionFilter {
+		t.Errorf("quarantine TimePartitioning = %#v, RequirePartitionFilter = %v, want 7d expiration and true", quarantineMD.TimePartitioning, quarantineMD.RequirePartitionFilter)
+	}
+}
+
+func TestPrepareDestinationReconcilesAdditiveSchemaWithETag(t *testing.T) {
+	full := mustBigQuerySchema(t, schema.SpansTableSchema())
+	var withoutPayloadRefs bq.Schema
+	for _, f := range full {
+		if f.Name == "payload_refs" {
+			continue
+		}
+		withoutPayloadRefs = append(withoutPayloadRefs, f)
+	}
+
+	t.Run("auto_create.tables enabled patches schema in place with ETag", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.AutoCreate.Tables = true
+		admin := &fakeDestinationAdmin{
+			datasetMetadata: &bq.DatasetMetadata{},
+			tableMetadata:   &bq.TableMetadata{Schema: withoutPayloadRefs, ETag: "etag-42"},
+			createViewErr:   alreadyExists(),
+		}
+		e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+
+		if err := e.prepareDestination(context.Background(), admin); err != nil {
+			t.Fatalf("prepareDestination failed: %v", err)
+		}
+		upd, ok := admin.updatedTables[cfg.Traces.Table]
+		if !ok || upd.Schema == nil {
+			t.Fatalf("updatedTables[%q] = %#v, want additive schema update", cfg.Traces.Table, upd)
+		}
+		if got := admin.updatedETags[cfg.Traces.Table]; got != "etag-42" {
+			t.Errorf("updatedETags[%q] = %q, want etag-42", cfg.Traces.Table, got)
+		}
+		if err := validateSchemaOf(&bq.TableMetadata{Schema: upd.Schema}, schema.SpansTableSchema(), "reconciled"); err != nil {
+			t.Errorf("reconciled schema fails full validation: %v", err)
+		}
+	})
+
+	t.Run("auto_create.tables disabled fails with clear instruction", func(t *testing.T) {
+		cfg := validConfig()
+		admin := &fakeDestinationAdmin{
+			datasetMetadata: &bq.DatasetMetadata{},
+			tableMetadata:   &bq.TableMetadata{Schema: withoutPayloadRefs, ETag: "etag-42"},
+		}
+		e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+
+		err := e.prepareDestination(context.Background(), admin)
+		if err == nil || !strings.Contains(err.Error(), "payload_refs is missing") {
+			t.Fatalf("error = %v, want missing column reported when auto_create.tables is disabled", err)
+		}
+		if _, ok := admin.updatedTables[cfg.Traces.Table]; ok {
+			t.Error("table must not be patched when auto_create.tables is disabled")
+		}
+	})
+}
+
+func TestPrepareDestinationCreatesSearchIndexesWhenEnabled(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		table       string
+		tableSchema *storagepb.TableSchema
+		wantDDL     string
+	}{
+		{
+			name:        "traces",
+			table:       defaultSpansTable,
+			tableSchema: schema.SpansTableSchema(),
+			wantDDL:     fmt.Sprintf(schema.SpansSearchIndexDDL, "my-project", "otel", defaultSpansTable),
+		},
+		{
+			name:        "logs",
+			table:       defaultLogsTable,
+			tableSchema: schema.LogsTableSchema(),
+			wantDDL:     fmt.Sprintf(schema.LogsSearchIndexDDL, "my-project", "otel", defaultLogsTable),
+		},
+		{
+			name:        "metrics skips search index",
+			table:       defaultMetricsTable,
+			tableSchema: schema.MetricsTableSchema(),
+			wantDDL:     "",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.AutoCreate.Tables = true
+			cfg.AutoCreate.SearchIndexes = true
+			admin := &fakeDestinationAdmin{datasetMetadata: &bq.DatasetMetadata{}, tableMetadataErr: notFound()}
+			e := newTestSignalExporter(cfg, tc.table, tc.tableSchema)
+
+			if err := e.prepareDestination(context.Background(), admin); err != nil {
+				t.Fatalf("prepareDestination failed: %v", err)
+			}
+			if tc.wantDDL == "" {
+				if len(admin.ranDDLs) != 0 {
+					t.Fatalf("ranDDLs = %v, want none for %s", admin.ranDDLs, tc.name)
+				}
+				return
+			}
+			if !equalStrings(admin.ranDDLs, []string{tc.wantDDL}) {
+				t.Fatalf("ranDDLs = %v, want [%q]", admin.ranDDLs, tc.wantDDL)
+			}
+		})
+	}
+}
+
+func TestAuthenticationAndEndpointOptionsSupportEnterpriseCredentials(t *testing.T) {
+	t.Run("credentials.json external_account with delegates, quota_project, universe_domain, and admin_url", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.Credentials.JSON = `{
+			"type": "external_account",
+			"audience": "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/p/providers/pr",
+			"subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+			"token_url": "https://sts.googleapis.com/v1/token",
+			"credential_source": {"file": "/var/run/secrets/token"}
+		}`
+		cfg.Credentials.ImpersonateServiceAccount = "writer@my-project.iam.gserviceaccount.com"
+		cfg.Credentials.ImpersonateDelegates = []string{"delegate-1@my-project.iam.gserviceaccount.com"}
+		cfg.Credentials.QuotaProject = "billing-project"
+		cfg.Credentials.UniverseDomain = "apis-tpclp.goog"
+		cfg.Endpoint.URL = "localhost:9050"
+		cfg.Endpoint.AdminURL = "http://localhost:9051/bigquery/v2/"
+		cfg.Endpoint.Insecure = true
+		e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+
+		metaOpts, err := e.metadataClientOptions(context.Background())
+		if err != nil {
+			t.Fatalf("metadataClientOptions failed: %v", err)
+		}
+		writerOpts, err := e.writerClientOptions(context.Background())
+		if err != nil {
+			t.Fatalf("writerClientOptions failed: %v", err)
+		}
+		// auth: TokenSource + Scopes + QuotaProject + UniverseDomain = 4; metadata adds AdminURL = 5; writer adds URL + transport + multiplexing + inflight requests + inflight bytes + pool = 10.
+		if len(metaOpts) != 5 {
+			t.Errorf("len(metaOpts) = %d, want 5", len(metaOpts))
+		}
+		if len(writerOpts) != 10 {
+			t.Errorf("len(writerOpts) = %d, want 10", len(writerOpts))
+		}
+	})
+
+	t.Run("credentials.json authorized_user and impersonated_service_account without target principal", func(t *testing.T) {
+		for _, credJSON := range []string{
+			`{"type":"authorized_user","client_id":"cid","client_secret":"csec","refresh_token":"rtok"}`,
+			`{"type":"impersonated_service_account","service_account_impersonation_url":"https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/sa@p.iam.gserviceaccount.com:generateAccessToken","source_credentials":{"type":"authorized_user","client_id":"cid","client_secret":"csec","refresh_token":"rtok"}}`,
+		} {
+			cfg := validConfig()
+			cfg.Credentials.JSON = configopaque.String(credJSON)
+			e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+			opts, err := e.writerClientOptions(context.Background())
+			if err != nil {
+				t.Fatalf("writerClientOptions failed: %v", err)
+			}
+			if len(opts) != 6 {
+				t.Errorf("len(opts) = %d, want 6 (TokenSource + Scopes + multiplexing + inflight requests + inflight bytes + pool)", len(opts))
+			}
+		}
+	})
+
+	t.Run("credentials.json rejects unknown credential type", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.Credentials.JSON = `{"type":"unknown_custom_type"}`
+		e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+		if _, err := e.writerClientOptions(context.Background()); err == nil {
+			t.Fatal("expected error for unknown credential type, got nil")
+		}
+	})
 }
 
 func mustBigQuerySchema(t *testing.T, in *storagepb.TableSchema) bq.Schema {
@@ -1015,4 +1298,86 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+type roundTripFunc func(*stdhttp.Request) (*stdhttp.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *stdhttp.Request) (*stdhttp.Response, error) {
+	return f(req)
+}
+
+func TestNewDestinationAdminAppliesAdminURL(t *testing.T) {
+	var gotURL string
+	origHTTP := newBigQueryHTTPClient
+	t.Cleanup(func() { newBigQueryHTTPClient = origHTTP })
+	newBigQueryHTTPClient = func(context.Context, ...option.ClientOption) (*stdhttp.Client, *stdhttp.Transport, error) {
+		client := &stdhttp.Client{
+			Transport: roundTripFunc(func(req *stdhttp.Request) (*stdhttp.Response, error) {
+				gotURL = req.URL.String()
+				return &stdhttp.Response{
+					StatusCode: stdhttp.StatusOK,
+					Header:     stdhttp.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{}`)),
+				}, nil
+			}),
+		}
+		return client, &stdhttp.Transport{}, nil
+	}
+
+	cfg := validConfig()
+	cfg.Endpoint.AdminURL = "https://private.example.test/bigquery/v2/"
+	e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+	metaOpts, err := e.metadataClientOptions(context.Background())
+	if err != nil {
+		t.Fatalf("metadataClientOptions() error = %v", err)
+	}
+
+	admin, err := newDestinationAdmin(context.Background(), cfg.Project, cfg.Dataset, metaOpts...)
+	if err != nil {
+		t.Fatalf("newDestinationAdmin() error = %v", err)
+	}
+	defer func() { _ = admin.Close() }()
+
+	if _, err := admin.DatasetMetadata(context.Background()); err != nil {
+		t.Fatalf("DatasetMetadata() error = %v", err)
+	}
+	wantPrefix := "https://private.example.test/bigquery/v2/projects/my-project/datasets/otel"
+	if !strings.HasPrefix(gotURL, wantPrefix) {
+		t.Fatalf("DatasetMetadata request URL = %q, want prefix %q", gotURL, wantPrefix)
+	}
+}
+
+func TestNewDestinationAdminAppliesUniverseDomain(t *testing.T) {
+	origHTTP := newBigQueryHTTPClient
+	t.Cleanup(func() { newBigQueryHTTPClient = origHTTP })
+	newBigQueryHTTPClient = func(context.Context, ...option.ClientOption) (*stdhttp.Client, *stdhttp.Transport, error) {
+		client := &stdhttp.Client{
+			Transport: roundTripFunc(func(_ *stdhttp.Request) (*stdhttp.Response, error) {
+				return &stdhttp.Response{
+					StatusCode: stdhttp.StatusOK,
+					Header:     stdhttp.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{}`)),
+				}, nil
+			}),
+		}
+		return client, &stdhttp.Transport{}, nil
+	}
+
+	cfg := validConfig()
+	cfg.Credentials.UniverseDomain = "my-universe.goog"
+	e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+	metaOpts, err := e.metadataClientOptions(context.Background())
+	if err != nil {
+		t.Fatalf("metadataClientOptions() error = %v", err)
+	}
+
+	admin, err := newDestinationAdmin(context.Background(), cfg.Project, cfg.Dataset, metaOpts...)
+	if err != nil {
+		t.Fatalf("newDestinationAdmin() error = %v", err)
+	}
+	defer func() { _ = admin.Close() }()
+
+	if _, err := admin.DatasetMetadata(context.Background()); err != nil {
+		t.Fatalf("DatasetMetadata() error = %v", err)
+	}
 }

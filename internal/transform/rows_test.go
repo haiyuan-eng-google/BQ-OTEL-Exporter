@@ -5,6 +5,8 @@ package transform
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"math"
 	"reflect"
@@ -1559,14 +1561,14 @@ type fakePayloadOffloader struct {
 	logRefs  []PayloadRef
 }
 
-func (f fakePayloadOffloader) OffloadSpan(span ptrace.Span, _ pcommon.Resource, _ pcommon.InstrumentationScope) []PayloadRef {
+func (f fakePayloadOffloader) OffloadSpan(_ context.Context, span ptrace.Span, _ pcommon.Resource, _ pcommon.InstrumentationScope) ([]PayloadRef, error) {
 	span.Attributes().PutStr("gen_ai.prompt", "[offloaded]")
-	return f.spanRefs
+	return f.spanRefs, nil
 }
 
-func (f fakePayloadOffloader) OffloadLog(lr plog.LogRecord, _ pcommon.Resource, _ pcommon.InstrumentationScope) []PayloadRef {
+func (f fakePayloadOffloader) OffloadLog(_ context.Context, lr plog.LogRecord, _ pcommon.Resource, _ pcommon.InstrumentationScope) ([]PayloadRef, error) {
 	lr.Body().SetStr("[offloaded]")
-	return f.logRefs
+	return f.logRefs, nil
 }
 
 func TestObjectRefToRow(t *testing.T) {
@@ -1721,7 +1723,7 @@ func TestQuarantineRowsWithPayloadOffloader(t *testing.T) {
 	opts := quarantineOpts()
 	var gotSignal string
 	var gotBytes int
-	opts.QuarantinePayloadOffloader = func(signal string, payload []byte) ObjectRef {
+	opts.QuarantinePayloadOffloader = func(_ context.Context, signal string, payload []byte) ObjectRef {
 		gotSignal = signal
 		gotBytes = len(payload)
 		return ObjectRef{
@@ -1754,7 +1756,7 @@ func TestQuarantineRowsWithPayloadOffloader(t *testing.T) {
 
 type thresholdOffloader struct{}
 
-func (thresholdOffloader) OffloadSpan(span ptrace.Span, res pcommon.Resource, scope pcommon.InstrumentationScope) []PayloadRef {
+func (thresholdOffloader) OffloadSpan(_ context.Context, span ptrace.Span, res pcommon.Resource, scope pcommon.InstrumentationScope) ([]PayloadRef, error) {
 	var refs []PayloadRef
 	if v, ok := span.Attributes().Get("gen_ai.prompt"); ok && len(v.Str()) > 10 {
 		span.Attributes().PutStr("gen_ai.prompt", "[offloaded]")
@@ -1767,10 +1769,10 @@ func (thresholdOffloader) OffloadSpan(span ptrace.Span, res pcommon.Resource, sc
 		res.Attributes().PutStr("resource.note", "[offloaded-res]")
 	}
 	scope.Attributes().PutStr("scope.note", "[offloaded-scope]")
-	return refs
+	return refs, nil
 }
 
-func (thresholdOffloader) OffloadLog(lr plog.LogRecord, res pcommon.Resource, scope pcommon.InstrumentationScope) []PayloadRef {
+func (thresholdOffloader) OffloadLog(_ context.Context, lr plog.LogRecord, res pcommon.Resource, scope pcommon.InstrumentationScope) ([]PayloadRef, error) {
 	var refs []PayloadRef
 	if lr.Body().Type() == pcommon.ValueTypeStr && len(lr.Body().Str()) > 10 {
 		lr.Body().SetStr("[offloaded]")
@@ -1790,7 +1792,7 @@ func (thresholdOffloader) OffloadLog(lr plog.LogRecord, res pcommon.Resource, sc
 	}
 	res.Attributes().PutStr("service.name", "[offloaded-svc]")
 	scope.Attributes().PutStr("scope.note", "[offloaded-scope]")
-	return refs
+	return refs, nil
 }
 
 func TestLogOffloaderPreservesOriginalIdentityAndRetryPayload(t *testing.T) {
@@ -1959,7 +1961,7 @@ func assertByteTreeUnmodified(t *testing.T, label string, m pcommon.Map) {
 
 type byteMutatingOffloader struct{}
 
-func (byteMutatingOffloader) OffloadSpan(span ptrace.Span, res pcommon.Resource, scope pcommon.InstrumentationScope) []PayloadRef {
+func (byteMutatingOffloader) OffloadSpan(_ context.Context, span ptrace.Span, res pcommon.Resource, scope pcommon.InstrumentationScope) ([]PayloadRef, error) {
 	mutateByteMapInPlace(span.Attributes())
 	for i := 0; i < span.Events().Len(); i++ {
 		mutateByteMapInPlace(span.Events().At(i).Attributes())
@@ -1969,15 +1971,15 @@ func (byteMutatingOffloader) OffloadSpan(span ptrace.Span, res pcommon.Resource,
 	}
 	mutateByteMapInPlace(res.Attributes())
 	mutateByteMapInPlace(scope.Attributes())
-	return nil
+	return nil, nil
 }
 
-func (byteMutatingOffloader) OffloadLog(lr plog.LogRecord, res pcommon.Resource, scope pcommon.InstrumentationScope) []PayloadRef {
+func (byteMutatingOffloader) OffloadLog(_ context.Context, lr plog.LogRecord, res pcommon.Resource, scope pcommon.InstrumentationScope) ([]PayloadRef, error) {
 	mutateByteValueInPlace(lr.Body())
 	mutateByteMapInPlace(lr.Attributes())
 	mutateByteMapInPlace(res.Attributes())
 	mutateByteMapInPlace(scope.Attributes())
-	return nil
+	return nil, nil
 }
 
 func TestLogBytePayloadCopyIsIsolated(t *testing.T) {
@@ -2088,4 +2090,282 @@ func TestSpanBytePayloadCopiesAreIsolated(t *testing.T) {
 	if !reflect.DeepEqual(firstRows, secondRows) {
 		t.Errorf("retry of SpanRows changed output:\nfirst:  %#v\nsecond: %#v", firstRows[0], secondRows[0])
 	}
+}
+
+type selectiveOffloader struct {
+	minBytes  int
+	spanCalls int
+	logCalls  int
+	skipAttr  string
+	skipLogs  bool
+	failErr   error
+}
+
+func (s *selectiveOffloader) OffloadSpan(_ context.Context, span ptrace.Span, _ pcommon.Resource, _ pcommon.InstrumentationScope) ([]PayloadRef, error) {
+	s.spanCalls++
+	if s.failErr != nil {
+		return nil, s.failErr
+	}
+	var refs []PayloadRef
+	span.Attributes().Range(func(k string, v pcommon.Value) bool {
+		if k == s.skipAttr {
+			return true
+		}
+		if v.Type() == pcommon.ValueTypeStr && len(v.Str()) >= s.minBytes {
+			v.SetStr("<offloaded:gs://bucket/spans/prompt>")
+			refs = append(refs, PayloadRef{
+				AttributePath: "attributes." + k,
+				StorageMode:   "gcs_object_ref",
+				ByteSize:      int64(s.minBytes),
+				ObjectRef:     ObjectRef{URI: "gs://bucket/spans/prompt"},
+			})
+		}
+		return true
+	})
+	return refs, nil
+}
+
+func (s *selectiveOffloader) OffloadLog(_ context.Context, lr plog.LogRecord, _ pcommon.Resource, _ pcommon.InstrumentationScope) ([]PayloadRef, error) {
+	s.logCalls++
+	if s.failErr != nil {
+		return nil, s.failErr
+	}
+	if s.skipLogs {
+		return nil, nil
+	}
+	var refs []PayloadRef
+	if lr.Body().Type() == pcommon.ValueTypeStr && len(lr.Body().Str()) >= s.minBytes {
+		lr.Body().SetStr("<offloaded:gs://bucket/logs/body>")
+		refs = append(refs, PayloadRef{
+			AttributePath: "body",
+			StorageMode:   "gcs_object_ref",
+			ByteSize:      int64(s.minBytes),
+			ObjectRef:     ObjectRef{URI: "gs://bucket/logs/body"},
+		})
+	}
+	return refs, nil
+}
+
+// A 512 KiB prompt or log body exceeds DefaultLimits().MaxValueBytes (256 KiB).
+// When PayloadOffloader is configured, MaxValueBytes must be evaluated AFTER
+// offloading so values offloaded below MaxValueBytes succeed rather than being
+// rejected pre-offload.
+func TestPreOffloadOrderingAllowsLargeValuesOffloadedBelowMaxValueBytes(t *testing.T) {
+	largePayload := strings.Repeat("p", 512*1024)
+	offloader := &selectiveOffloader{minBytes: 256 * 1024}
+
+	opts := testOpts()
+	opts.PayloadOffloader = offloader
+
+	td, span := newTraces()
+	span.Attributes().PutStr("gen_ai.prompt", largePayload)
+	spanRows, spanRejects := SpanRows(td, opts)
+	if len(spanRejects) != 0 || len(spanRows) != 1 {
+		t.Fatalf("SpanRows = (%d rows, %+v rejects), want (1, nil)", len(spanRows), spanRejects)
+	}
+	if !strings.Contains(spanRows[0]["attributes"].(string), "<offloaded:gs://bucket/spans/prompt>") {
+		t.Errorf("span attributes = %s, want offloaded placeholder", spanRows[0]["attributes"])
+	}
+
+	ld, lr := newLogs()
+	lr.Body().SetStr(largePayload)
+	logRows, logRejects := LogRows(ld, opts)
+	if len(logRejects) != 0 || len(logRows) != 1 {
+		t.Fatalf("LogRows = (%d rows, %+v rejects), want (1, nil)", len(logRows), logRejects)
+	}
+	if logRows[0]["body"] != `"<offloaded:gs://bucket/logs/body>"` {
+		t.Errorf("log body = %v, want offloaded placeholder", logRows[0]["body"])
+	}
+}
+
+// Structural breaches (attribute count, key size, depth) must still reject
+// BEFORE PayloadOffloader runs, while values remaining above MaxValueBytes
+// after offload must reject with ReasonValueSize without advancing log
+// fingerprinter ordinals.
+func TestPreAndPostOffloadLimitRejections(t *testing.T) {
+	largePayload := strings.Repeat("x", 512*1024)
+
+	t.Run("structural breach skips offloader", func(t *testing.T) {
+		offloader := &selectiveOffloader{minBytes: 256 * 1024}
+		opts := testOpts()
+		opts.Limits.MaxAttributeKeyBytes = 16
+		opts.PayloadOffloader = offloader
+
+		td, span := newTraces()
+		span.Attributes().PutStr("attribute.key.way.over.sixteen.bytes", largePayload)
+		rows, rejects := SpanRows(td, opts)
+		if len(rows) != 0 || len(rejects) != 1 || rejects[0].Reason != ReasonAttributeKeySize {
+			t.Fatalf("SpanRows = (%d, %+v), want 1 ReasonAttributeKeySize rejection", len(rows), rejects)
+		}
+		if offloader.spanCalls != 0 {
+			t.Errorf("OffloadSpan called %d times on structurally invalid span, want 0", offloader.spanCalls)
+		}
+	})
+
+	t.Run("unoffloaded oversized value rejected post-offload without advancing log ordinal", func(t *testing.T) {
+		offloader := &selectiveOffloader{minBytes: 256 * 1024, skipAttr: "unoffloaded", skipLogs: true}
+		opts := testOpts()
+		opts.PayloadOffloader = offloader
+
+		td, span := newTraces()
+		span.Attributes().PutStr("unoffloaded", largePayload)
+		spanRows, spanRejects := SpanRows(td, opts)
+		if len(spanRows) != 0 || len(spanRejects) != 1 || spanRejects[0].Reason != ReasonValueSize {
+			t.Fatalf("SpanRows = (%d, %+v), want 1 ReasonValueSize rejection", len(spanRows), spanRejects)
+		}
+
+		// Two log records: first fails post-offload MaxValueBytes; second is valid.
+		// Compare second record's fingerprint against a batch containing only the second record.
+		ld := plog.NewLogs()
+		sl := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty()
+		badLR := sl.LogRecords().AppendEmpty()
+		badLR.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+		badLR.Body().SetStr(largePayload)
+		goodLR := sl.LogRecords().AppendEmpty()
+		goodLR.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+		goodLR.Body().SetStr("small valid body")
+
+		singleLD := plog.NewLogs()
+		goodLR.CopyTo(singleLD.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty())
+		wantRows, _ := LogRows(singleLD, testOpts())
+
+		gotRows, logRejects := LogRows(ld, opts)
+		if len(gotRows) != 1 || len(logRejects) != 1 || logRejects[0].Reason != ReasonValueSize {
+			t.Fatalf("LogRows = (%d, %+v), want 1 row and 1 ReasonValueSize rejection", len(gotRows), logRejects)
+		}
+		if gotRows[0]["record_fingerprint"] != wantRows[0]["record_fingerprint"] {
+			t.Errorf("kept record fingerprint = %v, want %v (rejected record must not advance ordinal)",
+				gotRows[0]["record_fingerprint"], wantRows[0]["record_fingerprint"])
+		}
+	})
+}
+
+func TestOffloadUploadErrorReportsViaCallbackWithoutRejecting(t *testing.T) {
+	largePayload := strings.Repeat("u", 512*1024)
+	uploadErr := errors.New("GCS 503 Service Unavailable")
+	offloader := &selectiveOffloader{minBytes: 256 * 1024, failErr: uploadErr}
+
+	var failedIndices []int
+	var gotErr error
+	opts := testOpts()
+	opts.PayloadOffloader = offloader
+	opts.OnOffloadError = func(idx int, err error) {
+		failedIndices = append(failedIndices, idx)
+		gotErr = err
+	}
+
+	td, span := newTraces()
+	span.Attributes().PutStr("gen_ai.prompt", largePayload)
+	spanRows, spanRejects := SpanRows(td, opts)
+	if len(spanRows) != 0 || len(spanRejects) != 0 {
+		t.Fatalf("SpanRows = (%d rows, %+v rejects), want (0, nil)", len(spanRows), spanRejects)
+	}
+	if !reflect.DeepEqual(failedIndices, []int{0}) || !errors.Is(gotErr, uploadErr) {
+		t.Errorf("OnOffloadError got (%v, %v), want ([0], %v)", failedIndices, gotErr, uploadErr)
+	}
+
+	// For LogRows, a record whose offload fails must also not advance fingerprinter ordinals.
+	failedIndices = nil
+	gotErr = nil
+	ld := plog.NewLogs()
+	sl := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty()
+	lr0 := sl.LogRecords().AppendEmpty()
+	lr0.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+	lr0.Body().SetStr(largePayload)
+
+	logRows, logRejects := LogRows(ld, opts)
+	if len(logRows) != 0 || len(logRejects) != 0 {
+		t.Fatalf("LogRows = (%d rows, %+v rejects), want (0, nil)", len(logRows), logRejects)
+	}
+	if !reflect.DeepEqual(failedIndices, []int{0}) || !errors.Is(gotErr, uploadErr) {
+		t.Errorf("OnOffloadError for logs got (%v, %v), want ([0], %v)", failedIndices, gotErr, uploadErr)
+	}
+}
+
+func TestQuarantineMetadataOnlyAndMaxPayloadBytes(t *testing.T) {
+	td, span := newTraces()
+	span.SetTraceID(pcommon.NewTraceIDEmpty())
+	span.Attributes().PutStr("secret", "sensitive-pii-value")
+	entries := []QuarantineEntry{{Rejection: Rejection{Index: 0, Reason: ReasonInvalidID, FieldPath: "trace_id"}}}
+
+	t.Run("metadata_only omits payload and attributes and skips offloader", func(t *testing.T) {
+		opts := quarantineOpts()
+		opts.QuarantineMetadataOnly = true
+		offloadCalled := false
+		opts.QuarantinePayloadOffloader = func(context.Context, string, []byte) ObjectRef {
+			offloadCalled = true
+			return ObjectRef{URI: "gs://bucket/quarantine/should-not-be-called"}
+		}
+
+		rows := SpanQuarantineRows(td, entries, opts)
+		if len(rows) != 1 {
+			t.Fatalf("got %d rows, want 1", len(rows))
+		}
+		r := rows[0]
+		if offloadCalled {
+			t.Error("QuarantinePayloadOffloader must not be called when QuarantineMetadataOnly is true")
+		}
+		for _, forbidden := range []string{"raw_payload", "raw_attributes", "payload_ref"} {
+			if _, exists := r[forbidden]; exists {
+				t.Errorf("metadata_only row contains %q = %v, want NULL/omitted", forbidden, r[forbidden])
+			}
+		}
+		for _, required := range []string{"ingest_time", "signal", "error_code", "error_message", "service_name", "span_id", "exporter_instance", "schema_version"} {
+			if _, exists := r[required]; !exists {
+				t.Errorf("metadata_only row missing %q", required)
+			}
+		}
+	})
+
+	t.Run("metadata_only strips raw Detail from error_message", func(t *testing.T) {
+		detailEntries := []QuarantineEntry{
+			{
+				Rejection: Rejection{Index: 0, Reason: ReasonRowError},
+				Detail:    `FIELDS_ERROR: invalid value "secret-ssn-123-45-6789"`,
+			},
+			{
+				Rejection: Rejection{Index: 0, Reason: ReasonSerialization},
+				Detail:    `proto marshal: bad field "secret-token-abc"`,
+			},
+		}
+
+		metaOpts := quarantineOpts()
+		metaOpts.QuarantineMetadataOnly = true
+		metaRows := SpanQuarantineRows(td, detailEntries, metaOpts)
+		if len(metaRows) != 2 {
+			t.Fatalf("got %d metadata_only rows, want 2", len(metaRows))
+		}
+		if got := metaRows[0]["error_message"]; got != "row_error" {
+			t.Errorf("metadata_only row_error error_message = %q, want %q (must omit Detail)", got, "row_error")
+		}
+		if got := metaRows[1]["error_message"]; got != "serialization" {
+			t.Errorf("metadata_only serialization error_message = %q, want %q (must omit Detail)", got, "serialization")
+		}
+
+		// When QuarantineMetadataOnly is false, Detail is still included.
+		fullOpts := quarantineOpts()
+		fullRows := SpanQuarantineRows(td, detailEntries, fullOpts)
+		if !strings.Contains(fullRows[0]["error_message"].(string), "secret-ssn-123-45-6789") {
+			t.Errorf("full mode error_message = %q, want Detail included", fullRows[0]["error_message"])
+		}
+	})
+
+	t.Run("max_quarantine_payload_bytes truncates inline raw_payload", func(t *testing.T) {
+		opts := quarantineOpts()
+		opts.MaxQuarantinePayloadBytes = 64
+		rows := SpanQuarantineRows(td, entries, opts)
+		if len(rows) != 1 {
+			t.Fatalf("got %d rows, want 1", len(rows))
+		}
+		raw, ok := rows[0]["raw_payload"].(string)
+		if !ok || len(raw) > 64 || len(raw) == 0 {
+			t.Fatalf("raw_payload length = %d (present=%v), want 1..64 bytes", len(raw), ok)
+		}
+		if !utf8.ValidString(raw) {
+			t.Error("truncated raw_payload is not valid UTF-8")
+		}
+		if !strings.Contains(rows[0]["error_message"].(string), "raw_payload truncated to") {
+			t.Errorf("error_message = %q, want truncation note", rows[0]["error_message"])
+		}
+	})
 }

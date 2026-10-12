@@ -25,6 +25,8 @@ func TestCustomCollectorExampleIsSelfContainedAndPinned(t *testing.T) {
 				"path: .",
 				"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/fileexporter v0.158.0",
 				"go.opentelemetry.io/collector/receiver/otlpreceiver v0.158.0",
+				"go.opentelemetry.io/collector/processor/memorylimiterprocessor v0.158.0",
+				"github.com/open-telemetry/opentelemetry-collector-contrib/extension/healthcheckextension v0.158.0",
 			},
 		},
 		{
@@ -80,7 +82,7 @@ func TestComposePublishesOTLPOnlyOnLoopback(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := compose.Services["otelcollector"].Ports
-	want := []string{"127.0.0.1:4317:4317", "127.0.0.1:4318:4318"}
+	want := []string{"127.0.0.1:4317:4317", "127.0.0.1:4318:4318", "127.0.0.1:13133:13133"}
 	if len(got) != len(want) {
 		t.Fatalf("published ports = %v, want %v", got, want)
 	}

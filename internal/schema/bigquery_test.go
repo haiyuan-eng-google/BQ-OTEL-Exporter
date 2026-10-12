@@ -54,6 +54,7 @@ func TestBigQuerySchemaRoundTripPreservesCanonicalContracts(t *testing.T) {
 	}{
 		{name: "spans", in: SpansTableSchema()},
 		{name: "logs", in: LogsTableSchema()},
+		{name: "metrics", in: MetricsTableSchema()},
 		{name: "quarantine", in: QuarantineTableSchema()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -100,6 +101,14 @@ func TestDestinationMetadata(t *testing.T) {
 			cluster:       []string{"service_name", "trace_id", "severity_number"},
 			viewQuery:     LogsDedupViewQuery,
 		},
+		{
+			name:          "metrics",
+			in:            MetricsTableSchema(),
+			partitionType: bq.DayPartitioningType,
+			partition:     "timestamp",
+			cluster:       []string{"service_name", "metric_name", "metric_type"},
+			viewQuery:     MetricsDedupViewQuery,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			md, view, err := DestinationMetadata(tc.in, "proj", "ds", "tbl")
@@ -140,6 +149,22 @@ func TestDestinationMetadata(t *testing.T) {
 	}
 }
 
+func TestDestinationMetadataWithOptions(t *testing.T) {
+	md, _, err := DestinationMetadataWithOptions(SpansTableSchema(), "proj", "ds", "tbl", DestinationOptions{
+		PartitionExpirationDays: 90,
+		RequirePartitionFilter:  true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if md.TimePartitioning.Expiration != 90*24*time.Hour {
+		t.Fatalf("partition expiration = %v, want 90 days", md.TimePartitioning.Expiration)
+	}
+	if !md.RequirePartitionFilter {
+		t.Fatal("RequirePartitionFilter = false, want true")
+	}
+}
+
 // QuarantineDestinationMetadata is what auto-create applies for the opt-in
 // quarantine table, so it must carry the layout QuarantineDDL declares: daily
 // partitions on ingest_time that expire after 30 days, clustering on
@@ -175,6 +200,17 @@ func TestQuarantineDestinationMetadata(t *testing.T) {
 	if md.ViewQuery != "" {
 		t.Errorf("quarantine table metadata must not define a view, got %q", md.ViewQuery)
 	}
+
+	customMD, err := QuarantineDestinationMetadataWithOptions(DestinationOptions{
+		PartitionExpirationDays: 14,
+		RequirePartitionFilter:  true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if customMD.TimePartitioning.Expiration != 14*24*time.Hour || !customMD.RequirePartitionFilter {
+		t.Fatalf("custom quarantine options = %+v, want 14d expiration and RequirePartitionFilter=true", customMD)
+	}
 }
 
 // CompanionViewsMetadata is what auto-create applies for the optional
@@ -192,6 +228,9 @@ func TestCompanionViewsMetadata(t *testing.T) {
 			want: map[string]string{
 				"otel_spans_as_allspans": fmt.Sprintf(SpansAsAllSpansViewQuery, "proj", "ds", "spans_tbl"),
 				"v_gen_ai_spans":         fmt.Sprintf(GenAISpansViewQuery, "proj", "ds", "spans_tbl"),
+				"v_gen_ai_model_costs":   fmt.Sprintf(GenAIModelCostsViewQuery, "proj", "ds"),
+				"v_gen_ai_sessions":      fmt.Sprintf(GenAISessionsViewQuery, "proj", "ds"),
+				"v_gen_ai_tool_usage":    fmt.Sprintf(GenAIToolUsageViewQuery, "proj", "ds"),
 			},
 		},
 		{
@@ -217,6 +256,41 @@ func TestCompanionViewsMetadata(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestReconcileAdditiveSchema(t *testing.T) {
+	want := SpansTableSchema()
+	fullBQ, err := ToBigQuery(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Drop a top-level repeated field (payload_refs) and a nested nullable field (status.code_name).
+	var existing bq.Schema
+	for _, f := range fullBQ {
+		if f.Name == "payload_refs" {
+			continue
+		}
+		copyF := *f
+		if copyF.Name == "status" {
+			copyF.Schema = bq.Schema{copyF.Schema[0], copyF.Schema[2]}
+		}
+		existing = append(existing, &copyF)
+	}
+
+	merged, changed, err := ReconcileAdditiveSchema(existing, want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("expected ReconcileAdditiveSchema to detect missing additive fields")
+	}
+	haveProto, err := FromBigQuery(merged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diffs := CompatibilityDifferences(want, haveProto); len(diffs) != 0 {
+		t.Fatalf("reconciled schema still has differences: %v", diffs)
 	}
 }
 
