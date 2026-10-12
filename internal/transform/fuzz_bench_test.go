@@ -4,6 +4,7 @@
 package transform
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +13,8 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/redact"
 )
 
 func FuzzSpanRows(f *testing.F) {
@@ -60,7 +63,46 @@ func FuzzSpanRows(f *testing.F) {
 				}
 			}
 		}
+
+		// Redaction pass: the blocked key forces the copy-on-write branch on
+		// every input, the value pattern exercises substring replacement on
+		// fuzzed text, and the caller's batch must come back untouched.
+		sp.Attributes().PutStr("x-api-key", system)
+		before, err := (&ptrace.JSONMarshaler{}).MarshalTraces(td)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rrows, rrejects := SpanRows(td, Options{
+			Limits:   DefaultLimits(),
+			Now:      func() time.Time { return time.Unix(1700000000, 0).UTC() },
+			Redactor: fuzzRedactor(t),
+		})
+		if len(rrows)+len(rrejects) != 1 {
+			t.Fatalf("redaction broke conservation: rows=%d rejects=%d", len(rrows), len(rrejects))
+		}
+		after, err := (&ptrace.JSONMarshaler{}).MarshalTraces(td)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Fatal("SpanRows with a Redactor mutated the caller's batch")
+		}
 	})
+}
+
+// fuzzRedactor is the redactor shared by the fuzz targets: default keys plus
+// value patterns broad enough to fire on fuzzed strings.
+func fuzzRedactor(t testing.TB) *redact.Redactor {
+	t.Helper()
+	r, err := redact.New(redact.Config{
+		BlockedKeys:          redact.DefaultBlockedKeys(),
+		BlockedValuePatterns: []string{`(?i)secret[a-z0-9_-]*`, `\d{3}-\d{2}-\d{4}`},
+		RedactLogBody:        true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
 }
 
 func FuzzLogRows(f *testing.F) {
@@ -98,6 +140,34 @@ func FuzzLogRows(f *testing.F) {
 			id, ok := r["insert_id"].(string)
 			if !ok || len(id) != 68 || !strings.HasPrefix(id, "fp1:") {
 				t.Fatalf("expected 68-char fp1: insert_id, got %q", id)
+			}
+		}
+
+		// Redaction pass over the same record, including the body path.
+		lr.Attributes().PutStr("session_token", sessID)
+		before, err := (&plog.JSONMarshaler{}).MarshalLogs(ld)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rrows, rrejects := LogRows(ld, Options{
+			Limits:   DefaultLimits(),
+			Now:      func() time.Time { return time.Unix(1700000000, 0).UTC() },
+			Redactor: fuzzRedactor(t),
+		})
+		if len(rrows)+len(rrejects) != 1 {
+			t.Fatalf("redaction broke conservation: rows=%d rejects=%d", len(rrows), len(rrejects))
+		}
+		after, err := (&plog.JSONMarshaler{}).MarshalLogs(ld)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Fatal("LogRows with a Redactor mutated the caller's batch")
+		}
+		for _, r := range rrows {
+			id, ok := r["insert_id"].(string)
+			if !ok || len(id) != 68 || !strings.HasPrefix(id, "fp1:") {
+				t.Fatalf("redacted record lost its fp1: insert_id, got %q", id)
 			}
 		}
 	})
@@ -157,6 +227,55 @@ func TestTransformConservationProperty(t *testing.T) {
 }
 
 func BenchmarkSpanRows(b *testing.B) {
+	td := benchTraces(false)
+	opts := Options{
+		Limits: DefaultLimits(),
+		Now:    func() time.Time { return time.Unix(1700000000, 0).UTC() },
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rows, rejects := SpanRows(td, opts)
+		if len(rows) != 10 || len(rejects) != 0 {
+			b.Fatalf("unexpected result: rows=%d rejects=%d", len(rows), len(rejects))
+		}
+	}
+}
+
+// BenchmarkSpanRowsRedactionEnabled measures the redaction step on the same
+// fixture as BenchmarkSpanRows. "nomatch" is the hot path that must stay
+// allocation-neutral relative to the baseline; "match" pays one batch clone.
+func BenchmarkSpanRowsRedactionEnabled(b *testing.B) {
+	for _, tc := range []struct {
+		name       string
+		withSecret bool
+	}{
+		{"nomatch", false},
+		{"match", true},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			td := benchTraces(tc.withSecret)
+			opts := Options{
+				Limits:   DefaultLimits(),
+				Now:      func() time.Time { return time.Unix(1700000000, 0).UTC() },
+				Redactor: fuzzRedactor(b),
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				rows, rejects := SpanRows(td, opts)
+				if len(rows) != 10 || len(rejects) != 0 {
+					b.Fatalf("unexpected result: rows=%d rejects=%d", len(rows), len(rejects))
+				}
+			}
+		})
+	}
+}
+
+// benchTraces is the ten-span GenAI batch the span benchmarks share. With
+// withSecret each span also carries a blocked key and a pattern-matching
+// value so the redaction clone path is exercised on every record.
+func benchTraces(withSecret bool) ptrace.Traces {
 	td := ptrace.NewTraces()
 	rs := td.ResourceSpans().AppendEmpty()
 	rs.Resource().Attributes().PutStr("service.name", "bench-agent")
@@ -178,20 +297,12 @@ func BenchmarkSpanRows(b *testing.B) {
 		sp.Attributes().PutInt("gen_ai.usage.input_tokens", 512)
 		sp.Attributes().PutInt("gen_ai.usage.output_tokens", 256)
 		sp.Attributes().PutStr("gen_ai.conversation.id", "conv-bench-1")
-	}
-
-	opts := Options{
-		Limits: DefaultLimits(),
-		Now:    func() time.Time { return time.Unix(1700000000, 0).UTC() },
-	}
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		rows, rejects := SpanRows(td, opts)
-		if len(rows) != 10 || len(rejects) != 0 {
-			b.Fatalf("unexpected result: rows=%d rejects=%d", len(rows), len(rejects))
+		if withSecret {
+			sp.Attributes().PutStr("http.request.header.authorization", "Bearer secret-bench-token")
+			sp.Attributes().PutStr("api_key", "k-bench")
 		}
 	}
+	return td
 }
 
 func BenchmarkLogRows(b *testing.B) {

@@ -5,6 +5,8 @@ package bigqueryexporter
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -21,11 +23,13 @@ import (
 	"cloud.google.com/go/bigquery/storage/managedwriter"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/component/componentstatus"
+	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/consumer/consumererror"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric/noop"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -2804,4 +2808,220 @@ func TestPushPermanentRequestLevelFailureQuarantinesAndRecordsRejected(t *testin
 	if got := metricInt64ByAttr(t, reader, "otelcol_exporter_bigquery_quarantined_rows", "reason")["request_permanent"]; got != 2 {
 		t.Errorf("quarantined_rows{reason=request_permanent} = %d, want 2", got)
 	}
+}
+
+func TestNewSignalExporterWiresRedactorPerSignal(t *testing.T) {
+	cfg := validConfig()
+	cfg.Redaction.Enabled = true
+
+	traces, err := newTracesExporter(component.TelemetrySettings{Logger: zap.NewNop(), MeterProvider: noop.NewMeterProvider()}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs, err := newLogsExporter(component.TelemetrySettings{Logger: zap.NewNop(), MeterProvider: noop.NewMeterProvider()}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics, err := newMetricsExporter(component.TelemetrySettings{Logger: zap.NewNop(), MeterProvider: noop.NewMeterProvider()}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, e := range map[string]*signalExporter{"traces": traces.signalExporter, "logs": logs.signalExporter, "metrics": metrics.signalExporter} {
+		if e.opts.Redactor == nil {
+			t.Errorf("%s: Redactor not wired when redaction.enabled is set", name)
+		}
+		if e.startErr != nil {
+			t.Errorf("%s: unexpected startErr %v", name, e.startErr)
+		}
+	}
+	if got := signalForSchema(schema.SpansTableSchema()); got != schema.SignalSpans {
+		t.Errorf("signalForSchema(spans) = %q", got)
+	}
+	if got := signalForSchema(schema.LogsTableSchema()); got != schema.SignalLogs {
+		t.Errorf("signalForSchema(logs) = %q", got)
+	}
+	if got := signalForSchema(schema.MetricsTableSchema()); got != schema.SignalMetrics {
+		t.Errorf("signalForSchema(metrics) = %q", got)
+	}
+
+	off := validConfig()
+	e, err := newTracesExporter(component.TelemetrySettings{Logger: zap.NewNop(), MeterProvider: noop.NewMeterProvider()}, off)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.opts.Redactor != nil {
+		t.Fatal("Redactor must stay nil when redaction is disabled")
+	}
+}
+
+// TestPushTracesRedactsBeforeOffloadEndToEnd runs the real offloader against
+// an in-memory blob store: the stored object must be the redacted bytes, its
+// key must be their digest, the appended row must carry no cleartext, and
+// the redacted_values counter must reflect the batch.
+func TestPushTracesRedactsBeforeOffloadEndToEnd(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+
+	cfg := validConfig()
+	cfg.Offload.Enabled = true
+	cfg.Offload.Bucket = "otel-offload-bucket"
+	cfg.Offload.MinBytes = 1024
+	cfg.Offload.MaxObjectBytes = 64 * 1024 * 1024
+	cfg.Redaction.Enabled = true
+	cfg.Redaction.BlockedValuePatterns = []string{`sk-live-[0-9a-f]+`}
+
+	e, err := newTracesExporter(component.TelemetrySettings{Logger: zap.NewNop(), MeterProvider: mp}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	memStore := offload.NewMemoryBlobStore()
+	e.offloader.SetStore(memStore)
+
+	enc, err := protoenc.New(schema.SpansTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &recordingEncoder{next: enc}
+	app := &fakeAppender{outcome: bqi.AppendOutcome{AcknowledgedRows: 1}}
+	e.enc = rec
+	e.writer = app
+
+	const secret = "sk-live-0123456789abcdef0123456789abcdef"
+	prompt := strings.Repeat("context ", 200) + secret + strings.Repeat(" more", 100)
+	td := newTestTraces(1)
+	span := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
+	span.Attributes().PutStr("gen_ai.prompt", prompt)
+	span.Attributes().PutStr("authorization", "Bearer "+strings.Repeat("t", 2048)) // oversized, but key-redacted first
+	before, _ := (&ptrace.JSONMarshaler{}).MarshalTraces(td)
+
+	if err := e.pushTraceData(context.Background(), td); err != nil {
+		t.Fatalf("pushTraceData: %v", err)
+	}
+	if after, _ := (&ptrace.JSONMarshaler{}).MarshalTraces(td); string(after) != string(before) {
+		t.Fatal("pushTraceData mutated the caller's batch")
+	}
+	if app.gotRows != 1 || len(rec.rows) != 1 {
+		t.Fatalf("appended %d rows (encoded %d), want 1", app.gotRows, len(rec.rows))
+	}
+	if memStore.Count() != 1 {
+		t.Fatalf("blob store holds %d objects, want 1 (the authorization value must shrink below min_bytes)", memStore.Count())
+	}
+
+	wantData := strings.ReplaceAll(prompt, secret, "[REDACTED]")
+	wantSum := sha256.Sum256([]byte(wantData))
+	wantHex := hex.EncodeToString(wantSum[:])
+	refs, _ := rec.rows[0]["payload_refs"].([]transform.Row)
+	if len(refs) != 1 {
+		t.Fatalf("payload_refs = %#v, want 1", rec.rows[0]["payload_refs"])
+	}
+	objRef, _ := refs[0]["object_ref"].(transform.Row)
+	uri, _ := objRef["uri"].(string)
+	if !strings.Contains(uri, wantHex) {
+		t.Fatalf("object uri %q does not carry the digest of the redacted bytes %s", uri, wantHex)
+	}
+	object := strings.TrimPrefix(uri, "gs://"+cfg.Offload.Bucket+"/")
+	stored, ok := memStore.Get(cfg.Offload.Bucket, object)
+	if !ok {
+		t.Fatalf("object %q not found in the blob store", object)
+	}
+	if strings.Contains(string(stored.Data), secret) || !strings.Contains(string(stored.Data), "[REDACTED]") {
+		t.Fatalf("stored object leaks the secret or lacks the mask")
+	}
+	attrs, _ := rec.rows[0]["attributes"].(string)
+	if strings.Contains(attrs, secret) || strings.Contains(attrs, "Bearer") || !strings.Contains(attrs, `"authorization":"[REDACTED]"`) {
+		t.Fatalf("attributes column leaks cleartext: %s", attrs)
+	}
+
+	keyCount := metricInt64SumWithAttr(t, reader, "otelcol_exporter_bigquery_redacted_values", metadata.AttrMatchType, "key")
+	valueCount := metricInt64SumWithAttr(t, reader, "otelcol_exporter_bigquery_redacted_values", metadata.AttrMatchType, "value")
+	if keyCount != 1 || valueCount != 1 {
+		t.Fatalf("redacted_values key=%d value=%d, want 1 and 1", keyCount, valueCount)
+	}
+	if sig := metricInt64SumWithAttr(t, reader, "otelcol_exporter_bigquery_redacted_values", metadata.AttrSignal, schema.SignalSpans); sig != 2 {
+		t.Fatalf("redacted_values{signal=spans} = %d, want 2", sig)
+	}
+}
+
+// TestPushTracesQuarantineRowsAreRedacted drives a rejected span through the
+// exporter's quarantine path and checks the DLQ row content.
+func TestPushTracesQuarantineRowsAreRedacted(t *testing.T) {
+	cfg := validConfig()
+	cfg.Redaction.Enabled = true
+	e, err := newTracesExporter(component.TelemetrySettings{Logger: zap.NewNop(), MeterProvider: noop.NewMeterProvider()}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := protoenc.New(schema.SpansTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.enc = enc
+	e.writer = &fakeAppender{outcome: bqi.AppendOutcome{AcknowledgedRows: 1}}
+	quarantined, _ := withQuarantine(t, e.signalExporter, bqi.AppendOutcome{AcknowledgedRows: 1})
+
+	td := newTestTraces(2)
+	bad := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(1)
+	bad.SetEndTimestamp(0)
+	bad.Attributes().PutStr("password", "hunter2")
+	bad.Attributes().PutStr("x-api-key", "AKIA-not-really")
+
+	if err := e.pushTraceData(context.Background(), td); err != nil {
+		t.Fatalf("pushTraceData: %v", err)
+	}
+	if len(quarantined.rows) != 1 {
+		t.Fatalf("quarantine rows = %d, want 1", len(quarantined.rows))
+	}
+	row := quarantined.rows[0]
+	payload, _ := row["raw_payload"].(string)
+	attrs, _ := row["raw_attributes"].(string)
+	for _, leak := range []string{"hunter2", "AKIA-not-really"} {
+		if strings.Contains(payload, leak) || strings.Contains(attrs, leak) {
+			t.Fatalf("quarantine row leaks %q: payload=%s attrs=%s", leak, payload, attrs)
+		}
+	}
+	if !strings.Contains(payload, "[REDACTED]") || !strings.Contains(attrs, "[REDACTED]") {
+		t.Fatalf("quarantine row is missing the mask: payload=%s attrs=%s", payload, attrs)
+	}
+}
+
+func TestStartFailsClosedWhenRedactorCannotBeBuilt(t *testing.T) {
+	cfg := validConfig()
+	e := newSignalExporter(component.TelemetrySettings{Logger: zap.NewNop()}, cfg, cfg.Traces.Table, schema.SpansTableSchema())
+	e.startErr = errors.New("building redactor: synthetic")
+	err := e.start(context.Background(), componenttest.NewNopHost())
+	if err == nil || !strings.Contains(err.Error(), "building redactor") {
+		t.Fatalf("start error = %v, want the construction error", err)
+	}
+	if e.client != nil {
+		t.Fatal("start must not open a client after a construction failure")
+	}
+}
+
+// metricInt64SumWithAttr sums the data points of an int64 counter whose
+// attribute key equals value.
+func metricInt64SumWithAttr(t *testing.T, reader *sdkmetric.ManualReader, name, key, value string) int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	var total int64
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != name {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok {
+				t.Fatalf("%s is %T, want Sum[int64]", name, m.Data)
+			}
+			for _, dp := range sum.DataPoints {
+				if v, ok := dp.Attributes.Value(attribute.Key(key)); ok && v.AsString() == value {
+					total += dp.Value
+				}
+			}
+		}
+	}
+	return total
 }

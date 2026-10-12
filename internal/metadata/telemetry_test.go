@@ -48,14 +48,17 @@ func TestTelemetryRecordsEveryInstrument(t *testing.T) {
 	tel.RecordOffloadedPayloads(ctx, 2)
 	tel.RecordOffloadedBytes(ctx, 8192)
 	tel.RecordOffloadError(ctx, "unavailable", 1)
+	tel.RecordRedactedValues(ctx, "spans", "key", 4)
+	tel.RecordRedactedValues(ctx, "spans", "value", 2)
+	tel.RecordRedactedValues(ctx, "spans", "key", 0) // ignored
 
 	var resourceMetrics metricdata.ResourceMetrics
 	if err := reader.Collect(ctx, &resourceMetrics); err != nil {
 		t.Fatal(err)
 	}
 	metrics := metricsByName(resourceMetrics)
-	if len(metrics) != 15 {
-		t.Fatalf("collected %d metrics, want 15: %v", len(metrics), metricNames(metrics))
+	if len(metrics) != 16 {
+		t.Fatalf("collected %d metrics, want 16: %v", len(metrics), metricNames(metrics))
 	}
 
 	assertIntSum(t, metrics[nameAcknowledgedRows], 5, nil)
@@ -72,6 +75,29 @@ func TestTelemetryRecordsEveryInstrument(t *testing.T) {
 	assertIntSum(t, metrics[nameOffloadedPayloads], 2, nil)
 	assertIntSum(t, metrics[nameOffloadedBytes], 8192, nil)
 	assertIntSum(t, metrics[nameOffloadErrors], 1, []attribute.KeyValue{attribute.String(AttrClass, "unavailable")})
+	redacted, ok := metrics[nameRedactedValues].Data.(metricdata.Sum[int64])
+	if !ok || len(redacted.DataPoints) != 2 || !redacted.IsMonotonic {
+		t.Fatalf("redacted_values data = %#v, want a monotonic sum with one point per match type", metrics[nameRedactedValues].Data)
+	}
+	for _, dp := range redacted.DataPoints {
+		mt, _ := dp.Attributes.Value(AttrMatchType)
+		sig, _ := dp.Attributes.Value(AttrSignal)
+		if sig.AsString() != "spans" {
+			t.Errorf("redacted_values signal = %q, want spans", sig.AsString())
+		}
+		switch mt.AsString() {
+		case "key":
+			if dp.Value != 4 {
+				t.Errorf("redacted_values{match_type=key} = %d, want 4", dp.Value)
+			}
+		case "value":
+			if dp.Value != 2 {
+				t.Errorf("redacted_values{match_type=value} = %d, want 2", dp.Value)
+			}
+		default:
+			t.Errorf("unexpected match_type %q", mt.AsString())
+		}
+	}
 
 	histogram, ok := metrics[nameAppendResultWait].Data.(metricdata.Histogram[float64])
 	if !ok || len(histogram.DataPoints) != 1 {
@@ -107,6 +133,7 @@ func TestNilTelemetryIsSafe(_ *testing.T) {
 	tel.RecordOffloadedPayloads(ctx, 1)
 	tel.RecordOffloadedBytes(ctx, 1)
 	tel.RecordOffloadError(ctx, "y", 1)
+	tel.RecordRedactedValues(ctx, "spans", "key", 1)
 }
 
 // The instrument names in code must match the ones metadata.yaml documents.
@@ -135,6 +162,7 @@ func TestMetricNamesMatchMetadataYAML(t *testing.T) {
 		nameOffloadedPayloads,
 		nameOffloadedBytes,
 		nameOffloadErrors,
+		nameRedactedValues,
 	} {
 		if !strings.Contains(doc, name+":") {
 			t.Errorf("metric %q is emitted in code but not declared in metadata.yaml", name)

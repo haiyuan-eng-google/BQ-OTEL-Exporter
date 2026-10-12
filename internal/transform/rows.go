@@ -17,6 +17,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/otlpjson"
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/redact"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 )
 
@@ -89,6 +90,13 @@ type Options struct {
 	// Now supplies the exporter receive time stamped on every row.
 	// Injectable so tests are deterministic.
 	Now func() time.Time
+	// Redactor, when non-nil, scrubs sensitive keys and values as step 0 of
+	// every row and quarantine builder: before PayloadOffloader uploads
+	// anything, before Limits are checked, before fingerprints are hashed,
+	// and before a quarantine payload is marshaled. It works on a copy, so
+	// the batch the caller passed in is never mutated and a retry payload
+	// rebuilt from it is unaffected.
+	Redactor *redact.Redactor
 }
 
 func (o Options) context() context.Context {
@@ -320,6 +328,9 @@ var (
 // Index in a rejection is the position of the span in a flattened walk of the
 // batch, which is the same order the caller sees.
 func SpanRows(td ptrace.Traces, opts Options) ([]Row, []Rejection) {
+	// Step 0: redact before anything reads an attribute. Every later stage
+	// (offload, limits, fingerprint, row) sees only td as returned here.
+	td = opts.Redactor.Traces(td)
 	ctx := WithBatchUploadCache(opts.context())
 	received := opts.now()
 	spanCount := td.SpanCount()
@@ -723,6 +734,10 @@ func sanitize(s string) string {
 // the batch, which is the same order the caller sees. Fingerprints are
 // assigned in the same walk, so a retry of the batch reproduces them.
 func LogRows(ld plog.Logs, opts Options) ([]Row, []Rejection) {
+	// Step 0: redact before anything reads an attribute or body. The
+	// fingerprint and insert_id below are therefore taken from the redacted
+	// record, never from the cleartext one.
+	ld = opts.Redactor.Logs(ld)
 	ctx := WithBatchUploadCache(opts.context())
 	received := opts.now()
 	logCount := ld.LogRecordCount()
@@ -1189,7 +1204,6 @@ func SpanQuarantineRows(td ptrace.Traces, entries []QuarantineEntry, opts Option
 	idx := -1
 
 	for _, rs := range td.ResourceSpans().All() {
-		svc := stringAttr(rs.Resource().Attributes(), serviceNameAttr)
 		for _, ss := range rs.ScopeSpans().All() {
 			for _, span := range ss.Spans().All() {
 				idx++
@@ -1211,17 +1225,23 @@ func SpanQuarantineRows(td ptrace.Traces, entries []QuarantineEntry, opts Option
 				ss.Scope().CopyTo(oss.Scope())
 				oss.SetSchemaUrl(ss.SchemaUrl())
 				span.CopyTo(oss.Spans().AppendEmpty())
+				// Step 0 for the quarantine path: the copy is redacted before
+				// it is marshaled, offloaded, or mined for raw_attributes. The
+				// matches were already counted when the batch went through
+				// SpanRows, so this does not report telemetry.
+				opts.Redactor.RedactTraces(one)
+				oneSpan := oss.Spans().At(0)
 				payload, err := marshaler.MarshalTraces(one)
 				if err != nil {
 					payload = nil
 				}
 				rec := quarantinedRecord{
 					signal:  schema.SignalSpans,
-					service: svc,
-					traceID: traceIDString(span.TraceID()),
-					spanID:  spanIDString(span.SpanID()),
+					service: stringAttr(ors.Resource().Attributes(), serviceNameAttr),
+					traceID: traceIDString(oneSpan.TraceID()),
+					spanID:  spanIDString(oneSpan.SpanID()),
 					payload: payload,
-					attrs:   span.Attributes(),
+					attrs:   oneSpan.Attributes(),
 				}
 				for _, e := range group {
 					if err := opts.context().Err(); err != nil {
@@ -1252,7 +1272,6 @@ func LogQuarantineRows(ld plog.Logs, entries []QuarantineEntry, opts Options) []
 	idx := -1
 
 	for _, rl := range ld.ResourceLogs().All() {
-		svc := stringAttr(rl.Resource().Attributes(), serviceNameAttr)
 		for _, sl := range rl.ScopeLogs().All() {
 			for _, lr := range sl.LogRecords().All() {
 				idx++
@@ -1271,17 +1290,20 @@ func LogQuarantineRows(ld plog.Logs, entries []QuarantineEntry, opts Options) []
 				sl.Scope().CopyTo(osl.Scope())
 				osl.SetSchemaUrl(sl.SchemaUrl())
 				lr.CopyTo(osl.LogRecords().AppendEmpty())
+				// Step 0 for the quarantine path; see SpanQuarantineRows.
+				opts.Redactor.RedactLogs(one)
+				oneLR := osl.LogRecords().At(0)
 				payload, err := marshaler.MarshalLogs(one)
 				if err != nil {
 					payload = nil
 				}
 				rec := quarantinedRecord{
 					signal:  schema.SignalLogs,
-					service: svc,
-					traceID: traceIDString(lr.TraceID()),
-					spanID:  spanIDString(lr.SpanID()),
+					service: stringAttr(orl.Resource().Attributes(), serviceNameAttr),
+					traceID: traceIDString(oneLR.TraceID()),
+					spanID:  spanIDString(oneLR.SpanID()),
 					payload: payload,
-					attrs:   lr.Attributes(),
+					attrs:   oneLR.Attributes(),
 				}
 				for _, e := range group {
 					if err := opts.context().Err(); err != nil {

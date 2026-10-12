@@ -40,6 +40,9 @@ const (
 // Index in a rejection is the 0-based position of the data point in a
 // flattened walk of the batch, matching MetricQuarantineRows and SelectMetrics.
 func MetricRows(md pmetric.Metrics, opts Options) ([]Row, []Rejection) {
+	// Step 0: redact before anything reads an attribute, metadata entry, or
+	// exemplar. point_fingerprint below is taken from the redacted point.
+	md = opts.Redactor.Metrics(md)
 	received := opts.now()
 	rows := make([]Row, 0, md.DataPointCount())
 	var rejects []Rejection
@@ -857,10 +860,9 @@ func MetricQuarantineRows(md pmetric.Metrics, entries []QuarantineEntry, opts Op
 	idx := -1
 
 	for _, rm := range md.ResourceMetrics().All() {
-		svc := stringAttr(rm.Resource().Attributes(), serviceNameAttr)
 		for _, sm := range rm.ScopeMetrics().All() {
 			for _, m := range sm.Metrics().All() {
-				visitMetricPoints(m, func(_ int, copyInto func(pmetric.Metric), attrs pcommon.Map, exemplars pmetric.ExemplarSlice) {
+				visitMetricPoints(m, func(_ int, copyInto func(pmetric.Metric), _ pcommon.Map, _ pmetric.ExemplarSlice) {
 					idx++
 					group := byIndex[idx]
 					if len(group) == 0 {
@@ -881,6 +883,11 @@ func MetricQuarantineRows(md pmetric.Metrics, entries []QuarantineEntry, opts Op
 					om := osm.Metrics().AppendEmpty()
 					copyMetricHeader(m, om)
 					copyInto(om)
+					// Step 0 for the quarantine path; see SpanQuarantineRows.
+					// Attributes and exemplars are read back from the redacted
+					// copy, never from the visitor's view of the original.
+					opts.Redactor.RedactMetrics(one)
+					attrs, exemplars := singleMetricPoint(om)
 
 					payload, err := marshaler.MarshalMetrics(one)
 					if err != nil {
@@ -897,7 +904,7 @@ func MetricQuarantineRows(md pmetric.Metrics, entries []QuarantineEntry, opts Op
 					}
 					rec := quarantinedRecord{
 						signal:  schema.SignalMetrics,
-						service: svc,
+						service: stringAttr(orm.Resource().Attributes(), serviceNameAttr),
 						traceID: traceID,
 						spanID:  spanID,
 						payload: payload,
@@ -914,6 +921,35 @@ func MetricQuarantineRows(md pmetric.Metrics, entries []QuarantineEntry, opts Op
 		}
 	}
 	return rows
+}
+
+// singleMetricPoint returns the attributes and exemplars of the only data
+// point in a metric produced by copyInto. A summary point has no exemplars,
+// and an unknown or empty metric yields empty views.
+func singleMetricPoint(m pmetric.Metric) (pcommon.Map, pmetric.ExemplarSlice) {
+	switch m.Type() {
+	case pmetric.MetricTypeGauge:
+		if dps := m.Gauge().DataPoints(); dps.Len() > 0 {
+			return dps.At(0).Attributes(), dps.At(0).Exemplars()
+		}
+	case pmetric.MetricTypeSum:
+		if dps := m.Sum().DataPoints(); dps.Len() > 0 {
+			return dps.At(0).Attributes(), dps.At(0).Exemplars()
+		}
+	case pmetric.MetricTypeHistogram:
+		if dps := m.Histogram().DataPoints(); dps.Len() > 0 {
+			return dps.At(0).Attributes(), dps.At(0).Exemplars()
+		}
+	case pmetric.MetricTypeExponentialHistogram:
+		if dps := m.ExponentialHistogram().DataPoints(); dps.Len() > 0 {
+			return dps.At(0).Attributes(), dps.At(0).Exemplars()
+		}
+	case pmetric.MetricTypeSummary:
+		if dps := m.Summary().DataPoints(); dps.Len() > 0 {
+			return dps.At(0).Attributes(), pmetric.NewExemplarSlice()
+		}
+	}
+	return pcommon.NewMap(), pmetric.NewExemplarSlice()
 }
 
 // SelectMetrics rebuilds a metrics payload containing only the data points at
