@@ -83,8 +83,12 @@ claude
 ```
 
 Prompt and tool content remain redacted unless `OTEL_LOG_USER_PROMPTS=1` or
-`OTEL_LOG_TOOL_DETAILS=1` is set. Claude’s event identity is stored as the
-`event.name` log attribute, not necessarily the `otel_logs.event_name` column.
+`OTEL_LOG_TOOL_DETAILS=1` is set. Claude’s event identity is the `event.name`
+log attribute (for example `api_request` for the `claude_code.api_request`
+cost event). The exporter copies it into `otel_logs.event_name` when a record
+has no OTLP event name. These events carry no `gen_ai.*` attribute, so
+`v_gen_ai_logs` does not select them: query cost from `otel_logs_dedup`, for
+example `WHERE event_name = 'api_request'`.
 
 Official reference: [Claude Code monitoring](https://code.claude.com/docs/en/monitoring-usage).
 

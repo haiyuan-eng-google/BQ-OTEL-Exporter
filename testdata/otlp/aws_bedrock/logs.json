@@ -1,0 +1,43 @@
+{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          {"key": "service.name", "value": {"stringValue": "bedrock-converse-worker"}},
+          {"key": "service.version", "value": {"stringValue": "0.65b0"}}
+        ]
+      },
+      "scopeLogs": [
+        {
+          "scope": {
+            "name": "opentelemetry.instrumentation.botocore.bedrock-runtime",
+            "version": "0.65b0"
+          },
+          "logRecords": [
+            {
+              "timeUnixNano": "1723420850200000000",
+              "observedTimeUnixNano": "1723420850210000000",
+              "severityNumber": 9,
+              "severityText": "INFO",
+              "eventName": "gen_ai.user.message",
+              "traceId": "660102030405060708090a0b0c0d0e06",
+              "spanId": "6601020304050601",
+              "body": {
+                "kvlistValue": {
+                  "values": [
+                    {"key": "role", "value": {"stringValue": "user"}},
+                    {"key": "content", "value": {"stringValue": "List active regions"}}
+                  ]
+                }
+              },
+              "attributes": [
+                {"key": "gen_ai.system", "value": {"stringValue": "aws.bedrock"}},
+                {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-bdrk-77"}}
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

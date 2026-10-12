@@ -755,8 +755,8 @@ func isTeardown(err error) bool {
 // extractRowErrors pulls per-row failures out of a response, translating
 // request-local indices into batch-local ones.
 func extractRowErrors(ctx context.Context, res appendResult, base int) []RowError {
-	resp, err := res.FullResponse(ctx)
-	if err != nil || resp == nil {
+	resp, _ := res.FullResponse(ctx)
+	if resp == nil {
 		return nil
 	}
 	var out []RowError

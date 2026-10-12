@@ -1,0 +1,42 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {"key": "service.name", "value": {"stringValue": "bedrock-converse-worker"}},
+          {"key": "service.version", "value": {"stringValue": "0.65b0"}}
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "opentelemetry.instrumentation.botocore.bedrock-runtime",
+            "version": "0.65b0"
+          },
+          "spans": [
+            {
+              "traceId": "660102030405060708090a0b0c0d0e06",
+              "spanId": "6601020304050601",
+              "name": "converse amazon.nova-pro-v1:0",
+              "kind": 3,
+              "startTimeUnixNano": "1723420850000000000",
+              "endTimeUnixNano": "1723420851100000000",
+              "attributes": [
+                {"key": "gen_ai.system", "value": {"stringValue": "aws.bedrock"}},
+                {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                {"key": "gen_ai.agent.name", "value": {"stringValue": "bedrock_router"}},
+                {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-bdrk-77"}},
+                {"key": "gen_ai.request.model", "value": {"stringValue": "amazon.nova-pro-v1:0"}},
+                {"key": "gen_ai.response.model", "value": {"stringValue": "amazon.nova-pro-v1:0"}},
+                {"key": "gen_ai.usage.input_tokens", "value": {"intValue": "350"}},
+                {"key": "gen_ai.usage.output_tokens", "value": {"intValue": "140"}},
+                {"key": "gen_ai.response.finish_reasons", "value": {"arrayValue": {"values": [{"stringValue": "end_turn"}]}}}
+              ],
+              "status": {"code": 1}
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

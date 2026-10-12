@@ -1,0 +1,42 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {"key": "service.name", "value": {"stringValue": "langgraph-research-graph"}},
+          {"key": "service.version", "value": {"stringValue": "1.2.0"}}
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "langsmith.otel",
+            "version": "0.10.18"
+          },
+          "spans": [
+            {
+              "traceId": "330102030405060708090a0b0c0d0e03",
+              "spanId": "3301020304050601",
+              "name": "LangGraph.workflow",
+              "kind": 1,
+              "startTimeUnixNano": "1723420820000000000",
+              "endTimeUnixNano": "1723420821800000000",
+              "attributes": [
+                {"key": "gen_ai.system", "value": {"stringValue": "langsmith"}},
+                {"key": "gen_ai.operation.name", "value": {"stringValue": "invoke_agent"}},
+                {"key": "gen_ai.agent.name", "value": {"stringValue": "research_supervisor"}},
+                {"key": "gen_ai.conversation.id", "value": {"stringValue": "thread-lg-404"}},
+                {"key": "gen_ai.request.model", "value": {"stringValue": "gpt-4o"}},
+                {"key": "gen_ai.usage.input_tokens", "value": {"intValue": "840"}},
+                {"key": "gen_ai.usage.output_tokens", "value": {"intValue": "310"}},
+                {"key": "langsmith.metadata.graph_node", "value": {"stringValue": "planner"}},
+                {"key": "langsmith.span.kind", "value": {"stringValue": "chain"}}
+              ],
+              "status": {"code": 1}
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

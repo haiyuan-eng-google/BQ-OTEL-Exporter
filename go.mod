@@ -7,6 +7,7 @@ require (
 	github.com/googleapis/gax-go/v2 v2.23.0
 	go.opentelemetry.io/collector/component v1.64.0
 	go.opentelemetry.io/collector/component/componentstatus v0.158.0
+	go.opentelemetry.io/collector/component/componenttest v0.158.0
 	go.opentelemetry.io/collector/config/configopaque v1.64.0
 	go.opentelemetry.io/collector/config/configoptional v1.64.0
 	go.opentelemetry.io/collector/config/configretry v1.64.0
@@ -67,7 +68,6 @@ require (
 	go.opencensus.io v0.24.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/collector/client v1.64.0 // indirect
-	go.opentelemetry.io/collector/component/componenttest v0.158.0 // indirect
 	go.opentelemetry.io/collector/confmap v1.64.0 // indirect
 	go.opentelemetry.io/collector/consumer v1.64.0 // indirect
 	go.opentelemetry.io/collector/consumer/consumertest v0.158.0 // indirect
