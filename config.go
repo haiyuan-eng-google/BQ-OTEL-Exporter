@@ -312,6 +312,9 @@ type OffloadConfig struct {
 	MaxObjectBytes int `mapstructure:"max_object_bytes"`
 	// MaxConcurrency bounds concurrent GCS uploads within an offload batch.
 	MaxConcurrency int `mapstructure:"max_concurrency"`
+	// CacheSize bounds the in-memory LRU cache of content-addressed object
+	// generations across batches (0 disables cross-batch caching).
+	CacheSize int `mapstructure:"cache_size"`
 	// Timeout bounds each object upload attempt.
 	Timeout time.Duration `mapstructure:"timeout"`
 }
@@ -711,6 +714,9 @@ func (cfg *Config) validateOffload() []error {
 	}
 	if o.MaxObjectBytes < 0 {
 		errs = append(errs, errors.New("offload.max_object_bytes must not be negative"))
+	}
+	if o.CacheSize < 0 {
+		errs = append(errs, errors.New("offload.cache_size must not be negative"))
 	}
 	if o.Timeout < 0 {
 		errs = append(errs, errors.New("offload.timeout must not be negative"))

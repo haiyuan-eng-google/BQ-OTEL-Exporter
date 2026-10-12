@@ -30,7 +30,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	var (
 		inputPath  = fs.String("input", "-", "Path to quarantine JSONL or JSON array file ('-' for stdin)")
 		outputPath = fs.String("output", "-", "Path to write replayed OTLP JSONL ('-' for stdout)")
-		signal     = fs.String("signal", "", "Optional signal filter ('spans' or 'logs')")
+		signal     = fs.String("signal", "", "Optional comma-separated signal filter ('spans', 'logs', 'metrics')")
 		errorCodes = fs.String("error-code", "", "Optional comma-separated error_code filter (for example, 'OVERSIZE_ROW,ROW_ERROR')")
 		sinceStr   = fs.String("since", "", "Optional inclusive lower bound on ingest_time (RFC3339)")
 		untilStr   = fs.String("until", "", "Optional inclusive upper bound on ingest_time (RFC3339)")
@@ -42,6 +42,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 2
 	}
 
+	if strings.TrimSpace(*signal) != "" {
+		if _, err := quarantinereplay.ParseSignals(*signal); err != nil {
+			_, _ = fmt.Fprintf(stderr, "invalid -signal %q: %v\n", *signal, err)
+			return 2
+		}
+	}
 	filter := quarantinereplay.Filter{
 		Signal: strings.TrimSpace(*signal),
 	}
@@ -80,7 +86,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		in = f
 	}
 
-	var sink quarantinereplay.Sink
+	var (
+		sink    quarantinereplay.Sink
+		outFile *os.File
+	)
 	if *dryRun {
 		sink = quarantinereplay.NewNopSink()
 	} else {
@@ -91,7 +100,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 				_, _ = fmt.Fprintf(stderr, "creating output %q: %v\n", *outputPath, err)
 				return 1
 			}
-			defer func() { _ = f.Close() }()
+			outFile = f
 			out = f
 		}
 		sink = quarantinereplay.NewJSONWriterSink(out)
@@ -102,6 +111,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if *fetchGCS {
 		fetcher, cleanup, err := quarantinereplay.NewGCSObjectFetcher(ctx)
 		if err != nil {
+			if outFile != nil {
+				_ = outFile.Close()
+			}
 			_, _ = fmt.Fprintf(stderr, "initializing GCS object fetcher: %v\n", err)
 			return 1
 		}
@@ -110,10 +122,16 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 
 	sum, err := quarantinereplay.Replay(ctx, in, sink, opts)
+	if outFile != nil {
+		if cerr := outFile.Close(); cerr != nil && err == nil {
+			_, _ = fmt.Fprintf(stderr, "closing output %q: %v\n", *outputPath, cerr)
+			return 1
+		}
+	}
 	_, _ = fmt.Fprintf(
 		stderr,
-		"quarantine replay summary: total_read=%d matched=%d replayed_spans=%d replayed_logs=%d skipped_filtered=%d skipped_no_payload=%d failed_unmarshal=%d failed_export=%d\n",
-		sum.TotalRead, sum.Matched, sum.ReplayedSpans, sum.ReplayedLogs,
+		"quarantine replay summary: total_read=%d matched=%d replayed_spans=%d replayed_logs=%d replayed_metrics=%d skipped_filtered=%d skipped_no_payload=%d failed_unmarshal=%d failed_export=%d\n",
+		sum.TotalRead, sum.Matched, sum.ReplayedSpans, sum.ReplayedLogs, sum.ReplayedMetrics,
 		sum.SkippedFiltered, sum.SkippedNoPayload, sum.FailedUnmarshal, sum.FailedExport,
 	)
 	if err != nil {

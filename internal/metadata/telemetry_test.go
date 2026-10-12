@@ -47,6 +47,8 @@ func TestTelemetryRecordsEveryInstrument(t *testing.T) {
 	tel.RecordAppendBytes(ctx, 4096)
 	tel.RecordOffloadedPayloads(ctx, 2)
 	tel.RecordOffloadedBytes(ctx, 8192)
+	tel.RecordOffloadDedupHit(ctx, "spans", 3)
+	tel.RecordOffloadDedupHit(ctx, "spans", 0) // ignored
 	tel.RecordOffloadError(ctx, "unavailable", 1)
 	tel.RecordRedactedValues(ctx, "spans", "key", 4)
 	tel.RecordRedactedValues(ctx, "spans", "value", 2)
@@ -57,8 +59,8 @@ func TestTelemetryRecordsEveryInstrument(t *testing.T) {
 		t.Fatal(err)
 	}
 	metrics := metricsByName(resourceMetrics)
-	if len(metrics) != 16 {
-		t.Fatalf("collected %d metrics, want 16: %v", len(metrics), metricNames(metrics))
+	if len(metrics) != 17 {
+		t.Fatalf("collected %d metrics, want 17: %v", len(metrics), metricNames(metrics))
 	}
 
 	assertIntSum(t, metrics[nameAcknowledgedRows], 5, nil)
@@ -74,6 +76,7 @@ func TestTelemetryRecordsEveryInstrument(t *testing.T) {
 	assertIntSum(t, metrics[nameAppendBytes], 4096, nil)
 	assertIntSum(t, metrics[nameOffloadedPayloads], 2, nil)
 	assertIntSum(t, metrics[nameOffloadedBytes], 8192, nil)
+	assertIntSum(t, metrics[nameOffloadDedupHits], 3, []attribute.KeyValue{attribute.String(AttrSignal, "spans")})
 	assertIntSum(t, metrics[nameOffloadErrors], 1, []attribute.KeyValue{attribute.String(AttrClass, "unavailable")})
 	redacted, ok := metrics[nameRedactedValues].Data.(metricdata.Sum[int64])
 	if !ok || len(redacted.DataPoints) != 2 || !redacted.IsMonotonic {
@@ -132,6 +135,7 @@ func TestNilTelemetryIsSafe(_ *testing.T) {
 	tel.RecordAppendBytes(ctx, 1)
 	tel.RecordOffloadedPayloads(ctx, 1)
 	tel.RecordOffloadedBytes(ctx, 1)
+	tel.RecordOffloadDedupHit(ctx, "spans", 1)
 	tel.RecordOffloadError(ctx, "y", 1)
 	tel.RecordRedactedValues(ctx, "spans", "key", 1)
 }
@@ -161,6 +165,7 @@ func TestMetricNamesMatchMetadataYAML(t *testing.T) {
 		nameAppendBytes,
 		nameOffloadedPayloads,
 		nameOffloadedBytes,
+		nameOffloadDedupHits,
 		nameOffloadErrors,
 		nameRedactedValues,
 	} {

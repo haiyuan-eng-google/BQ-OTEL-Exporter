@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,6 +21,8 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"google.golang.org/api/option"
+
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
 )
 
 var fixedOffloadTime = time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
@@ -297,5 +301,226 @@ func TestGCSBlobStoreUploadAndPreconditionPreservesGeneration(t *testing.T) {
 	// Size mismatch on existing object returns error.
 	if _, err := store.WriteObject(context.Background(), "test-bucket", "otel-offload/spans/2026-10-11/abc", "text/plain", []byte("different-length")); err == nil {
 		t.Error("expected error when existing object size does not match upload size")
+	}
+}
+
+type countingStore struct {
+	mu      sync.Mutex
+	calls   int
+	objects map[string]string
+	seq     int
+	writeFn func(ctx context.Context, bucket, object, contentType string, data []byte) (string, error)
+}
+
+func (s *countingStore) WriteObject(ctx context.Context, bucket, object, contentType string, data []byte) (string, error) {
+	if s.writeFn != nil {
+		return s.writeFn(ctx, bucket, object, contentType, data)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	if s.objects == nil {
+		s.objects = make(map[string]string)
+	}
+	key := bucket + "/" + object
+	if ver, ok := s.objects[key]; ok {
+		return ver, nil
+	}
+	s.seq++
+	ver := "gen-" + string(rune('0'+s.seq))
+	s.objects[key] = ver
+	return ver, nil
+}
+
+func TestOffloadIntraBatchAndCrossBatchDedupMetricsAndLRU(t *testing.T) {
+	store := &countingStore{}
+	var offloadPayloads atomic.Int64
+	var offloadBytes atomic.Int64
+	var dedupHits atomic.Int64
+
+	off, err := New(store, Options{
+		Bucket:         "dedup-bucket",
+		MinBytes:       16,
+		MaxObjectBytes: 8192,
+		CacheSize:      2,
+		Now:            func() time.Time { return fixedOffloadTime },
+		OnOffload: func(payloads int, bytes int64, errClass string) {
+			if errClass == "" {
+				offloadPayloads.Add(int64(payloads))
+				offloadBytes.Add(bytes)
+			}
+		},
+		OnDedupHit: func() {
+			dedupHits.Add(1)
+		},
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	payloadA := strings.Repeat("A", 1024)
+	batchCtx := transform.WithBatchUploadCache(context.Background())
+	for range 3 {
+		sp := ptrace.NewSpan()
+		sp.Attributes().PutStr("prompt", payloadA)
+		refs, err := off.OffloadSpan(batchCtx, sp, pcommon.NewResource(), pcommon.NewInstrumentationScope())
+		if err != nil || len(refs) != 1 {
+			t.Fatalf("OffloadSpan() = (%d, %v), want 1 ref", len(refs), err)
+		}
+	}
+
+	if store.calls != 1 {
+		t.Fatalf("intra-batch WriteObject calls = %d, want 1", store.calls)
+	}
+	if got := offloadPayloads.Load(); got != 1 {
+		t.Fatalf("intra-batch OnOffload payloads = %d, want 1", got)
+	}
+	if got := offloadBytes.Load(); got != 1024 {
+		t.Fatalf("intra-batch OnOffload bytes = %d, want 1024", got)
+	}
+	if got := dedupHits.Load(); got != 2 {
+		t.Fatalf("intra-batch OnDedupHit = %d, want 2", got)
+	}
+
+	// Cross-batch cache hit with a fresh context.
+	sp2 := ptrace.NewSpan()
+	sp2.Attributes().PutStr("prompt", payloadA)
+	if _, err := off.OffloadSpan(context.Background(), sp2, pcommon.NewResource(), pcommon.NewInstrumentationScope()); err != nil {
+		t.Fatalf("cross-batch OffloadSpan() error = %v", err)
+	}
+	if store.calls != 1 {
+		t.Fatalf("cross-batch WriteObject calls = %d, want 1 (served from LRU cache)", store.calls)
+	}
+	if got := offloadPayloads.Load(); got != 1 {
+		t.Fatalf("cross-batch OnOffload payloads = %d, want 1", got)
+	}
+	if got := dedupHits.Load(); got != 3 {
+		t.Fatalf("cross-batch OnDedupHit = %d, want 3", got)
+	}
+
+	// LRU eviction when CacheSize (2) is exceeded: insert B and C, evicting A.
+	for _, ch := range []string{"B", "C"} {
+		sp := ptrace.NewSpan()
+		sp.Attributes().PutStr("prompt", strings.Repeat(ch, 1024))
+		if _, err := off.OffloadSpan(context.Background(), sp, pcommon.NewResource(), pcommon.NewInstrumentationScope()); err != nil {
+			t.Fatalf("OffloadSpan(%s) error = %v", ch, err)
+		}
+	}
+	if store.calls != 3 {
+		t.Fatalf("after inserting B and C, WriteObject calls = %d, want 3", store.calls)
+	}
+
+	// B is still cached; A was evicted and must re-upload.
+	spB := ptrace.NewSpan()
+	spB.Attributes().PutStr("prompt", strings.Repeat("B", 1024))
+	if _, err := off.OffloadSpan(context.Background(), spB, pcommon.NewResource(), pcommon.NewInstrumentationScope()); err != nil {
+		t.Fatalf("OffloadSpan(B again) error = %v", err)
+	}
+	if store.calls != 3 {
+		t.Fatalf("WriteObject calls after cached B = %d, want 3", store.calls)
+	}
+
+	spA := ptrace.NewSpan()
+	spA.Attributes().PutStr("prompt", payloadA)
+	if _, err := off.OffloadSpan(context.Background(), spA, pcommon.NewResource(), pcommon.NewInstrumentationScope()); err != nil {
+		t.Fatalf("OffloadSpan(evicted A) error = %v", err)
+	}
+	if store.calls != 4 {
+		t.Fatalf("WriteObject calls after evicted A = %d, want 4", store.calls)
+	}
+}
+
+func TestBatchUploadCacheWaiterCancellationDoesNotFailFollowers(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	store := &countingStore{
+		writeFn: func(ctx context.Context, _, _, _ string, _ []byte) (string, error) {
+			close(started)
+			select {
+			case <-release:
+				return "gen-shared", nil
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		},
+	}
+
+	off, err := New(store, Options{
+		Bucket:         "shared-bucket",
+		MinBytes:       16,
+		MaxObjectBytes: 8192,
+		Now:            func() time.Time { return fixedOffloadTime },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sharedCtx := transform.WithBatchUploadCache(context.Background())
+	waiter1Ctx, cancel1 := context.WithCancel(sharedCtx)
+	defer cancel1()
+	waiter2Ctx := sharedCtx
+
+	payload := strings.Repeat("Z", 128)
+	errCh1 := make(chan error, 1)
+	go func() {
+		sp := ptrace.NewSpan()
+		sp.Attributes().PutStr("k", payload)
+		_, err := off.OffloadSpan(waiter1Ctx, sp, pcommon.NewResource(), pcommon.NewInstrumentationScope())
+		errCh1 <- err
+	}()
+
+	<-started
+
+	errCh2 := make(chan error, 1)
+	go func() {
+		sp := ptrace.NewSpan()
+		sp.Attributes().PutStr("k", payload)
+		_, err := off.OffloadSpan(waiter2Ctx, sp, pcommon.NewResource(), pcommon.NewInstrumentationScope())
+		errCh2 <- err
+	}()
+
+	// Give waiter2 a moment to register on the shared BatchUploadCache entry,
+	// then cancel waiter1 while the upload is still in flight.
+	time.Sleep(10 * time.Millisecond)
+	cancel1()
+
+	if err1 := <-errCh1; !errors.Is(err1, context.Canceled) {
+		t.Fatalf("waiter1 error = %v, want context.Canceled", err1)
+	}
+
+	close(release)
+	if err2 := <-errCh2; err2 != nil {
+		t.Fatalf("waiter2 error = %v, want nil (detached leader context must finish)", err2)
+	}
+}
+
+func TestGCSHTTPErrorAndClassifyOffloadError(t *testing.T) {
+	cases := []struct {
+		err      error
+		wantCode string
+		wantPerm bool
+	}{
+		{&GCSHTTPError{StatusCode: http.StatusBadRequest, Status: "400 Bad Request"}, "http_400", true},
+		{&GCSHTTPError{StatusCode: http.StatusUnauthorized, Status: "401 Unauthorized"}, "http_401", true},
+		{&GCSHTTPError{StatusCode: http.StatusForbidden, Status: "403 Forbidden", Body: "access denied"}, "http_403", true},
+		{&GCSHTTPError{StatusCode: http.StatusNotFound, Status: "404 Not Found"}, "http_404", true},
+		{&GCSHTTPError{StatusCode: http.StatusRequestTimeout, Status: "408 Request Timeout"}, "http_408", false},
+		{&GCSHTTPError{StatusCode: http.StatusTooManyRequests, Status: "429 Too Many Requests"}, "http_429", false},
+		{&GCSHTTPError{StatusCode: http.StatusUnprocessableEntity, Status: "422 Unprocessable"}, "http_4xx", true},
+		{&GCSHTTPError{StatusCode: http.StatusServiceUnavailable, Status: "503 Service Unavailable"}, "http_5xx", false},
+		{context.Canceled, "request_canceled", false},
+		{context.DeadlineExceeded, "request_canceled", false},
+		{errors.New("socket reset"), "unknown", false},
+	}
+
+	for _, tc := range cases {
+		gotCode, gotPerm := ClassifyOffloadError(tc.err)
+		if gotCode != tc.wantCode || gotPerm != tc.wantPerm {
+			t.Errorf("ClassifyOffloadError(%v) = (%q, %v), want (%q, %v)",
+				tc.err, gotCode, gotPerm, tc.wantCode, tc.wantPerm)
+		}
+		if IsPermanentOffloadError(tc.err) != tc.wantPerm {
+			t.Errorf("IsPermanentOffloadError(%v) = %v, want %v", tc.err, !tc.wantPerm, tc.wantPerm)
+		}
 	}
 }

@@ -4,6 +4,7 @@
 package transform
 
 import (
+	"context"
 	"math"
 	"strings"
 	"testing"
@@ -545,5 +546,58 @@ func TestMetricPointFingerprintsIncludeDistributionsAndExemplars(t *testing.T) {
 	})
 	if exBase == exChanged {
 		t.Errorf("gauge point_fingerprint did not change when exemplars changed: %q", exBase)
+	}
+}
+
+func TestMetricQuarantineRowsCancelledContextShortCircuits(t *testing.T) {
+	const totalPoints = 10_000
+	md := pmetric.NewMetrics()
+	rm := md.ResourceMetrics().AppendEmpty()
+	sm := rm.ScopeMetrics().AppendEmpty()
+	m := sm.Metrics().AppendEmpty()
+	m.SetName("cpu.utilization")
+	dps := m.SetEmptyGauge().DataPoints()
+
+	entries := make([]QuarantineEntry, totalPoints)
+	for i := range totalPoints {
+		dp := dps.AppendEmpty()
+		dp.SetTimestamp(pcommon.Timestamp(1760000000000000000 + int64(i)))
+		dp.SetDoubleValue(float64(i))
+		entries[i] = QuarantineEntry{
+			Rejection: Rejection{Index: i, Reason: ReasonAttributeCount},
+		}
+	}
+
+	// Verify visitMetricPoints stops immediately when the visitor returns false.
+	visited := 0
+	cont := visitMetricPoints(m, func(_ int, _ metricPointRef) bool {
+		visited++
+		return false
+	})
+	if cont || visited != 1 {
+		t.Fatalf("visitMetricPoints cont=%v visited=%d, want false and 1", cont, visited)
+	}
+
+	// Verify MetricQuarantineRows short-circuits remaining points once ctx is cancelled after point 1.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	offloadCalls := 0
+	rows := MetricQuarantineRows(md, entries, Options{
+		Context:                   ctx,
+		Limits:                    DefaultLimits(),
+		MaxQuarantinePayloadBytes: 8 * 1024 * 1024,
+		QuarantinePayloadOffloader: func(_ context.Context, _ string, _ []byte) ObjectRef {
+			offloadCalls++
+			cancel()
+			return ObjectRef{URI: "gs://b/k"}
+		},
+	})
+	if offloadCalls != 1 {
+		t.Fatalf("QuarantinePayloadOffloader called %d times, want 1 (must short-circuit remaining %d points)",
+			offloadCalls, totalPoints-1)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("len(rows) = %d, want 1", len(rows))
 	}
 }

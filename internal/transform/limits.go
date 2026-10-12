@@ -91,6 +91,7 @@ const (
 	ReasonRowBytes         Reason = "row_bytes"
 	ReasonRowError         Reason = "row_error"
 	ReasonRequestPermanent Reason = "request_permanent"
+	ReasonOffloadPermanent Reason = "offload_permanent"
 
 	// Contract violations. A record that cannot fill a NOT NULL column, or
 	// whose value does not fit the column type, has no valid row at all.

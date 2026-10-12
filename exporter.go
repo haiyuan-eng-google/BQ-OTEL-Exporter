@@ -130,6 +130,7 @@ func newSignalExporter(
 			MaxQuarantinePayloadBytes: cfg.Quarantine.MaxRawPayloadBytes,
 		},
 	}
+	signal := signalForSchema(tableSchema)
 	if cfg.Offload.Enabled {
 		off, err := offload.New(nil, offload.Options{
 			Bucket:         cfg.Offload.Bucket,
@@ -138,6 +139,7 @@ func newSignalExporter(
 			MinBytes:       cfg.Offload.MinBytes,
 			MaxObjectBytes: cfg.Offload.MaxObjectBytes,
 			MaxConcurrency: cfg.Offload.MaxConcurrency,
+			CacheSize:      cfg.Offload.CacheSize,
 			Timeout:        cfg.Offload.Timeout,
 			OnOffload: func(payloads int, bytes int64, errClass string) {
 				if se.tel == nil {
@@ -152,6 +154,12 @@ func newSignalExporter(
 					se.tel.RecordOffloadError(ctx, errClass, 1)
 				}
 			},
+			OnDedupHit: func() {
+				if se.tel == nil {
+					return
+				}
+				se.tel.RecordOffloadDedupHit(context.Background(), signal, 1)
+			},
 		})
 		if err == nil {
 			se.offloader = off
@@ -160,7 +168,6 @@ func newSignalExporter(
 		}
 	}
 	if cfg.Redaction.Enabled {
-		signal := signalForSchema(tableSchema)
 		rd, err := redact.New(cfg.Redaction.toRedact(func(matchType string, n int) {
 			if se.tel == nil {
 				return
@@ -826,33 +833,69 @@ func rowErrorDetail(re bqi.RowError) string {
 	return re.Code + ": " + re.Message
 }
 
-// mergeOutcomeWithOffloadFailures merges records whose payload offload failed
-// into the retryable subset so they are returned to exporterhelper for retry
-// rather than rejected or dropped.
+type offloadFailure struct {
+	index int
+	err   error
+}
+
+// mergeOutcomeWithOffloadFailures partitions records whose payload offload
+// failed into permanent failures (routed to quarantine/rejected_rows) and
+// retryable failures (returned to exporterhelper for retry).
 func (e *signalExporter) mergeOutcomeWithOffloadFailures(
-	decision appendDecision, offloadFailedIndices []int, offloadErr error, opID string,
-) appendDecision {
-	if len(offloadFailedIndices) == 0 {
-		return decision
+	ctx context.Context, decision appendDecision, failures []offloadFailure, opID string,
+) (appendDecision, []int) {
+	if len(failures) == 0 {
+		return decision, nil
 	}
-	e.logger.Warn("payload offload failed; returning affected records for retry",
-		append(diag.Fields(e.tableID(), opID), zap.Int("records", len(offloadFailedIndices)))...)
-	if decision.permanent {
-		return appendDecision{
-			retryableIndices: slices.Clone(offloadFailedIndices),
-			err:              errors.Join(offloadErr, decision.err),
-			rowErrors:        decision.rowErrors,
+
+	var retryableIndices []int
+	var retryableErr error
+	for _, f := range failures {
+		if offload.IsPermanentOffloadError(f.err) {
+			errCode, _ := offload.ClassifyOffloadError(f.err)
+			e.tel.RecordRejected(ctx, string(transform.ReasonOffloadPermanent), 1)
+			e.logger.Warn("dropping record due to permanent payload offload error",
+				append(diag.Fields(e.tableID(), opID),
+					zap.Int("index", f.index),
+					zap.String("error_code", errCode),
+					zap.Error(f.err),
+				)...)
+			decision.rowErrors = append(decision.rowErrors, transform.QuarantineEntry{
+				Rejection: transform.Rejection{Index: f.index, Reason: transform.ReasonOffloadPermanent},
+				Detail:    errCode + ": " + f.err.Error(),
+			})
+			continue
+		}
+		retryableIndices = append(retryableIndices, f.index)
+		if retryableErr == nil {
+			retryableErr = f.err
 		}
 	}
-	combinedErr := offloadErr
+
+	if len(retryableIndices) == 0 {
+		return decision, nil
+	}
+	slices.Sort(retryableIndices)
+	retryableIndices = slices.Compact(retryableIndices)
+
+	e.logger.Warn("payload offload failed; returning affected records for retry",
+		append(diag.Fields(e.tableID(), opID), zap.Int("records", len(retryableIndices)))...)
+	if decision.permanent {
+		return appendDecision{
+			retryableIndices: slices.Clone(retryableIndices),
+			err:              errors.Join(retryableErr, decision.err),
+			rowErrors:        decision.rowErrors,
+		}, retryableIndices
+	}
+	combinedErr := retryableErr
 	if decision.err != nil {
-		combinedErr = errors.Join(decision.err, offloadErr)
+		combinedErr = errors.Join(decision.err, retryableErr)
 	}
 	return appendDecision{
-		retryableIndices: mergeSortedIndices(decision.retryableIndices, offloadFailedIndices),
+		retryableIndices: mergeSortedIndices(decision.retryableIndices, retryableIndices),
 		err:              combinedErr,
 		rowErrors:        decision.rowErrors,
-	}
+	}, retryableIndices
 }
 
 // quarantineEntries lists every record a push drops permanently, indexed by
@@ -915,6 +958,8 @@ func quarantineRowReason(row transform.Row) string {
 		return string(transform.ReasonRowError)
 	case "REQUEST_PERMANENT":
 		return string(transform.ReasonRequestPermanent)
+	case "OFFLOAD_PERMANENT":
+		return string(transform.ReasonOffloadPermanent)
 	case "TIMESTAMP_OVERFLOW":
 		return string(transform.ReasonTimestampOverflow)
 	default:

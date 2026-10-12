@@ -66,6 +66,7 @@ type Telemetry struct {
 	AppendBytes           metric.Int64Counter
 	OffloadedPayloads     metric.Int64Counter
 	OffloadedBytes        metric.Int64Counter
+	OffloadDedupHits      metric.Int64Counter
 	OffloadErrors         metric.Int64Counter
 
 	// RedactedValues counts attribute keys and string values masked by the
@@ -91,6 +92,7 @@ const (
 	nameAppendBytes           = "otelcol_exporter_bigquery_append_bytes"
 	nameOffloadedPayloads     = "otelcol_exporter_bigquery_offloaded_payloads"
 	nameOffloadedBytes        = "otelcol_exporter_bigquery_offloaded_bytes"
+	nameOffloadDedupHits      = "otelcol_exporter_bigquery_offload_dedup_hits"
 	nameOffloadErrors         = "otelcol_exporter_bigquery_offload_errors"
 	nameRedactedValues        = "otelcol_exporter_bigquery_redacted_values"
 )
@@ -179,6 +181,11 @@ func NewTelemetry(mp metric.MeterProvider) (*Telemetry, error) {
 		metric.WithDescription("Payload bytes offloaded to external object storage."),
 		metric.WithUnit("By")); err != nil {
 		return nil, fmt.Errorf("creating %s: %w", nameOffloadedBytes, err)
+	}
+	if t.OffloadDedupHits, err = m.Int64Counter(nameOffloadDedupHits,
+		metric.WithDescription("Payload offload requests satisfied from the intra-batch coalescing cache or cross-batch generation LRU cache without a GCS upload, by signal."),
+		metric.WithUnit("{hit}")); err != nil {
+		return nil, fmt.Errorf("creating %s: %w", nameOffloadDedupHits, err)
 	}
 	if t.OffloadErrors, err = m.Int64Counter(nameOffloadErrors,
 		metric.WithDescription("Payload offload attempts to external object storage that failed, by error class."),
@@ -310,6 +317,15 @@ func (t *Telemetry) RecordOffloadedBytes(ctx context.Context, n int64) {
 		return
 	}
 	t.OffloadedBytes.Add(ctx, n)
+}
+
+// RecordOffloadDedupHit records payload offload requests satisfied from the
+// intra-batch or cross-batch generation cache without a GCS upload.
+func (t *Telemetry) RecordOffloadDedupHit(ctx context.Context, signal string, n int) {
+	if t == nil || n <= 0 {
+		return
+	}
+	t.OffloadDedupHits.Add(ctx, int64(n), metric.WithAttributes(attribute.String(AttrSignal, signal)))
 }
 
 // RecordOffloadError records a payload offload failure under a bounded error class.

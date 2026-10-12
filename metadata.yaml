@@ -79,6 +79,19 @@ telemetry:
         value_type: int
         monotonic: false
 
+    otelcol_exporter_bigquery_offload_dedup_hits:
+      enabled: true
+      stability: development
+      description: >-
+        Payload offload requests satisfied from the intra-batch coalescing
+        cache or cross-batch generation LRU cache without a GCS upload, by
+        signal.
+      unit: "{hit}"
+      sum:
+        value_type: int
+        monotonic: true
+      attributes: [signal]
+
     otelcol_exporter_bigquery_offload_errors:
       enabled: true
       stability: development
@@ -233,6 +246,14 @@ attributes:
       - connection
       - request_canceled
       - shutdown_timeout
+      - http_400
+      - http_401
+      - http_403
+      - http_404
+      - http_408
+      - http_429
+      - http_4xx
+      - http_5xx
       - unknown
 
   match_type:
@@ -259,6 +280,7 @@ attributes:
       - collection_size
       - value_size
       - serialization
+      - offload_permanent
       - request_permanent
       - row_bytes
       - row_error

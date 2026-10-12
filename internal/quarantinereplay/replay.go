@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"google.golang.org/api/option"
 	htransport "google.golang.org/api/transport/http"
@@ -34,7 +35,49 @@ import (
 const (
 	defaultGCSEndpoint = "https://storage.googleapis.com"
 	gcsReadOnlyScope   = "https://www.googleapis.com/auth/devstorage.read_only"
+	maxJSONLLineBytes  = 64 * 1024 * 1024
 )
+
+// CanonicalSignal normalizes a signal alias ("spans", "traces", "otel_spans",
+// "logs", "otel_logs", "metrics", "otel_metrics") to its canonical
+// otel_quarantine signal name ("spans", "logs", or "metrics"), or returns ""
+// if unrecognized.
+func CanonicalSignal(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case schema.SignalSpans, "traces", "otel_spans":
+		return schema.SignalSpans
+	case schema.SignalLogs, "otel_logs":
+		return schema.SignalLogs
+	case schema.SignalMetrics, "otel_metrics":
+		return schema.SignalMetrics
+	default:
+		return ""
+	}
+}
+
+// ParseSignals parses a comma-separated signal filter string into canonical
+// signal names ("spans", "logs", "metrics"), returning an error if any token
+// is unrecognized.
+func ParseSignals(raw string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		token := strings.TrimSpace(part)
+		if token == "" {
+			continue
+		}
+		canon := CanonicalSignal(token)
+		if canon == "" {
+			return nil, fmt.Errorf("unknown signal %q (valid: spans, traces, logs, metrics)", token)
+		}
+		if !slices.Contains(out, canon) {
+			out = append(out, canon)
+		}
+	}
+	return out, nil
+}
 
 // ObjectRef mirrors the BigQuery ObjectRef STRUCT stored in payload_ref.
 type ObjectRef struct {
@@ -122,7 +165,8 @@ func floatToTime(v float64) time.Time {
 
 // Filter selects which quarantine records should be replayed.
 type Filter struct {
-	// Signal restricts replay to "spans" or "logs" when non-empty.
+	// Signal restricts replay to one or more comma-separated signals ("spans",
+	// "logs", "metrics", or aliases such as "traces") when non-empty.
 	Signal string
 	// ErrorCodes restricts replay to records whose error_code is in the list
 	// when non-empty.
@@ -133,10 +177,24 @@ type Filter struct {
 	Until time.Time
 }
 
-// Matches reports whether rec satisfies f.
-func (f Filter) Matches(rec Record) bool {
-	if f.Signal != "" && !strings.EqualFold(rec.Signal, f.Signal) {
-		return false
+func (f Filter) matchesSignalAndErrorCode(rec Record) bool {
+	if strings.TrimSpace(f.Signal) != "" {
+		recCanon := CanonicalSignal(rec.Signal)
+		matchedSignal := false
+		for _, part := range strings.Split(f.Signal, ",") {
+			token := strings.TrimSpace(part)
+			if token == "" {
+				continue
+			}
+			tokCanon := CanonicalSignal(token)
+			if (tokCanon != "" && tokCanon == recCanon) || strings.EqualFold(token, rec.Signal) {
+				matchedSignal = true
+				break
+			}
+		}
+		if !matchedSignal {
+			return false
+		}
 	}
 	if len(f.ErrorCodes) > 0 {
 		matched := slices.ContainsFunc(f.ErrorCodes, func(code string) bool {
@@ -145,6 +203,14 @@ func (f Filter) Matches(rec Record) bool {
 		if !matched {
 			return false
 		}
+	}
+	return true
+}
+
+// Matches reports whether rec satisfies f.
+func (f Filter) Matches(rec Record) bool {
+	if !f.matchesSignalAndErrorCode(rec) {
+		return false
 	}
 	if !f.Since.IsZero() || !f.Until.IsZero() {
 		ts, ok := rec.ParsedIngestTime()
@@ -161,10 +227,11 @@ func (f Filter) Matches(rec Record) bool {
 	return true
 }
 
-// Sink receives reconstructed OTLP traces and logs batches.
+// Sink receives reconstructed OTLP traces, logs, and metrics batches.
 type Sink interface {
 	ExportTraces(ctx context.Context, td ptrace.Traces) error
 	ExportLogs(ctx context.Context, ld plog.Logs) error
+	ExportMetrics(ctx context.Context, md pmetric.Metrics) error
 }
 
 // ObjectFetcher resolves an offloaded payload URI (for example,
@@ -183,6 +250,7 @@ type Summary struct {
 	Matched          int
 	ReplayedSpans    int
 	ReplayedLogs     int
+	ReplayedMetrics  int
 	SkippedFiltered  int
 	SkippedNoPayload int
 	FailedUnmarshal  int
@@ -190,30 +258,37 @@ type Summary struct {
 }
 
 // Replay reads quarantine records from r (either JSONL/NDJSON or a JSON array),
-// filters them according to opts.Filter, reconstructs ptrace.Traces or
-// plog.Logs, and forwards each record to sink.
+// filters them according to opts.Filter, reconstructs ptrace.Traces,
+// plog.Logs, or pmetric.Metrics, and forwards each record to sink.
 func Replay(ctx context.Context, r io.Reader, sink Sink, opts Options) (Summary, error) {
 	if sink == nil {
 		return Summary{}, errors.New("sink must not be nil")
-	}
-	records, err := ReadRecords(r)
-	if err != nil {
-		return Summary{}, err
 	}
 
 	var sum Summary
 	var errs []error
 	traceUnmarshaler := &ptrace.JSONUnmarshaler{}
 	logUnmarshaler := &plog.JSONUnmarshaler{}
+	metricUnmarshaler := &pmetric.JSONUnmarshaler{}
 
-	for i, rec := range records {
-		if err := ctx.Err(); err != nil {
-			return sum, err
-		}
+	processRecord := func(i int, rec Record) {
 		sum.TotalRead++
-		if !opts.Filter.Matches(rec) {
+		if !opts.Filter.matchesSignalAndErrorCode(rec) {
 			sum.SkippedFiltered++
-			continue
+			return
+		}
+		if !opts.Filter.Since.IsZero() || !opts.Filter.Until.IsZero() {
+			ts, ok := rec.ParsedIngestTime()
+			if !ok {
+				sum.FailedUnmarshal++
+				errs = append(errs, fmt.Errorf("record %d: unparseable ingest_time %v", i, rec.IngestTime))
+				return
+			}
+			if (!opts.Filter.Since.IsZero() && ts.Before(opts.Filter.Since)) ||
+				(!opts.Filter.Until.IsZero() && ts.After(opts.Filter.Until)) {
+				sum.SkippedFiltered++
+				return
+			}
 		}
 		sum.Matched++
 
@@ -221,25 +296,25 @@ func Replay(ctx context.Context, r io.Reader, sink Sink, opts Options) (Summary,
 		if fetchErr != nil {
 			sum.FailedUnmarshal++
 			errs = append(errs, fmt.Errorf("record %d: fetching payload_ref: %w", i, fetchErr))
-			continue
+			return
 		}
 		if !ok {
 			sum.SkippedNoPayload++
-			continue
+			return
 		}
 
-		switch strings.ToLower(rec.Signal) {
+		switch CanonicalSignal(rec.Signal) {
 		case schema.SignalSpans:
 			td, uerr := traceUnmarshaler.UnmarshalTraces(payload)
 			if uerr != nil {
 				sum.FailedUnmarshal++
 				errs = append(errs, fmt.Errorf("record %d: unmarshaling traces: %w", i, uerr))
-				continue
+				return
 			}
 			if eerr := sink.ExportTraces(ctx, td); eerr != nil {
 				sum.FailedExport++
 				errs = append(errs, fmt.Errorf("record %d: exporting traces: %w", i, eerr))
-				continue
+				return
 			}
 			sum.ReplayedSpans++
 
@@ -248,19 +323,82 @@ func Replay(ctx context.Context, r io.Reader, sink Sink, opts Options) (Summary,
 			if uerr != nil {
 				sum.FailedUnmarshal++
 				errs = append(errs, fmt.Errorf("record %d: unmarshaling logs: %w", i, uerr))
-				continue
+				return
 			}
 			if eerr := sink.ExportLogs(ctx, ld); eerr != nil {
 				sum.FailedExport++
 				errs = append(errs, fmt.Errorf("record %d: exporting logs: %w", i, eerr))
-				continue
+				return
 			}
 			sum.ReplayedLogs++
+
+		case schema.SignalMetrics:
+			md, uerr := metricUnmarshaler.UnmarshalMetrics(payload)
+			if uerr != nil {
+				sum.FailedUnmarshal++
+				errs = append(errs, fmt.Errorf("record %d: unmarshaling metrics: %w", i, uerr))
+				return
+			}
+			if eerr := sink.ExportMetrics(ctx, md); eerr != nil {
+				sum.FailedExport++
+				errs = append(errs, fmt.Errorf("record %d: exporting metrics: %w", i, eerr))
+				return
+			}
+			sum.ReplayedMetrics++
 
 		default:
 			sum.FailedUnmarshal++
 			errs = append(errs, fmt.Errorf("record %d: unsupported signal %q", i, rec.Signal))
 		}
+	}
+
+	br := bufio.NewReader(r)
+	first, err := peekNonSpaceByte(br)
+	if errors.Is(err, io.EOF) {
+		return Summary{}, nil
+	}
+	if err != nil {
+		return Summary{}, fmt.Errorf("reading quarantine input: %w", err)
+	}
+
+	if first == '[' {
+		dec := json.NewDecoder(br)
+		dec.UseNumber()
+		var records []Record
+		if err := dec.Decode(&records); err != nil {
+			return Summary{}, fmt.Errorf("decoding JSON array of quarantine records: %w", err)
+		}
+		for i, rec := range records {
+			if err := ctx.Err(); err != nil {
+				return sum, err
+			}
+			processRecord(i, rec)
+		}
+		return sum, errors.Join(errs...)
+	}
+
+	scanner := bufio.NewScanner(br)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxJSONLLineBytes)
+	recordIdx := 0
+	for scanner.Scan() {
+		if err := ctx.Err(); err != nil {
+			return sum, err
+		}
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		dec := json.NewDecoder(bytes.NewReader(line))
+		dec.UseNumber()
+		var rec Record
+		if err := dec.Decode(&rec); err != nil {
+			return sum, fmt.Errorf("decoding quarantine JSONL record %d: %w", recordIdx, err)
+		}
+		processRecord(recordIdx, rec)
+		recordIdx++
+	}
+	if err := scanner.Err(); err != nil {
+		return sum, fmt.Errorf("reading quarantine JSONL input: %w", err)
 	}
 
 	return sum, errors.Join(errs...)
@@ -353,12 +491,13 @@ func peekNonSpaceByte(br *bufio.Reader) (byte, error) {
 }
 
 // JSONWriterSink writes replayed OTLP JSON requests as newline-delimited JSON
-// envelopes (`{"signal":"spans|logs","otlp":{...}}`).
+// envelopes (`{"signal":"spans|logs|metrics","otlp":{...}}`).
 type JSONWriterSink struct {
-	mu           sync.Mutex
-	w            io.Writer
-	traceMarshal ptrace.JSONMarshaler
-	logMarshal   plog.JSONMarshaler
+	mu            sync.Mutex
+	w             io.Writer
+	traceMarshal  ptrace.JSONMarshaler
+	logMarshal    plog.JSONMarshaler
+	metricMarshal pmetric.JSONMarshaler
 }
 
 // NewJSONWriterSink creates a JSONWriterSink writing to w.
@@ -382,6 +521,15 @@ func (s *JSONWriterSink) ExportLogs(_ context.Context, ld plog.Logs) error {
 		return err
 	}
 	return s.writeEnvelope(schema.SignalLogs, raw)
+}
+
+// ExportMetrics marshals md as OTLP JSON and writes one envelope line.
+func (s *JSONWriterSink) ExportMetrics(_ context.Context, md pmetric.Metrics) error {
+	raw, err := s.metricMarshal.MarshalMetrics(md)
+	if err != nil {
+		return err
+	}
+	return s.writeEnvelope(schema.SignalMetrics, raw)
 }
 
 func (s *JSONWriterSink) writeEnvelope(signal string, rawOTLP []byte) error {
@@ -408,14 +556,16 @@ type nopSink struct{}
 // NewNopSink returns a Sink that discards all replayed batches (for dry runs).
 func NewNopSink() Sink { return nopSink{} }
 
-func (nopSink) ExportTraces(context.Context, ptrace.Traces) error { return nil }
-func (nopSink) ExportLogs(context.Context, plog.Logs) error       { return nil }
+func (nopSink) ExportTraces(context.Context, ptrace.Traces) error    { return nil }
+func (nopSink) ExportLogs(context.Context, plog.Logs) error          { return nil }
+func (nopSink) ExportMetrics(context.Context, pmetric.Metrics) error { return nil }
 
-// MemorySink records replayed traces and logs batches in memory for tests.
+// MemorySink records replayed traces, logs, and metrics batches in memory for tests.
 type MemorySink struct {
-	mu     sync.Mutex
-	Traces []ptrace.Traces
-	Logs   []plog.Logs
+	mu      sync.Mutex
+	Traces  []ptrace.Traces
+	Logs    []plog.Logs
+	Metrics []pmetric.Metrics
 }
 
 // NewMemorySink returns an empty MemorySink.
@@ -438,6 +588,16 @@ func (s *MemorySink) ExportLogs(_ context.Context, ld plog.Logs) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Logs = append(s.Logs, cp)
+	return nil
+}
+
+// ExportMetrics appends a copy of md to s.Metrics.
+func (s *MemorySink) ExportMetrics(_ context.Context, md pmetric.Metrics) error {
+	cp := pmetric.NewMetrics()
+	md.CopyTo(cp)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Metrics = append(s.Metrics, cp)
 	return nil
 }
 
