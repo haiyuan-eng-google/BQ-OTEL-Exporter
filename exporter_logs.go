@@ -70,10 +70,7 @@ func (e *logsExporter) pushLogData(ctx context.Context, ld plog.Logs) error {
 			qCtx, cancel := e.quarantineContext(ctx)
 			qOpts := e.opts
 			qOpts.Context = qCtx
-			rows := transform.LogQuarantineRows(ld, entries, qOpts)
-			if len(rows) > 0 && qCtx.Err() == nil {
-				e.quarantineRows(qCtx, rows, opID)
-			}
+			e.writeQuarantine(qCtx, entries, transform.LogQuarantineRows(ld, entries, qOpts), opID)
 			cancel()
 		}
 	}
@@ -92,7 +89,7 @@ func (e *logsExporter) pushLogData(ctx context.Context, ld plog.Logs) error {
 	// fingerprinted afresh, so a retried record keeps its intra_batch_ordinal,
 	// and with it its insert_id, only if the identical records ahead of it
 	// travel along.
-	candidates := validRecordIndices(recordIndex, decision.rowErrors)
+	candidates := validRecordIndices(rowToRecord, decision.rowErrors)
 	if len(offloadFailedIndices) > 0 {
 		candidates = mergeSortedIndices(candidates, offloadFailedIndices)
 	}

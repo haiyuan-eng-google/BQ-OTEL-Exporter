@@ -9,21 +9,38 @@ exporters:
     location: US
     traces:
       table: spans
+      partition_expiration_days: 365
+      require_partition_filter: true
     logs:
       table: logs
+      partition_expiration_days: 90
+      require_partition_filter: true
       # Optional. Records without these attributes fall back to well-known
       # attributes, then to the service name and the record fingerprint.
       log_name_attribute: log.file.name
       insert_id_attribute: log.record.uid
+    metrics:
+      table: metrics
+      partition_expiration_days: 180
+      require_partition_filter: true
     quarantine:
       enabled: true
       table: otel_quarantine
+      partition_expiration_days: 30
+      require_partition_filter: false
     credentials:
       impersonate_service_account: writer@my-project.iam.gserviceaccount.com
+      impersonate_delegates:
+        - hop@my-project.iam.gserviceaccount.com
+      quota_project: my-billing-project
+      universe_domain: googleapis.com
+    endpoint:
+      admin_url: https://bigquery.googleapis.com
     auto_create:
       dataset: true
       tables: true
       companion_views: true
+      search_indexes: true
     write:
       max_request_bytes: 8388608
       max_row_bytes: 1048576

@@ -13,6 +13,7 @@ import (
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
@@ -1032,6 +1033,132 @@ func BenchmarkEncodeSpanRow(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		if _, err := enc.Encode(rows[0]); err != nil {
 			b.Fatal(err)
+		}
+	}
+}
+
+func TestEncodeMetricRow(t *testing.T) {
+	enc, err := New(schema.MetricsTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	row := transform.Row{
+		"timestamp":               int64(1_700_000_000_000_000),
+		"time_unix_nano":          int64(1_700_000_000_000_000_000),
+		"receive_time":            int64(1_700_000_001_000_000),
+		"receive_time_unix_nano":  int64(1_700_000_001_000_000_000),
+		"service_name":            "checkout",
+		"metric_name":             "gen_ai.client.operation.duration",
+		"metric_type":             "HISTOGRAM",
+		"aggregation_temporality": "DELTA",
+		"is_monotonic":            true,
+		"flags":                   int64(0),
+		"attributes":              `{"gen_ai.provider.name":"gcp.vertex_ai"}`,
+		"attributes_schema":       `{"gen_ai.provider.name":"string"}`,
+		"count":                   int64(3),
+		"sum":                     1.75,
+		"explicit_bounds":         []float64{0.25, 0.5, 1.0},
+		"bucket_counts":           []int64{1, 1, 1, 0},
+		"exp_positive": transform.Row{
+			"offset":        int64(1),
+			"bucket_counts": []int64{2, 3},
+		},
+		"summary_quantiles": []transform.Row{
+			{"quantile": 0.95, "value": 0.9},
+		},
+		"exemplars": []transform.Row{
+			{
+				"time":                       int64(1_700_000_000_000_000),
+				"time_unix_nano":             int64(1_700_000_000_000_000_000),
+				"value_double":               0.42,
+				"trace_id":                   "0102030405060708090a0b0c0d0e0f10",
+				"span_id":                    "0102030405060708",
+				"filtered_attributes":        "{}",
+				"filtered_attributes_schema": "{}",
+			},
+		},
+		"resource": transform.Row{
+			"attributes":               `{"service.name":"checkout"}`,
+			"attributes_schema":        `{"service.name":"string"}`,
+			"dropped_attributes_count": int64(0),
+		},
+		"instrumentation_scope": transform.Row{
+			"name":                     "otel-genai",
+			"attributes":               "{}",
+			"attributes_schema":        "{}",
+			"dropped_attributes_count": int64(0),
+		},
+		"point_fingerprint": "fp1:0123456789abcdef",
+		"schema_version":    schema.Version,
+	}
+
+	b, err := enc.Encode(row)
+	if err != nil {
+		t.Fatalf("Encode metric row: %v", err)
+	}
+	norm := decodeNormalized(t, enc, b)
+	if got := get(t, norm, "metric_name").String(); got != "gen_ai.client.operation.duration" {
+		t.Errorf("metric_name = %q", got)
+	}
+	if got := get(t, norm, "is_monotonic").Bool(); !got {
+		t.Errorf("is_monotonic = %v, want true", got)
+	}
+	if bounds := norm.Get(norm.Descriptor().Fields().ByName("explicit_bounds")).List(); bounds.Len() != 3 {
+		t.Errorf("explicit_bounds len = %d, want 3", bounds.Len())
+	}
+	if buckets := norm.Get(norm.Descriptor().Fields().ByName("bucket_counts")).List(); buckets.Len() != 4 {
+		t.Errorf("bucket_counts len = %d, want 4", buckets.Len())
+	}
+}
+
+func TestEncodeMetricNonFiniteFloats(t *testing.T) {
+	enc, err := New(schema.MetricsTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const ts = pcommon.Timestamp(1_700_000_000_000_000_000)
+	md := pmetric.NewMetrics()
+	sm := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
+
+	gm := sm.Metrics().AppendEmpty()
+	gm.SetName("m.gauge.nonfinite")
+	g := gm.SetEmptyGauge()
+	for _, v := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		dp := g.DataPoints().AppendEmpty()
+		dp.SetTimestamp(ts)
+		dp.SetDoubleValue(v)
+		ex := dp.Exemplars().AppendEmpty()
+		ex.SetTimestamp(ts)
+		ex.SetDoubleValue(v)
+	}
+
+	rows, rejects := transform.MetricRows(md, opts())
+	if len(rejects) != 0 || len(rows) != 3 {
+		t.Fatalf("MetricRows() rows=%d rejects=%+v", len(rows), rejects)
+	}
+
+	checks := []func(float64) bool{
+		math.IsNaN,
+		func(v float64) bool { return math.IsInf(v, 1) },
+		func(v float64) bool { return math.IsInf(v, -1) },
+	}
+	for i, check := range checks {
+		b, err := enc.Encode(rows[i])
+		if err != nil {
+			t.Fatalf("Encode(rows[%d]) error = %v", i, err)
+		}
+		norm := decodeNormalized(t, enc, b)
+		if got := get(t, norm, "value_double").Float(); !check(got) {
+			t.Errorf("rows[%d] decoded value_double = %v", i, got)
+		}
+		exList := norm.Get(norm.Descriptor().Fields().ByName("exemplars")).List()
+		if exList.Len() != 1 {
+			t.Fatalf("rows[%d] exemplars len = %d, want 1", i, exList.Len())
+		}
+		if got := get(t, exList.Get(0).Message(), "value_double").Float(); !check(got) {
+			t.Errorf("rows[%d] decoded exemplars[0].value_double = %v", i, got)
 		}
 	}
 }

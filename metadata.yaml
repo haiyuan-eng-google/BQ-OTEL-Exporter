@@ -4,15 +4,10 @@ display_name: BigQuery Exporter
 status:
   class: exporter
   stability:
-    development: [traces, logs]
+    development: [traces, logs, metrics]
   distributions: []
   codeowners:
     active: [haiyuan-eng-google]
-
-# Metrics are deliberately out of scope for v1: the OTLP metrics signal needs
-# its own relational design (five data-point types, delta vs cumulative
-# temporality, exemplars, per-series identity) and guessing at one would freeze
-# the guess into a versioned schema contract.
 
 tests:
   config:
@@ -128,14 +123,73 @@ telemetry:
         value_type: int
         monotonic: true
 
+    otelcol_exporter_bigquery_quarantined_rows:
+      enabled: true
+      description: >-
+        Rows acknowledged by the BigQuery quarantine table stream, by reason.
+      unit: "{row}"
+      sum:
+        value_type: int
+        monotonic: true
+      attributes: [reason]
+
+    otelcol_exporter_bigquery_quarantine_failed_rows:
+      enabled: true
+      description: >-
+        Rows targeted for quarantine that could not be written due to
+        serialization, size limit, or quarantine stream append failures.
+      unit: "{row}"
+      sum:
+        value_type: int
+        monotonic: true
+      attributes: [reason]
+
+    otelcol_exporter_bigquery_append_bytes:
+      enabled: true
+      description: >-
+        Serialized protobuf wire bytes dispatched to the BigQuery Storage Write API.
+      unit: By
+      sum:
+        value_type: int
+        monotonic: true
+
+    otelcol_exporter_bigquery_offloaded_payloads:
+      enabled: true
+      description: >-
+        Multimodal or oversized payloads offloaded to external object storage.
+      unit: "{payload}"
+      sum:
+        value_type: int
+        monotonic: true
+
+    otelcol_exporter_bigquery_offloaded_bytes:
+      enabled: true
+      description: >-
+        Payload bytes offloaded to external object storage.
+      unit: By
+      sum:
+        value_type: int
+        monotonic: true
+
+    otelcol_exporter_bigquery_offload_errors:
+      enabled: true
+      description: >-
+        Payload offload attempts to external object storage that failed, by error class.
+      unit: "{error}"
+      sum:
+        value_type: int
+        monotonic: true
+      attributes: [class]
+
   attributes:
     reason:
       description: >-
-        Why a row was permanently rejected. Bounded by construction; this
-        enumeration is the whole domain.
+        Why a row was permanently rejected or quarantined. Bounded by construction;
+        this enumeration is the whole domain.
       type: string
       enum:
         - attribute_count
+        - attribute_key_size
         - event_count
         - link_count
         - nesting_depth
@@ -147,10 +201,11 @@ telemetry:
         - invalid_id
         - missing_timestamp
         - timestamp_overflow
+        - other
 
     class:
       description: >-
-        The error class of a retryable append failure. Bounded by
+        The error class of a retryable append or offload failure. Bounded by
         construction; this enumeration is the whole domain.
       type: string
       enum:

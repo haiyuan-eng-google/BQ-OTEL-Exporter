@@ -80,10 +80,7 @@ func (e *tracesExporter) pushTraceData(ctx context.Context, td ptrace.Traces) er
 			qCtx, cancel := e.quarantineContext(ctx)
 			qOpts := e.opts
 			qOpts.Context = qCtx
-			rows := transform.SpanQuarantineRows(td, entries, qOpts)
-			if len(rows) > 0 && qCtx.Err() == nil {
-				e.quarantineRows(qCtx, rows, opID)
-			}
+			e.writeQuarantine(qCtx, entries, transform.SpanQuarantineRows(td, entries, qOpts), opID)
 			cancel()
 		}
 	}

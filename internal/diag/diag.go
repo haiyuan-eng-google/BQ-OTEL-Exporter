@@ -107,6 +107,29 @@ var knownFieldTokens = map[string]bool{
 	"ingest_time": true, "signal": true, "error_code": true,
 	"error_message": true, "raw_payload": true, "raw_attributes": true,
 	"payload_ref": true, "exporter_instance": true,
+
+	// Columns and nested STRUCT fields of the metric data-point contract.
+	"metric_name": true, "metric_description": true, "metric_unit": true,
+	"metric_type": true, "aggregation_temporality": true, "is_monotonic": true,
+	"metric_metadata": true, "metric_metadata_schema": true,
+	"value_type": true, "value_double": true, "value_int64": true,
+	"count": true, "sum": true, "min": true, "max": true,
+	"explicit_bounds": true, "bucket_counts": true,
+	"exp_scale": true, "exp_zero_count": true, "exp_zero_threshold": true,
+	"exp_positive": true, "exp_negative": true, "offset": true,
+	"summary_quantiles": true, "quantile": true, "value": true,
+	"exemplars": true, "filtered_attributes": true,
+	"filtered_attributes_schema": true, "point_fingerprint": true,
+}
+
+// nestedOnlyTokens are STRUCT sub-field names that never appear as top-level
+// columns and collide with common English words in service error prose (for
+// example, "Invalid value for field ..."). They are recognized only when they
+// appear as part of a dotted path such as "summary_quantiles.value".
+var nestedOnlyTokens = map[string]bool{
+	"value":    true,
+	"quantile": true,
+	"offset":   true,
 }
 
 // SanitizeFieldPath reduces a service message to the recognized column names
@@ -122,11 +145,17 @@ func SanitizeFieldPath(message string) string {
 	}
 	var found []string
 	seen := map[string]bool{}
-	for _, token := range strings.FieldsFunc(message, isSeparator) {
-		token = strings.ToLower(token)
-		if knownFieldTokens[token] && !seen[token] {
-			seen[token] = true
-			found = append(found, token)
+	for _, word := range strings.FieldsFunc(message, isWordSeparator) {
+		dotted := strings.Contains(word, ".")
+		for _, token := range strings.Split(word, ".") {
+			token = strings.ToLower(token)
+			if token == "" || (nestedOnlyTokens[token] && !dotted) {
+				continue
+			}
+			if knownFieldTokens[token] && !seen[token] {
+				seen[token] = true
+				found = append(found, token)
+			}
 		}
 	}
 	if len(found) == 0 {
@@ -135,8 +164,9 @@ func SanitizeFieldPath(message string) string {
 	return strings.Join(found, ",")
 }
 
-func isSeparator(r rune) bool {
-	return r != '_' &&
+func isWordSeparator(r rune) bool {
+	return r != '.' &&
+		r != '_' &&
 		(r < 'a' || r > 'z') &&
 		(r < 'A' || r > 'Z') &&
 		(r < '0' || r > '9')

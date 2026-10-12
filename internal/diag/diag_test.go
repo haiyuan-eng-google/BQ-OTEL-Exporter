@@ -55,6 +55,7 @@ func TestKnownFieldTokensMatchTheContract(t *testing.T) {
 	}
 	walk(schema.SpansTableSchema().GetFields())
 	walk(schema.LogsTableSchema().GetFields())
+	walk(schema.MetricsTableSchema().GetFields())
 	walk(schema.QuarantineTableSchema().GetFields())
 
 	for name := range want {

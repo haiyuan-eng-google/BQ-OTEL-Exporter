@@ -188,23 +188,111 @@ PARTITION BY DATE(timestamp)
 CLUSTER BY service_name, trace_id, severity_number;
 `
 
+// MetricsDDL creates the v0alpha2 metric data-point table.
+//
+// Partitioning is daily on timestamp, and clustering on (service_name,
+// metric_name, metric_type) keeps per-service and per-instrument queries
+// pruned across all five OTLP metric types (Gauge, Sum, Histogram,
+// ExponentialHistogram, Summary).
+const MetricsDDL = `
+CREATE TABLE IF NOT EXISTS ` + "`%[1]s.%[2]s.%[3]s`" + ` (
+  -- Time family
+  timestamp                          TIMESTAMP NOT NULL,
+  time_unix_nano                     INT64     NOT NULL,
+  start_time                         TIMESTAMP,
+  start_time_unix_nano               INT64,
+  receive_time                       TIMESTAMP NOT NULL,
+  receive_time_unix_nano             INT64     NOT NULL,
+  -- Metric identity & metadata
+  service_name                       STRING,
+  metric_name                        STRING    NOT NULL,
+  metric_description                 STRING,
+  metric_unit                        STRING,
+  metric_type                        STRING    NOT NULL,
+  aggregation_temporality            STRING,
+  is_monotonic                       BOOL,
+  flags                              INT64,
+  attributes                         JSON,
+  attributes_schema                  JSON,
+  metric_metadata                    JSON,
+  metric_metadata_schema             JSON,
+  -- Scalar values (GAUGE / SUM)
+  value_type                         STRING,
+  value_double                       FLOAT64,
+  value_int64                        INT64,
+  -- Distribution values (HISTOGRAM / EXPONENTIAL_HISTOGRAM / SUMMARY)
+  count                              INT64,
+  sum                                FLOAT64,
+  min                                FLOAT64,
+  max                                FLOAT64,
+  explicit_bounds                    ARRAY<FLOAT64>,
+  bucket_counts                      ARRAY<INT64>,
+  exp_scale                          INT64,
+  exp_zero_count                     INT64,
+  exp_zero_threshold                 FLOAT64,
+  exp_positive STRUCT<
+    offset                           INT64,
+    bucket_counts                    ARRAY<INT64>
+  >,
+  exp_negative STRUCT<
+    offset                           INT64,
+    bucket_counts                    ARRAY<INT64>
+  >,
+  summary_quantiles ARRAY<STRUCT<
+    quantile                         FLOAT64,
+    value                            FLOAT64
+  >>,
+  -- Exemplars (trace/span correlation)
+  exemplars ARRAY<STRUCT<
+    time                             TIMESTAMP,
+    time_unix_nano                   INT64,
+    value_double                     FLOAT64,
+    value_int64                      INT64,
+    span_id                          STRING,
+    trace_id                         STRING,
+    filtered_attributes              JSON,
+    filtered_attributes_schema       JSON
+  >>,
+  -- Resource & Instrumentation Scope family
+  resource STRUCT<
+    attributes                       JSON,
+    attributes_schema                JSON,
+    dropped_attributes_count         INT64
+  >,
+  resource_schema_url                STRING,
+  instrumentation_scope STRUCT<
+    name                             STRING,
+    version                          STRING,
+    attributes                       JSON,
+    attributes_schema                JSON,
+    dropped_attributes_count         INT64
+  >,
+  scope_schema_url                   STRING,
+  -- Dedup & Contract identity
+  point_fingerprint                  STRING    NOT NULL,
+  schema_version                     STRING    NOT NULL
+)
+PARTITION BY DATE(timestamp)
+CLUSTER BY service_name, metric_name, metric_type;
+`
+
 // QuarantineDDL creates the opt-in quarantine (dead-letter) table, which the
-// exporter writes only when quarantine.enabled is set. A span or log record
-// that cannot be written to its signal table, because of an invalid ID, a
-// missing or overflowing timestamp, a value over a configured limit, a row
+// exporter writes only when quarantine.enabled is set. A span, log, or metric
+// record that cannot be written to its signal table, because of an invalid ID,
+// a missing or overflowing timestamp, a value over a configured limit, a row
 // over the row size limit, or a row BigQuery itself rejects, lands here
 // instead of being dropped, with the reason in error_code and error_message
 // and the record serialized as OTLP JSON in raw_payload.
 //
-// Partitioning is daily on ingest_time and partitions expire after 30 days,
-// because the table is a triage queue rather than an archive; clustering on
-// (signal, error_code, service_name) keeps "what is failing, and where"
-// queries pruned. There is no dedup view: a record whose whole batch is
+// Partitioning is daily on ingest_time and partitions expire after 30 days by
+// default, because the table is a triage queue rather than an archive;
+// clustering on (signal, error_code, service_name) keeps "what is failing, and
+// where" queries pruned. There is no dedup view: a record whose whole batch is
 // retried can be quarantined more than once.
 const QuarantineDDL = `
 CREATE TABLE IF NOT EXISTS ` + "`%[1]s.%[2]s.%[3]s`" + ` (
   ingest_time                        TIMESTAMP NOT NULL,
-  signal                             STRING    NOT NULL, -- 'spans' | 'logs'
+  signal                             STRING    NOT NULL, -- 'spans' | 'logs' | 'metrics'
   error_code                         STRING    NOT NULL, -- e.g. 'INVALID_SPAN_ID', 'MISSING_END_TIME', 'OVERSIZE_ROW'
   error_message                      STRING    NOT NULL,
   service_name                       STRING,
@@ -303,17 +391,45 @@ QUALIFY ROW_NUMBER() OVER (
 ) = 1
 `
 
+// MetricsDedupViewDDL is the canonical metric deduplication view.
+//
+// Identity is (timestamp, time_unix_nano, service_name, metric_name,
+// point_fingerprint). The partitioning column and leading clustering columns
+// come first so filters on them prune partitions and clusters before the
+// window function runs; receive_time_unix_nano selects the most recently
+// received copy.
+const MetricsDedupViewDDL = `
+CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s.%[3]s_dedup`" + ` AS
+` + MetricsDedupViewQuery + `;
+`
+
+// MetricsDedupViewQuery is shared by operator-run DDL and metadata-API view
+// creation so their deduplication behavior cannot drift.
+const MetricsDedupViewQuery = `
+SELECT *
+FROM ` + "`%[1]s.%[2]s.%[3]s`" + `
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY
+    timestamp,
+    time_unix_nano,
+    service_name,
+    metric_name,
+    point_fingerprint
+  ORDER BY
+    receive_time_unix_nano DESC
+) = 1
+`
+
 // SpansSearchIndexDDL creates the trace lookup search index on the span
 // table. NO_OP_ANALYZER indexes every trace_id and span_id value whole,
 // without tokenizing it, which suits exact-match lookups of one trace or one
 // span.
 //
-// The exporter never runs this statement. Auto-create goes through the table
-// metadata API only, while a search index is created by a SQL query job,
-// which needs bigquery.jobs.create; operators run it themselves or manage it
-// with their infrastructure-as-code tooling. The index name is derived from
-// the table name, so the default otel_spans table gets
-// otel_spans_trace_lookup_idx.
+// The exporter runs this statement during startup only when
+// auto_create.search_indexes is enabled (which requires bigquery.jobs.create);
+// otherwise operators run it themselves or manage it with their
+// infrastructure-as-code tooling. The index name is derived from the table
+// name, so the default otel_spans table gets otel_spans_trace_lookup_idx.
 const SpansSearchIndexDDL = `
 CREATE SEARCH INDEX IF NOT EXISTS ` + "`%[3]s_trace_lookup_idx`" + `
 ON ` + "`%[1]s.%[2]s.%[3]s`" + ` (trace_id, span_id) OPTIONS (analyzer = 'NO_OP_ANALYZER');
@@ -321,8 +437,9 @@ ON ` + "`%[1]s.%[2]s.%[3]s`" + ` (trace_id, span_id) OPTIONS (analyzer = 'NO_OP_
 
 // LogsSearchIndexDDL creates the trace lookup search index on the log table,
 // so looking up the records correlated with one trace or one span can use the
-// index. As with SpansSearchIndexDDL, the exporter never runs it, and the
-// default otel_logs table gets otel_logs_trace_lookup_idx.
+// index. As with SpansSearchIndexDDL, the exporter runs it only when
+// auto_create.search_indexes is enabled, and the default otel_logs table gets
+// otel_logs_trace_lookup_idx.
 const LogsSearchIndexDDL = `
 CREATE SEARCH INDEX IF NOT EXISTS ` + "`%[3]s_trace_lookup_idx`" + `
 ON ` + "`%[1]s.%[2]s.%[3]s`" + ` (trace_id, span_id) OPTIONS (analyzer = 'NO_OP_ANALYZER');
@@ -336,6 +453,9 @@ const (
 	SpansAsAllSpansViewName = "otel_spans_as_allspans"
 	GenAISpansViewName      = "v_gen_ai_spans"
 	GenAILogsViewName       = "v_gen_ai_logs"
+	GenAIModelCostsViewName = "v_gen_ai_model_costs"
+	GenAISessionsViewName   = "v_gen_ai_sessions"
+	GenAIToolUsageViewName  = "v_gen_ai_tool_usage"
 )
 
 // SpansAsAllSpansViewDDL creates otel_spans_as_allspans, which presents the
@@ -381,8 +501,10 @@ FROM ` + "`%[1]s.%[2]s.%[3]s_dedup`" + `
 `
 
 // GenAISpansViewDDL creates v_gen_ai_spans: the spans that carry
-// gen_ai.operation.name, gen_ai.system or gcp.vertex.agent.invocation_id,
-// with the OpenTelemetry GenAI semantic convention attributes and the Agent
+// gen_ai.operation.name, gen_ai.system, gen_ai.provider.name or
+// gcp.vertex.agent.invocation_id, with the OpenTelemetry GenAI semantic
+// convention attributes (including v1.37+/v1.40+ provider, cache/reasoning
+// token, output, tool, agent, and data source fields) and the Agent
 // Development Kit gcp.vertex.agent.* attributes promoted out of the plain
 // JSON attributes into typed top-level columns. Where the same fact can arrive
 // under more than one key, such as gen_ai.system and its successor
@@ -452,15 +574,41 @@ SELECT
   resource,
   instrumentation_scope,
   events,
-  links
+  links,
+  -- Promoted OTel GenAI v1.37+/v1.40+ semantic convention fields
+  JSON_VALUE(attributes, '$."gen_ai.provider.name"') AS gen_ai_provider_name,
+  COALESCE(
+    LAX_INT64(attributes['gen_ai.usage.cache_read.input_tokens']),
+    LAX_INT64(attributes['gen_ai.usage.cache_read_input_tokens'])
+  ) AS gen_ai_usage_cache_read_input_tokens,
+  COALESCE(
+    LAX_INT64(attributes['gen_ai.usage.cache_creation.input_tokens']),
+    LAX_INT64(attributes['gen_ai.usage.cache_creation_input_tokens'])
+  ) AS gen_ai_usage_cache_creation_input_tokens,
+  LAX_INT64(attributes['gen_ai.usage.reasoning_tokens']) AS gen_ai_usage_reasoning_tokens,
+  LAX_FLOAT64(attributes['gen_ai.request.top_p']) AS gen_ai_request_top_p,
+  LAX_INT64(attributes['gen_ai.request.top_k']) AS gen_ai_request_top_k,
+  LAX_INT64(attributes['gen_ai.request.max_tokens']) AS gen_ai_request_max_tokens,
+  JSON_VALUE(attributes, '$."gen_ai.output.type"') AS gen_ai_output_type,
+  JSON_VALUE(attributes, '$."gen_ai.tool.type"') AS gen_ai_tool_type,
+  JSON_VALUE(attributes, '$."gen_ai.tool.description"') AS gen_ai_tool_description,
+  JSON_VALUE(attributes, '$."gen_ai.agent.description"') AS gen_ai_agent_description,
+  JSON_VALUE(attributes, '$."gen_ai.agent.parent.id"') AS gen_ai_agent_parent_id,
+  JSON_VALUE(attributes, '$."gen_ai.data_source.id"') AS gen_ai_data_source_id,
+  JSON_VALUE(attributes, '$."gen_ai.evaluation.name"') AS gen_ai_evaluation_name,
+  COALESCE(
+    LAX_FLOAT64(attributes['gen_ai.evaluation.score.value']),
+    LAX_FLOAT64(attributes['gen_ai.evaluation.score'])
+  ) AS gen_ai_evaluation_score
 FROM ` + "`%[1]s.%[2]s.%[3]s_dedup`" + `
 WHERE JSON_VALUE(attributes, '$."gen_ai.operation.name"') IS NOT NULL
    OR JSON_VALUE(attributes, '$."gen_ai.system"') IS NOT NULL
+   OR JSON_VALUE(attributes, '$."gen_ai.provider.name"') IS NOT NULL
    OR JSON_VALUE(attributes, '$."gcp.vertex.agent.invocation_id"') IS NOT NULL
 `
 
 // GenAILogsViewDDL creates v_gen_ai_logs: the log records whose event name
-// starts with "gen_ai.", or that carry gen_ai.system or
+// starts with "gen_ai.", or that carry gen_ai.system, gen_ai.provider.name or
 // gcp.vertex.agent.invocation_id, with the GenAI and agent fields promoted
 // from the record's own attributes and, where the record lacks one, from the
 // attributes of the span it belongs to. The event name falls back from the
@@ -487,7 +635,12 @@ SELECT
   l.severity_number,
   l.severity_text,
   COALESCE(JSON_VALUE(l.attributes, '$."gen_ai.operation.name"'), JSON_VALUE(s.attributes, '$."gen_ai.operation.name"')) AS gen_ai_operation_name,
-  COALESCE(JSON_VALUE(l.attributes, '$."gen_ai.system"'), JSON_VALUE(s.attributes, '$."gen_ai.system"')) AS gen_ai_system,
+  COALESCE(
+    JSON_VALUE(l.attributes, '$."gen_ai.system"'),
+    JSON_VALUE(l.attributes, '$."gen_ai.provider.name"'),
+    JSON_VALUE(s.attributes, '$."gen_ai.system"'),
+    JSON_VALUE(s.attributes, '$."gen_ai.provider.name"')
+  ) AS gen_ai_system,
   COALESCE(JSON_VALUE(l.attributes, '$."gen_ai.agent.name"'), JSON_VALUE(s.attributes, '$."gen_ai.agent.name"')) AS gen_ai_agent_name,
   COALESCE(JSON_VALUE(l.attributes, '$."gen_ai.conversation.id"'), JSON_VALUE(s.attributes, '$."gen_ai.conversation.id"'), JSON_VALUE(s.attributes, '$."gcp.vertex.agent.session_id"')) AS adk_session_id,
   COALESCE(JSON_VALUE(l.attributes, '$."gcp.vertex.agent.invocation_id"'), JSON_VALUE(s.attributes, '$."gcp.vertex.agent.invocation_id"')) AS adk_invocation_id,
@@ -503,11 +656,102 @@ LEFT JOIN ` + "`%[1]s.%[2]s.%[4]s_dedup`" + ` s
   USING (service_name, trace_id, span_id)
 WHERE COALESCE(NULLIF(l.event_name, ''), JSON_VALUE(l.attributes, '$."event.name"')) LIKE 'gen_ai.%%'
    OR JSON_VALUE(l.attributes, '$."gen_ai.system"') IS NOT NULL
+   OR JSON_VALUE(l.attributes, '$."gen_ai.provider.name"') IS NOT NULL
    OR JSON_VALUE(l.attributes, '$."gcp.vertex.agent.invocation_id"') IS NOT NULL
 `
 
-// FingerprintPrefix is the version tag on record_fingerprint values, which are
-// formatted as "fp1:" + lowercase_hex(SHA-256(canonical_log_record)).
+// GenAIModelCostsViewDDL creates v_gen_ai_model_costs: hourly token and
+// latency rollup per service, agent, provider, and model over v_gen_ai_spans.
+const GenAIModelCostsViewDDL = `
+CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAIModelCostsViewName + "`" + ` AS
+` + GenAIModelCostsViewQuery + `;
+`
+
+// GenAIModelCostsViewQuery is shared by operator-run DDL and metadata-API
+// view creation. It takes (project, dataset) and reads v_gen_ai_spans.
+const GenAIModelCostsViewQuery = `
+SELECT
+  TIMESTAMP_TRUNC(start_time, HOUR) AS usage_hour,
+  service_name,
+  gen_ai_agent_name,
+  COALESCE(gen_ai_provider_name, gen_ai_system) AS provider,
+  COALESCE(gen_ai_response_model, gen_ai_request_model) AS model,
+  COUNT(*) AS call_count,
+  COUNTIF(status_code = 2) AS error_count,
+  SUM(COALESCE(gen_ai_usage_input_tokens, 0)) AS total_input_tokens,
+  SUM(COALESCE(gen_ai_usage_output_tokens, 0)) AS total_output_tokens,
+  SUM(COALESCE(gen_ai_usage_cache_read_input_tokens, 0)) AS total_cache_read_input_tokens,
+  SUM(COALESCE(gen_ai_usage_cache_creation_input_tokens, 0)) AS total_cache_creation_input_tokens,
+  SUM(COALESCE(gen_ai_usage_reasoning_tokens, 0)) AS total_reasoning_tokens,
+  APPROX_QUANTILES(duration_ms, 100)[OFFSET(50)] AS p50_duration_ms,
+  APPROX_QUANTILES(duration_ms, 100)[OFFSET(95)] AS p95_duration_ms,
+  APPROX_QUANTILES(duration_ms, 100)[OFFSET(99)] AS p99_duration_ms
+FROM ` + "`%[1]s.%[2]s." + GenAISpansViewName + "`" + `
+WHERE gen_ai_operation_name IN ('chat', 'generate_content', 'text_completion', 'embeddings')
+   OR gen_ai_request_model IS NOT NULL
+GROUP BY 1, 2, 3, 4, 5
+`
+
+// GenAISessionsViewDDL creates v_gen_ai_sessions: per-session / conversation
+// summary over v_gen_ai_spans.
+const GenAISessionsViewDDL = `
+CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAISessionsViewName + "`" + ` AS
+` + GenAISessionsViewQuery + `;
+`
+
+// GenAISessionsViewQuery is shared by operator-run DDL and metadata-API view
+// creation. It takes (project, dataset) and reads v_gen_ai_spans.
+const GenAISessionsViewQuery = `
+SELECT
+  COALESCE(adk_session_id, gen_ai_conversation_id) AS session_id,
+  ANY_VALUE(adk_user_id) AS user_id,
+  ANY_VALUE(service_name) AS service_name,
+  ANY_VALUE(gen_ai_agent_name) AS agent_name,
+  MIN(start_time) AS session_start_time,
+  MAX(end_time) AS session_end_time,
+  TIMESTAMP_DIFF(MAX(end_time), MIN(start_time), MILLISECOND) AS session_duration_ms,
+  COUNT(DISTINCT trace_id) AS turn_count,
+  COUNT(DISTINCT adk_invocation_id) AS invocation_count,
+  COUNTIF(gen_ai_operation_name = 'execute_tool' OR gen_ai_tool_name IS NOT NULL) AS tool_call_count,
+  COUNTIF(status_code = 2) AS error_count,
+  SUM(COALESCE(gen_ai_usage_input_tokens, 0)) AS total_input_tokens,
+  SUM(COALESCE(gen_ai_usage_output_tokens, 0)) AS total_output_tokens,
+  SUM(COALESCE(gen_ai_usage_cache_read_input_tokens, 0)) AS total_cache_read_input_tokens,
+  SUM(COALESCE(gen_ai_usage_reasoning_tokens, 0)) AS total_reasoning_tokens
+FROM ` + "`%[1]s.%[2]s." + GenAISpansViewName + "`" + `
+WHERE COALESCE(adk_session_id, gen_ai_conversation_id) IS NOT NULL
+GROUP BY session_id
+`
+
+// GenAIToolUsageViewDDL creates v_gen_ai_tool_usage: hourly tool invocation
+// volume, error rate, and latency percentiles over v_gen_ai_spans.
+const GenAIToolUsageViewDDL = `
+CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAIToolUsageViewName + "`" + ` AS
+` + GenAIToolUsageViewQuery + `;
+`
+
+// GenAIToolUsageViewQuery is shared by operator-run DDL and metadata-API view
+// creation. It takes (project, dataset) and reads v_gen_ai_spans.
+const GenAIToolUsageViewQuery = `
+SELECT
+  TIMESTAMP_TRUNC(start_time, HOUR) AS usage_hour,
+  service_name,
+  gen_ai_agent_name,
+  gen_ai_tool_name,
+  gen_ai_tool_type,
+  COUNT(*) AS call_count,
+  COUNTIF(status_code = 2) AS error_count,
+  SAFE_DIVIDE(COUNTIF(status_code = 2), COUNT(*)) AS error_rate,
+  APPROX_QUANTILES(duration_ms, 100)[OFFSET(50)] AS p50_duration_ms,
+  APPROX_QUANTILES(duration_ms, 100)[OFFSET(95)] AS p95_duration_ms
+FROM ` + "`%[1]s.%[2]s." + GenAISpansViewName + "`" + `
+WHERE gen_ai_tool_name IS NOT NULL OR gen_ai_operation_name = 'execute_tool'
+GROUP BY 1, 2, 3, 4, 5
+`
+
+// FingerprintPrefix is the version tag on record_fingerprint and
+// point_fingerprint values, which are formatted as
+// "fp1:" + lowercase_hex(SHA-256(canonical_record)).
 //
 // The canonical form covers every non-derived OTLP field of the record, its
 // resource and its scope, encodes values as plain JSON together with their

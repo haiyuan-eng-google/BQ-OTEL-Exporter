@@ -19,9 +19,11 @@ import (
 	bq "cloud.google.com/go/bigquery"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/component/componentstatus"
 	"go.opentelemetry.io/collector/consumer/consumererror"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/otel/metric/noop"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -1332,6 +1334,10 @@ func TestNewSignalExporterWiresOffloadAndQuarantinePIIOptions(t *testing.T) {
 }
 
 func TestPushTracesOffloadsOversizedPayloadEndToEnd(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+
 	cfg := validConfig()
 	cfg.Offload.Enabled = true
 	cfg.Offload.Bucket = "otel-offload-bucket"
@@ -1340,7 +1346,7 @@ func TestPushTracesOffloadsOversizedPayloadEndToEnd(t *testing.T) {
 
 	e, err := newTracesExporter(component.TelemetrySettings{
 		Logger:        zap.NewNop(),
-		MeterProvider: noop.NewMeterProvider(),
+		MeterProvider: mp,
 	}, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -1376,6 +1382,21 @@ func TestPushTracesOffloadsOversizedPayloadEndToEnd(t *testing.T) {
 	}
 	if refs[0]["attribute_path"] != "attributes.gen_ai.prompt" {
 		t.Errorf("payload_refs[0].attribute_path = %v, want attributes.gen_ai.prompt", refs[0]["attribute_path"])
+	}
+	if got := metricInt64Sum(t, reader, "otelcol_exporter_bigquery_offloaded_payloads"); got != 1 {
+		t.Errorf("offloaded_payloads = %d, want 1", got)
+	}
+	if got := metricInt64Sum(t, reader, "otelcol_exporter_bigquery_offloaded_bytes"); got != int64(len(largePrompt)) {
+		t.Errorf("offloaded_bytes = %d, want %d", got, len(largePrompt))
+	}
+
+	// Simulate an offload upload failure and verify offload_errors increments.
+	memStore.SetError(errors.New("gcs write error"))
+	tdFail := newTestTraces(1)
+	tdFail.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Attributes().PutStr("gen_ai.prompt", largePrompt)
+	_ = e.pushTraceData(context.Background(), tdFail)
+	if got := metricInt64Sum(t, reader, "otelcol_exporter_bigquery_offload_errors"); got != 1 {
+		t.Errorf("offload_errors = %d, want 1", got)
 	}
 }
 
@@ -2090,4 +2111,546 @@ func insertIDsWrittenUntilDelivered(t *testing.T, concurrency int, fail func(n i
 	}
 	t.Fatal("the batch was not delivered within 10 pushes")
 	return nil
+}
+
+func newTestMetrics(points int) pmetric.Metrics {
+	md := pmetric.NewMetrics()
+	sm := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
+	m := sm.Metrics().AppendEmpty()
+	m.SetName("gen_ai.client.token.usage")
+	g := m.SetEmptyGauge()
+	for i := 0; i < points; i++ {
+		dp := g.DataPoints().AppendEmpty()
+		dp.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000 + uint64(i)*1_000_000_000))
+		dp.SetIntValue(int64(i + 1))
+	}
+	return md
+}
+
+func newTestMetricsExporter(t *testing.T, out bqi.AppendOutcome) (*metricsExporter, *fakeAppender) {
+	t.Helper()
+	cfg := validConfig()
+	tel, err := metadata.NewTelemetry(noop.NewMeterProvider())
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := protoenc.New(schema.MetricsTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &fakeAppender{outcome: out}
+
+	se := &signalExporter{
+		cfg:    cfg,
+		table:  cfg.Metrics.Table,
+		logger: zap.NewNop(),
+		tel:    tel,
+		writer: app,
+		enc:    enc,
+		schema: schema.MetricsTableSchema(),
+		opts:   transform.Options{Limits: cfg.Limits.toTransform()},
+	}
+	return &metricsExporter{se}, app
+}
+
+func TestPushMetricsSuccess(t *testing.T) {
+	e, app := newTestMetricsExporter(t, bqi.AppendOutcome{AcknowledgedRows: 3})
+
+	if err := e.pushMetricsData(context.Background(), newTestMetrics(3)); err != nil {
+		t.Fatalf("expected success, got %v", err)
+	}
+	if app.gotRows != 3 {
+		t.Fatalf("appended %d rows, want 3", app.gotRows)
+	}
+}
+
+func TestPushMetricsReturnsValidSubsetOnRowErrors(t *testing.T) {
+	e, _ := newTestMetricsExporter(t, bqi.AppendOutcome{
+		RowErrors: []bqi.RowError{{Index: 1, Code: "FIELDS_ERROR", Message: "bad field metric_name"}},
+	})
+
+	err := e.pushMetricsData(context.Background(), newTestMetrics(3))
+	if err == nil || consumererror.IsPermanent(err) {
+		t.Fatalf("error = %v, want retryable subset error", err)
+	}
+	var mdErr consumererror.Metrics
+	if !errors.As(err, &mdErr) {
+		t.Fatalf("error %T does not carry pmetric.Metrics", err)
+	}
+	dps := mdErr.Data().ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Gauge().DataPoints()
+	if dps.Len() != 2 || dps.At(0).IntValue() != 1 || dps.At(1).IntValue() != 3 {
+		t.Fatalf("retry subset len=%d, want 2 points with values [1, 3]", dps.Len())
+	}
+}
+
+func TestPushMetricsQuarantinesEveryDroppedDataPoint(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+	tel, err := metadata.NewTelemetry(mp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, _ := newTestMetricsExporter(t, bqi.AppendOutcome{
+		AcknowledgedRows: 1,
+		RowErrors:        []bqi.RowError{{Index: 1, Code: "FIELDS_ERROR", Message: "bad metric row"}},
+	})
+	e.tel = tel
+	e.cfg.Limits.MaxAttributeCount = 1
+	e.opts.Limits = e.cfg.Limits.toTransform()
+	_, stream := withQuarantine(t, e.signalExporter, bqi.AppendOutcome{AcknowledgedRows: 2})
+
+	md := newTestMetrics(3)
+	dps := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Gauge().DataPoints()
+	dps.At(0).Attributes().PutStr("a", "1")
+	dps.At(0).Attributes().PutStr("b", "2") // exceeds MaxAttributeCount=1
+
+	err = e.pushMetricsData(context.Background(), md)
+	if err == nil || consumererror.IsPermanent(err) {
+		t.Fatalf("pushMetricsData error = %v, want retryable subset error for surviving point", err)
+	}
+	if stream.gotRows != 2 {
+		t.Fatalf("quarantined %d rows, want 2 (1 limit breach + 1 row rejection)", stream.gotRows)
+	}
+	if got := metricInt64Sum(t, reader, "otelcol_exporter_bigquery_quarantined_rows"); got != 2 {
+		t.Errorf("quarantined_rows = %d, want 2", got)
+	}
+	if got := metricInt64Sum(t, reader, "otelcol_exporter_bigquery_append_bytes"); got <= 0 {
+		t.Errorf("append_bytes = %d, want > 0", got)
+	}
+}
+
+type fakeStatusHost struct {
+	events []*componentstatus.Event
+}
+
+func (f *fakeStatusHost) GetExtensions() map[component.ID]component.Component { return nil }
+
+func (f *fakeStatusHost) Report(ev *componentstatus.Event) {
+	f.events = append(f.events, ev)
+}
+
+func TestComponentStatusReportedAcrossLifecycleAndAppend(t *testing.T) {
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(t.TempDir(), "missing-adc.json"))
+	originalAdmin := newDestinationAdmin
+	t.Cleanup(func() { newDestinationAdmin = originalAdmin })
+	newDestinationAdmin = func(
+		context.Context, string, string, ...option.ClientOption,
+	) (destinationAdmin, error) {
+		return &fakeDestinationAdmin{datasetMetadata: &bq.DatasetMetadata{}, tableMetadata: &bq.TableMetadata{Schema: mustBigQuerySchema(t, schema.SpansTableSchema())}}, nil
+	}
+
+	cfg := validConfig()
+	cfg.Endpoint.URL = "localhost:19050"
+	cfg.Endpoint.Insecure = true
+	cfg.Endpoint.WithoutAuthentication = true
+	e := newSignalExporter(componentTelemetryForTest(), cfg, cfg.Traces.Table, schema.SpansTableSchema())
+	host := &fakeStatusHost{}
+
+	if err := e.start(context.Background(), host); err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	// Replace writer with fakeAppender to test appendEncoded status transitions.
+	_ = e.writer.Close()
+	tempErr := status.Error(codes.Unavailable, "temp")
+	app := &fakeAppender{outcome: bqi.AppendOutcome{Verdict: bqi.Classify(tempErr), Err: tempErr}}
+	e.writer = app
+
+	_ = e.appendEncoded(context.Background(), [][]byte{[]byte("row")}, []int{0}, "op-1")
+	app.outcome = bqi.AppendOutcome{AcknowledgedRows: 1}
+	_ = e.appendEncoded(context.Background(), [][]byte{[]byte("row")}, []int{0}, "op-2")
+	permErr := status.Error(codes.PermissionDenied, "denied")
+	app.outcome = bqi.AppendOutcome{Verdict: bqi.Classify(permErr), Err: permErr}
+	_ = e.appendEncoded(context.Background(), [][]byte{[]byte("row")}, []int{0}, "op-3")
+
+	if err := e.shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown failed: %v", err)
+	}
+
+	var gotStatuses []componentstatus.Status
+	for _, ev := range host.events {
+		gotStatuses = append(gotStatuses, ev.Status())
+	}
+	wantStatuses := []componentstatus.Status{
+		componentstatus.StatusStarting,
+		componentstatus.StatusOK,
+		componentstatus.StatusRecoverableError,
+		componentstatus.StatusOK,
+		componentstatus.StatusPermanentError,
+		componentstatus.StatusStopping,
+		componentstatus.StatusStopped,
+	}
+	if len(gotStatuses) != len(wantStatuses) {
+		t.Fatalf("reported statuses = %v, want %v", gotStatuses, wantStatuses)
+	}
+	for i := range wantStatuses {
+		if gotStatuses[i] != wantStatuses[i] {
+			t.Errorf("status[%d] = %v, want %v", i, gotStatuses[i], wantStatuses[i])
+		}
+	}
+}
+
+// The quarantine self-telemetry exists to expose dead-letter loss, so a
+// quarantine append that only partly succeeds must count each row by its own
+// fate: quarantined when its sub-request was acknowledged and the service did
+// not reject it, failed otherwise. A real writer reports AckedRanges alongside
+// AcknowledgedRows, and rows outside the acknowledged ranges were not written
+// even though another sub-request was.
+func TestQuarantineTelemetryCountsEachRowOfAPartiallyFailedAppend(t *testing.T) {
+	unavailable := status.Error(codes.Unavailable, "later quarantine sub-request failed")
+	rejected := status.Error(codes.InvalidArgument, "quarantine row rejected")
+	tests := []struct {
+		name                   string
+		out                    bqi.AppendOutcome
+		quarantined, failedRow int64
+	}{
+		{
+			name: "first sub-request acknowledged, the second failed",
+			out: bqi.AppendOutcome{
+				AcknowledgedRows: 2, AckedRanges: [][2]int{{0, 2}},
+				Verdict: bqi.Classify(unavailable), Err: unavailable,
+			},
+			quarantined: 2, failedRow: 1,
+		},
+		{
+			name: "a row error fails the sub-request it travelled in",
+			out: bqi.AppendOutcome{
+				AcknowledgedRows: 1, AckedRanges: [][2]int{{0, 1}},
+				RowErrors: []bqi.RowError{{Index: 2, Code: "FIELDS_ERROR", Message: "bad quarantine row"}},
+				Verdict:   bqi.Classify(rejected), Err: rejected,
+			},
+			quarantined: 1, failedRow: 2,
+		},
+		{
+			name:        "every sub-request acknowledged",
+			out:         bqi.AppendOutcome{AcknowledgedRows: 3, AckedRanges: [][2]int{{0, 2}, {2, 3}}},
+			quarantined: 3, failedRow: 0,
+		},
+		{
+			name:        "nothing acknowledged",
+			out:         bqi.AppendOutcome{Verdict: bqi.Classify(unavailable), Err: unavailable},
+			quarantined: 0, failedRow: 3,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := sdkmetric.NewManualReader()
+			mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+			t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+			tel, err := metadata.NewTelemetry(mp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			e, app := newTestTracesExporter(t, bqi.AppendOutcome{})
+			e.tel = tel
+			_, stream := withQuarantine(t, e.signalExporter, tc.out)
+
+			// Three spans without an end time: the transform stage rejects all
+			// three, so the signal table receives nothing and the quarantine
+			// append carries three rows.
+			td := newTestTraces(3)
+			spans := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+			for i := range spans.Len() {
+				spans.At(i).SetEndTimestamp(0)
+			}
+			if err := e.pushTraceData(context.Background(), td); err != nil {
+				t.Fatalf("pushTraceData returned %v, want nil: every span was rejected", err)
+			}
+			if app.appended != 0 || stream.gotRows != 3 {
+				t.Fatalf("signal appends = %d, quarantine rows = %d, want 0 and 3", app.appended, stream.gotRows)
+			}
+			if got := metricInt64SumOrZero(t, reader, "otelcol_exporter_bigquery_quarantined_rows"); got != tc.quarantined {
+				t.Errorf("quarantined_rows = %d, want %d", got, tc.quarantined)
+			}
+			if got := metricInt64SumOrZero(t, reader, "otelcol_exporter_bigquery_quarantine_failed_rows"); got != tc.failedRow {
+				t.Errorf("quarantine_failed_rows = %d, want %d", got, tc.failedRow)
+			}
+		})
+	}
+}
+
+// metricInt64SumOrZero is metricInt64Sum for a counter that may never have
+// been incremented, and so never collected.
+func metricInt64SumOrZero(t *testing.T, reader *sdkmetric.ManualReader, name string) int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name == name {
+				return metricInt64Sum(t, reader, name)
+			}
+		}
+	}
+	return 0
+}
+
+// slowQuarantineStore is a payload store whose every upload outlasts a 10 ms
+// quarantine budget, and that counts the uploads it was asked for.
+func slowQuarantineStore(calls *atomic.Int32) funcBlobStore {
+	return funcBlobStore{
+		writeFn: func(ctx context.Context, _, _, _ string, _ []byte) (string, error) {
+			calls.Add(1)
+			select {
+			case <-time.After(20 * time.Millisecond):
+				return "1", nil
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		},
+	}
+}
+
+// Metric points dropped for quarantine get the same quarantine budget as spans
+// and log records: their payload uploads run under quarantine.timeout rather
+// than offload.timeout from a background context, and building rows stops once
+// the budget is spent. Every point that never reaches the quarantine table is
+// counted in quarantine_failed_rows.
+func TestPushMetricsQuarantineStopsOnceBudgetIsExhausted(t *testing.T) {
+	cfg := validConfig()
+	cfg.Quarantine.Enabled = true
+	cfg.Quarantine.Timeout = 10 * time.Millisecond
+	cfg.Offload.Enabled = true
+	cfg.Offload.Bucket = "otel-offload-bucket"
+	cfg.Offload.MinBytes = 512
+	cfg.Offload.MaxObjectBytes = 64 * 1024 * 1024
+	cfg.Limits.MaxAttributeCount = 1
+
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+	e, err := newMetricsExporter(component.TelemetrySettings{Logger: zap.NewNop(), MeterProvider: mp}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	e.offloader.SetStore(slowQuarantineStore(&calls))
+	enc, err := protoenc.New(schema.MetricsTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.enc = enc
+	e.writer = &fakeAppender{}
+	_, stream := withQuarantine(t, e.signalExporter, bqi.AppendOutcome{AcknowledgedRows: 32})
+
+	// Two attributes against a limit of one reject every point, and the large
+	// one makes each point's quarantine payload eligible for upload.
+	const count = 32
+	md := newTestMetrics(count)
+	dps := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Gauge().DataPoints()
+	for i := range dps.Len() {
+		dps.At(i).Attributes().PutStr("large", strings.Repeat("X", 2048))
+		dps.At(i).Attributes().PutStr("b", "2")
+	}
+
+	start := time.Now()
+	if err := e.pushMetricsData(context.Background(), md); err != nil {
+		t.Fatalf("pushMetricsData returned %v, want nil: every point was rejected", err)
+	}
+	elapsed := time.Since(start)
+
+	if got := calls.Load(); got > 2 {
+		t.Errorf("quarantine payload uploads = %d, want <= 2 once the 10ms budget is spent", got)
+	}
+	if elapsed > 300*time.Millisecond {
+		t.Errorf("pushMetricsData took %v, want it bounded by the 10ms quarantine budget", elapsed)
+	}
+	if stream.appended != 0 {
+		t.Errorf("quarantine appends = %d, want 0 after the budget expired", stream.appended)
+	}
+	quarantined := metricInt64SumOrZero(t, reader, "otelcol_exporter_bigquery_quarantined_rows")
+	failed := metricInt64SumOrZero(t, reader, "otelcol_exporter_bigquery_quarantine_failed_rows")
+	if quarantined != 0 || failed != count {
+		t.Errorf("quarantined_rows = %d, quarantine_failed_rows = %d, want 0 and %d", quarantined, failed, count)
+	}
+}
+
+// Spans and log records whose quarantine rows are given up on when the budget
+// runs out, whether before their row was built or before it was written, are
+// counted in quarantine_failed_rows: it covers every row targeted for
+// quarantine that never reached the table.
+func TestQuarantineBudgetExpiryCountsEveryUnwrittenRow(t *testing.T) {
+	const count = 32
+	for _, signal := range []string{"traces", "logs"} {
+		t.Run(signal, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.Quarantine.Enabled = true
+			cfg.Quarantine.Timeout = 10 * time.Millisecond
+			cfg.Offload.Enabled = true
+			cfg.Offload.Bucket = "otel-offload-bucket"
+			cfg.Offload.MinBytes = 512
+			cfg.Offload.MaxObjectBytes = 64 * 1024 * 1024
+			cfg.Limits.MaxAttributeCount = 1
+
+			reader := sdkmetric.NewManualReader()
+			mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+			t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+			set := component.TelemetrySettings{Logger: zap.NewNop(), MeterProvider: mp}
+			var calls atomic.Int32
+
+			var push func() error
+			switch signal {
+			case "traces":
+				e, err := newTracesExporter(set, cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				e.offloader.SetStore(slowQuarantineStore(&calls))
+				e.writer = &fakeAppender{}
+				withQuarantine(t, e.signalExporter, bqi.AppendOutcome{AcknowledgedRows: count})
+				td := newTestTraces(count)
+				spans := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+				for i := range spans.Len() {
+					spans.At(i).Attributes().PutStr("large", strings.Repeat("X", 2048))
+					spans.At(i).Attributes().PutStr("b", "2")
+				}
+				push = func() error { return e.pushTraceData(context.Background(), td) }
+			case "logs":
+				e, err := newLogsExporter(set, cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				e.offloader.SetStore(slowQuarantineStore(&calls))
+				e.writer = &fakeAppender{}
+				withQuarantine(t, e.signalExporter, bqi.AppendOutcome{AcknowledgedRows: count})
+				ld := logsWithBodies(make([]string, count)...)
+				records := ld.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords()
+				for i := range records.Len() {
+					records.At(i).Attributes().PutStr("large", strings.Repeat("X", 2048))
+					records.At(i).Attributes().PutStr("b", "2")
+				}
+				push = func() error { return e.pushLogData(context.Background(), ld) }
+			}
+
+			if err := push(); err != nil {
+				t.Fatalf("push returned %v, want nil: every record was rejected", err)
+			}
+			quarantined := metricInt64SumOrZero(t, reader, "otelcol_exporter_bigquery_quarantined_rows")
+			failed := metricInt64SumOrZero(t, reader, "otelcol_exporter_bigquery_quarantine_failed_rows")
+			if quarantined+failed != count || quarantined != 0 {
+				t.Errorf("quarantined_rows = %d, quarantine_failed_rows = %d, want 0 and %d", quarantined, failed, count)
+			}
+		})
+	}
+}
+
+func TestPushMetricsPreservesRetryIdentityWhenEarlierOrdinalPeerDroppedByEncodeRows(t *testing.T) {
+	// Construct 3 otherwise identical delta-sum points whose metric descriptions differ.
+	// Point 0 has a long description that makes its proto-encoded row exceed max_row_bytes.
+	// Point 1 and Point 2 fit within max_row_bytes and are sent to the writer.
+	md := pmetric.NewMetrics()
+	rm := md.ResourceMetrics().AppendEmpty()
+	rm.Resource().Attributes().PutStr("service.name", "test-svc")
+	sm := rm.ScopeMetrics().AppendEmpty()
+	sm.Scope().SetName("test-scope")
+
+	addDeltaSum := func(desc string, val int64) {
+		m := sm.Metrics().AppendEmpty()
+		m.SetName("test.counter")
+		m.SetDescription(desc)
+		sum := m.SetEmptySum()
+		sum.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
+		sum.SetIsMonotonic(true)
+		dp := sum.DataPoints().AppendEmpty()
+		dp.SetTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+		dp.SetIntValue(val)
+	}
+
+	// 3 identical delta-sum points (same timestamp, value, metric name, scope, resource).
+	// Because metric description is excluded from canonicalMetricPoint, all 3 points share
+	// the same fingerprint group and consume ordinals 0, 1, 2.
+	addDeltaSum(strings.Repeat("X", 2048), 7) // Point 0: oversized, will be dropped by encodeRows
+	addDeltaSum("short", 7)                   // Point 1: kept in request 0 (fails)
+	addDeltaSum("short", 7)                   // Point 2: kept in request 1 (acknowledged)
+
+	// Verify original row fingerprints: ordinals 0, 1, 2
+	rows, rejects := transform.MetricRows(md, transform.Options{Limits: transform.DefaultLimits()})
+	if len(rejects) != 0 || len(rows) != 3 {
+		t.Fatalf("MetricRows got %d rows, %d rejects; want 3 rows, 0 rejects", len(rows), len(rejects))
+	}
+	fp0 := rows[0]["point_fingerprint"].(string)
+	fp1 := rows[1]["point_fingerprint"].(string)
+	fp2 := rows[2]["point_fingerprint"].(string)
+	if fp0 == fp1 || fp1 == fp2 || fp0 == fp2 {
+		t.Fatalf("expected distinct ordinals/fingerprints; got fps: %s, %s, %s", fp0, fp1, fp2)
+	}
+
+	cfg := validConfig()
+	cfg.Write.MaxRowBytes = 1024 // point 0 exceeds 1024, points 1 and 2 fit
+	tel, err := metadata.NewTelemetry(noop.NewMeterProvider())
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := protoenc.New(schema.MetricsTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Configure fakeAppender:
+	// Points 1 and 2 are passed to Append (2 rows).
+	// Request for row 0 (Point 1) fails with retryable error.
+	// Request for row 1 (Point 2) is acknowledged: AckedRanges = [][2]int{{1, 2}}, AcknowledgedRows = 1.
+	tempErr := status.Error(codes.Unavailable, "request 0 temporary error")
+	app := &fakeAppender{
+		outcome: bqi.AppendOutcome{
+			AcknowledgedRows: 1,
+			AckedRanges:      [][2]int{{1, 2}},
+			Verdict:          bqi.Classify(tempErr),
+			Err:              tempErr,
+		},
+	}
+
+	se := &signalExporter{
+		cfg:    cfg,
+		table:  cfg.Metrics.Table,
+		logger: zap.NewNop(),
+		tel:    tel,
+		writer: app,
+		enc:    enc,
+		schema: schema.MetricsTableSchema(),
+		opts:   transform.Options{Limits: cfg.Limits.toTransform()},
+	}
+	e := &metricsExporter{se}
+
+	pushErr := e.pushMetricsData(context.Background(), md)
+	if pushErr == nil || consumererror.IsPermanent(pushErr) {
+		t.Fatalf("pushMetricsData returned %v, want retryable error", pushErr)
+	}
+	var mdErr consumererror.Metrics
+	if !errors.As(pushErr, &mdErr) {
+		t.Fatalf("error %T does not carry pmetric.Metrics", pushErr)
+	}
+
+	// On retry, the payload must include Point 0 so that Point 1 reproduces its original ordinal 1 and fingerprint!
+	retryRows, _ := transform.MetricRows(mdErr.Data(), e.opts)
+	if len(retryRows) != 3 {
+		t.Fatalf("expected 3 retry rows (peer 0, point 1, point 2), got %d", len(retryRows))
+	}
+	if retryRows[0]["point_fingerprint"].(string) != fp0 {
+		t.Errorf("retried point 0 fingerprint = %s, want %s", retryRows[0]["point_fingerprint"], fp0)
+	}
+	if retryRows[1]["point_fingerprint"].(string) != fp1 {
+		t.Errorf("retried point 1 fingerprint = %s, want %s (original ordinal 1 preserved)",
+			retryRows[1]["point_fingerprint"], fp1)
+	}
+	if retryRows[2]["point_fingerprint"].(string) != fp2 {
+		t.Errorf("retried point 2 fingerprint = %s, want %s (original ordinal 2 preserved)",
+			retryRows[2]["point_fingerprint"], fp2)
+	}
+
+	// When pushMetricsData is retried with mdErr.Data(), point 0 is dropped by encodeRows again,
+	// and point 1 is sent with its original identity to BigQuery.
+	var secondPushRows [][]byte
+	app.appendFn = func(_ context.Context, rows [][]byte) bqi.AppendOutcome {
+		secondPushRows = rows
+		return bqi.AppendOutcome{AcknowledgedRows: len(rows)}
+	}
+	if err := e.pushMetricsData(context.Background(), mdErr.Data()); err != nil {
+		t.Fatalf("retry pushMetricsData failed: %v", err)
+	}
+	if len(secondPushRows) != 2 {
+		t.Fatalf("second push sent %d rows, want 2 (points 1 and 2; point 0 dropped by encoder)", len(secondPushRows))
+	}
 }
