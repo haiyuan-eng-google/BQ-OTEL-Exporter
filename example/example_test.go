@@ -32,7 +32,7 @@ func TestCustomCollectorExampleIsSelfContainedAndPinned(t *testing.T) {
 		{
 			path: "Dockerfile",
 			contains: []string{
-				"golang:1.26.9-bookworm@sha256:",
+				"golang:1.27.0-bookworm@sha256:",
 				"gcr.io/distroless/base-debian12:nonroot@sha256:",
 			},
 			notContain: []string{"latest"},
