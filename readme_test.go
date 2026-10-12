@@ -104,6 +104,8 @@ func TestReadmeReflectsV0Alpha2Contract(t *testing.T) {
 		"redaction.blocked_keys",
 		"redaction.blocked_value_patterns",
 		"otelcol_exporter_bigquery_redacted_values",
+		"offload.cache_size",
+		"otelcol_exporter_bigquery_offload_dedup_hits",
 		"v0alpha2",
 		"Operating v0alpha2 tables",
 		"TIMESTAMP_TRUNC(start_time, HOUR)",
@@ -114,6 +116,7 @@ func TestReadmeReflectsV0Alpha2Contract(t *testing.T) {
 		"CREATE SEARCH INDEX",
 		"otel_spans_trace_lookup_idx",
 		"otel_logs_trace_lookup_idx",
+		"otel_metrics_trace_lookup_idx",
 		"NO_OP_ANALYZER",
 		"bigquery.jobs.create",
 		spansIndexDDL,
@@ -128,6 +131,7 @@ func TestReadmeReflectsV0Alpha2Contract(t *testing.T) {
 		"source_record_namespace",
 		"source_record_id_attribute",
 		"otlp-protojson-v1",
+		"attributes_fingerprint",
 	} {
 		if strings.Contains(readme, retired) {
 			t.Errorf("README.md still references retired v0alpha1 token %q", retired)

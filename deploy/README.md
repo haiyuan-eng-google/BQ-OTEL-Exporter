@@ -118,9 +118,25 @@ terraform apply \
   -var="kms_key_name=projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/bq"
 ```
 
-Terraform also grants the BigQuery encryption service agent decrypt permission
-on the key automatically. When `kms_key_name` is empty (the default), the
-dataset uses Google-managed encryption.
+Terraform also grants the BigQuery encryption service agent
+`roles/cloudkms.cryptoKeyEncrypterDecrypter` on the key automatically. When
+`kms_key_name` is empty (the default), the dataset uses Google-managed
+encryption.
+
+### Max Staleness
+
+Set `max_staleness` in the Terraform module to enforce a maximum data staleness
+window on partitioned tables. Partitions newer than this duration are not
+queried:
+
+```bash
+terraform apply \
+  -var="project_id=my-project" \
+  -var="max_staleness=15m"
+```
+
+The value is a Go duration string (e.g. `15m`, `1h`, `30s`). It is applied to
+all four signal and quarantine tables, never to views.
 
 ### Labels
 

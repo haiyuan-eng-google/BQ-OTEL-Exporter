@@ -15,8 +15,8 @@ variable "location" {
   default     = "US"
 
   validation {
-    condition     = can(regex("^\\S+$", var.location))
-    error_message = "Location must not be empty or contain whitespace."
+    condition     = can(regex("^[A-Za-z]{2,10}(-[A-Za-z0-9]+)*$", var.location))
+    error_message = "Location must be a valid BigQuery location (letters and hyphens, e.g. US, us-central1, eu)."
   }
 }
 
@@ -82,4 +82,15 @@ variable "offload_bucket" {
   description = "GCS bucket name for optional large-payload offloading. When set, grants the collector service account objectCreator and objectViewer on the bucket. The bucket must already exist."
   type        = string
   default     = ""
+}
+
+variable "max_staleness" {
+  description = "Maximum staleness of data in partitioned tables. When set, partitions newer than this duration are not queried. Applied to all signal and quarantine tables, never to views. Leave empty to disable."
+  type        = string
+  default     = ""
+
+  validation {
+    condition = var.max_staleness == "" ? true : can(regex("^[0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h)$", var.max_staleness))
+    error_message = "max_staleness must be a Go duration string (e.g. 15m, 1h, 30s) or empty."
+  }
 }

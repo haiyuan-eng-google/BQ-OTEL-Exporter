@@ -33,7 +33,7 @@ flowchart TD
     GRPC --> BQ
     HTTP --> BQ
     BQ -->|Storage Write API| BQDest["BigQuery
-    otel_spans, otel_logs"]
+    otel_spans, otel_logs, otel_metrics"]
 ```
 
 ## Model A: Sidecar Collector
@@ -211,10 +211,9 @@ underlying issue:
 
 ```bash
 go run ./cmd/bq-quarantine-replay \
-  --project=my-project \
-  --dataset=otel \
-  --table=otel_quarantine \
-  --signal=all
+  --input=quarantine.jsonl \
+  --signal=spans,logs \
+  --error-code=OVERSIZE_ROW
 ```
 
 ### Redaction
@@ -250,8 +249,8 @@ labels:
 
 The Terraform module (`deploy/terraform/`) provisions CMEK on the dataset and
 all tables when `kms_key_name` is set, and grants the BigQuery encryption
-service agent decrypt permission on the KMS key. Labels are applied to the
-dataset, all tables, and all views.
+service agent `roles/cloudkms.cryptoKeyEncrypterDecrypter` on the KMS key. Labels
+are applied to the dataset, all tables, and all views.
 
 ### Search Indexes
 

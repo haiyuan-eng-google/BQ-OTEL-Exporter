@@ -40,7 +40,7 @@ data:
           search_indexes: {{ .Values.bigquery.autoCreateSearchIndexes }}
           {{- end }}
         traces:
-          table: {{ .Values.bigquery.tracesTable }}
+          table: {{ .Values.bigquery.tracesTable | quote }}
           {{- if .Values.bigquery.traces.partitionExpirationDays }}
           partition_expiration_days: {{ .Values.bigquery.traces.partitionExpirationDays }}
           {{- end }}
@@ -48,17 +48,19 @@ data:
           require_partition_filter: {{ .Values.bigquery.traces.requirePartitionFilter }}
           {{- end }}
           {{- if .Values.bigquery.traces.kmsKeyName }}
-          kms_key_name: {{ .Values.bigquery.traces.kmsKeyName }}
+          kms_key_name: {{ .Values.bigquery.traces.kmsKeyName | quote }}
           {{- end }}
           {{- with .Values.bigquery.traces.labels }}
           labels:
-            {{- toYaml . | nindent 12 }}
+            {{- range $k, $v := . }}
+            {{ $k }}: {{ $v | quote }}
+            {{- end }}
           {{- end }}
           {{- if .Values.bigquery.traces.maxStaleness }}
-          max_staleness: {{ .Values.bigquery.traces.maxStaleness }}
+          max_staleness: {{ .Values.bigquery.traces.maxStaleness | quote }}
           {{- end }}
         logs:
-          table: {{ .Values.bigquery.logsTable }}
+          table: {{ .Values.bigquery.logsTable | quote }}
           {{- if .Values.bigquery.logs.partitionExpirationDays }}
           partition_expiration_days: {{ .Values.bigquery.logs.partitionExpirationDays }}
           {{- end }}
@@ -66,17 +68,19 @@ data:
           require_partition_filter: {{ .Values.bigquery.logs.requirePartitionFilter }}
           {{- end }}
           {{- if .Values.bigquery.logs.kmsKeyName }}
-          kms_key_name: {{ .Values.bigquery.logs.kmsKeyName }}
+          kms_key_name: {{ .Values.bigquery.logs.kmsKeyName | quote }}
           {{- end }}
           {{- with .Values.bigquery.logs.labels }}
           labels:
-            {{- toYaml . | nindent 12 }}
+            {{- range $k, $v := . }}
+            {{ $k }}: {{ $v | quote }}
+            {{- end }}
           {{- end }}
           {{- if .Values.bigquery.logs.maxStaleness }}
-          max_staleness: {{ .Values.bigquery.logs.maxStaleness }}
+          max_staleness: {{ .Values.bigquery.logs.maxStaleness | quote }}
           {{- end }}
         metrics:
-          table: {{ .Values.bigquery.metricsTable }}
+          table: {{ .Values.bigquery.metricsTable | quote }}
           {{- if .Values.bigquery.metrics.partitionExpirationDays }}
           partition_expiration_days: {{ .Values.bigquery.metrics.partitionExpirationDays }}
           {{- end }}
@@ -84,31 +88,35 @@ data:
           require_partition_filter: {{ .Values.bigquery.metrics.requirePartitionFilter }}
           {{- end }}
           {{- if .Values.bigquery.metrics.kmsKeyName }}
-          kms_key_name: {{ .Values.bigquery.metrics.kmsKeyName }}
+          kms_key_name: {{ .Values.bigquery.metrics.kmsKeyName | quote }}
           {{- end }}
           {{- with .Values.bigquery.metrics.labels }}
           labels:
-            {{- toYaml . | nindent 12 }}
+            {{- range $k, $v := . }}
+            {{ $k }}: {{ $v | quote }}
+            {{- end }}
           {{- end }}
           {{- if .Values.bigquery.metrics.maxStaleness }}
-          max_staleness: {{ .Values.bigquery.metrics.maxStaleness }}
+          max_staleness: {{ .Values.bigquery.metrics.maxStaleness | quote }}
           {{- end }}
         {{- if .Values.bigquery.kmsKeyName }}
-        kms_key_name: {{ .Values.bigquery.kmsKeyName }}
+        kms_key_name: {{ .Values.bigquery.kmsKeyName | quote }}
         {{- end }}
         {{- with .Values.bigquery.labels }}
         labels:
-          {{- toYaml . | nindent 10 }}
+          {{- range $k, $v := . }}
+          {{ $k }}: {{ $v | quote }}
+          {{- end }}
         {{- end }}
         {{- if .Values.offload.enabled }}
         offload:
           enabled: true
-          bucket: {{ .Values.offload.bucket }}
+          bucket: {{ .Values.offload.bucket | quote }}
           {{- if .Values.offload.prefix }}
-          prefix: {{ .Values.offload.prefix }}
+          prefix: {{ .Values.offload.prefix | quote }}
           {{- end }}
           {{- if .Values.offload.authorizer }}
-          authorizer: {{ .Values.offload.authorizer }}
+          authorizer: {{ .Values.offload.authorizer | quote }}
           {{- end }}
           {{- if .Values.offload.minBytes }}
           min_bytes: {{ .Values.offload.minBytes }}
@@ -120,7 +128,7 @@ data:
           max_concurrency: {{ .Values.offload.maxConcurrency }}
           {{- end }}
           {{- if .Values.offload.timeout }}
-          timeout: {{ .Values.offload.timeout }}
+          timeout: {{ .Values.offload.timeout | quote }}
           {{- end }}
           {{- if .Values.offload.cacheSize }}
           cache_size: {{ .Values.offload.cacheSize }}
@@ -129,7 +137,7 @@ data:
         {{- if .Values.quarantine.enabled }}
         quarantine:
           enabled: true
-          table: {{ .Values.quarantine.table }}
+          table: {{ .Values.quarantine.table | quote }}
           {{- if .Values.quarantine.metadataOnly }}
           metadata_only: {{ .Values.quarantine.metadataOnly }}
           {{- end }}
@@ -137,7 +145,7 @@ data:
           max_raw_payload_bytes: {{ .Values.quarantine.maxRawPayloadBytes }}
           {{- end }}
           {{- if .Values.quarantine.timeout }}
-          timeout: {{ .Values.quarantine.timeout }}
+          timeout: {{ .Values.quarantine.timeout | quote }}
           {{- end }}
           {{- if .Values.quarantine.partitionExpirationDays }}
           partition_expiration_days: {{ .Values.quarantine.partitionExpirationDays }}
@@ -146,14 +154,16 @@ data:
           require_partition_filter: {{ .Values.quarantine.requirePartitionFilter }}
           {{- end }}
           {{- if .Values.quarantine.kmsKeyName }}
-          kms_key_name: {{ .Values.quarantine.kmsKeyName }}
+          kms_key_name: {{ .Values.quarantine.kmsKeyName | quote }}
           {{- end }}
           {{- with .Values.quarantine.labels }}
           labels:
-            {{- toYaml . | nindent 12 }}
+            {{- range $k, $v := . }}
+            {{ $k }}: {{ $v | quote }}
+            {{- end }}
           {{- end }}
           {{- if .Values.quarantine.maxStaleness }}
-          max_staleness: {{ .Values.quarantine.maxStaleness }}
+          max_staleness: {{ .Values.quarantine.maxStaleness | quote }}
           {{- end }}
         {{- end }}
         {{- if .Values.redaction.enabled }}
@@ -161,17 +171,21 @@ data:
           enabled: true
           {{- with .Values.redaction.blockedKeys }}
           blocked_keys:
-            {{- toYaml . | nindent 12 }}
+            {{- range . }}
+            - {{ . | quote }}
+            {{- end }}
           {{- end }}
           {{- if .Values.redaction.disableDefaultKeys }}
           disable_default_keys: {{ .Values.redaction.disableDefaultKeys }}
           {{- end }}
           {{- with .Values.redaction.blockedValuePatterns }}
           blocked_value_patterns:
-            {{- toYaml . | nindent 12 }}
+            {{- range . }}
+            - {{ . | quote }}
+            {{- end }}
           {{- end }}
           {{- if .Values.redaction.maskReplacement }}
-          mask_replacement: {{ .Values.redaction.maskReplacement }}
+          mask_replacement: {{ .Values.redaction.maskReplacement | quote }}
           {{- end }}
           {{- if .Values.redaction.redactLogBody }}
           redact_log_body: {{ .Values.redaction.redactLogBody }}

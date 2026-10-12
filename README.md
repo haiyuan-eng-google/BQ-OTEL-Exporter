@@ -244,6 +244,15 @@ as log events rather than span attributes.
 | `sending_queue`                 | 8 consumers           | Standard `exporterhelper` queue, including the persistent queue. Consumer concurrency defaults to the managedwriter request window. |
 | `retry_on_failure`              | `max_elapsed_time: 900s` | Standard `exporterhelper` retry. The horizon must be finite. |
 | `timeout`                       | `5s`                  | Budget for one export attempt, including slot waits and every acknowledgement. See [Timeout and concurrency envelope](#timeout-and-concurrency-envelope). |
+| `offload.enabled`               | `false`               | Route oversized span/log values and quarantine payloads to Google Cloud Storage, recording BigQuery ObjectRef references. |
+| `offload.bucket`                | —                     | GCS bucket name for offloaded payloads. Required when `offload.enabled` is true. |
+| `offload.prefix`                | `otel`                | Object name prefix within the bucket. |
+| `offload.authorizer`             | —                     | BigQuery connection resource name for authorized GCS reads. |
+| `offload.min_bytes`             | `1048576` (1 MiB)     | Minimum payload size to offload. Smaller payloads stay inline. |
+| `offload.max_object_bytes`       | `67108864` (64 MiB)   | Maximum size of a single offloaded object. |
+| `offload.max_concurrency`        | `4`                   | Maximum concurrent GCS uploads. |
+| `offload.timeout`                | `30s`                 | GCS upload timeout. |
+| `offload.cache_size`             | `4096`                | Cross-batch LRU cache entries to dedup offloaded objects by content hash. |
 
 ### Structural limits
 
@@ -385,7 +394,7 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
   `record_fingerprint STRING` (`fp1:<sha256_hex>`).
 - **Relational OTLP metrics table (`otel_metrics` and `otel_metrics_dedup`).**
   `otel_metrics` stores all five OTLP metric data-point types (`GAUGE`, `SUM`,
-  `HISTOGRAM`, `EXPONENTIAL_HISTOGRAM`, `SUMMARY`) in a single 40-column
+  `HISTOGRAM`, `EXPONENTIAL_HISTOGRAM`, `SUMMARY`) in a single 39-column
   relational table partitioned by `DATE(timestamp)` and clustered by
   `(service_name, metric_name, metric_type)`, with `point_fingerprint STRING NOT NULL`
   (`fp1:<sha256_hex>` over canonical `attributes` JSON) and
@@ -449,7 +458,7 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
     `agent_invocation_count` are the last four columns, so every earlier column
     keeps its position.
   - `v_gen_ai_tool_usage`: hourly tool invocation count, error rate, and latency
-    rollups over `v_gen_ai_spans` grouped by `(hour_bucket, service_name, gen_ai_agent_name, gen_ai_tool_name, gen_ai_tool_type)`.
+    rollups over `v_gen_ai_spans` grouped by `(usage_hour, service_name, gen_ai_agent_name, gen_ai_tool_name, gen_ai_tool_type)`.
   - `v_gen_ai_logs`: filters `otel_logs_dedup` to GenAI/agent log events and
     left-joins `otel_spans_dedup` on `(trace_id, span_id)` and a null-safe
     `service_name` match, within the window described under *Time-bounded
@@ -546,6 +555,9 @@ ON `my-project.otel.otel_spans` (trace_id, span_id) OPTIONS (analyzer = 'NO_OP_A
 
 CREATE SEARCH INDEX IF NOT EXISTS `otel_logs_trace_lookup_idx`
 ON `my-project.otel.otel_logs` (trace_id, span_id) OPTIONS (analyzer = 'NO_OP_ANALYZER');
+
+CREATE SEARCH INDEX IF NOT EXISTS `otel_metrics_trace_lookup_idx`
+ON `my-project.otel.otel_metrics` (ALL COLUMNS) OPTIONS (analyzer = 'NO_OP_ANALYZER');
 ```
 
 - **Exporter-fallback log timestamps on retry.** When a log record omits both
@@ -627,7 +639,7 @@ read time:
   where `insert_id` resolves from `logs.insert_id_attribute` or well-known
   insert ID attributes (`logging.googleapis.com/insertId`, `gcp.insert.id`,
   `gcp.insert_id`, `log.record.uid`) and falls back to `record_fingerprint`.
-- **Metrics**: `(timestamp, time_unix_nano, service_name, metric_name, metric_type, attributes_fingerprint, start_time_unix_nano)`.
+- **Metrics**: `(timestamp, time_unix_nano, service_name, metric_name, metric_type, point_fingerprint, start_time_unix_nano)`.
 
 The repo ships `otel_spans_dedup`, `otel_logs_dedup`, and `otel_metrics_dedup`
 **logical views** so the default object an analyst touches is already
@@ -675,7 +687,7 @@ Use these content-free self-telemetry instruments to detect a stuck path:
 | `otelcol_exporter_bigquery_offloaded_payloads` | Payloads offloaded to object storage (`{signal, mime_type}`). |
 | `otelcol_exporter_bigquery_offloaded_bytes` | Bytes offloaded to object storage (`{signal}`). |
 | `otelcol_exporter_bigquery_offload_errors` | Object storage offload failures (`{signal, stage}`). |
-| `otelcol_exporter_bigquery_offload_dedup_hits` | Offload attempts satisfied from the cross-batch LRU cache instead of uploading (`{signal}`). |
+| `otelcol_exporter_bigquery_offload_dedup_hits` | Offload attempts satisfied from the cross-batch LRU cache (`offload.cache_size` entries) instead of uploading (`{signal}`). |
 | `otelcol_exporter_bigquery_redacted_values` | Attribute keys and string values masked by [redaction](#redaction) (`{signal, match_type}`); never records key names or values. |
 
 Both current-value instruments should return to zero after recovery or clean

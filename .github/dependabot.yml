@@ -52,3 +52,6 @@ updates:
       interval: weekly
     commit-message:
       prefix: "chore(docker)"
+    groups:
+      docker:
+        group-by: "dependency-name"

@@ -19,14 +19,19 @@
 #   therefore turn off the image's default auto_create.
 # - Enterprise overrides (uncomment to enable):
 #   --set=exporters.bigquery.metrics.table=otel_metrics
-#   --set=exporters.bigquery.auto_create.companion_views=true
-#   --set=exporters.bigquery.auto_create.search_indexes=true
 #   --set=exporters.bigquery.offload.enabled=true \
 #   --set=exporters.bigquery.offload.bucket=my-otel-offload-bucket
+#   --set=exporters.bigquery.offload.authorizer=my-project.us.otel-gcs
 #   --set=exporters.bigquery.quarantine.enabled=true \
 #   --set=exporters.bigquery.quarantine.table=otel_quarantine
+#   --set=exporters.bigquery.quarantine.max_raw_payload_bytes=1048576
+#   --set=exporters.bigquery.quarantine.timeout=5s
+#   --set=exporters.bigquery.quarantine.max_staleness=30m
 #   --set=exporters.bigquery.redaction.enabled=true
+#   --set=exporters.bigquery.redaction.mask_replacement="[REDACTED]"
 #   --set=exporters.bigquery.kms_key_name=projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/bq
+#   --set=exporters.bigquery.traces.kms_key_name=projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/spans
+#   --set=exporters.bigquery.traces.max_staleness=15m
 #   --set=exporters.bigquery.labels.environment=production
 #   --set=exporters.bigquery.traces.partition_expiration_days=365
 #   The bundled config wires traces, logs, and metrics pipelines to the bigquery
@@ -58,6 +63,8 @@ spec:
             - "--config=/etc/otel/config.yml"
             - "--set=exporters.bigquery.auto_create.dataset=false"
             - "--set=exporters.bigquery.auto_create.tables=false"
+            - "--set=exporters.bigquery.auto_create.companion_views=false"
+            - "--set=exporters.bigquery.auto_create.search_indexes=false"
           ports:
             - name: http1
               containerPort: 4318

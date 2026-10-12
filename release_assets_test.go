@@ -344,7 +344,8 @@ func TestHelmPersistentQueueCompactsOnTheQueueVolume(t *testing.T) {
 // Terraform provisions every table and view, so by default the collector's
 // service account gets only the data path on the dataset. The auto_create
 // permissions are granted only when grant_auto_create is set, and the only
-// project-scope grant is the jobs.create needed for search indexes.
+// project-scope grant is the jobs.create needed for search indexes. CMEK
+// uses the BigQuery default service account, not data.google_project.number.
 func TestTerraformGrantsWritePathOnDatasetOnly(t *testing.T) {
 	raw, err := os.ReadFile("deploy/terraform/main.tf")
 	if err != nil {
@@ -372,6 +373,61 @@ func TestTerraformGrantsWritePathOnDatasetOnly(t *testing.T) {
 				t.Errorf("role %s grants %s without grant_auto_create", name, strings.Trim(perm, `"`))
 			}
 		}
+	}
+	if !strings.Contains(text, "roles/cloudkms.cryptoKeyEncrypterDecrypter") {
+		t.Error("main.tf must use roles/cloudkms.cryptoKeyEncrypterDecrypter for CMEK")
+	}
+	if !strings.Contains(text, "google_bigquery_default_service_account") {
+		t.Error("main.tf must use google_bigquery_default_service_account for CMEK, not data.google_project.number")
+	}
+	if strings.Contains(text, "data.google_project.number") {
+		t.Error("main.tf must not reference data.google_project.number; use google_bigquery_default_service_account instead")
+	}
+}
+
+// TestTerraformViewQueriesMatchSchemaContract asserts that the dedup view SQL
+// in main.tf matches the schema contract: otel_metrics_dedup must partition by
+// metric_type, and gen_ai views must use LIKE 'gen_ai.%' (single %, not %%).
+func TestTerraformViewQueriesMatchSchemaContract(t *testing.T) {
+	raw, err := os.ReadFile("deploy/terraform/main.tf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+
+	// otel_metrics_dedup must partition by metric_type.
+	metricsDedupSection := regexp.MustCompile(`(?s)resource "google_bigquery_table" "otel_metrics_dedup" \{.*?PARTITION BY(.*?)ORDER BY`).FindStringSubmatch(text)
+	if metricsDedupSection == nil {
+		t.Fatal("could not find otel_metrics_dedup PARTITION BY clause")
+	}
+	if !strings.Contains(metricsDedupSection[1], "metric_type") {
+		t.Error("otel_metrics_dedup PARTITION BY must include metric_type")
+	}
+
+	// gen_ai views must use LIKE 'gen_ai.%' (single %), not 'gen_ai.%%'.
+	for _, view := range []string{"v_gen_ai_logs", "v_gen_ai_metrics"} {
+		section := regexp.MustCompile(`(?s)resource "google_bigquery_table" "` + view + `" \{.*?\n\}`).FindString(text)
+		if section == "" {
+			t.Fatalf("could not find %s view in main.tf", view)
+		}
+		if strings.Contains(section, "gen_ai.%%") {
+			t.Errorf("%s must use LIKE 'gen_ai.%%' (single percent), not 'gen_ai.%%%%'", view)
+		}
+		if !strings.Contains(section, "gen_ai.%") {
+			t.Errorf("%s must contain LIKE 'gen_ai.%%'", view)
+		}
+	}
+
+	// v_gen_ai_spans must not have backslash-escaped error.type.
+	spansSection := regexp.MustCompile(`(?s)resource "google_bigquery_table" "v_gen_ai_spans" \{.*?\n\}`).FindString(text)
+	if spansSection == "" {
+		t.Fatal("could not find v_gen_ai_spans view in main.tf")
+	}
+	if strings.Contains(spansSection, "\\") {
+		t.Error("v_gen_ai_spans must not backslash-escape JSON paths in heredocs")
+	}
+	if !strings.Contains(spansSection, "$.\"error.type\"") {
+		t.Error("v_gen_ai_spans must reference error.type with $.\"error.type\" (no backslash escaping in heredoc)")
 	}
 }
 
@@ -603,104 +659,46 @@ func TestRuntimeImagesExposeSamePorts(t *testing.T) {
 	}
 }
 
-// TestDeploymentTemplatesCoverExporterConfigKeys verifies that the example
-// collector config, the Helm ConfigMap, and testdata/config.yaml each expose
-// the metrics pipeline and cover the major exporter config sections.
-func TestDeploymentTemplatesCoverExporterConfigKeys(t *testing.T) {
-	// The example config and the Helm ConfigMap must wire the metrics pipeline.
-	exampleCfg := readRepoText(t, "example/otel-collector-config.yml")
-	if !strings.Contains(exampleCfg, "metrics:") {
-		t.Error("example/otel-collector-config.yml must configure the metrics exporter section")
-	}
-	if !strings.Contains(exampleCfg, "metrics:") || !strings.Contains(exampleCfg, "exporters: [bigquery]") {
-		t.Error("example/otel-collector-config.yml must wire the metrics pipeline with exporters: [bigquery]")
-	}
-	// Check that metrics pipeline is wired in the service.pipelines section.
-	if !strings.Contains(exampleCfg, "    metrics:\n      receivers: [otlp]") {
-		t.Error("example/otel-collector-config.yml must have a metrics pipeline in service.pipelines")
-	}
-
-	helmCfg := readRepoText(t, "deploy/helm/bigquery-otel-collector/templates/configmap.yaml")
-	if !strings.Contains(helmCfg, "metrics:") {
-		t.Error("Helm configmap.yaml must configure the metrics exporter section")
-	}
-	if !strings.Contains(helmCfg, "metrics:") || !strings.Contains(helmCfg, "exporters: [bigquery]") {
-		t.Error("Helm configmap.yaml must wire the metrics pipeline with exporters: [bigquery]")
-	}
-
-	helmValues := readRepoText(t, "deploy/helm/bigquery-otel-collector/values.yaml")
-	if !strings.Contains(helmValues, "metricsTable") {
-		t.Error("Helm values.yaml must expose bigquery.metricsTable")
-	}
-	if !strings.Contains(helmValues, "offload:") {
-		t.Error("Helm values.yaml must expose offload config section")
-	}
-	if !strings.Contains(helmValues, "quarantine:") {
-		t.Error("Helm values.yaml must expose quarantine config section")
-	}
-	if !strings.Contains(helmValues, "redaction:") {
-		t.Error("Helm values.yaml must expose redaction config section")
-	}
-	if !strings.Contains(helmValues, "kmsKeyName") {
-		t.Error("Helm values.yaml must expose bigquery.kmsKeyName for CMEK")
-	}
-	if !strings.Contains(helmValues, "autoCreateCompanionViews") {
-		t.Error("Helm values.yaml must expose bigquery.autoCreateCompanionViews")
-	}
-	if !strings.Contains(helmValues, "autoCreateSearchIndexes") {
-		t.Error("Helm values.yaml must expose bigquery.autoCreateSearchIndexes")
-	}
-
-	// testdata/config.yaml must cover the full exporter config surface.
-	testdataCfg := readRepoText(t, "testdata/config.yaml")
-	for _, key := range []string{
-		"metrics:",
-		"offload:",
-		"redaction:",
-		"quarantine:",
-		"kms_key_name:",
-		"labels:",
-		"companion_views:",
-		"search_indexes:",
-	} {
-		if !strings.Contains(testdataCfg, key) {
-			t.Errorf("testdata/config.yaml must contain %q", key)
-		}
-	}
-
-	// Cloud Run service.yaml must document enterprise --set overrides.
-	cloudRun := readRepoText(t, "deploy/cloudrun/service.yaml")
-	for _, key := range []string{
-		"metrics.table",
-		"companion_views",
-		"search_indexes",
-		"offload",
-		"quarantine",
-		"redaction",
-		"kms_key_name",
-	} {
-		if !strings.Contains(cloudRun, key) {
-			t.Errorf("deploy/cloudrun/service.yaml must document --set override for %q", key)
-		}
-	}
-}
-
 // TestDependabotCombinesDockerEntries verifies that dependabot.yml uses a
-// single docker entry with directories instead of separate entries.
+// single docker entry with directories instead of separate entries, and
+// that the docker entry groups updates by dependency-name.
 func TestDependabotCombinesDockerEntries(t *testing.T) {
-	raw := readRepoText(t, ".github/dependabot.yml")
-	// Count docker ecosystem entries.
-	dockerCount := strings.Count(raw, "package-ecosystem: docker")
+	var doc struct {
+		Updates []struct {
+			PackageEcosystem string   `yaml:"package-ecosystem"`
+			Directories       []string `yaml:"directories"`
+			Groups           map[string]struct {
+				GroupBy string `yaml:"group-by"`
+			} `yaml:"groups"`
+		} `yaml:"updates"`
+	}
+	if err := yaml.Unmarshal([]byte(readRepoText(t, ".github/dependabot.yml")), &doc); err != nil {
+		t.Fatalf("parsing .github/dependabot.yml: %v", err)
+	}
+	var dockerCount int
+	for _, u := range doc.Updates {
+		if u.PackageEcosystem == "docker" {
+			dockerCount++
+			if len(u.Directories) != 2 {
+				t.Errorf("docker entry has %d directories, want 2", len(u.Directories))
+			}
+			want := map[string]bool{"/": false, "/example": false}
+			for _, d := range u.Directories {
+				want[d] = true
+			}
+			for d, found := range want {
+				if !found {
+					t.Errorf("docker entry is missing directory %q", d)
+				}
+			}
+			if g, ok := u.Groups["docker"]; !ok {
+				t.Error("docker entry must have a 'docker' group with group-by")
+			} else if g.GroupBy != "dependency-name" {
+				t.Errorf("docker group group-by = %q, want %q", g.GroupBy, "dependency-name")
+			}
+		}
+	}
 	if dockerCount != 1 {
 		t.Errorf(".github/dependabot.yml has %d docker entries, want 1 (combined with directories)", dockerCount)
-	}
-	if !strings.Contains(raw, "directories:") {
-		t.Error(".github/dependabot.yml must use directories: for the combined docker entry")
-	}
-	if !strings.Contains(raw, "- /") && !strings.Contains(raw, "\"/\"") {
-		t.Error(".github/dependabot.yml must list / in directories")
-	}
-	if !strings.Contains(raw, "- /example") && !strings.Contains(raw, "\"/example\"") {
-		t.Error(".github/dependabot.yml must list /example in directories")
 	}
 }

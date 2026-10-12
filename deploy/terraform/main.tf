@@ -67,6 +67,7 @@ resource "google_bigquery_table" "otel_spans" {
   time_partitioning {
     type  = "HOUR"
     field = "start_time"
+    max_staleness = var.max_staleness
   }
 
   clustering = ["service_name", "trace_id", "name"]
@@ -157,6 +158,7 @@ resource "google_bigquery_table" "otel_logs" {
   time_partitioning {
     type  = "DAY"
     field = "timestamp"
+    max_staleness = var.max_staleness
   }
 
   clustering = ["service_name", "trace_id", "severity_number"]
@@ -210,6 +212,7 @@ resource "google_bigquery_table" "otel_metrics" {
   time_partitioning {
     type  = "DAY"
     field = "timestamp"
+    max_staleness = var.max_staleness
   }
 
   clustering = ["service_name", "metric_name", "metric_type"]
@@ -316,9 +319,17 @@ resource "google_bigquery_table" "otel_quarantine" {
     type          = "DAY"
     field         = "ingest_time"
     expiration_ms = 2592000000 # 30 days
+    max_staleness = var.max_staleness
   }
 
   clustering = ["signal", "error_code", "service_name"]
+
+  dynamic "encryption_configuration" {
+    for_each = var.kms_key_name == "" ? [] : [1]
+    content {
+      kms_key_name = var.kms_key_name
+    }
+  }
 
   labels = var.labels
 
@@ -344,6 +355,8 @@ resource "google_bigquery_table" "otel_spans_dedup" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "${var.spans_table}_dedup"
 
+  labels = var.labels
+
   view {
     use_legacy_sql = false
     query          = <<-EOT
@@ -367,6 +380,8 @@ resource "google_bigquery_table" "otel_spans_dedup" {
 resource "google_bigquery_table" "otel_logs_dedup" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "${var.logs_table}_dedup"
+
+  labels = var.labels
 
   view {
     use_legacy_sql = false
@@ -394,6 +409,8 @@ resource "google_bigquery_table" "otel_metrics_dedup" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "${var.metrics_table}_dedup"
 
+  labels = var.labels
+
   view {
     use_legacy_sql = false
     query          = <<-EOT
@@ -405,6 +422,7 @@ resource "google_bigquery_table" "otel_metrics_dedup" {
           time_unix_nano,
           service_name,
           metric_name,
+          metric_type,
           point_fingerprint
         ORDER BY
           receive_time_unix_nano DESC
@@ -416,6 +434,8 @@ resource "google_bigquery_table" "otel_metrics_dedup" {
 resource "google_bigquery_table" "otel_spans_as_allspans" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "otel_spans_as_allspans"
+
+  labels = var.labels
 
   view {
     use_legacy_sql = false
@@ -454,6 +474,8 @@ resource "google_bigquery_table" "otel_spans_as_allspans" {
 resource "google_bigquery_table" "v_gen_ai_spans" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "v_gen_ai_spans"
+
+  labels = var.labels
 
   view {
     use_legacy_sql = false
@@ -537,7 +559,7 @@ resource "google_bigquery_table" "v_gen_ai_spans" {
           LAX_FLOAT64(attributes['gen_ai.evaluation.score.value']),
           LAX_FLOAT64(attributes['gen_ai.evaluation.score'])
         ) AS gen_ai_evaluation_score,
-        JSON_VALUE(attributes, '$.\"error.type\"') AS error_type
+        JSON_VALUE(attributes, '$."error.type"') AS error_type
       FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.otel_spans_dedup.table_id}`
       WHERE JSON_VALUE(attributes, '$."gen_ai.operation.name"') IS NOT NULL
          OR JSON_VALUE(attributes, '$."gen_ai.system"') IS NOT NULL
@@ -550,6 +572,8 @@ resource "google_bigquery_table" "v_gen_ai_spans" {
 resource "google_bigquery_table" "v_gen_ai_logs" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "v_gen_ai_logs"
+
+  labels = var.labels
 
   view {
     use_legacy_sql = false
@@ -601,7 +625,7 @@ resource "google_bigquery_table" "v_gen_ai_logs" {
         AND l.span_id = s.span_id
         AND l.service_name IS NOT DISTINCT FROM s.service_name
         AND s.start_time BETWEEN TIMESTAMP_SUB(l.timestamp, INTERVAL 24 HOUR) AND TIMESTAMP_ADD(l.timestamp, INTERVAL 1 HOUR)
-      WHERE COALESCE(NULLIF(l.event_name, ''), JSON_VALUE(l.attributes, '$."event.name"')) LIKE 'gen_ai.%%'
+      WHERE COALESCE(NULLIF(l.event_name, ''), JSON_VALUE(l.attributes, '$."event.name"')) LIKE 'gen_ai.%'
          OR JSON_VALUE(l.attributes, '$."gen_ai.system"') IS NOT NULL
          OR JSON_VALUE(l.attributes, '$."gen_ai.provider.name"') IS NOT NULL
          OR JSON_VALUE(l.attributes, '$."gcp.vertex.agent.invocation_id"') IS NOT NULL
@@ -612,6 +636,8 @@ resource "google_bigquery_table" "v_gen_ai_logs" {
 resource "google_bigquery_table" "v_gen_ai_model_costs" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "v_gen_ai_model_costs"
+
+  labels = var.labels
 
   view {
     use_legacy_sql = false
@@ -691,6 +717,8 @@ resource "google_bigquery_table" "v_gen_ai_model_costs" {
 resource "google_bigquery_table" "v_gen_ai_sessions" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "v_gen_ai_sessions"
+
+  labels = var.labels
 
   view {
     use_legacy_sql = false
@@ -789,6 +817,8 @@ resource "google_bigquery_table" "v_gen_ai_metrics" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "v_gen_ai_metrics"
 
+  labels = var.labels
+
   view {
     use_legacy_sql = false
     query          = <<EOT
@@ -833,7 +863,7 @@ resource "google_bigquery_table" "v_gen_ai_metrics" {
         resource,
         instrumentation_scope
       FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.otel_metrics_dedup.table_id}`
-      WHERE metric_name LIKE 'gen_ai.%%'
+      WHERE metric_name LIKE 'gen_ai.%'
     EOT
   }
 }
@@ -841,6 +871,8 @@ resource "google_bigquery_table" "v_gen_ai_metrics" {
 resource "google_bigquery_table" "v_gen_ai_tool_usage" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "v_gen_ai_tool_usage"
+
+  labels = var.labels
 
   view {
     use_legacy_sql = false
@@ -959,21 +991,21 @@ resource "google_storage_bucket_iam_member" "otel_collector_offload_viewer" {
   member = "serviceAccount:${google_service_account.otel_collector.email}"
 }
 
-# --- Optional CMEK: grant the BigQuery service agent decrypt on the KMS key ---
+# --- Optional CMEK: grant the BigQuery service agent encrypt/decrypt on the KMS key ---
 #
 # When CMEK is enabled, the BigQuery service agent
-# (bq-<project-number>@bigquery-encryption.iam.gserviceaccount.com) needs
-# roles/cloudkms.cryptoKeyDecrypter on the KMS key. This module grants it
-# automatically when kms_key_name is set.
+# (serviceAccount:bq-<project-number>@bigquery-encryption.iam.gserviceaccount.com)
+# needs roles/cloudkms.cryptoKeyEncrypterDecrypter on the KMS key. This module
+# grants it automatically when kms_key_name is set.
+
+data "google_bigquery_default_service_account" "bq_cmek" {
+  project = var.project_id
+}
 
 resource "google_kms_crypto_key_iam_member" "bq_encryptor" {
   count         = var.kms_key_name == "" ? 0 : 1
   crypto_key_id = var.kms_key_name
-  role          = "roles/cloudkms.cryptoKeyDecrypter"
-  member        = "serviceAccount:bq-${data.google_project.number}@bigquery-encryption.iam.gserviceaccount.com"
-}
-
-data "google_project" "current" {
-  project_id = var.project_id
+  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  member        = "serviceAccount:${data.google_bigquery_default_service_account.bq_cmek.email}"
 }
 

@@ -3,8 +3,8 @@
 
 //go:generate make mdatagen
 
-// Package bigqueryexporter exports OTLP traces and logs to BigQuery relational
-// tables through the Storage Write API.
+// Package bigqueryexporter exports OTLP traces, logs, and metrics to BigQuery
+// relational tables through the Storage Write API.
 //
 // The exporter has one job: reliable transport with a stable, documented
 // schema. It does not aggregate, sample or interpret telemetry.

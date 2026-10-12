@@ -11,6 +11,10 @@ exporters:
       table: spans
       partition_expiration_days: 365
       require_partition_filter: true
+      kms_key_name: projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/spans
+      labels:
+        signal: traces
+      max_staleness: 15m
     logs:
       table: logs
       partition_expiration_days: 90
@@ -19,20 +23,35 @@ exporters:
       # attributes, then to the service name and the record fingerprint.
       log_name_attribute: log.file.name
       insert_id_attribute: log.record.uid
+      kms_key_name: projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/logs
+      labels:
+        signal: logs
+      max_staleness: 10m
     metrics:
       table: metrics
       partition_expiration_days: 180
       require_partition_filter: true
+      kms_key_name: projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/metrics
+      labels:
+        signal: metrics
+      max_staleness: 20m
     quarantine:
       enabled: true
       table: otel_quarantine
       metadata_only: true
       partition_expiration_days: 30
       require_partition_filter: false
+      max_raw_payload_bytes: 1048576
+      timeout: 5s
+      kms_key_name: projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/quarantine
+      labels:
+        signal: quarantine
+      max_staleness: 30m
     offload:
       enabled: true
       bucket: my-otel-offload-bucket
       prefix: otel
+      authorizer: my-project.us.otel-gcs
       min_bytes: 1048576
       max_object_bytes: 67108864
       max_concurrency: 4
@@ -70,6 +89,13 @@ exporters:
       max_row_bytes: 1048576
       max_inflight_requests: 8
       max_inflight_bytes: 67108864
+      compression: gzip
+      enable_multiplexing: true
+      connection_pool_size: 4
+      keepalive:
+        permit_without_stream: true
+        time: 30s
+        timeout: 10s
     limits:
       max_attribute_count: 1024
       max_event_count: 1024
@@ -77,6 +103,7 @@ exporters:
       max_nesting_depth: 16
       max_collection_size: 4096
       max_value_bytes: 262144
+      max_attribute_key_bytes: 4096
     sending_queue:
       enabled: true
       num_consumers: 10
@@ -86,6 +113,22 @@ exporters:
       initial_interval: 5s
       max_elapsed_time: 900s
     timeout: 30s
+
+  # Credentials: file-based key. Mutually exclusive with json and
+  # impersonate_service_account, so in its own section.
+  bigquery/creds_file:
+    project: my-project
+    dataset: otel
+    credentials:
+      file: /path/to/service-account.json
+
+  # Credentials: inline JSON. Mutually exclusive with file and
+  # impersonate_service_account, so in its own section.
+  bigquery/creds_json:
+    project: my-project
+    dataset: otel
+    credentials:
+      json: '{"type":"service_account","project_id":"my-project"}'
 
   # Emulator only. Insecure transport and disabled auth are refused unless the
   # endpoint is a loopback address.
