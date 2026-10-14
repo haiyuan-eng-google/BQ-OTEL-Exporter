@@ -685,6 +685,46 @@ func TestHelmConfigMapDecodesAndValidates(t *testing.T) {
 	}
 }
 
+// An offload.cacheSize of 0 disables the cross-batch cache, whose exporter
+// default is 4096, so it has to reach the exporter rather than be dropped as
+// false; an explicit quarantine.partitionExpirationDays of 0 renders as
+// written too. A values file delivers numbers as float64 and --set as int64.
+// An unset value is still left to the exporter default.
+func TestHelmConfigMapRendersZeroCacheSizeAndPartitionExpiration(t *testing.T) {
+	for _, tc := range []struct {
+		name                  string
+		cacheSize, expiration any
+		// Rendered values, nil when the key is absent.
+		renderedCacheSize, renderedExpiration any
+		// Decoded onto the factory defaults.
+		wantCacheSize, wantExpiration int
+	}{
+		{"zero from --set", int64(0), int64(0), 0, 0, 0, 0},
+		{"zero from a values file", float64(0), float64(0), 0, 0, 0, 0},
+		{"positive", int64(2048), int64(14), 2048, 14, 2048, 14},
+		{"unset", nil, nil, nil, nil, defaultOffloadCacheSize, defaultQuarantinePartitionExpiryDays},
+		{"empty", "", "", nil, nil, defaultOffloadCacheSize, defaultQuarantinePartitionExpiryDays},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := helmCollectorConfig(t, map[string]any{
+				"offload":    map[string]any{"enabled": true, "bucket": "test-offload-bucket", "cacheSize": tc.cacheSize},
+				"quarantine": map[string]any{"enabled": true, "partitionExpirationDays": tc.expiration},
+			})
+			if got := yamlPath(doc, "exporters", "bigquery", "offload", "cache_size"); got != tc.renderedCacheSize {
+				t.Errorf("rendered offload.cache_size = %#v, want %#v", got, tc.renderedCacheSize)
+			}
+			if got := yamlPath(doc, "exporters", "bigquery", "quarantine", "partition_expiration_days"); got != tc.renderedExpiration {
+				t.Errorf("rendered quarantine.partition_expiration_days = %#v, want %#v", got, tc.renderedExpiration)
+			}
+			cfg := decodeExporterConfig(t, tc.name, exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
+			if cfg.Offload.CacheSize != tc.wantCacheSize || cfg.Quarantine.PartitionExpirationDays != tc.wantExpiration {
+				t.Errorf("offload.cache_size = %d and quarantine.partition_expiration_days = %d, want %d and %d",
+					cfg.Offload.CacheSize, cfg.Quarantine.PartitionExpirationDays, tc.wantCacheSize, tc.wantExpiration)
+			}
+		})
+	}
+}
+
 // helmUnexposedExporterKeys lists the exporter options the chart does not
 // surface as values, with the reason. Every other option must reach the
 // exporter's section of the rendered ConfigMap, and an option listed here must

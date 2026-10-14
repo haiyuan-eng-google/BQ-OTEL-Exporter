@@ -130,7 +130,8 @@ data:
           {{- if .Values.offload.timeout }}
           timeout: {{ .Values.offload.timeout | quote }}
           {{- end }}
-          {{- if .Values.offload.cacheSize }}
+          {{- /* 0 disables cross-batch caching, so render it; only an unset value falls back to the exporter default. */}}
+          {{- if and (ne .Values.offload.cacheSize nil) (ne (printf "%v" .Values.offload.cacheSize) "") }}
           cache_size: {{ .Values.offload.cacheSize }}
           {{- end }}
         {{- end }}
@@ -147,7 +148,8 @@ data:
           {{- if .Values.quarantine.timeout }}
           timeout: {{ .Values.quarantine.timeout | quote }}
           {{- end }}
-          {{- if .Values.quarantine.partitionExpirationDays }}
+          {{- /* Render an explicit 0 as written; only an unset value is left to the exporter default. */}}
+          {{- if and (ne .Values.quarantine.partitionExpirationDays nil) (ne (printf "%v" .Values.quarantine.partitionExpirationDays) "") }}
           partition_expiration_days: {{ .Values.quarantine.partitionExpirationDays }}
           {{- end }}
           {{- if .Values.quarantine.requirePartitionFilter }}

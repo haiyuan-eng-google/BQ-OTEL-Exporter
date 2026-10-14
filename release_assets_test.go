@@ -7,9 +7,13 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	bq "cloud.google.com/go/bigquery"
 	"gopkg.in/yaml.v3"
 )
 
@@ -428,6 +432,224 @@ func TestTerraformViewQueriesMatchSchemaContract(t *testing.T) {
 	}
 	if !strings.Contains(spansSection, "$.\"error.type\"") {
 		t.Error("v_gen_ai_spans must reference error.type with $.\"error.type\" (no backslash escaping in heredoc)")
+	}
+}
+
+// terraformBlock returns the body of the top-level Terraform block that header
+// opens (for example `resource "google_bigquery_table" "otel_spans"`), or ""
+// when there is none. Nested blocks are indented, so the block ends at the
+// first closing brace in the first column.
+func terraformBlock(text, header string) string {
+	return firstCapture(`(?s)(?:^|\n)`+regexp.QuoteMeta(header)+` \{\n(.*?)\n\}`, text)
+}
+
+// terraformTables are the partitioned tables main.tf provisions, which take
+// max_staleness and the CMEK key; the views take neither.
+var terraformTables = []string{"otel_spans", "otel_logs", "otel_metrics", "otel_quarantine"}
+
+// max_staleness is an argument of the table itself: inside time_partitioning,
+// terraform validate rejects it ("An argument named "max_staleness" is not
+// expected here"). Every table takes the converted local, and no view sets it.
+func TestTerraformSetsMaxStalenessOnTablesNotPartitioning(t *testing.T) {
+	text := readRepoText(t, "deploy/terraform/main.tf")
+	if strings.Contains(text, "max_staleness = var.max_staleness") {
+		t.Error("main.tf passes var.max_staleness to a resource unconverted")
+	}
+	for _, table := range terraformTables {
+		body := terraformBlock(text, `resource "google_bigquery_table" "`+table+`"`)
+		if body == "" {
+			t.Fatalf("main.tf has no %s table", table)
+		}
+		partitioning := firstCapture(`(?s)\n  time_partitioning \{\n(.*?)\n  \}`, body)
+		if partitioning == "" {
+			t.Errorf("%s has no time_partitioning block", table)
+		} else if strings.Contains(partitioning, "max_staleness") {
+			t.Errorf("%s sets max_staleness inside time_partitioning, where the provider rejects it:\n%s", table, partitioning)
+		}
+		if !strings.Contains(body, "\n  max_staleness = local.max_staleness\n") {
+			t.Errorf("%s does not set max_staleness = local.max_staleness on the table", table)
+		}
+	}
+	views := 0
+	for _, m := range regexp.MustCompile(`(?s)(?:^|\n)resource "google_bigquery_table" "([^"]+)" \{\n(.*?)\n\}`).FindAllStringSubmatch(text, -1) {
+		if !strings.Contains(m[2], "\n  view {") {
+			continue
+		}
+		views++
+		if strings.Contains(m[2], "max_staleness") {
+			t.Errorf("view %s sets max_staleness", m[1])
+		}
+	}
+	if views == 0 {
+		t.Error("main.tf defines no views")
+	}
+}
+
+// The provider passes max_staleness to the API unchanged, and the API takes
+// only a SQL interval string, so main.tf converts the Go duration the exporter
+// options take: timeadd adds it to an epoch, and formatdate reads back the day
+// of the month, hour, minute and second. This replays that conversion with
+// main.tf's epoch and checks it against the interval the exporter writes for
+// the same duration (bq.IntervalValueFromDuration), up to the 168h bound.
+func TestTerraformMaxStalenessConvertsToTheExporterInterval(t *testing.T) {
+	locals := terraformBlock(readRepoText(t, "deploy/terraform/main.tf"), "locals")
+	for _, want := range []string{
+		`timeadd(local.max_staleness_epoch, var.max_staleness)`,
+		`var.max_staleness == "" ? null :`,
+		`startswith(var.max_staleness, "0-0 ") ? var.max_staleness :`,
+		`format("0-0 0 %d:%s:%s",`,
+		`(tonumber(formatdate("D", local.max_staleness_end)) - 1) * 24 + tonumber(formatdate("h", local.max_staleness_end))`,
+		`formatdate("m", local.max_staleness_end)`,
+		`formatdate("s", local.max_staleness_end)`,
+	} {
+		if !strings.Contains(locals, want) {
+			t.Errorf("main.tf locals do not contain %s; update the conversion this test replays", want)
+		}
+	}
+	epoch, err := time.Parse(time.RFC3339, firstCapture(`max_staleness_epoch\s*=\s*"([^"]+)"`, locals))
+	if err != nil {
+		t.Fatalf("main.tf max_staleness_epoch: %v", err)
+	}
+	// The day of the month counts the elapsed days only while the sum stays
+	// in the epoch's month.
+	if epoch.Day() != 1 || epoch.Hour() != 0 || epoch.Minute() != 0 || epoch.Second() != 0 ||
+		epoch.Add(maxTableStaleness).Month() != epoch.Month() {
+		t.Fatalf("max_staleness_epoch %v must be midnight on the first of a month that holds %v", epoch, maxTableStaleness)
+	}
+	for _, raw := range []string{"1s", "30s", "15m", "90m", "1h30m", "2h45m", "1.5h", "25h", "48h", "100h59m59s", "168h", "1500ms500ms"} {
+		d, err := parseMaxStaleness("max_staleness", raw)
+		if err != nil {
+			t.Errorf("the exporter rejects %q: %v", raw, err)
+			continue
+		}
+		end := epoch.Add(d)
+		got := fmt.Sprintf("0-0 0 %d:%d:%d", (end.Day()-1)*24+end.Hour(), end.Minute(), end.Second())
+		if want := bq.IntervalValueFromDuration(d).String(); got != want {
+			t.Errorf("max_staleness %q converts to %q, but the exporter writes %q", raw, got, want)
+		}
+	}
+}
+
+// terraformValidationPatterns returns the patterns the named variable's
+// validation rules in variables.tf pass to regex(), in order. Terraform's
+// regex() is RE2, as Go's regexp is, so the patterns are evaluated directly.
+func terraformValidationPatterns(t *testing.T, variable string) []*regexp.Regexp {
+	t.Helper()
+	block := terraformBlock(readRepoText(t, "deploy/terraform/variables.tf"), `variable "`+variable+`"`)
+	var patterns []*regexp.Regexp
+	for _, m := range regexp.MustCompile(`regex\(("(?:[^"\\]|\\.)*")`).FindAllStringSubmatch(block, -1) {
+		// The patterns use only escapes HCL and Go strings share.
+		pattern, err := strconv.Unquote(m[1])
+		if err != nil {
+			t.Fatalf("variables.tf %s pattern %s: %v", variable, m[1], err)
+		}
+		patterns = append(patterns, regexp.MustCompile(pattern))
+	}
+	return patterns
+}
+
+// The location rule must accept every BigQuery location, including regions
+// whose first label is longer than ten letters.
+func TestTerraformLocationValidationAcceptsBigQueryLocations(t *testing.T) {
+	patterns := terraformValidationPatterns(t, "location")
+	if len(patterns) != 1 {
+		t.Fatalf("location has %d regex validation rules, want 1", len(patterns))
+	}
+	for _, location := range []string{
+		"US", "EU", "us-central1", "europe-west4", "asia-northeast1", "me-central2", "australia-southeast1",
+		"africa-south1", "northamerica-northeast1", "northamerica-northeast2", "northamerica-south1",
+		"southamerica-east1", "southamerica-west1",
+	} {
+		if !patterns[0].MatchString(location) {
+			t.Errorf("location validation rejects the BigQuery location %q", location)
+		}
+	}
+	for _, location := range []string{"", "u", "us_central1", "1us", "us-", "-us", "us central1"} {
+		if patterns[0].MatchString(location) {
+			t.Errorf("location validation accepts %q", location)
+		}
+	}
+}
+
+// variables.tf takes max_staleness as the exporter options do, as a Go
+// duration (compound ones included), or as a SQL interval string. A well
+// formed duration then meets the range rule, which timeadd and timecmp
+// evaluate in Terraform against the exporter's own bounds, in whole seconds,
+// because the conversion in main.tf drops fractions of a second.
+func TestTerraformMaxStalenessValidationMatchesExporter(t *testing.T) {
+	patterns := terraformValidationPatterns(t, "max_staleness")
+	if len(patterns) != 2 {
+		t.Fatalf("max_staleness has %d regex validation rules, want the format rule and the range rule", len(patterns))
+	}
+	format, duration := patterns[0], patterns[1]
+	for _, raw := range []string{"15m", "1h30m", "2h45m", "30s", "1m30s", "1.5h", "168h", "1500ms500ms", "60000000µs"} {
+		if _, err := parseMaxStaleness("max_staleness", raw); err != nil {
+			t.Fatalf("the exporter rejects %q: %v", raw, err)
+		}
+		if !format.MatchString(raw) || !duration.MatchString(raw) {
+			t.Errorf("max_staleness validation does not take %q as a duration, though the exporter accepts it", raw)
+		}
+	}
+	for _, raw := range []string{"0-0 0 0:15:0", "0-0 1 2:3:4"} {
+		if !format.MatchString(raw) || duration.MatchString(raw) {
+			t.Errorf("max_staleness validation does not take %q as a SQL interval", raw)
+		}
+	}
+	for _, raw := range []string{"15", "1d", "abc", "15 m", "-1h", "0-0 0 0:15", "1-0 0 0:0:0"} {
+		if format.MatchString(raw) {
+			t.Errorf("max_staleness validation accepts %q", raw)
+		}
+	}
+	// Durations the exporter rejects are well formed, so the range rule sees them.
+	for _, raw := range []string{"0s", "500ms", "168h1s", "800h"} {
+		if _, err := parseMaxStaleness("max_staleness", raw); err == nil {
+			t.Errorf("the exporter accepts %q", raw)
+		}
+		if !duration.MatchString(raw) {
+			t.Errorf("the max_staleness range rule does not check %q", raw)
+		}
+	}
+
+	const epoch = "2000-01-01T00:00:00Z"
+	start, err := time.Parse(time.RFC3339, epoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := terraformBlock(readRepoText(t, "deploy/terraform/variables.tf"), `variable "max_staleness"`)
+	for _, rule := range []string{
+		fmt.Sprintf(`timecmp(timeadd(%q, var.max_staleness), %q) >= 0`, epoch, start.Add(minTableStaleness).Format(time.RFC3339)),
+		fmt.Sprintf(`timecmp(timeadd(%q, var.max_staleness), %q) <= 0`, epoch, start.Add(maxTableStaleness).Format(time.RFC3339)),
+		fmt.Sprintf(`timeadd(%q, var.max_staleness) == timeadd(%q, "${var.max_staleness}999999999ns")`, epoch, epoch),
+	} {
+		if !strings.Contains(block, rule) {
+			t.Errorf("variables.tf max_staleness has no range rule %s", rule)
+		}
+	}
+}
+
+// A first apply with a new key has to grant the BigQuery service agent on the
+// key before BigQuery creates anything encrypted with it, and no argument of
+// the dataset or the tables refers to the grant, so each of them depends on
+// it. Without CMEK the grant has no instances and orders nothing.
+func TestTerraformEncryptedResourcesDependOnKeyGrant(t *testing.T) {
+	text := readRepoText(t, "deploy/terraform/main.tf")
+	grant := terraformBlock(text, `resource "google_kms_crypto_key_iam_member" "bq_encryptor"`)
+	if !strings.Contains(grant, `count         = var.kms_key_name == "" ? 0 : 1`) {
+		t.Fatalf("main.tf must grant the BigQuery service agent on the key exactly when kms_key_name is set:\n%s", grant)
+	}
+	dependsOnGrant := regexp.MustCompile(`(?m)^  depends_on = \[google_kms_crypto_key_iam_member\.bq_encryptor\]$`)
+	var encrypted []string
+	for _, m := range regexp.MustCompile(`(?s)(?:^|\n)resource "([^"]+)" "([^"]+)" \{\n(.*?)\n\}`).FindAllStringSubmatch(text, -1) {
+		if !strings.Contains(m[3], "kms_key_name = var.kms_key_name") {
+			continue
+		}
+		encrypted = append(encrypted, m[2])
+		if !dependsOnGrant.MatchString(m[3]) {
+			t.Errorf("%s.%s is encrypted with var.kms_key_name but does not depend on the key grant", m[1], m[2])
+		}
+	}
+	if want := append([]string{"otel"}, terraformTables...); !slices.Equal(encrypted, want) {
+		t.Errorf("resources encrypted with var.kms_key_name = %v, want %v", encrypted, want)
 	}
 }
 

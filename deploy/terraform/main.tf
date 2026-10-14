@@ -38,6 +38,27 @@ locals {
     { name = "sha256", type = "STRING", mode = "NULLABLE" },
     { name = "object_ref", type = "RECORD", mode = "NULLABLE", fields = local.object_ref_fields },
   ]
+
+  # The provider passes max_staleness to the API unchanged, and the API takes
+  # only a SQL interval string, so a Go duration is converted to the interval
+  # the exporter writes for it: everything in the hours, minutes and seconds,
+  # so 15m is 0-0 0 0:15:0 and 48h is 0-0 0 48:0:0. timeadd parses the
+  # duration with the exporter's grammar, and formatdate reads the elapsed
+  # days, hours, minutes and seconds back from the epoch it was added to,
+  # which holds because variables.tf keeps a duration to whole seconds from 1s
+  # to 168h. An interval is passed through as given, and an empty value leaves
+  # the option unset.
+  max_staleness_epoch = "2000-01-01T00:00:00Z"
+  max_staleness_end   = try(timeadd(local.max_staleness_epoch, var.max_staleness), local.max_staleness_epoch)
+  max_staleness = (
+    var.max_staleness == "" ? null :
+    startswith(var.max_staleness, "0-0 ") ? var.max_staleness :
+    format("0-0 0 %d:%s:%s",
+      (tonumber(formatdate("D", local.max_staleness_end)) - 1) * 24 + tonumber(formatdate("h", local.max_staleness_end)),
+      formatdate("m", local.max_staleness_end),
+      formatdate("s", local.max_staleness_end),
+    )
+  )
 }
 
 # --- Dataset ---
@@ -54,6 +75,11 @@ resource "google_bigquery_dataset" "otel" {
   }
 
   labels = var.labels
+
+  # With CMEK, BigQuery must be allowed to use the key before it creates an
+  # encrypted dataset or table, so a first apply grants it first. Without
+  # CMEK the grant has no instances and this orders nothing.
+  depends_on = [google_kms_crypto_key_iam_member.bq_encryptor]
 }
 
 # --- Signal Tables (v0alpha2 contract matching internal/schema/schema.go) ---
@@ -67,10 +93,11 @@ resource "google_bigquery_table" "otel_spans" {
   time_partitioning {
     type  = "HOUR"
     field = "start_time"
-    max_staleness = var.max_staleness
   }
 
   clustering = ["service_name", "trace_id", "name"]
+
+  max_staleness = local.max_staleness
 
   dynamic "encryption_configuration" {
     for_each = var.kms_key_name == "" ? [] : [1]
@@ -147,6 +174,8 @@ resource "google_bigquery_table" "otel_spans" {
     { name = "payload_refs", type = "RECORD", mode = "REPEATED", fields = local.payload_ref_fields },
     { name = "schema_version", type = "STRING", mode = "REQUIRED" },
   ])
+
+  depends_on = [google_kms_crypto_key_iam_member.bq_encryptor]
 }
 
 # otel_logs: 27-column v0alpha2 log table, daily-partitioned on timestamp,
@@ -158,10 +187,11 @@ resource "google_bigquery_table" "otel_logs" {
   time_partitioning {
     type  = "DAY"
     field = "timestamp"
-    max_staleness = var.max_staleness
   }
 
   clustering = ["service_name", "trace_id", "severity_number"]
+
+  max_staleness = local.max_staleness
 
   dynamic "encryption_configuration" {
     for_each = var.kms_key_name == "" ? [] : [1]
@@ -201,6 +231,8 @@ resource "google_bigquery_table" "otel_logs" {
     { name = "record_fingerprint", type = "STRING", mode = "NULLABLE" },
     { name = "schema_version", type = "STRING", mode = "REQUIRED" },
   ])
+
+  depends_on = [google_kms_crypto_key_iam_member.bq_encryptor]
 }
 
 # otel_metrics: 39-column v0alpha2 metric data-point table, daily-partitioned on
@@ -212,10 +244,11 @@ resource "google_bigquery_table" "otel_metrics" {
   time_partitioning {
     type  = "DAY"
     field = "timestamp"
-    max_staleness = var.max_staleness
   }
 
   clustering = ["service_name", "metric_name", "metric_type"]
+
+  max_staleness = local.max_staleness
 
   dynamic "encryption_configuration" {
     for_each = var.kms_key_name == "" ? [] : [1]
@@ -306,6 +339,8 @@ resource "google_bigquery_table" "otel_metrics" {
     { name = "point_fingerprint", type = "STRING", mode = "REQUIRED" },
     { name = "schema_version", type = "STRING", mode = "REQUIRED" },
   ])
+
+  depends_on = [google_kms_crypto_key_iam_member.bq_encryptor]
 }
 
 # otel_quarantine: 12-column v0alpha2 quarantine (dead-letter) table,
@@ -319,10 +354,11 @@ resource "google_bigquery_table" "otel_quarantine" {
     type          = "DAY"
     field         = "ingest_time"
     expiration_ms = 2592000000 # 30 days
-    max_staleness = var.max_staleness
   }
 
   clustering = ["signal", "error_code", "service_name"]
+
+  max_staleness = local.max_staleness
 
   dynamic "encryption_configuration" {
     for_each = var.kms_key_name == "" ? [] : [1]
@@ -347,6 +383,8 @@ resource "google_bigquery_table" "otel_quarantine" {
     { name = "exporter_instance", type = "STRING", mode = "NULLABLE" },
     { name = "schema_version", type = "STRING", mode = "REQUIRED" },
   ])
+
+  depends_on = [google_kms_crypto_key_iam_member.bq_encryptor]
 }
 
 # --- Deduplication & Companion Views (matching internal/schema/schema.go) ---
