@@ -13,8 +13,71 @@ bigquery:
   location: "US"
   tracesTable: "otel_spans"
   logsTable: "otel_logs"
+  metricsTable: "otel_metrics"
   autoCreateDataset: false
   autoCreateTables: false
+  autoCreateCompanionViews: false
+  autoCreateSearchIndexes: false
+  # Enterprise governance: CMEK key and labels for the dataset and tables.
+  # These and the table options below, quarantine's included, take effect only
+  # on resources the collector creates itself (the autoCreate* options above).
+  # For Terraform-provisioned tables, set the deploy/terraform/ variables
+  # instead; see "Enterprise Governance" in deploy/README.md.
+  kmsKeyName: ""
+  labels: {}
+  # Per-signal partition lifecycle and governance (collector-created tables).
+  traces:
+    partitionExpirationDays: 0
+    requirePartitionFilter: false
+    kmsKeyName: ""
+    labels: {}
+    maxStaleness: ""
+  logs:
+    partitionExpirationDays: 0
+    requirePartitionFilter: false
+    kmsKeyName: ""
+    labels: {}
+    maxStaleness: ""
+  metrics:
+    partitionExpirationDays: 0
+    requirePartitionFilter: false
+    kmsKeyName: ""
+    labels: {}
+    maxStaleness: ""
+
+# Optional GCS offload for large payloads.
+offload:
+  enabled: false
+  bucket: ""
+  prefix: ""
+  authorizer: ""
+  minBytes: 0
+  maxObjectBytes: 0
+  maxConcurrency: 0
+  timeout: ""
+  cacheSize: 4096
+
+# Optional quarantine dead-letter table.
+quarantine:
+  enabled: false
+  table: "otel_quarantine"
+  metadataOnly: false
+  maxRawPayloadBytes: 0
+  timeout: ""
+  partitionExpirationDays: 30
+  requirePartitionFilter: false
+  kmsKeyName: ""
+  labels: {}
+  maxStaleness: ""
+
+# Optional client-side PII / secret redaction.
+redaction:
+  enabled: false
+  blockedKeys: []
+  disableDefaultKeys: false
+  blockedValuePatterns: []
+  maskReplacement: ""
+  redactLogBody: false
 
 # Collector OTLP receivers.
 receivers:

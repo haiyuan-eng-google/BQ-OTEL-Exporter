@@ -4,7 +4,8 @@
 # exporter requires a Google-hosted collector; it serves any OTLP producer.
 #
 # Delivery is at least once and may duplicate data. Query the shipped
-# otel_spans_dedup and otel_logs_dedup views rather than the base tables.
+# otel_spans_dedup, otel_logs_dedup, and otel_metrics_dedup views rather than
+# the base tables.
 
 receivers:
   otlp:
@@ -37,10 +38,91 @@ exporters:
     auto_create:
       dataset: true
       tables: true
+      # Companion views (otel_spans_as_allspans, v_gen_ai_spans, v_gen_ai_logs,
+      # v_gen_ai_metrics, v_gen_ai_model_costs, v_gen_ai_sessions,
+      # v_gen_ai_tool_usage) are opt-in. Uncomment to have auto_create build them.
+      # companion_views: true
+      # Search indexes on (trace_id, span_id) for otel_spans and otel_logs,
+      # and all columns on otel_metrics. Requires auto_create.tables and
+      # bigquery.jobs.create (see deploy/terraform/ with grant_auto_create).
+      search_indexes: false
     traces:
       table: otel_spans
+      # partition_expiration_days: 365
+      # require_partition_filter: true
+      # kms_key_name: projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/spans
+      # labels:
+      #   environment: production
+      # max_staleness: 15m
     logs:
       table: otel_logs
+      # partition_expiration_days: 90
+      # require_partition_filter: true
+      # log_name_attribute: log.file.name
+      # insert_id_attribute: log.record.uid
+      # kms_key_name: projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/logs
+      # labels:
+      #   environment: production
+      # max_staleness: 10m
+    metrics:
+      table: otel_metrics
+      # partition_expiration_days: 180
+      # require_partition_filter: true
+      # kms_key_name: projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/metrics
+      # labels:
+      #   environment: production
+      # max_staleness: 20m
+
+    # Optional GCS offload for large payloads (prompts, completions, images).
+    # Offloaded payloads are referenced from payload_refs via BigQuery
+    # ObjectRef. Configure a GCS lifecycle policy to manage retention; the
+    # exporter does not delete offloaded objects. A 401/403/404 on upload is
+    # classified as a permanent error and routes the record to quarantine.
+    # offload:
+    #   enabled: false
+    #   bucket: my-otel-offload-bucket
+    #   prefix: otel
+    #   authorizer: my-project.us.otel-gcs
+    #   min_bytes: 1048576
+    #   max_object_bytes: 67108864
+    #   max_concurrency: 4
+    #   timeout: 30s
+    #   cache_size: 4096
+
+    # Optional quarantine dead-letter table for rejected records. When
+    # enabled, permanently rejected rows are written to otel_quarantine
+    # instead of being dropped. Use cmd/bq-quarantine-replay to replay
+    # quarantined records after fixing the underlying issue.
+    # quarantine:
+    #   enabled: false
+    #   table: otel_quarantine
+    #   metadata_only: false
+    #   partition_expiration_days: 30
+    #   max_raw_payload_bytes: 1048576
+    #   timeout: 5s
+    #   kms_key_name: projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/quarantine
+    #   labels:
+    #     environment: production
+    #   max_staleness: 30m
+
+    # Optional client-side PII and secret redaction. Runs at Step 0 before
+    # offload, fingerprinting, and quarantine. Default sensitive keys
+    # (authorization, token, password, api_key, secret, private_key, etc.)
+    # are redacted unless disable_default_keys is true.
+    # redaction:
+    #   enabled: false
+    #   blocked_keys: []
+    #   disable_default_keys: false
+    #   blocked_value_patterns: []
+    #   mask_replacement: "[REDACTED]"
+    #   redact_log_body: false
+
+    # Enterprise governance: CMEK encryption and labels for cost allocation.
+    # kms_key_name: projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/bq
+    # labels:
+    #   environment: production
+    #   team: observability
+
     retry_on_failure:
       enabled: true
       # Finite on purpose: an unbounded horizon would remove the bound on how
@@ -97,6 +179,10 @@ service:
       processors: [memory_limiter, batch]
       exporters: [bigquery]
     logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [bigquery]
+    metrics:
       receivers: [otlp]
       processors: [memory_limiter, batch]
       exporters: [bigquery]
