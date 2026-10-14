@@ -18,10 +18,14 @@ bigquery:
   autoCreateTables: false
   autoCreateCompanionViews: false
   autoCreateSearchIndexes: false
-  # Enterprise governance: CMEK key and labels applied to dataset and tables.
+  # Enterprise governance: CMEK key and labels for the dataset and tables.
+  # These and the table options below, quarantine's included, take effect only
+  # on resources the collector creates itself (the autoCreate* options above).
+  # For Terraform-provisioned tables, set the deploy/terraform/ variables
+  # instead; see "Enterprise Governance" in deploy/README.md.
   kmsKeyName: ""
   labels: {}
-  # Per-signal partition lifecycle and governance.
+  # Per-signal partition lifecycle and governance (collector-created tables).
   traces:
     partitionExpirationDays: 0
     requirePartitionFilter: false

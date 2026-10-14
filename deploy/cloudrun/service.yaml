@@ -17,7 +17,11 @@
 #   only read metadata and append rows, so the dataset, tables, and views must
 #   already be provisioned by deploy/terraform/. The `--set` arguments below
 #   therefore turn off the image's default auto_create.
-# - Enterprise overrides (uncomment to enable):
+# - Enterprise overrides (uncomment to enable). The table options among them
+#   (kms_key_name, labels, max_staleness, partition_expiration_days) take effect
+#   only on resources the collector creates (auto_create.*, turned off below);
+#   for Terraform-provisioned tables, set the deploy/terraform/ variables
+#   instead (see "Enterprise Governance" in deploy/README.md).
 #   --set=exporters.bigquery.metrics.table=otel_metrics
 #   --set=exporters.bigquery.offload.enabled=true \
 #   --set=exporters.bigquery.offload.bucket=my-otel-offload-bucket
@@ -29,8 +33,8 @@
 #   --set=exporters.bigquery.quarantine.max_staleness=30m
 #   --set=exporters.bigquery.redaction.enabled=true
 #   --set=exporters.bigquery.redaction.mask_replacement="[REDACTED]"
-#   --set=exporters.bigquery.kms_key_name=projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/bq
-#   --set=exporters.bigquery.traces.kms_key_name=projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/spans
+#   --set=exporters.bigquery.kms_key_name=projects/my-project/locations/us/keyRings/otel/cryptoKeys/bq
+#   --set=exporters.bigquery.traces.kms_key_name=projects/my-project/locations/us/keyRings/otel/cryptoKeys/spans
 #   --set=exporters.bigquery.traces.max_staleness=15m
 #   --set=exporters.bigquery.labels.environment=production
 #   --set=exporters.bigquery.traces.partition_expiration_days=365
