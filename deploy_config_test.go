@@ -8,14 +8,19 @@ import (
 	"fmt"
 	"maps"
 	"reflect"
+	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"text/template"
+	"time"
 
 	"go.opentelemetry.io/collector/confmap"
 	"gopkg.in/yaml.v3"
+
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 )
 
 // The deploy templates (example config, Cloud Run manifest, Compose overlay,
@@ -786,6 +791,139 @@ func TestHelmChartExposesExporterOptions(t *testing.T) {
 	for _, key := range slices.Sorted(maps.Keys(helmUnexposedExporterKeys)) {
 		if !slices.Contains(exporterConfigKeys(), key) {
 			t.Errorf("helmUnexposedExporterKeys lists %q, which is not an exporter option", key)
+		}
+	}
+}
+
+// readmeByteCount renders a byte count the way the README's configuration
+// table does: the exact count, then the size in the largest binary unit that
+// divides it.
+func readmeByteCount(n int) string {
+	for _, unit := range []struct {
+		name string
+		size int
+	}{{"MiB", 1 << 20}, {"KiB", 1 << 10}} {
+		if n >= unit.size && n%unit.size == 0 {
+			return fmt.Sprintf("`%d` (%d %s)", n, n/unit.size, unit.name)
+		}
+	}
+	return fmt.Sprintf("`%d`", n)
+}
+
+// The README's configuration table gives the default of every offload
+// option. Each Default cell is rebuilt here from createDefaultConfig, so a
+// default cannot change without the table following it, and an offload
+// option cannot be added without its row being checked.
+func TestReadmeOffloadDefaultsMatchFactory(t *testing.T) {
+	offload := createDefaultConfig().(*Config).Offload
+	literal := func(value string) string {
+		if value == "" {
+			return "—"
+		}
+		return "`" + value + "`"
+	}
+	cells := map[string]string{
+		"offload.enabled":          literal(strconv.FormatBool(offload.Enabled)),
+		"offload.bucket":           literal(offload.Bucket),
+		"offload.prefix":           literal(offload.Prefix),
+		"offload.authorizer":       literal(offload.Authorizer),
+		"offload.min_bytes":        readmeByteCount(offload.MinBytes),
+		"offload.max_object_bytes": readmeByteCount(offload.MaxObjectBytes),
+		"offload.max_concurrency":  literal(strconv.Itoa(offload.MaxConcurrency)),
+		"offload.timeout":          literal(offload.Timeout.String()),
+		"offload.cache_size":       literal(strconv.Itoa(offload.CacheSize)),
+	}
+	readme := readRepoText(t, "README.md")
+	for _, key := range exporterConfigKeys() {
+		if !strings.HasPrefix(key, "offload.") {
+			continue
+		}
+		want, ok := cells[key]
+		if !ok {
+			t.Errorf("the README default of %s is not checked; add it here", key)
+			continue
+		}
+		if got := firstCapture("(?m)^\\| `"+regexp.QuoteMeta(key)+"` +\\| (.*?) +\\|", readme); got != want {
+			t.Errorf("the README gives the %s default as %q, but the exporter's default is %q", key, got, want)
+		}
+	}
+}
+
+// The Terraform module provisions the tables the collector would otherwise
+// create, so each retention variable defaults to what the exporter applies
+// when it creates that table, and a number of days becomes the partition
+// expiration the exporter sets for that many days. One partition filter
+// variable covers all four tables, so it defaults to what the exporter
+// applies to each of them.
+func TestTerraformRetentionMatchesExporter(t *testing.T) {
+	cfg := createDefaultConfig().(*Config)
+	vars := readRepoText(t, "deploy/terraform/variables.tf")
+	defaultOf := func(variable string) string {
+		t.Helper()
+		block := terraformBlock(vars, `variable "`+variable+`"`)
+		if block == "" {
+			t.Fatalf("variables.tf declares no %s", variable)
+		}
+		return firstCapture(`(?m)^  default\s+=\s+(.+)$`, block)
+	}
+	for table, days := range map[string]int{
+		"otel_spans":      cfg.Traces.PartitionExpirationDays,
+		"otel_logs":       cfg.Logs.PartitionExpirationDays,
+		"otel_metrics":    cfg.Metrics.PartitionExpirationDays,
+		"otel_quarantine": cfg.Quarantine.PartitionExpirationDays,
+	} {
+		variable := terraformExpirationVariables[table]
+		if got := defaultOf(variable); got != strconv.Itoa(days) {
+			t.Errorf("variables.tf %s defaults to %s, but the exporter creates %s with %d", variable, got, table, days)
+		}
+	}
+	for table, required := range map[string]bool{
+		"otel_spans":      cfg.Traces.RequirePartitionFilter,
+		"otel_logs":       cfg.Logs.RequirePartitionFilter,
+		"otel_metrics":    cfg.Metrics.RequirePartitionFilter,
+		"otel_quarantine": cfg.Quarantine.RequirePartitionFilter,
+	} {
+		if got := defaultOf("require_partition_filter"); got != strconv.FormatBool(required) {
+			t.Errorf("variables.tf require_partition_filter defaults to %s, but the exporter creates %s with %t", got, table, required)
+		}
+	}
+
+	// exporterExpiration is the partition expiration the exporter gives a
+	// table it creates with partition_expiration_days set to days.
+	exporterExpiration := func(table string, days int) time.Duration {
+		t.Helper()
+		opts := schema.DestinationOptions{PartitionExpirationDays: days}
+		if table == "otel_quarantine" {
+			md, err := schema.QuarantineDestinationMetadataWithOptions(opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return md.TimePartitioning.Expiration
+		}
+		in := schema.SpansTableSchema()
+		switch table {
+		case "otel_logs":
+			in = schema.LogsTableSchema()
+		case "otel_metrics":
+			in = schema.MetricsTableSchema()
+		}
+		md, _, err := schema.DestinationMetadataWithOptions(in, "my-project", "otel", table, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return md.TimePartitioning.Expiration
+	}
+	mainTF := readRepoText(t, "deploy/terraform/main.tf")
+	for table, variable := range terraformExpirationVariables {
+		perDay, err := strconv.ParseInt(firstCapture(`var\.`+variable+` \* ([0-9]+) : null`, mainTF), 10, 64)
+		if err != nil {
+			t.Fatalf("main.tf does not convert %s to milliseconds: %v", variable, err)
+		}
+		for _, days := range []int{1, 30, 400} {
+			if got, want := time.Duration(int64(days)*perDay)*time.Millisecond, exporterExpiration(table, days); got != want {
+				t.Errorf("%s = %d expires %s partitions after %v, but the exporter expires them after %v",
+					variable, days, table, got, want)
+			}
 		}
 	}
 }

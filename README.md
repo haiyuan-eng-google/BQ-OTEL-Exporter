@@ -246,12 +246,12 @@ as log events rather than span attributes.
 | `timeout`                       | `5s`                  | Budget for one export attempt, including slot waits and every acknowledgement. See [Timeout and concurrency envelope](#timeout-and-concurrency-envelope). |
 | `offload.enabled`               | `false`               | Route oversized span/log values and quarantine payloads to Google Cloud Storage, recording BigQuery ObjectRef references. |
 | `offload.bucket`                | —                     | GCS bucket name for offloaded payloads. Required when `offload.enabled` is true. |
-| `offload.prefix`                | `otel`                | Object name prefix within the bucket. |
+| `offload.prefix`                | `otel-offload`        | Object name prefix within the bucket. |
 | `offload.authorizer`             | —                     | BigQuery connection resource name for authorized GCS reads. |
-| `offload.min_bytes`             | `1048576` (1 MiB)     | Minimum payload size to offload. Smaller payloads stay inline. |
+| `offload.min_bytes`             | `262144` (256 KiB)    | Minimum payload size to offload. Smaller payloads stay inline. |
 | `offload.max_object_bytes`       | `67108864` (64 MiB)   | Maximum size of a single offloaded object. |
-| `offload.max_concurrency`        | `4`                   | Maximum concurrent GCS uploads. |
-| `offload.timeout`                | `30s`                 | GCS upload timeout. |
+| `offload.max_concurrency`        | `8`                   | Maximum concurrent GCS uploads. |
+| `offload.timeout`                | `10s`                 | GCS upload timeout. |
 | `offload.cache_size`             | `4096`                | Cross-batch LRU cache entries to dedup offloaded objects by content hash. |
 
 ### Structural limits
@@ -394,7 +394,7 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
   `record_fingerprint STRING` (`fp1:<sha256_hex>`).
 - **Relational OTLP metrics table (`otel_metrics` and `otel_metrics_dedup`).**
   `otel_metrics` stores all five OTLP metric data-point types (`GAUGE`, `SUM`,
-  `HISTOGRAM`, `EXPONENTIAL_HISTOGRAM`, `SUMMARY`) in a single 39-column
+  `HISTOGRAM`, `EXPONENTIAL_HISTOGRAM`, `SUMMARY`) in a single 40-column
   relational table partitioned by `DATE(timestamp)` and clustered by
   `(service_name, metric_name, metric_type)`, with `point_fingerprint STRING NOT NULL`
   (`fp1:<sha256_hex>` over canonical `attributes` JSON) and

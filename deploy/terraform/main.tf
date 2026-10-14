@@ -83,6 +83,11 @@ resource "google_bigquery_dataset" "otel" {
 }
 
 # --- Signal Tables (v0alpha2 contract matching internal/schema/schema.go) ---
+#
+# Each table takes its partition expiration from its own
+# *_partition_expiration_days variable, where 0 leaves partitions without
+# expiration. require_partition_filter is set on the table itself, because the
+# time_partitioning argument of that name is deprecated.
 
 # otel_spans: 30-column v0alpha2 span table, hourly-partitioned on start_time,
 # clustered by (service_name, trace_id, name).
@@ -91,9 +96,12 @@ resource "google_bigquery_table" "otel_spans" {
   table_id   = var.spans_table
 
   time_partitioning {
-    type  = "HOUR"
-    field = "start_time"
+    type          = "HOUR"
+    field         = "start_time"
+    expiration_ms = var.spans_partition_expiration_days > 0 ? var.spans_partition_expiration_days * 86400000 : null
   }
+
+  require_partition_filter = var.require_partition_filter
 
   clustering = ["service_name", "trace_id", "name"]
 
@@ -185,9 +193,12 @@ resource "google_bigquery_table" "otel_logs" {
   table_id   = var.logs_table
 
   time_partitioning {
-    type  = "DAY"
-    field = "timestamp"
+    type          = "DAY"
+    field         = "timestamp"
+    expiration_ms = var.logs_partition_expiration_days > 0 ? var.logs_partition_expiration_days * 86400000 : null
   }
+
+  require_partition_filter = var.require_partition_filter
 
   clustering = ["service_name", "trace_id", "severity_number"]
 
@@ -235,16 +246,19 @@ resource "google_bigquery_table" "otel_logs" {
   depends_on = [google_kms_crypto_key_iam_member.bq_encryptor]
 }
 
-# otel_metrics: 39-column v0alpha2 metric data-point table, daily-partitioned on
+# otel_metrics: 40-column v0alpha2 metric data-point table, daily-partitioned on
 # timestamp, clustered by (service_name, metric_name, metric_type).
 resource "google_bigquery_table" "otel_metrics" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = var.metrics_table
 
   time_partitioning {
-    type  = "DAY"
-    field = "timestamp"
+    type          = "DAY"
+    field         = "timestamp"
+    expiration_ms = var.metrics_partition_expiration_days > 0 ? var.metrics_partition_expiration_days * 86400000 : null
   }
+
+  require_partition_filter = var.require_partition_filter
 
   clustering = ["service_name", "metric_name", "metric_type"]
 
@@ -344,8 +358,8 @@ resource "google_bigquery_table" "otel_metrics" {
 }
 
 # otel_quarantine: 12-column v0alpha2 quarantine (dead-letter) table,
-# daily-partitioned on ingest_time with 30-day expiration, clustered by
-# (signal, error_code, service_name).
+# daily-partitioned on ingest_time with a 30-day partition expiration by
+# default, clustered by (signal, error_code, service_name).
 resource "google_bigquery_table" "otel_quarantine" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = var.quarantine_table
@@ -353,8 +367,10 @@ resource "google_bigquery_table" "otel_quarantine" {
   time_partitioning {
     type          = "DAY"
     field         = "ingest_time"
-    expiration_ms = 2592000000 # 30 days
+    expiration_ms = var.quarantine_partition_expiration_days > 0 ? var.quarantine_partition_expiration_days * 86400000 : null
   }
+
+  require_partition_filter = var.require_partition_filter
 
   clustering = ["signal", "error_code", "service_name"]
 

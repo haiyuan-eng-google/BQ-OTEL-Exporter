@@ -85,7 +85,7 @@ variable "offload_bucket" {
 }
 
 variable "max_staleness" {
-  description = "Maximum staleness of data in partitioned tables. When set, partitions newer than this duration are not queried. Applied to all signal and quarantine tables, never to views. Either a Go duration, as the exporter's max_staleness options take it, in whole seconds from 1s to 168h (e.g. 15m, 1h30m), or a BigQuery SQL interval string (e.g. 0-0 0 0:15:0). Leave empty to disable."
+  description = "BigQuery max_staleness option of the signal and quarantine tables, never views: the maximum staleness of the data a query over a table may return. Within it, BigQuery can answer a query from the changes it has already applied instead of applying pending changes, such as change data capture upserts and deletes, at query time. It does not exclude partitions from queries. Either a Go duration, as the exporter's max_staleness options take it, in whole seconds from 1s to 168h (e.g. 15m, 1h30m, 30s), or a BigQuery SQL interval string (e.g. 0-0 0 0:15:0), which is passed through as given. Leave empty to disable."
   type        = string
   default     = ""
 
@@ -107,4 +107,59 @@ variable "max_staleness" {
     )
     error_message = "A max_staleness duration must be a whole number of seconds from 1s to 168h, the range the exporter accepts."
   }
+}
+
+# --- Partition retention and partition filters ---
+#
+# These govern the tables this module creates. The collector's per-table
+# options of the same names apply only to tables the collector creates itself.
+
+variable "spans_partition_expiration_days" {
+  description = "Partition expiration in days for otel_spans; 0 means no expiration."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.spans_partition_expiration_days >= 0 && floor(var.spans_partition_expiration_days) == var.spans_partition_expiration_days
+    error_message = "spans_partition_expiration_days must be a whole number of days, 0 or more."
+  }
+}
+
+variable "logs_partition_expiration_days" {
+  description = "Partition expiration in days for otel_logs; 0 means no expiration."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.logs_partition_expiration_days >= 0 && floor(var.logs_partition_expiration_days) == var.logs_partition_expiration_days
+    error_message = "logs_partition_expiration_days must be a whole number of days, 0 or more."
+  }
+}
+
+variable "metrics_partition_expiration_days" {
+  description = "Partition expiration in days for otel_metrics; 0 means no expiration."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.metrics_partition_expiration_days >= 0 && floor(var.metrics_partition_expiration_days) == var.metrics_partition_expiration_days
+    error_message = "metrics_partition_expiration_days must be a whole number of days, 0 or more."
+  }
+}
+
+variable "quarantine_partition_expiration_days" {
+  description = "Partition expiration in days for otel_quarantine; default 30 days, 0 means no expiration."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.quarantine_partition_expiration_days >= 0 && floor(var.quarantine_partition_expiration_days) == var.quarantine_partition_expiration_days
+    error_message = "quarantine_partition_expiration_days must be a whole number of days, 0 or more."
+  }
+}
+
+variable "require_partition_filter" {
+  description = "Require a partition filter on queries against the partitioned signal and quarantine tables. A query over a view must then filter on a column BigQuery can use to skip partitions, and a query over v_gen_ai_logs is rejected (see deploy/README.md)."
+  type        = bool
+  default     = false
 }

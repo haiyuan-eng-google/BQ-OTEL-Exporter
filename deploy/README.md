@@ -107,14 +107,31 @@ See [docs/deployment-models.md](../docs/deployment-models.md) for more details.
 
 ## Enterprise Governance
 
+When Terraform provisions the tables, Terraform governs their retention,
+partition filter requirement, CMEK key, labels, and max staleness, through the
+variables below. The collector's table options (`partition_expiration_days`,
+`require_partition_filter`, `kms_key_name`, `labels`, and `max_staleness` for
+each signal and for quarantine, and the top-level `kms_key_name` and `labels`)
+apply only to a dataset, table, or view that the collector creates itself with
+`auto_create.dataset`, `auto_create.tables`, or `auto_create.companion_views`.
+The collector never changes them on one that already exists, so on tables
+Terraform created, the same options in the collector config, the Helm values,
+or the Cloud Run overrides have no effect. Set them here instead.
+
 ### CMEK Encryption
 
 Set `kms_key_name` in the Terraform module to encrypt the BigQuery dataset and
-all tables with a Cloud KMS key:
+all tables with a Cloud KMS key. The key must be in the dataset's location: a
+dataset in the `US` multi-region needs a key in `locations/us`, one in the `EU`
+multi-region a key in `locations/europe`, and one in a region such as
+`us-central1` a key in that same region, `locations/us-central1`. The module
+creates the dataset in `US` unless you set `location`, so a regional key needs
+the matching `location`:
 
 ```bash
 terraform apply \
   -var="project_id=my-project" \
+  -var="location=us-central1" \
   -var="kms_key_name=projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/bq"
 ```
 
@@ -125,9 +142,12 @@ encryption.
 
 ### Max Staleness
 
-Set `max_staleness` in the Terraform module to enforce a maximum data staleness
-window on partitioned tables. Partitions newer than this duration are not
-queried:
+Set `max_staleness` in the Terraform module to set BigQuery's `max_staleness`
+option on the tables: the maximum staleness of the data a query over a table
+may return. Within that window, BigQuery can answer a query from the changes it
+has already applied instead of applying pending changes, such as change data
+capture upserts and deletes, at query time. The option bounds how stale results
+may be; it does not exclude recent partitions from queries.
 
 ```bash
 terraform apply \
@@ -135,8 +155,53 @@ terraform apply \
   -var="max_staleness=15m"
 ```
 
-The value is a Go duration string (e.g. `15m`, `1h`, `30s`). It is applied to
-all four signal and quarantine tables, never to views.
+The value is either a Go duration, as the collector's `max_staleness` options
+take it, in whole seconds from `1s` to `168h` (for example `30s`, `15m`, or
+`1h30m`), or a BigQuery SQL interval string (for example `0-0 0 0:15:0`).
+Terraform converts a duration to the interval the collector writes for it, so
+`15m` is sent as `0-0 0 0:15:0`, and rejects a duration outside that range or
+one that is not a whole number of seconds. An interval string is passed to
+BigQuery as given; only its format is checked. The option is applied to all
+four signal and quarantine tables, never to views.
+
+### Partition Retention and Partition Filters
+
+Set these variables in the Terraform module to expire old partitions and to
+require a partition filter on queries:
+
+| Variable | Default | Applies to |
+|:---|:---|:---|
+| `spans_partition_expiration_days` | `0` | `otel_spans` (hourly partitions on `start_time`) |
+| `logs_partition_expiration_days` | `0` | `otel_logs` (daily partitions on `timestamp`) |
+| `metrics_partition_expiration_days` | `0` | `otel_metrics` (daily partitions on `timestamp`) |
+| `quarantine_partition_expiration_days` | `30` | `otel_quarantine` (daily partitions on `ingest_time`) |
+| `require_partition_filter` | `false` | All four tables |
+
+```bash
+terraform apply \
+  -var="project_id=my-project" \
+  -var="spans_partition_expiration_days=365" \
+  -var="logs_partition_expiration_days=90" \
+  -var="metrics_partition_expiration_days=90"
+```
+
+An expiration is a whole number of days, and `0` leaves partitions without
+expiration. For the signal tables this matches the collector's
+`partition_expiration_days` options, but not for quarantine: the collector
+treats `quarantine.partition_expiration_days: 0` as its 30-day default, while
+`quarantine_partition_expiration_days=0` here keeps quarantined records
+indefinitely. BigQuery allows at most 10,000 partitions per table, which is
+about 416 days of hourly `otel_spans` partitions, so with the default `0` the
+spans table eventually reaches that limit; set
+`spans_partition_expiration_days` to 416 or less to stay under it.
+
+With `require_partition_filter=true`, BigQuery rejects a query over these
+tables, or over the views built on them, that has no filter BigQuery can use
+to skip partitions. See "Filtering the GenAI views by time" under
+[Operating v0alpha2 tables](../README.md#operating-v0alpha2-tables) for the
+columns the views take. A query over `v_gen_ai_logs` is rejected even with a
+filter, because no such filter reaches its scan of `otel_spans`, so leave the
+option off for a deployment that queries that view.
 
 ### Labels
 

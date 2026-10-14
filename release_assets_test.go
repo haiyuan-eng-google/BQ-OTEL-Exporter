@@ -5,6 +5,7 @@ package bigqueryexporter
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"regexp"
 	"slices"
@@ -15,6 +16,8 @@ import (
 
 	bq "cloud.google.com/go/bigquery"
 	"gopkg.in/yaml.v3"
+
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 )
 
 func TestGoReleaserConfigUsesValidSchemaAndSignsManifests(t *testing.T) {
@@ -650,6 +653,229 @@ func TestTerraformEncryptedResourcesDependOnKeyGrant(t *testing.T) {
 	}
 	if want := append([]string{"otel"}, terraformTables...); !slices.Equal(encrypted, want) {
 		t.Errorf("resources encrypted with var.kms_key_name = %v, want %v", encrypted, want)
+	}
+}
+
+// terraformExpirationVariables maps each table main.tf provisions to the
+// variable holding its partition expiration in days.
+var terraformExpirationVariables = map[string]string{
+	"otel_spans":      "spans_partition_expiration_days",
+	"otel_logs":       "logs_partition_expiration_days",
+	"otel_metrics":    "metrics_partition_expiration_days",
+	"otel_quarantine": "quarantine_partition_expiration_days",
+}
+
+// Each table takes its partition expiration from its own variable, converted
+// from days to the milliseconds the provider takes and left unset at 0, and
+// the partition filter requirement from require_partition_filter, set on the
+// table because the time_partitioning argument of that name is deprecated.
+// An expiration variable takes what the exporter's partition_expiration_days
+// options take: a whole number of days, 0 or more.
+func TestTerraformTablesTakeRetentionAndPartitionFilterVariables(t *testing.T) {
+	text := readRepoText(t, "deploy/terraform/main.tf")
+	if regexp.MustCompile(`expiration_ms\s*=\s*[0-9]`).MatchString(text) {
+		t.Error("main.tf hard-codes a partition expiration instead of reading it from a variable")
+	}
+	vars := readRepoText(t, "deploy/terraform/variables.tf")
+	for _, table := range terraformTables {
+		variable := terraformExpirationVariables[table]
+		body := terraformBlock(text, `resource "google_bigquery_table" "`+table+`"`)
+		partitioning := firstCapture(`(?s)\n  time_partitioning \{\n(.*?)\n  \}`, body)
+		expiration := fmt.Sprintf("expiration_ms = var.%[1]s > 0 ? var.%[1]s * %[2]d : null", variable, (24 * time.Hour).Milliseconds())
+		if !strings.Contains(partitioning, expiration) {
+			t.Errorf("%s time_partitioning does not set %s:\n%s", table, expiration, partitioning)
+		}
+		if strings.Contains(partitioning, "require_partition_filter") {
+			t.Errorf("%s sets the deprecated time_partitioning.require_partition_filter", table)
+		}
+		if !strings.Contains(body, "\n  require_partition_filter = var.require_partition_filter\n") {
+			t.Errorf("%s does not set require_partition_filter = var.require_partition_filter on the table", table)
+		}
+		block := terraformBlock(vars, `variable "`+variable+`"`)
+		for _, want := range []string{
+			"type        = number",
+			fmt.Sprintf("condition     = var.%[1]s >= 0 && floor(var.%[1]s) == var.%[1]s", variable),
+		} {
+			if !strings.Contains(block, want) {
+				t.Errorf("variables.tf %s does not contain %s:\n%s", variable, want, block)
+			}
+		}
+	}
+	if block := terraformBlock(vars, `variable "require_partition_filter"`); !strings.Contains(block, "type        = bool") {
+		t.Errorf("variables.tf require_partition_filter is not a bool:\n%s", block)
+	}
+}
+
+// The prose gives the column count of the tables, and each count is taken
+// here from the exporter's schema, so a column cannot be added without the
+// prose following it.
+func TestDocsStateTableColumnCounts(t *testing.T) {
+	columns := map[string]int{
+		"otel_spans":      len(schema.SpansTableSchema().GetFields()),
+		"otel_logs":       len(schema.LogsTableSchema().GetFields()),
+		"otel_metrics":    len(schema.MetricsTableSchema().GetFields()),
+		"otel_quarantine": len(schema.QuarantineTableSchema().GetFields()),
+	}
+	for _, doc := range []struct {
+		path string
+		// pattern takes the table name, and its group captures the count.
+		pattern string
+		tables  []string
+	}{
+		{"deploy/terraform/main.tf", `(?m)^# %s: ([0-9]+)-column\b`, terraformTables},
+		{"docs/schema-rationale.md", "(?m)^\\| `%s` is a ([0-9]+)-column\\b", []string{"otel_metrics", "otel_quarantine"}},
+		{"README.md", "`%s` stores [^.]*? ([0-9]+)-column\\b", []string{"otel_metrics"}},
+	} {
+		text := readRepoText(t, doc.path)
+		for _, table := range doc.tables {
+			got := firstCapture(fmt.Sprintf(doc.pattern, table), text)
+			if want := strconv.Itoa(columns[table]); got != want {
+				t.Errorf("%s gives %s %q columns, but its schema has %s", doc.path, table, got, want)
+			}
+		}
+	}
+}
+
+// kmsKeyLocation is the Cloud KMS location of the keys that can encrypt a
+// BigQuery dataset in datasetLocation: us for the US multi-region, europe for
+// the EU multi-region, and the dataset's own region otherwise.
+func kmsKeyLocation(datasetLocation string) string {
+	if location := strings.ToLower(datasetLocation); location != "eu" {
+		return location
+	}
+	return "europe"
+}
+
+// A CMEK key has to be in the location of the dataset it encrypts, so every
+// example command in deploy/README.md that sets kms_key_name names a key in
+// the location of the dataset that command creates: the location it sets, or
+// the module default. The CMEK section gives the rule for each kind of
+// location.
+func TestDeployReadmeCMEKExamplesUseKeysInTheDatasetLocation(t *testing.T) {
+	readme := readRepoText(t, "deploy/README.md")
+	defaultLocation := firstCapture(`(?m)^  default\s+=\s+"([^"]+)"$`,
+		terraformBlock(readRepoText(t, "deploy/terraform/variables.tf"), `variable "location"`))
+	if defaultLocation == "" {
+		t.Fatal("variables.tf location has no default")
+	}
+	examples := 0
+	for _, m := range regexp.MustCompile("(?s)```bash\n(.*?)```").FindAllStringSubmatch(readme, -1) {
+		keyLocation := firstCapture(`kms_key_name=projects/[^/]+/locations/([^/]+)/`, m[1])
+		if keyLocation == "" {
+			continue
+		}
+		examples++
+		location := firstCapture(`-var="location=([^"]+)"`, m[1])
+		if location == "" {
+			location = defaultLocation
+		}
+		if want := kmsKeyLocation(location); keyLocation != want {
+			t.Errorf("deploy/README.md encrypts a dataset in %s with a key in locations/%s, but it needs a key in locations/%s:\n%s",
+				location, keyLocation, want, m[1])
+		}
+	}
+	if examples == 0 {
+		t.Error("deploy/README.md has no example that sets kms_key_name")
+	}
+	section := firstCapture(`(?s)\n### CMEK Encryption\n(.*?)\n### `, readme)
+	for _, location := range []string{"US", "EU", "us-central1"} {
+		for _, want := range []string{"`" + location + "`", "`locations/" + kmsKeyLocation(location) + "`"} {
+			if !strings.Contains(section, want) {
+				t.Errorf("the CMEK section does not give the key location for a dataset in %s: it has no %s", location, want)
+			}
+		}
+	}
+}
+
+// The Max Staleness section documents the values the module takes: each
+// duration it shows is one the exporter and the variable validation accept,
+// its interval example has the form the validation takes as an interval, the
+// range it gives is the exporter's, and the conversion it shows is the
+// interval the exporter writes. Neither it nor the variable describes the
+// option as keeping recent partitions out of queries any more.
+func TestDeployReadmeDocumentsMaxStalenessValues(t *testing.T) {
+	section := firstCapture(`(?s)\n### Max Staleness\n(.*?)\n### `, readRepoText(t, "deploy/README.md"))
+	if section == "" {
+		t.Fatal("deploy/README.md has no Max Staleness section")
+	}
+	patterns := terraformValidationPatterns(t, "max_staleness")
+	if len(patterns) != 2 {
+		t.Fatalf("max_staleness has %d regex validation rules, want the format rule and the range rule", len(patterns))
+	}
+	format, duration := patterns[0], patterns[1]
+	// Code spans are read from the prose, outside the example command, whose
+	// fences would pair backticks wrongly; the command's value is read apart.
+	prose := regexp.MustCompile("(?s)```.*?```").ReplaceAllString(section, "")
+	values := regexp.MustCompile("`([^`]+)`").FindAllStringSubmatch(prose, -1)
+	values = append(values, regexp.MustCompile(`max_staleness=([^"]+)"`).FindAllStringSubmatch(section, -1)...)
+	durations := 0
+	for _, m := range values {
+		if value := m[1]; duration.MatchString(value) {
+			durations++
+			if _, err := parseMaxStaleness("max_staleness", value); err != nil || !format.MatchString(value) {
+				t.Errorf("the Max Staleness section shows the duration %q, which the module or the exporter rejects: %v", value, err)
+			}
+		}
+	}
+	if durations == 0 {
+		t.Error("the Max Staleness section shows no duration")
+	}
+	if interval := firstCapture("interval string \\(for example `([^`]+)`\\)", prose); !format.MatchString(interval) || duration.MatchString(interval) {
+		t.Errorf("the Max Staleness section gives %q as its SQL interval example, which the module does not take as an interval", interval)
+	}
+
+	bounds := regexp.MustCompile("whole seconds from `([^`]+)` to `([^`]+)`").FindStringSubmatch(prose)
+	if bounds == nil {
+		t.Fatal("the Max Staleness section does not give the range of a duration")
+	}
+	for i, want := range []time.Duration{minTableStaleness, maxTableStaleness} {
+		if got, err := time.ParseDuration(bounds[i+1]); err != nil || got != want {
+			t.Errorf("the Max Staleness section bounds a duration at %q, but the exporter's bound is %v", bounds[i+1], want)
+		}
+	}
+
+	conversion := regexp.MustCompile("`([^`]+)` is sent as `([^`]+)`").FindStringSubmatch(prose)
+	if conversion == nil {
+		t.Fatal("the Max Staleness section shows no conversion of a duration")
+	}
+	d, err := parseMaxStaleness("max_staleness", conversion[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := bq.IntervalValueFromDuration(d).String(); conversion[2] != want {
+		t.Errorf("the Max Staleness section converts %s to %q, but the exporter writes %q", conversion[1], conversion[2], want)
+	}
+
+	variable := terraformBlock(readRepoText(t, "deploy/terraform/variables.tf"), `variable "max_staleness"`)
+	for name, text := range map[string]string{"deploy/README.md": section, "variables.tf": variable} {
+		if strings.Contains(strings.ToLower(text), "partitions newer than") {
+			t.Errorf("%s still says max_staleness keeps partitions newer than its value out of queries", name)
+		}
+	}
+}
+
+// deploy/README.md lists every retention and partition filter variable with
+// the default variables.tf declares, and says that the collector's own
+// options for a table apply only to tables the collector creates, naming
+// every per-signal option other than the table name.
+func TestDeployReadmeDocumentsTerraformGovernance(t *testing.T) {
+	readme := readRepoText(t, "deploy/README.md")
+	vars := readRepoText(t, "deploy/terraform/variables.tf")
+	for _, variable := range append(slices.Sorted(maps.Values(terraformExpirationVariables)), "require_partition_filter") {
+		want := firstCapture(`(?m)^  default\s+=\s+(.+)$`, terraformBlock(vars, `variable "`+variable+`"`))
+		got := firstCapture("(?m)^\\| `"+variable+"` \\| `([^`]*)` \\|", readme)
+		if want == "" || got != want {
+			t.Errorf("deploy/README.md gives %s the default %q, but variables.tf declares %q", variable, got, want)
+		}
+	}
+	intro := firstCapture(`(?s)\n## Enterprise Governance\n(.*?)\n### `, readme)
+	for _, key := range exporterConfigKeys() {
+		if option, ok := strings.CutPrefix(key, "traces."); ok && option != "table" && !strings.Contains(intro, "`"+option+"`") {
+			t.Errorf("the Enterprise Governance introduction does not say that the collector's %s applies only to tables it creates", option)
+		}
+	}
+	if !strings.Contains(intro, "`auto_create.tables`") {
+		t.Error("the Enterprise Governance introduction does not name auto_create.tables")
 	}
 }
 
