@@ -1444,11 +1444,20 @@ func TestGoBuildConstraint(t *testing.T) {
 	}
 }
 
+// stripSQLComments removes /* ... */ block comments and -- ... line comments
+// so tests can inspect the active SQL statement of a template.
+func stripSQLComments(sql string) string {
+	noBlocks := regexp.MustCompile(`(?s)/\*.*?\*/`).ReplaceAllString(sql, "")
+	return regexp.MustCompile(`(?m)--.*$`).ReplaceAllString(noBlocks, "")
+}
+
 // BigQuery Continuous Queries cannot read views built on QUALIFY or window
 // functions, so every SQL template in deploy/continuous-queries/ reads the
-// base spans table through APPENDS(TABLE ...) and exports to Cloud Pub/Sub (with
-// a commented INSERT INTO variant for otel_alerts). No template may name a
-// _dedup, v_gen_ai_, or v_mcp_ view, or use QUALIFY, anywhere in the file.
+// base spans table through APPENDS(TABLE ...) and exports to Cloud Pub/Sub.
+// Templates start with a block comment (never --) so bq never mistakes leading
+// comment text for a CLI flag, include a start_time partition filter, omit
+// policy-tagged columns (status.message), and use only placeholders passed by
+// templatefile in deploy/terraform/outputs.tf.
 func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
 	const dir = "deploy/continuous-queries"
 	entries, err := os.ReadDir(dir)
@@ -1471,29 +1480,77 @@ func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
 		t.Fatalf("SQL templates in %s = %v, want %v", dir, gotTemplates, wantTemplates)
 	}
 
+	outputs := readRepoText(t, "deploy/terraform/outputs.tf")
+	renderedBlock := terraformBlock(outputs, `output "continuous_queries_rendered_sql"`)
+	templateVarsSection := firstCapture(`(?s)templatefile\([^\n]+,\s*\{(.*?)\n\s*\}\)`, renderedBlock)
+	if templateVarsSection == "" {
+		t.Fatalf("could not parse templatefile vars map in continuous_queries_rendered_sql:\n%s", renderedBlock)
+	}
+	templatefileKeys := map[string]bool{}
+	for _, m := range regexp.MustCompile(`(?m)^\s+([a-z0-9_]+)\s+=`).FindAllStringSubmatch(templateVarsSection, -1) {
+		templatefileKeys[m[1]] = true
+	}
+
+	specificChecks := map[string][]string{
+		"tool_error_rate_alert.sql": {
+			"status.code = 2",
+			`$."error.type"`,
+			`$."gen_ai.operation.name"') = 'execute_tool'`,
+			`$."gen_ai.tool.name"`,
+			`$."mcp.method.name"`,
+		},
+		"token_budget_burn.sql": {
+			"> ${max_turn_input_tokens}",
+			"> ${max_turn_output_tokens}",
+		},
+		"agent_latency_p95.sql": {
+			"duration_nano / 1e6 > ${max_turn_duration_ms}",
+		},
+	}
+
+	placeholderRE := regexp.MustCompile(`\$\{([a-zA-Z0-9_]+)\}`)
 	readme := readRepoText(t, filepath.Join(dir, "README.md"))
 	for _, name := range wantTemplates {
 		path := filepath.Join(dir, name)
-		sql := readRepoText(t, path)
+		rawSQL := readRepoText(t, path)
+		trimmedRaw := strings.TrimSpace(rawSQL)
+		if !strings.HasPrefix(trimmedRaw, "/*") || strings.HasPrefix(trimmedRaw, "--") {
+			t.Errorf("%s must start with a /* ... */ block comment, not --, so bq CLI flag parsing cannot fail", path)
+		}
+
+		activeSQL := stripSQLComments(rawSQL)
 		for _, want := range []string{
-			"APPENDS(",
-			"TABLE `${project_id}.${dataset_id}.${spans_table}`",
 			"EXPORT DATA",
 			"CLOUD_PUBSUB",
 			"https://pubsub.googleapis.com/projects/${project_id}/topics/${pubsub_topic}",
-			"INSERT INTO `${project_id}.${dataset_id}.${alerts_table}`",
+			"APPENDS(",
+			"TABLE `${project_id}.${dataset_id}.${spans_table}`",
+			"start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)",
 		} {
-			if !strings.Contains(sql, want) {
-				t.Errorf("%s is missing %q", path, want)
+			if !strings.Contains(activeSQL, want) {
+				t.Errorf("%s active SQL is missing %q", path, want)
 			}
 		}
-		for _, banned := range []string{"_dedup", "v_gen_ai_", "v_mcp_", "duration_ns"} {
-			if strings.Contains(sql, banned) {
-				t.Errorf("%s contains banned view or column reference %q", path, banned)
+		for _, want := range specificChecks[name] {
+			if !strings.Contains(activeSQL, want) {
+				t.Errorf("%s active SQL is missing template predicate %q", path, want)
 			}
 		}
-		if strings.Contains(strings.ToUpper(sql), "QUALIFY") {
-			t.Errorf("%s contains QUALIFY, which Continuous Queries do not support", path)
+		for _, banned := range []string{"_dedup", "v_gen_ai_", "v_mcp_", "duration_ns", "status.message"} {
+			if strings.Contains(activeSQL, banned) {
+				t.Errorf("%s active SQL contains banned reference %q", path, banned)
+			}
+		}
+		upperSQL := strings.ToUpper(activeSQL)
+		for _, bannedKW := range []string{"QUALIFY", "OVER (", "OVER(", "DISTINCT"} {
+			if strings.Contains(upperSQL, bannedKW) {
+				t.Errorf("%s active SQL contains unsupported Continuous Query keyword %q", path, bannedKW)
+			}
+		}
+		for _, m := range placeholderRE.FindAllStringSubmatch(rawSQL, -1) {
+			if !templatefileKeys[m[1]] {
+				t.Errorf("%s references placeholder ${%s}, which is not passed by templatefile in deploy/terraform/outputs.tf", path, m[1])
+			}
 		}
 		if !strings.Contains(readme, name) {
 			t.Errorf("%s/README.md does not document %s", dir, name)
@@ -1505,6 +1562,11 @@ func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
 		"--continuous=true",
 		"--connection_property=",
 		"service_account=",
+		"| bq query",
+		"INSERT INTO",
+		"TUMBLE",
+		"require_partition_filter",
+		"enable_column_level_security",
 	} {
 		if !strings.Contains(readme, want) {
 			t.Errorf("%s/README.md is missing %q", dir, want)
@@ -1515,7 +1577,8 @@ func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
 // Continuous Queries Terraform resources are opt-in: enable_continuous_queries
 // defaults to false, every Continuous Query resource in main.tf is gated on
 // var.enable_continuous_queries, outputs.tf renders all three SQL templates
-// through templatefile, and deploy/README.md and README.md document the setup.
+// through templatefile and pipes SQL on stdin to bq query, and deploy/README.md
+// and README.md document the setup.
 func TestTerraformContinuousQueriesAreOptIn(t *testing.T) {
 	const gate = "var.enable_continuous_queries"
 	vars := readRepoText(t, "deploy/terraform/variables.tf")
@@ -1526,6 +1589,8 @@ func TestTerraformContinuousQueriesAreOptIn(t *testing.T) {
 		{"continuous_query_max_turn_input_tokens", "number", "100000"},
 		{"continuous_query_max_turn_output_tokens", "number", "32000"},
 		{"continuous_query_max_turn_duration_ms", "number", "30000"},
+		{"alerts_deletion_protection", "bool", "false"},
+		{"alerts_partition_expiration_days", "number", "0"},
 	}
 	for _, v := range wantVars {
 		block := terraformBlock(vars, `variable "`+v.name+`"`)
@@ -1544,6 +1609,20 @@ func TestTerraformContinuousQueriesAreOptIn(t *testing.T) {
 		terraformBlock(vars, `variable "continuous_query_edition"`))
 	if !strings.Contains(editions, `"ENTERPRISE"`) || !strings.Contains(editions, `"ENTERPRISE_PLUS"`) {
 		t.Errorf("continuous_query_edition validation = %q, want ENTERPRISE and ENTERPRISE_PLUS", editions)
+	}
+	slotBlock := terraformBlock(vars, `variable "continuous_query_slot_capacity"`)
+	for _, want := range []string{
+		"var.continuous_query_slot_capacity >= 10",
+		"var.continuous_query_slot_capacity <= 500",
+		"var.continuous_query_slot_capacity % 10 == 0",
+	} {
+		if !strings.Contains(slotBlock, want) {
+			t.Errorf("continuous_query_slot_capacity validation missing %q:\n%s", want, slotBlock)
+		}
+	}
+	saBlock := terraformBlock(vars, `variable "service_account_id"`)
+	if !strings.Contains(saBlock, "length(var.service_account_id) <= 27") {
+		t.Errorf("service_account_id validation must cap length at 27 so -cq stays within 30 chars:\n%s", saBlock)
 	}
 
 	mainTF := readRepoText(t, "deploy/terraform/main.tf")
@@ -1570,9 +1649,42 @@ func TestTerraformContinuousQueriesAreOptIn(t *testing.T) {
 			t.Errorf("main.tf %s sets count = %q, want %q", header, got, gated)
 		}
 	}
+
+	alertsTable := terraformBlock(mainTF, `resource "google_bigquery_table" "otel_alerts"`)
+	if got := terraformAttribute(alertsTable, "deletion_protection"); got != "var.alerts_deletion_protection" {
+		t.Errorf("otel_alerts sets deletion_protection = %q, want var.alerts_deletion_protection", got)
+	}
+	if got := terraformAttribute(alertsTable, "require_partition_filter"); got != "var.require_partition_filter" {
+		t.Errorf("otel_alerts sets require_partition_filter = %q, want var.require_partition_filter", got)
+	}
+
+	reservation := terraformBlock(mainTF, `resource "google_bigquery_reservation" "continuous_queries"`)
+	if got := terraformAttribute(reservation, "edition"); got != "var.continuous_query_edition" {
+		t.Errorf("continuous_queries reservation sets edition = %q, want var.continuous_query_edition", got)
+	}
+	if got := terraformAttribute(reservation, "slot_capacity"); got != "var.continuous_query_slot_capacity" {
+		t.Errorf("continuous_queries reservation sets slot_capacity = %q, want var.continuous_query_slot_capacity", got)
+	}
+	if !strings.Contains(reservation, "condition     = !var.enable_column_level_security") {
+		t.Errorf("continuous_queries reservation missing !var.enable_column_level_security precondition:\n%s", reservation)
+	}
+
 	assignment := terraformBlock(mainTF, `resource "google_bigquery_reservation_assignment" "continuous_queries"`)
 	if got := terraformAttribute(assignment, "job_type"); got != `"CONTINUOUS"` {
 		t.Errorf("continuous_queries reservation assignment sets job_type = %q, want \"CONTINUOUS\"", got)
+	}
+
+	wantRoles := map[string]string{
+		`resource "google_bigquery_dataset_iam_member" "continuous_queries_viewer"`:      `"roles/bigquery.dataViewer"`,
+		`resource "google_bigquery_table_iam_member" "continuous_queries_alerts_writer"`: `"roles/bigquery.dataEditor"`,
+		`resource "google_pubsub_topic_iam_member" "continuous_queries_publisher"`:       `"roles/pubsub.publisher"`,
+		`resource "google_pubsub_topic_iam_member" "continuous_queries_pubsub_viewer"`:   `"roles/pubsub.viewer"`,
+		`resource "google_project_iam_member" "continuous_queries_jobs"`:                 `"roles/bigquery.jobUser"`,
+	}
+	for header, wantRole := range wantRoles {
+		if got := terraformAttribute(terraformBlock(mainTF, header), "role"); got != wantRole {
+			t.Errorf("%s sets role = %q, want %s", header, got, wantRole)
+		}
 	}
 
 	outputs := readRepoText(t, "deploy/terraform/outputs.tf")
@@ -1600,6 +1712,10 @@ func TestTerraformContinuousQueriesAreOptIn(t *testing.T) {
 	}
 	if !strings.Contains(renderedBlock, `templatefile("${path.module}/../continuous-queries/${name}.sql"`) {
 		t.Errorf("continuous_queries_rendered_sql does not render templates with templatefile:\n%s", renderedBlock)
+	}
+	cliBlock := terraformBlock(outputs, `output "continuous_queries_bq_cli_commands"`)
+	if !strings.Contains(cliBlock, "| bq query") || strings.Contains(cliBlock, `"$(terraform`) {
+		t.Errorf("continuous_queries_bq_cli_commands must pipe SQL on stdin to bq query:\n%s", cliBlock)
 	}
 
 	deploySection := firstCapture(`(?s)\n### Real-Time Alerting \(Continuous Queries\)\n(.*?)(?:\n##+ |\z)`, readRepoText(t, "deploy/README.md"))

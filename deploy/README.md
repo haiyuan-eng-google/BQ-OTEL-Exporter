@@ -342,34 +342,50 @@ a table that already has every column sends no update.
 ### Real-Time Alerting (Continuous Queries)
 
 [`deploy/continuous-queries/`](continuous-queries/README.md) ships three
-BigQuery Continuous Query templates (`tool_error_rate_alert.sql`,
-`token_budget_burn.sql`, and `agent_latency_p95.sql`) that evaluate new rows on
-`otel_spans` via `APPENDS(TABLE ...)` and export alerts to Cloud Pub/Sub or to
-an `otel_alerts` table. Because BigQuery `APPENDS` reads base tables and views
-using `QUALIFY` or window functions are ineligible, the templates read
-`otel_spans` directly rather than `otel_spans_dedup` or `v_gen_ai_*`.
+stateless per-span BigQuery Continuous Query templates
+(`tool_error_rate_alert.sql`, `token_budget_burn.sql`, and
+`agent_latency_p95.sql`) that evaluate new rows on `otel_spans` via
+`APPENDS(TABLE ...)` and export alerts to Cloud Pub/Sub (with `INSERT INTO` and
+Preview `TUMBLE` window variants in the directory README). Because BigQuery
+`APPENDS` reads base tables and views using `QUALIFY` or window functions are
+ineligible, the templates read `otel_spans` directly rather than
+`otel_spans_dedup` or `v_gen_ai_*`.
+
+Each template includes a `start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)`
+filter so it runs when `require_partition_filter = true`. BigQuery Continuous
+Queries do not support tables with column-level security policy tags, so
+Terraform enforces a precondition that `enable_column_level_security` is `false`
+when `enable_continuous_queries` is `true`.
 
 Set `enable_continuous_queries=true` in the Terraform module to provision the
-`otel_alerts` table, Pub/Sub topic, dedicated service account, IAM bindings,
-and Enterprise `CONTINUOUS` reservation assignment:
+`otel_alerts` table, Pub/Sub topic, dedicated service account
+(`<service_account_id>-cq`), IAM bindings, and Enterprise `CONTINUOUS`
+reservation assignment:
 
 | Variable | Default | Purpose |
 |:---|:---|:---|
 | `enable_continuous_queries` | `false` | Create `otel_alerts`, the Pub/Sub alert topic, the Continuous Queries service account and IAM bindings, and the `CONTINUOUS` reservation assignment |
-| `continuous_query_slot_capacity` | `100` | Slot capacity for the `CONTINUOUS` reservation (multiple of 50, at least 50) |
+| `continuous_query_slot_capacity` | `100` | Baseline slot capacity for the `CONTINUOUS` reservation (whole multiple of 10 from 10 to 500) |
 | `continuous_query_edition` | `ENTERPRISE` | BigQuery edition for the `CONTINUOUS` reservation: `ENTERPRISE` or `ENTERPRISE_PLUS` |
-| `continuous_query_max_turn_input_tokens` | `100000` | Single-turn input token threshold rendered into `token_budget_burn.sql` |
-| `continuous_query_max_turn_output_tokens` | `32000` | Single-turn output token threshold rendered into `token_budget_burn.sql` |
-| `continuous_query_max_turn_duration_ms` | `30000` | Span duration threshold in milliseconds rendered into `agent_latency_p95.sql` |
+| `continuous_query_max_turn_input_tokens` | `100000` | Stateless per-span input token threshold rendered into `token_budget_burn.sql` |
+| `continuous_query_max_turn_output_tokens` | `32000` | Stateless per-span output token threshold rendered into `token_budget_burn.sql` |
+| `continuous_query_max_turn_duration_ms` | `30000` | Stateless per-span duration threshold in milliseconds rendered into `agent_latency_p95.sql` |
+| `alerts_deletion_protection` | `false` | Deletion protection on the `otel_alerts` table |
+| `alerts_partition_expiration_days` | `0` | Partition expiration in days for `otel_alerts` (`0` means no expiration) |
 
 ```bash
-terraform apply \
+terraform -chdir=deploy/terraform apply \
   -var="project_id=my-project" \
   -var="enable_continuous_queries=true"
 ```
 
-Terraform renders the SQL templates into the `continuous_queries_rendered_sql`
-output and prints the `bq query --continuous=true` commands in
-`continuous_queries_bq_cli_commands`. See
-[`deploy/continuous-queries/README.md`](continuous-queries/README.md) for
-prerequisites, IAM roles, and downstream deduplication on `alert_id`.
+Enable `bigquery.googleapis.com`, `bigqueryreservation.googleapis.com`,
+`pubsub.googleapis.com`, and `iam.googleapis.com` first. Provisioning
+`continuous_query_slot_capacity = 100` creates 100 always-on baseline
+Enterprise slots; create a Pub/Sub subscription on `<dataset_id>-otel-alerts`
+to consume published alerts. Terraform renders the SQL templates into
+`continuous_queries_rendered_sql` and prints ready-to-run stdin-piped
+`bq query --continuous=true` commands in `continuous_queries_bq_cli_commands`.
+See [`deploy/continuous-queries/README.md`](continuous-queries/README.md) for
+IAM roles, replay/watermark/150-day runtime limits, and downstream
+deduplication on `alert_id`.

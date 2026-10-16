@@ -45,9 +45,14 @@ variable "quarantine_table" {
 }
 
 variable "service_account_id" {
-  description = "Service account ID for the collector"
+  description = "Service account ID for the collector (6 to 27 characters; Continuous Queries appends -cq)"
   type        = string
   default     = "otel-collector"
+
+  validation {
+    condition     = length(var.service_account_id) >= 6 && length(var.service_account_id) <= 27 && can(regex("^[a-z]([-a-z0-9]*[a-z0-9])?$", var.service_account_id))
+    error_message = "service_account_id must be 6 to 27 lowercase letters, digits, or hyphens, starting with a letter and ending with a letter or digit."
+  }
 }
 
 variable "grant_auto_create" {
@@ -215,21 +220,23 @@ variable "masked_reader_members" {
 # Off by default. When enable_continuous_queries is set, main.tf provisions the
 # otel_alerts sink table, Pub/Sub alert topic, dedicated service account,
 # least-privilege IAM bindings, and Enterprise CONTINUOUS reservation.
+# The shipped SQL templates are stateless per-span filters; see
+# deploy/continuous-queries/README.md for INSERT INTO and TUMBLE window variants.
 
 variable "enable_continuous_queries" {
-  description = "Provision the opt-in Continuous Queries alerting infrastructure: the otel_alerts table, Pub/Sub alert topic, service account, IAM bindings, and Enterprise CONTINUOUS slot reservation."
+  description = "Provision the opt-in Continuous Queries alerting infrastructure: the otel_alerts table, Pub/Sub alert topic, service account, IAM bindings, and Enterprise CONTINUOUS slot reservation. Needs the BigQuery Reservation, Cloud Pub/Sub, and IAM APIs enabled, and cannot be combined with enable_column_level_security."
   type        = bool
   default     = false
 }
 
 variable "continuous_query_slot_capacity" {
-  description = "Slot capacity of the BigQuery reservation created for CONTINUOUS jobs when enable_continuous_queries is set. Must be a multiple of 50, at least 50."
+  description = "Baseline slot capacity of the BigQuery reservation created for CONTINUOUS jobs when enable_continuous_queries is set (whole multiple of 10 from 10 to 500)."
   type        = number
   default     = 100
 
   validation {
-    condition     = var.continuous_query_slot_capacity >= 50 && floor(var.continuous_query_slot_capacity) == var.continuous_query_slot_capacity && var.continuous_query_slot_capacity % 50 == 0
-    error_message = "continuous_query_slot_capacity must be a whole multiple of 50, at least 50."
+    condition     = var.continuous_query_slot_capacity >= 10 && var.continuous_query_slot_capacity <= 500 && floor(var.continuous_query_slot_capacity) == var.continuous_query_slot_capacity && var.continuous_query_slot_capacity % 10 == 0
+    error_message = "continuous_query_slot_capacity must be a whole multiple of 10 between 10 and 500."
   }
 }
 
@@ -245,7 +252,7 @@ variable "continuous_query_edition" {
 }
 
 variable "continuous_query_max_turn_input_tokens" {
-  description = "Single-turn input token threshold rendered into deploy/continuous-queries/token_budget_burn.sql."
+  description = "Stateless per-span input token threshold rendered into deploy/continuous-queries/token_budget_burn.sql."
   type        = number
   default     = 100000
 
@@ -256,7 +263,7 @@ variable "continuous_query_max_turn_input_tokens" {
 }
 
 variable "continuous_query_max_turn_output_tokens" {
-  description = "Single-turn output token threshold rendered into deploy/continuous-queries/token_budget_burn.sql."
+  description = "Stateless per-span output token threshold rendered into deploy/continuous-queries/token_budget_burn.sql."
   type        = number
   default     = 32000
 
@@ -267,12 +274,29 @@ variable "continuous_query_max_turn_output_tokens" {
 }
 
 variable "continuous_query_max_turn_duration_ms" {
-  description = "Single-turn span duration threshold in milliseconds rendered into deploy/continuous-queries/agent_latency_p95.sql."
+  description = "Stateless per-span duration threshold in milliseconds rendered into deploy/continuous-queries/agent_latency_p95.sql."
   type        = number
   default     = 30000
 
   validation {
     condition     = var.continuous_query_max_turn_duration_ms > 0 && floor(var.continuous_query_max_turn_duration_ms) == var.continuous_query_max_turn_duration_ms
     error_message = "continuous_query_max_turn_duration_ms must be a positive whole number."
+  }
+}
+
+variable "alerts_deletion_protection" {
+  description = "Deletion protection on the otel_alerts table when enable_continuous_queries is set."
+  type        = bool
+  default     = false
+}
+
+variable "alerts_partition_expiration_days" {
+  description = "Partition expiration in days for otel_alerts when enable_continuous_queries is set; 0 means no expiration."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.alerts_partition_expiration_days >= 0 && floor(var.alerts_partition_expiration_days) == var.alerts_partition_expiration_days
+    error_message = "alerts_partition_expiration_days must be a whole number of days, 0 or more."
   }
 }

@@ -91,7 +91,6 @@ output "continuous_queries_rendered_sql" {
       project_id             = var.project_id
       dataset_id             = google_bigquery_dataset.otel.dataset_id
       spans_table            = google_bigquery_table.otel_spans.table_id
-      alerts_table           = google_bigquery_table.otel_alerts[0].table_id
       pubsub_topic           = google_pubsub_topic.otel_alerts[0].name
       max_turn_input_tokens  = var.continuous_query_max_turn_input_tokens
       max_turn_output_tokens = var.continuous_query_max_turn_output_tokens
@@ -101,15 +100,15 @@ output "continuous_queries_rendered_sql" {
 }
 
 output "continuous_queries_bq_cli_commands" {
-  description = "Ready-to-run bq query CLI commands for each Continuous Query template, or null unless enable_continuous_queries is set"
+  description = "Ready-to-run bq query CLI commands (piping SQL on stdin) for each Continuous Query template, or null unless enable_continuous_queries is set"
   value = var.enable_continuous_queries ? {
     for name in ["tool_error_rate_alert", "token_budget_burn", "agent_latency_p95"] :
     name => format(
-      "bq query --project_id=%s --location=%s --use_legacy_sql=false --continuous=true --connection_property=service_account=%s \"$(terraform -chdir=deploy/terraform output -json continuous_queries_rendered_sql | jq -r '.%s')\"",
+      "terraform -chdir=deploy/terraform output -json continuous_queries_rendered_sql | jq -r '.%s' | bq query --project_id=%s --location=%s --use_legacy_sql=false --continuous=true --connection_property=service_account=%s",
+      name,
       var.project_id,
       var.location,
       google_service_account.continuous_queries[0].email,
-      name,
     )
   } : null
 }

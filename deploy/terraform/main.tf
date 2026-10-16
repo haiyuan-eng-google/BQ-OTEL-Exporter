@@ -1238,13 +1238,15 @@ resource "google_kms_crypto_key_iam_member" "bq_encryptor" {
 resource "google_bigquery_table" "otel_alerts" {
   count = var.enable_continuous_queries ? 1 : 0
 
-  dataset_id          = google_bigquery_dataset.otel.dataset_id
-  table_id            = "otel_alerts"
-  deletion_protection = false
+  dataset_id               = google_bigquery_dataset.otel.dataset_id
+  table_id                 = "otel_alerts"
+  deletion_protection      = var.alerts_deletion_protection
+  require_partition_filter = var.require_partition_filter
 
   time_partitioning {
-    type  = "DAY"
-    field = "event_time"
+    type          = "DAY"
+    field         = "event_time"
+    expiration_ms = var.alerts_partition_expiration_days > 0 ? var.alerts_partition_expiration_days * 86400000 : null
   }
 
   clustering = ["alert_kind", "service_name"]
@@ -1324,6 +1326,13 @@ resource "google_bigquery_reservation" "continuous_queries" {
   slot_capacity     = var.continuous_query_slot_capacity
   edition           = var.continuous_query_edition
   ignore_idle_slots = false
+
+  lifecycle {
+    precondition {
+      condition     = !var.enable_column_level_security
+      error_message = "BigQuery Continuous Queries do not support tables with column-level security policy tags (enable_column_level_security must be false when enable_continuous_queries is true)."
+    }
+  }
 }
 
 resource "google_bigquery_reservation_assignment" "continuous_queries" {
