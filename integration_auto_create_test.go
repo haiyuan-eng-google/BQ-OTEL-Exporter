@@ -164,6 +164,7 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 		"v_gen_ai_model_costs",
 		"v_gen_ai_sessions",
 		"v_gen_ai_tool_usage",
+		"v_gen_ai_agent_trajectory",
 	} {
 		if _, err := admin.Dataset(dataset).Table(name).Metadata(ctx); err != nil {
 			t.Errorf("resource %s metadata: %v", name, err)
@@ -308,6 +309,11 @@ func assertIntegrationViewColumns(ctx context.Context, t *testing.T, client *bq.
 			name: "v_gen_ai_tool_usage",
 			sql:  fmt.Sprintf("SELECT typed_error_count, ARRAY_LENGTH(top_error_types), top_error_types[OFFSET(0)].value FROM `%s.%s.v_gen_ai_tool_usage` LIMIT 1", project, dataset),
 			want: []bq.Value{int64(1), int64(1), "rate_limited"},
+		},
+		{
+			name: "v_gen_ai_agent_trajectory",
+			sql:  fmt.Sprintf("SELECT depth, is_orphan, is_leaf, is_token_leaf FROM `%s.%s.v_gen_ai_agent_trajectory` WHERE error_type IS NOT NULL LIMIT 1", project, dataset),
+			want: []bq.Value{int64(0), false, true, true},
 		},
 	} {
 		rows, err := client.Query(tc.sql).Read(ctx)

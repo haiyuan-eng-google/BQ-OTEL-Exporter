@@ -1026,6 +1026,7 @@ func TestTerraformCompanionViewsMatchExporter(t *testing.T) {
 		{schema.GenAIModelCostsViewName, schema.GenAIModelCostsViewQuery, []any{"p", "d"}},
 		{schema.GenAISessionsViewName, schema.GenAISessionsViewQuery, []any{"p", "d"}},
 		{schema.GenAIToolUsageViewName, schema.GenAIToolUsageViewQuery, []any{"p", "d"}},
+		{schema.GenAIAgentTrajectoryViewName, schema.GenAIAgentTrajectoryViewQuery, []any{"p", "d"}},
 	} {
 		t.Run(tc.resource, func(t *testing.T) {
 			block := terraformBlock(mainTF, `resource "google_bigquery_table" "`+tc.resource+`"`)

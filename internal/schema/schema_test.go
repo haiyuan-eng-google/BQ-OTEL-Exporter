@@ -561,6 +561,14 @@ func TestCompanionViewTemplates(t *testing.T) {
 			args:    []any{"proj", "ds"},
 			sources: []string{"FROM `proj.ds.v_gen_ai_spans`"},
 		},
+		{
+			name:    "gen_ai_agent_trajectory",
+			view:    "v_gen_ai_agent_trajectory",
+			query:   GenAIAgentTrajectoryViewQuery,
+			ddl:     GenAIAgentTrajectoryViewDDL,
+			args:    []any{"proj", "ds"},
+			sources: []string{"FROM `proj.ds.v_gen_ai_spans`"},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			query := strings.TrimSpace(fmt.Sprintf(tc.query, tc.args...))
@@ -1207,6 +1215,29 @@ func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 				"span_gen_ai_agent_name", "span_gen_ai_tool_name", "adk_session_id", "span_error_type",
 			},
 		},
+		{
+			name:      "gen_ai_agent_trajectory",
+			query:     GenAIAgentTrajectoryViewQuery,
+			args:      []any{"proj", "ds"},
+			qualifier: "t",
+			// 31 base columns from v_gen_ai_spans followed by the 9
+			// recursive trajectory columns.
+			want: []string{
+				"start_time", "end_time", "duration_nano", "duration_ms",
+				"trace_id", "span_id", "parent_span_id", "service_name",
+				"span_name", "span_kind", "status_code", "status_message",
+				"gen_ai_operation_name", "gen_ai_system", "gen_ai_provider_name",
+				"gen_ai_request_model", "gen_ai_response_model",
+				"gen_ai_agent_id", "gen_ai_agent_name", "gen_ai_agent_version",
+				"gen_ai_main_agent_id", "gen_ai_main_agent_name",
+				"gen_ai_tool_name", "gen_ai_tool_call_id",
+				"gen_ai_usage_input_tokens", "gen_ai_usage_output_tokens", "gen_ai_usage_reasoning_tokens",
+				"adk_session_id", "adk_invocation_id", "adk_user_id",
+				"error_type",
+				"depth", "root_span_id", "nearest_agent_span_id", "nearest_agent_name",
+				"agent_path", "is_orphan", "step_index", "is_leaf", "is_token_leaf",
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			items, err := selectList(fmt.Sprintf(tc.query, tc.args...))
@@ -1335,6 +1366,27 @@ func TestCompanionViewPreExistingColumnIndicesUnchanged(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestGenAIAgentTrajectoryView(t *testing.T) {
+	query := normalizeSQL(fmt.Sprintf(GenAIAgentTrajectoryViewQuery, "proj", "ds"))
+	for _, want := range []string{
+		"WITH RECURSIVE spans AS (",
+		"FROM `proj.ds.v_gen_ai_spans`",
+		"LEFT JOIN spans AS p ON s.trace_id = p.trace_id AND s.parent_span_id = p.span_id AND s.service_name IS NOT DISTINCT FROM p.service_name AND p.start_time BETWEEN TIMESTAMP_SUB(s.start_time, INTERVAL 24 HOUR) AND TIMESTAMP_ADD(s.start_time, INTERVAL 1 HOUR)",
+		"JOIN spans AS c ON c.trace_id = t.trace_id AND c.parent_span_id = t.span_id AND c.service_name IS NOT DISTINCT FROM t.service_name AND c.start_time BETWEEN TIMESTAMP_SUB(t.start_time, INTERVAL 1 HOUR) AND TIMESTAMP_ADD(t.start_time, INTERVAL 24 HOUR)",
+		"WHERE t.depth < 16 AND c.span_id NOT IN UNNEST(t.visited_span_ids)",
+		"ROW_NUMBER() OVER ( PARTITION BY t.trace_id, t.service_name ORDER BY t.start_time ASC, t.span_id ASC ) AS step_index",
+		"LEFT JOIN parent_ids AS leaf_check ON t.trace_id = leaf_check.trace_id AND t.span_id = leaf_check.span_id AND t.service_name IS NOT DISTINCT FROM leaf_check.service_name",
+		"LEFT JOIN token_parent_ids AS token_leaf_check ON t.trace_id = token_leaf_check.trace_id AND t.span_id = token_leaf_check.span_id AND t.service_name IS NOT DISTINCT FROM token_leaf_check.service_name",
+	} {
+		if !strings.Contains(query, want) {
+			t.Errorf("v_gen_ai_agent_trajectory query missing %q:\n%s", want, query)
+		}
+	}
+	if n := strings.Count(query, "IS NOT DISTINCT FROM"); n != 4 {
+		t.Errorf("v_gen_ai_agent_trajectory query has %d IS NOT DISTINCT FROM clauses, want 4", n)
 	}
 }
 

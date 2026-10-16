@@ -488,21 +488,22 @@ func TestPrepareDestinationCreatesSpanCompanionViews(t *testing.T) {
 		t.Fatal(err)
 	}
 	for id, want := range map[string]string{
-		"otel_spans_as_allspans": fmt.Sprintf(schema.SpansAsAllSpansViewQuery, "my-project", "otel", cfg.Traces.Table),
-		"v_gen_ai_spans":         fmt.Sprintf(schema.GenAISpansViewQuery, "my-project", "otel", cfg.Traces.Table),
-		"v_gen_ai_model_costs":   fmt.Sprintf(schema.GenAIModelCostsViewQuery, "my-project", "otel"),
-		"v_gen_ai_sessions":      fmt.Sprintf(schema.GenAISessionsViewQuery, "my-project", "otel"),
-		"v_gen_ai_tool_usage":    fmt.Sprintf(schema.GenAIToolUsageViewQuery, "my-project", "otel"),
+		"otel_spans_as_allspans":    fmt.Sprintf(schema.SpansAsAllSpansViewQuery, "my-project", "otel", cfg.Traces.Table),
+		"v_gen_ai_spans":            fmt.Sprintf(schema.GenAISpansViewQuery, "my-project", "otel", cfg.Traces.Table),
+		"v_gen_ai_model_costs":      fmt.Sprintf(schema.GenAIModelCostsViewQuery, "my-project", "otel"),
+		"v_gen_ai_sessions":         fmt.Sprintf(schema.GenAISessionsViewQuery, "my-project", "otel"),
+		"v_gen_ai_tool_usage":       fmt.Sprintf(schema.GenAIToolUsageViewQuery, "my-project", "otel"),
+		"v_gen_ai_agent_trajectory": fmt.Sprintf(schema.GenAIAgentTrajectoryViewQuery, "my-project", "otel"),
 	} {
 		if md := admin.createdTables[id]; md == nil || md.ViewQuery != want {
 			t.Errorf("companion view %s = %#v, want expected view query", id, md)
 		}
 	}
-	if got := len(admin.createdTables); got != 7 {
-		t.Errorf("created %d tables and views, want the table, its dedup view and five span companion views", got)
+	if got := len(admin.createdTables); got != 8 {
+		t.Errorf("created %d tables and views, want the table, its dedup view and six span companion views", got)
 	}
 	spansIdx := slices.Index(admin.createdTableOrder, "v_gen_ai_spans")
-	for _, rollup := range []string{"v_gen_ai_model_costs", "v_gen_ai_sessions", "v_gen_ai_tool_usage"} {
+	for _, rollup := range []string{"v_gen_ai_model_costs", "v_gen_ai_sessions", "v_gen_ai_tool_usage", "v_gen_ai_agent_trajectory"} {
 		if idx := slices.Index(admin.createdTableOrder, rollup); spansIdx < 0 || idx < spansIdx {
 			t.Errorf("createdTableOrder = %v, want v_gen_ai_spans before %s", admin.createdTableOrder, rollup)
 		}
@@ -556,8 +557,8 @@ func TestPrepareDestinationCreatesLogsCompanionViewWhenTracesStartsSecond(t *tes
 	if md := admin.createdTables["v_gen_ai_logs"]; md == nil || md.ViewQuery != want {
 		t.Fatalf("v_gen_ai_logs = %#v, want traces startup to create v_gen_ai_logs when log dedup view already exists", md)
 	}
-	if got := len(admin.createdTables); got != 8 {
-		t.Errorf("created %d tables and views, want the table, its dedup view, five span companion views, and v_gen_ai_logs", got)
+	if got := len(admin.createdTables); got != 9 {
+		t.Errorf("created %d tables and views, want the table, its dedup view, six span companion views, and v_gen_ai_logs", got)
 	}
 	if !slices.Contains(admin.tableReadIDs, cfg.Logs.Table+"_dedup") {
 		t.Errorf("table reads = %v, want a probe of the log dedup view", admin.tableReadIDs)
@@ -640,12 +641,13 @@ func TestPrepareDestinationCompanionViewCreationResults(t *testing.T) {
 		{
 			name: "already exists preserved",
 			createErrs: map[string]error{
-				"otel_spans_as_allspans": alreadyExists(),
-				"v_gen_ai_spans":         status.Error(codes.AlreadyExists, "existing view"),
-				"v_gen_ai_model_costs":   alreadyExists(),
-				"v_gen_ai_sessions":      alreadyExists(),
-				"v_gen_ai_tool_usage":    alreadyExists(),
-				"v_gen_ai_logs":          alreadyExists(),
+				"otel_spans_as_allspans":    alreadyExists(),
+				"v_gen_ai_spans":            status.Error(codes.AlreadyExists, "existing view"),
+				"v_gen_ai_model_costs":      alreadyExists(),
+				"v_gen_ai_sessions":         alreadyExists(),
+				"v_gen_ai_tool_usage":       alreadyExists(),
+				"v_gen_ai_agent_trajectory": alreadyExists(),
+				"v_gen_ai_logs":             alreadyExists(),
 			},
 		},
 		{
@@ -915,6 +917,11 @@ func reconcileTargets() []reconcileTarget {
 			peers: map[string]fakeTableMetadataResponse{
 				defaultSpansTable + "_dedup": {metadata: &bq.TableMetadata{Type: bq.ViewTable}},
 			},
+		},
+		{
+			name: "agent trajectory companion view", table: defaultSpansTable, tableSchema: schema.SpansTableSchema(),
+			viewID: schema.GenAIAgentTrajectoryViewName,
+			query:  fmt.Sprintf(schema.GenAIAgentTrajectoryViewQuery, project, dataset),
 		},
 	}
 }

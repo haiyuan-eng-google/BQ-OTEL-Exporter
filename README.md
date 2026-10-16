@@ -476,6 +476,17 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
   - `v_gen_ai_tool_usage`: hourly tool invocation count, error rate, typed error
     count (`typed_error_count`, `top_error_types`), and latency
     rollups over `v_gen_ai_spans` grouped by `(usage_hour, service_name, gen_ai_agent_name, gen_ai_tool_name, gen_ai_tool_type)`.
+  - `v_gen_ai_agent_trajectory`: recursive span DAG over `v_gen_ai_spans` (`WITH
+    RECURSIVE`, depth cap `16`, `visited_span_ids` cycle guard) with 40 columns:
+    31 base span and GenAI columns plus `depth`, `root_span_id`,
+    `nearest_agent_span_id`, `nearest_agent_name`, `agent_path` (consecutive
+    duplicates skipped), `is_orphan` (true when `parent_span_id` is absent from
+    `v_gen_ai_spans` for the same `trace_id` and null-safe `service_name` within
+    24 hours before to 1 hour after the child's `start_time`), `step_index`
+    (`ROW_NUMBER()` per `(trace_id, service_name)` ordered by `(start_time ASC,
+    span_id ASC)`), `is_leaf`, and `is_token_leaf`. Like `v_gen_ai_logs` and
+    `v_gen_ai_metric_exemplars`, it joins spans across a bounded time window and
+    cannot be queried when `traces.require_partition_filter` is `true`.
   - `v_gen_ai_logs`: filters `otel_logs_dedup` to GenAI/agent log events and
     left-joins `otel_spans_dedup` on `(trace_id, span_id)` and a null-safe
     `service_name` match, within the window described under *Time-bounded

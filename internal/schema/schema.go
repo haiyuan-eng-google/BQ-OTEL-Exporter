@@ -487,6 +487,7 @@ const (
 	GenAIModelCostsViewName      = "v_gen_ai_model_costs"
 	GenAISessionsViewName        = "v_gen_ai_sessions"
 	GenAIToolUsageViewName       = "v_gen_ai_tool_usage"
+	GenAIAgentTrajectoryViewName = "v_gen_ai_agent_trajectory"
 )
 
 // SpansAsAllSpansViewDDL creates otel_spans_as_allspans, which presents the
@@ -1243,6 +1244,271 @@ SELECT
     LIMIT 5
   ) AS top_error_types
 FROM tool_agg
+`
+
+// GenAIAgentTrajectoryViewDDL creates v_gen_ai_agent_trajectory: a recursive
+// span-DAG companion view over v_gen_ai_spans that walks parent_span_id links
+// up to depth 16, records the nearest agent span and deduplicated agent_path,
+// flags orphan roots whose parent_span_id is absent, and computes step_index,
+// is_leaf, and is_token_leaf per trace and service.
+const GenAIAgentTrajectoryViewDDL = `
+CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAIAgentTrajectoryViewName + "`" + ` AS
+` + GenAIAgentTrajectoryViewQuery + `;
+`
+
+// GenAIAgentTrajectoryViewQuery is shared by operator-run DDL and metadata-API
+// view creation. It takes (project, dataset) and reads v_gen_ai_spans.
+//
+// Anchor rows are true roots (parent_span_id IS NULL or empty) and orphan
+// roots whose parent_span_id does not appear in v_gen_ai_spans for the same
+// trace_id and null-safe service_name within 24 hours before to 1 hour after
+// the child's start_time. Recursive steps traverse child spans within the
+// symmetric [-1h, +24h] window up to depth < 16 and guard against cycles with
+// visited_span_ids.
+const GenAIAgentTrajectoryViewQuery = `
+WITH RECURSIVE
+  spans AS (
+    SELECT
+      start_time,
+      end_time,
+      duration_nano,
+      duration_ms,
+      trace_id,
+      span_id,
+      parent_span_id,
+      service_name,
+      span_name,
+      span_kind,
+      status_code,
+      status_message,
+      gen_ai_operation_name,
+      gen_ai_system,
+      gen_ai_provider_name,
+      gen_ai_request_model,
+      gen_ai_response_model,
+      gen_ai_agent_id,
+      gen_ai_agent_name,
+      gen_ai_agent_version,
+      gen_ai_main_agent_id,
+      gen_ai_main_agent_name,
+      gen_ai_tool_name,
+      gen_ai_tool_call_id,
+      gen_ai_usage_input_tokens,
+      gen_ai_usage_output_tokens,
+      gen_ai_usage_reasoning_tokens,
+      adk_session_id,
+      adk_invocation_id,
+      adk_user_id,
+      error_type
+    FROM ` + "`%[1]s.%[2]s." + GenAISpansViewName + "`" + `
+  ),
+  parent_ids AS (
+    SELECT DISTINCT
+      trace_id,
+      service_name,
+      parent_span_id AS span_id
+    FROM spans
+    WHERE parent_span_id IS NOT NULL
+      AND parent_span_id != ''
+  ),
+  token_parent_ids AS (
+    SELECT DISTINCT
+      trace_id,
+      service_name,
+      parent_span_id AS span_id
+    FROM spans
+    WHERE parent_span_id IS NOT NULL
+      AND parent_span_id != ''
+      AND (COALESCE(gen_ai_usage_input_tokens, 0) + COALESCE(gen_ai_usage_output_tokens, 0) > 0)
+  ),
+  trajectory AS (
+    SELECT
+      s.start_time,
+      s.end_time,
+      s.duration_nano,
+      s.duration_ms,
+      s.trace_id,
+      s.span_id,
+      s.parent_span_id,
+      s.service_name,
+      s.span_name,
+      s.span_kind,
+      s.status_code,
+      s.status_message,
+      s.gen_ai_operation_name,
+      s.gen_ai_system,
+      s.gen_ai_provider_name,
+      s.gen_ai_request_model,
+      s.gen_ai_response_model,
+      s.gen_ai_agent_id,
+      s.gen_ai_agent_name,
+      s.gen_ai_agent_version,
+      s.gen_ai_main_agent_id,
+      s.gen_ai_main_agent_name,
+      s.gen_ai_tool_name,
+      s.gen_ai_tool_call_id,
+      s.gen_ai_usage_input_tokens,
+      s.gen_ai_usage_output_tokens,
+      s.gen_ai_usage_reasoning_tokens,
+      s.adk_session_id,
+      s.adk_invocation_id,
+      s.adk_user_id,
+      s.error_type,
+      0 AS depth,
+      s.span_id AS root_span_id,
+      CASE
+        WHEN s.gen_ai_operation_name IN ('invoke_agent', 'create_agent')
+          OR s.gen_ai_agent_name IS NOT NULL
+        THEN s.span_id
+        ELSE CAST(NULL AS STRING)
+      END AS nearest_agent_span_id,
+      CASE
+        WHEN s.gen_ai_operation_name IN ('invoke_agent', 'create_agent')
+          OR s.gen_ai_agent_name IS NOT NULL
+        THEN s.gen_ai_agent_name
+        ELSE CAST(NULL AS STRING)
+      END AS nearest_agent_name,
+      CASE
+        WHEN s.gen_ai_agent_name IS NOT NULL THEN [s.gen_ai_agent_name]
+        ELSE ARRAY<STRING>[]
+      END AS agent_path,
+      (s.parent_span_id IS NOT NULL AND s.parent_span_id != '') AS is_orphan,
+      [s.span_id] AS visited_span_ids
+    FROM spans AS s
+    LEFT JOIN spans AS p
+      ON s.trace_id = p.trace_id
+      AND s.parent_span_id = p.span_id
+      AND s.service_name IS NOT DISTINCT FROM p.service_name
+      AND p.start_time BETWEEN TIMESTAMP_SUB(s.start_time, INTERVAL 24 HOUR) AND TIMESTAMP_ADD(s.start_time, INTERVAL 1 HOUR)
+    WHERE s.parent_span_id IS NULL
+       OR s.parent_span_id = ''
+       OR p.span_id IS NULL
+
+    UNION ALL
+
+    SELECT
+      c.start_time,
+      c.end_time,
+      c.duration_nano,
+      c.duration_ms,
+      c.trace_id,
+      c.span_id,
+      c.parent_span_id,
+      c.service_name,
+      c.span_name,
+      c.span_kind,
+      c.status_code,
+      c.status_message,
+      c.gen_ai_operation_name,
+      c.gen_ai_system,
+      c.gen_ai_provider_name,
+      c.gen_ai_request_model,
+      c.gen_ai_response_model,
+      c.gen_ai_agent_id,
+      c.gen_ai_agent_name,
+      c.gen_ai_agent_version,
+      c.gen_ai_main_agent_id,
+      c.gen_ai_main_agent_name,
+      c.gen_ai_tool_name,
+      c.gen_ai_tool_call_id,
+      c.gen_ai_usage_input_tokens,
+      c.gen_ai_usage_output_tokens,
+      c.gen_ai_usage_reasoning_tokens,
+      c.adk_session_id,
+      c.adk_invocation_id,
+      c.adk_user_id,
+      c.error_type,
+      t.depth + 1 AS depth,
+      t.root_span_id AS root_span_id,
+      CASE
+        WHEN c.gen_ai_operation_name IN ('invoke_agent', 'create_agent')
+          OR (t.nearest_agent_span_id IS NULL AND c.gen_ai_agent_name IS NOT NULL)
+        THEN c.span_id
+        ELSE t.nearest_agent_span_id
+      END AS nearest_agent_span_id,
+      CASE
+        WHEN c.gen_ai_operation_name IN ('invoke_agent', 'create_agent')
+        THEN COALESCE(c.gen_ai_agent_name, t.nearest_agent_name)
+        WHEN t.nearest_agent_name IS NULL
+        THEN c.gen_ai_agent_name
+        ELSE t.nearest_agent_name
+      END AS nearest_agent_name,
+      CASE
+        WHEN c.gen_ai_agent_name IS NOT NULL
+          AND (
+            ARRAY_LENGTH(t.agent_path) = 0
+            OR t.agent_path[OFFSET(ARRAY_LENGTH(t.agent_path) - 1)] != c.gen_ai_agent_name
+          )
+        THEN ARRAY_CONCAT(t.agent_path, [c.gen_ai_agent_name])
+        ELSE t.agent_path
+      END AS agent_path,
+      t.is_orphan AS is_orphan,
+      ARRAY_CONCAT(t.visited_span_ids, [c.span_id]) AS visited_span_ids
+    FROM trajectory AS t
+    JOIN spans AS c
+      ON c.trace_id = t.trace_id
+      AND c.parent_span_id = t.span_id
+      AND c.service_name IS NOT DISTINCT FROM t.service_name
+      AND c.start_time BETWEEN TIMESTAMP_SUB(t.start_time, INTERVAL 1 HOUR) AND TIMESTAMP_ADD(t.start_time, INTERVAL 24 HOUR)
+    WHERE t.depth < 16
+      AND c.span_id NOT IN UNNEST(t.visited_span_ids)
+  )
+SELECT
+  t.start_time,
+  t.end_time,
+  t.duration_nano,
+  t.duration_ms,
+  t.trace_id,
+  t.span_id,
+  t.parent_span_id,
+  t.service_name,
+  t.span_name,
+  t.span_kind,
+  t.status_code,
+  t.status_message,
+  t.gen_ai_operation_name,
+  t.gen_ai_system,
+  t.gen_ai_provider_name,
+  t.gen_ai_request_model,
+  t.gen_ai_response_model,
+  t.gen_ai_agent_id,
+  t.gen_ai_agent_name,
+  t.gen_ai_agent_version,
+  t.gen_ai_main_agent_id,
+  t.gen_ai_main_agent_name,
+  t.gen_ai_tool_name,
+  t.gen_ai_tool_call_id,
+  t.gen_ai_usage_input_tokens,
+  t.gen_ai_usage_output_tokens,
+  t.gen_ai_usage_reasoning_tokens,
+  t.adk_session_id,
+  t.adk_invocation_id,
+  t.adk_user_id,
+  t.error_type,
+  t.depth,
+  t.root_span_id,
+  t.nearest_agent_span_id,
+  t.nearest_agent_name,
+  t.agent_path,
+  t.is_orphan,
+  ROW_NUMBER() OVER (
+    PARTITION BY t.trace_id, t.service_name
+    ORDER BY t.start_time ASC, t.span_id ASC
+  ) AS step_index,
+  (leaf_check.span_id IS NULL) AS is_leaf,
+  (
+    (COALESCE(t.gen_ai_usage_input_tokens, 0) + COALESCE(t.gen_ai_usage_output_tokens, 0) > 0)
+    AND token_leaf_check.span_id IS NULL
+  ) AS is_token_leaf
+FROM trajectory AS t
+LEFT JOIN parent_ids AS leaf_check
+  ON t.trace_id = leaf_check.trace_id
+  AND t.span_id = leaf_check.span_id
+  AND t.service_name IS NOT DISTINCT FROM leaf_check.service_name
+LEFT JOIN token_parent_ids AS token_leaf_check
+  ON t.trace_id = token_leaf_check.trace_id
+  AND t.span_id = token_leaf_check.span_id
+  AND t.service_name IS NOT DISTINCT FROM token_leaf_check.service_name
 `
 
 // FingerprintPrefix is the version tag on record_fingerprint and

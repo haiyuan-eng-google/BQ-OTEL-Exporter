@@ -704,6 +704,7 @@ func isRollupView(id string) bool {
 	case schema.GenAIModelCostsViewName,
 		schema.GenAISessionsViewName,
 		schema.GenAIToolUsageViewName,
+		schema.GenAIAgentTrajectoryViewName,
 		schema.GenAIMetricExemplarsViewName:
 		return true
 	default:

@@ -124,21 +124,23 @@ func applyGovernanceOptions(md *bq.TableMetadata, opts DestinationOptions) {
 }
 
 // SpanCompanionViewOrder lists the span companion views in dependency order so
-// v_gen_ai_spans is created before the rollup views that query it.
+// v_gen_ai_spans is created before the rollup and trajectory views that query it.
 var SpanCompanionViewOrder = []string{
 	SpansAsAllSpansViewName,
 	GenAISpansViewName,
 	GenAIModelCostsViewName,
 	GenAISessionsViewName,
 	GenAIToolUsageViewName,
+	GenAIAgentTrajectoryViewName,
 }
 
 // CompanionViewsMetadata builds the optional companion views of one signal,
 // keyed by view name: otel_spans_as_allspans, v_gen_ai_spans,
-// v_gen_ai_model_costs, v_gen_ai_sessions, and v_gen_ai_tool_usage for traces,
-// and v_gen_ai_logs for logs. The views read the dedup views, never the raw
-// tables, and v_gen_ai_logs reads the span dedup view as well as the log one,
-// so it can only be created once the span dedup view exists.
+// v_gen_ai_model_costs, v_gen_ai_sessions, v_gen_ai_tool_usage, and
+// v_gen_ai_agent_trajectory for traces, and v_gen_ai_logs for logs. The views
+// read the dedup views, never the raw tables, and v_gen_ai_logs reads the span
+// dedup view as well as the log one, so it can only be created once the span
+// dedup view exists.
 func CompanionViewsMetadata(
 	project, dataset, spansTable, logsTable string, isSpans bool,
 ) map[string]*bq.TableMetadata {
@@ -147,11 +149,12 @@ func CompanionViewsMetadata(
 	}
 	if isSpans {
 		return map[string]*bq.TableMetadata{
-			SpansAsAllSpansViewName: view(fmt.Sprintf(SpansAsAllSpansViewQuery, project, dataset, spansTable)),
-			GenAISpansViewName:      view(fmt.Sprintf(GenAISpansViewQuery, project, dataset, spansTable)),
-			GenAIModelCostsViewName: view(fmt.Sprintf(GenAIModelCostsViewQuery, project, dataset)),
-			GenAISessionsViewName:   view(fmt.Sprintf(GenAISessionsViewQuery, project, dataset)),
-			GenAIToolUsageViewName:  view(fmt.Sprintf(GenAIToolUsageViewQuery, project, dataset)),
+			SpansAsAllSpansViewName:      view(fmt.Sprintf(SpansAsAllSpansViewQuery, project, dataset, spansTable)),
+			GenAISpansViewName:           view(fmt.Sprintf(GenAISpansViewQuery, project, dataset, spansTable)),
+			GenAIModelCostsViewName:      view(fmt.Sprintf(GenAIModelCostsViewQuery, project, dataset)),
+			GenAISessionsViewName:        view(fmt.Sprintf(GenAISessionsViewQuery, project, dataset)),
+			GenAIToolUsageViewName:       view(fmt.Sprintf(GenAIToolUsageViewQuery, project, dataset)),
+			GenAIAgentTrajectoryViewName: view(fmt.Sprintf(GenAIAgentTrajectoryViewQuery, project, dataset)),
 		}
 	}
 	return map[string]*bq.TableMetadata{
