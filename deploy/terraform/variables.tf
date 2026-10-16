@@ -45,13 +45,13 @@ variable "quarantine_table" {
 }
 
 variable "service_account_id" {
-  description = "Service account ID for the collector (6 to 27 characters; Continuous Queries appends -cq)"
+  description = "Service account ID for the collector (6 to 30 characters; at most 27 when enable_continuous_queries is true so -cq fits within 30)"
   type        = string
   default     = "otel-collector"
 
   validation {
-    condition     = length(var.service_account_id) >= 6 && length(var.service_account_id) <= 27 && can(regex("^[a-z]([-a-z0-9]*[a-z0-9])?$", var.service_account_id))
-    error_message = "service_account_id must be 6 to 27 lowercase letters, digits, or hyphens, starting with a letter and ending with a letter or digit."
+    condition     = length(var.service_account_id) >= 6 && length(var.service_account_id) <= 30 && can(regex("^[a-z][-a-z0-9]{4,28}[a-z0-9]$", var.service_account_id))
+    error_message = "service_account_id must be 6 to 30 lowercase letters, digits, or hyphens, starting with a letter and ending with a letter or digit."
   }
 }
 
@@ -230,13 +230,13 @@ variable "enable_continuous_queries" {
 }
 
 variable "continuous_query_slot_capacity" {
-  description = "Baseline slot capacity of the BigQuery reservation created for CONTINUOUS jobs when enable_continuous_queries is set (whole multiple of 10 from 10 to 500)."
+  description = "Baseline slot capacity of the BigQuery reservation created for CONTINUOUS jobs when enable_continuous_queries is set (whole multiple of 50 from 50 to 500; each continuous query job needs at least 10 slots to start, while Enterprise reservation baseline capacity is configured in multiples of 50 up to the 500-slot CONTINUOUS cap)."
   type        = number
   default     = 100
 
   validation {
-    condition     = var.continuous_query_slot_capacity >= 10 && var.continuous_query_slot_capacity <= 500 && floor(var.continuous_query_slot_capacity) == var.continuous_query_slot_capacity && var.continuous_query_slot_capacity % 10 == 0
-    error_message = "continuous_query_slot_capacity must be a whole multiple of 10 between 10 and 500."
+    condition     = var.continuous_query_slot_capacity >= 50 && var.continuous_query_slot_capacity <= 500 && var.continuous_query_slot_capacity % 50 == 0 && floor(var.continuous_query_slot_capacity) == var.continuous_query_slot_capacity
+    error_message = "continuous_query_slot_capacity must be a whole multiple of 50 between 50 and 500."
   }
 }
 

@@ -1493,6 +1493,7 @@ func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
 
 	specificChecks := map[string][]string{
 		"tool_error_rate_alert.sql": {
+			"'TOOL_ERROR' AS alert_kind",
 			"status.code = 2",
 			`$."error.type"`,
 			`$."gen_ai.operation.name"') = 'execute_tool'`,
@@ -1500,10 +1501,12 @@ func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
 			`$."mcp.method.name"`,
 		},
 		"token_budget_burn.sql": {
+			"'TOKEN_BUDGET_BURN' AS alert_kind",
 			"> ${max_turn_input_tokens}",
 			"> ${max_turn_output_tokens}",
 		},
 		"agent_latency_p95.sql": {
+			"'AGENT_LATENCY_HIGH' AS alert_kind",
 			"duration_nano / 1e6 > ${max_turn_duration_ms}",
 		},
 	}
@@ -1525,7 +1528,7 @@ func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
 			"https://pubsub.googleapis.com/projects/${project_id}/topics/${pubsub_topic}",
 			"APPENDS(",
 			"TABLE `${project_id}.${dataset_id}.${spans_table}`",
-			"start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)",
+			"AND start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)",
 		} {
 			if !strings.Contains(activeSQL, want) {
 				t.Errorf("%s active SQL is missing %q", path, want)
@@ -1612,20 +1615,24 @@ func TestTerraformContinuousQueriesAreOptIn(t *testing.T) {
 	}
 	slotBlock := terraformBlock(vars, `variable "continuous_query_slot_capacity"`)
 	for _, want := range []string{
-		"var.continuous_query_slot_capacity >= 10",
+		"var.continuous_query_slot_capacity >= 50",
 		"var.continuous_query_slot_capacity <= 500",
-		"var.continuous_query_slot_capacity % 10 == 0",
+		"var.continuous_query_slot_capacity % 50 == 0",
 	} {
 		if !strings.Contains(slotBlock, want) {
 			t.Errorf("continuous_query_slot_capacity validation missing %q:\n%s", want, slotBlock)
 		}
 	}
 	saBlock := terraformBlock(vars, `variable "service_account_id"`)
-	if !strings.Contains(saBlock, "length(var.service_account_id) <= 27") {
-		t.Errorf("service_account_id validation must cap length at 27 so -cq stays within 30 chars:\n%s", saBlock)
+	if !strings.Contains(saBlock, "length(var.service_account_id) <= 30") {
+		t.Errorf("service_account_id validation must allow up to 30 chars by default:\n%s", saBlock)
 	}
 
 	mainTF := readRepoText(t, "deploy/terraform/main.tf")
+	cqSA := terraformBlock(mainTF, `resource "google_service_account" "continuous_queries"`)
+	if !strings.Contains(cqSA, "condition     = length(var.service_account_id) <= 27") {
+		t.Errorf("google_service_account.continuous_queries missing length(var.service_account_id) <= 27 precondition:\n%s", cqSA)
+	}
 	gated := gate + " ? 1 : 0"
 	resources := []string{
 		`resource "google_bigquery_table" "otel_alerts"`,

@@ -677,11 +677,13 @@ ON `my-project.otel.otel_metrics` (ALL COLUMNS) OPTIONS (analyzer = 'NO_OP_ANALY
   `agent_latency_p95.sql`) that evaluate newly appended rows on `otel_spans`
   via `APPENDS(TABLE ...)` and stream alerts to Cloud Pub/Sub (with
   `INSERT INTO` and Preview `TUMBLE` window variants in that README). Each
-  template includes a `start_time` partition filter for
-  `traces.require_partition_filter`. Because `APPENDS` operates on base tables
-  rather than `QUALIFY` views and Continuous Queries do not support
-  column-level security policy tags, downstream consumers deduplicate on
-  `alert_id` (`<ALERT_KIND>:<trace_id>:<span_id>`). Optional Terraform wiring in
+  template includes a 7-day `start_time` partition filter for
+  `traces.require_partition_filter`. `APPENDS` reads base tables rather than
+  `QUALIFY` views, and Continuous Queries do not support column-level security
+  policy tags. Because exporter retries, `APPENDS` lookback replay, and
+  BigQuery automatic reprocessing deliver alerts at-least-once, downstream
+  consumers deduplicate on `alert_id` (`<ALERT_KIND>:<trace_id>:<span_id>`).
+  Optional Terraform wiring in
   [`deploy/terraform`](deploy/README.md#real-time-alerting-continuous-queries)
   (`enable_continuous_queries=true`) provisions the `otel_alerts` table, Pub/Sub
   topic, service account, IAM bindings, and `CONTINUOUS` reservation assignment.

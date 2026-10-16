@@ -58,9 +58,9 @@ AS (
       CURRENT_TIMESTAMP() - INTERVAL 10 MINUTE
     )
   WHERE
-    start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
-    AND (
+    (
       COALESCE(LAX_INT64(attributes['gen_ai.usage.input_tokens']), 0) > ${max_turn_input_tokens}
       OR COALESCE(LAX_INT64(attributes['gen_ai.usage.output_tokens']), 0) > ${max_turn_output_tokens}
     )
+    AND start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
 );

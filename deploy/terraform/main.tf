@@ -1275,6 +1275,13 @@ resource "google_service_account" "continuous_queries" {
 
   account_id   = "${var.service_account_id}-cq"
   display_name = "OTel BigQuery Continuous Queries"
+
+  lifecycle {
+    precondition {
+      condition     = length(var.service_account_id) <= 27
+      error_message = "service_account_id must be at most 27 characters when enable_continuous_queries is true so the derived ${var.service_account_id}-cq account ID stays within Google Cloud's 30-character limit."
+    }
+  }
 }
 
 resource "google_bigquery_dataset_iam_member" "continuous_queries_viewer" {

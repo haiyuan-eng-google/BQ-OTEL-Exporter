@@ -50,12 +50,12 @@ AS (
       CURRENT_TIMESTAMP() - INTERVAL 10 MINUTE
     )
   WHERE
-    start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
-    AND duration_nano / 1e6 > ${max_turn_duration_ms}
+    duration_nano / 1e6 > ${max_turn_duration_ms}
     AND JSON_VALUE(attributes, '$."gen_ai.operation.name"') IN (
       'invoke_agent',
       'chat',
       'generate_content',
       'execute_tool'
     )
+    AND start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
 );

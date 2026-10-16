@@ -49,8 +49,7 @@ AS (
       CURRENT_TIMESTAMP() - INTERVAL 10 MINUTE
     )
   WHERE
-    start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
-    AND (
+    (
       status.code = 2
       OR JSON_VALUE(attributes, '$."error.type"') IS NOT NULL
     )
@@ -59,4 +58,5 @@ AS (
       OR JSON_VALUE(attributes, '$."gen_ai.tool.name"') IS NOT NULL
       OR JSON_VALUE(attributes, '$."mcp.method.name"') IS NOT NULL
     )
+    AND start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
 );

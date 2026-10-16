@@ -22,13 +22,13 @@ Every template accepts `${project_id}`, `${dataset_id}`, `${spans_table}`, and
 All three shipped templates are **stateless per-span filters**—each emits one
 Pub/Sub message per matching span row rather than computing a tumbling-window
 error rate, tokens-per-minute burn, or rolling p95. Stateful window
-aggregations (`TUMBLE`, `HOP`, `SESSION`) in BigQuery Continuous Queries are in
-Preview with strict operator restrictions, so the default templates evaluate
-each span row individually as it arrives. During an outage, a stateless filter
-emits one message per failing span; downstream consumers (Cloud Run, Cloud
-Functions, Dataflow, or Pub/Sub subscriptions) or an optional windowed query
-(see [Table-Sink and Windowed Variants](#table-sink-and-windowed-variants))
-should aggregate or rate-limit alerts.
+aggregations (`TUMBLE`) in BigQuery Continuous Queries are in Preview with
+strict operator restrictions, so the default templates evaluate each span row
+individually as it arrives. During an outage, a stateless filter emits one
+message per failing span; downstream consumers (Cloud Run, Cloud Functions,
+Dataflow, or Pub/Sub subscriptions) or an optional windowed query (see
+[Table-Sink and Windowed Variants](#table-sink-and-windowed-variants)) should
+aggregate or rate-limit alerts.
 
 ## Base Tables, Partition Filters, and Column-Level Security
 
@@ -39,9 +39,11 @@ should aggregate or rate-limit alerts.
   `v_mcp_spans`—are not eligible as `APPENDS` sources. Each template therefore
   reads `otel_spans` directly and extracts promoted JSON attributes inline.
 - **`require_partition_filter` compatibility**: Every template includes
-  `WHERE start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)` so
+  `AND start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)` so
   partition pruning succeeds when `require_partition_filter = true` is set on
-  `otel_spans`.
+  `otel_spans`. The 7-day window matches BigQuery's 7-day `APPENDS` time-travel
+  horizon, so long-running spans (>1 hour) and widened `APPENDS` lookback
+  offsets after multi-hour downtime are not dropped.
 - **Column-level security incompatibility**: BigQuery Continuous Queries do not
   support tables with column-level security policy tags or row-level security.
   `tool_error_rate_alert.sql` omits `status.message`, and `deploy/terraform`
@@ -52,14 +54,15 @@ should aggregate or rate-limit alerts.
 
 - **At-least-once delivery and automatic reprocessing**: Duplicate alerts can
   come from exporter retries on the Storage Write API default stream and from
-  BigQuery Continuous Query automatic reprocessing during internal maintenance
-  or transient sink retries. Every template sets a deterministic `alert_id` of
-  the form `<ALERT_KIND>:<trace_id>:<span_id>`. Downstream Pub/Sub subscribers
-  or queries over `otel_alerts` should deduplicate on `alert_id`.
+  BigQuery Continuous Query automatic reprocessing (BigQuery documents that
+  occasional temporary issues in BigQuery can cause automatic reprocessing).
+  Every template sets a deterministic `alert_id` of the form
+  `<ALERT_KIND>:<trace_id>:<span_id>`. Downstream Pub/Sub subscribers or
+  queries over `otel_alerts` should deduplicate on `alert_id`.
 - **10-minute lookback on start/restart**: Each template starts at
   `CURRENT_TIMESTAMP() - INTERVAL 10 MINUTE`. Starting or restarting a job
   replays the last 10 minutes of spans, while downtime longer than 10 minutes
-  skips older spans unless you widen that interval (within BigQuery's
+  skips older spans unless you widen that interval (within BigQuery's 7-day
   time-travel window).
 - **48-hour watermark lag and 150-day max runtime**: A Continuous Query fails
   if its processing watermark falls more than 48 hours behind, and a job run as
@@ -73,12 +76,15 @@ should aggregate or rate-limit alerts.
    `iam.googleapis.com` in the project.
 2. **BigQuery Edition, Reservation, and Slot Cost**: Continuous Queries require
    an `ENTERPRISE` or `ENTERPRISE_PLUS` reservation and a reservation
-   assignment with `job_type = "CONTINUOUS"`. Each Continuous Query needs at
-   least 10 slots, and a `CONTINUOUS` assignment is capped at 500 slots.
-   Setting `continuous_query_slot_capacity = 100` provisions 100 always-on
-   baseline Enterprise slots, which incur continuous capacity charges while the
-   reservation exists (configure slot autoscaling if you prefer scale-to-zero
-   or autoscale capacity).
+   assignment with `job_type = "CONTINUOUS"`. Each Continuous Query job needs
+   at least 10 slots to start, and a `CONTINUOUS` assignment is capped at 500
+   slots. Enterprise reservation baseline capacity
+   (`continuous_query_slot_capacity`) is configured in multiples of 50 slots
+   (50 to 500). Setting `continuous_query_slot_capacity = 100` provisions 100
+   always-on baseline Enterprise slots, which incur continuous capacity charges
+   while the reservation exists; a reservation running a Continuous Query does
+   not scale down to zero because an idle Continuous Query uses ~1 slot
+   continuously.
 3. **Service Account and IAM Roles**:
    - **Continuous Query service account**:
      - `roles/bigquery.jobUser` on the project (`bigquery.jobs.create`).
@@ -91,6 +97,8 @@ should aggregate or rate-limit alerts.
 4. **Pub/Sub Subscription**: Terraform creates the alert topic
    (`<dataset>-otel-alerts`) without a subscription. Create a pull or push
    subscription (or Cloud Run / Dataflow trigger) to receive published alerts.
+5. **CLI Tools**: Install the Google Cloud `bq` CLI and `jq` (used to extract
+   rendered SQL from `terraform output -json`).
 
 ## Provisioning with Terraform
 
@@ -131,8 +139,10 @@ terraform -chdir=deploy/terraform output -json continuous_queries_rendered_sql \
 
 ### Rendering Without Terraform
 
-If you do not use the Terraform module, substitute the `${...}` placeholders
-with `sed` before piping to `bq query`:
+If you do not use the Terraform module, substitute all `${...}` placeholders
+with `sed` before piping to `bq query` (the threshold flags are unused by
+`tool_error_rate_alert.sql` and required by `token_budget_burn.sql` and
+`agent_latency_p95.sql`):
 
 ```bash
 sed \
@@ -140,6 +150,9 @@ sed \
   -e 's/${dataset_id}/otel/g' \
   -e 's/${spans_table}/otel_spans/g' \
   -e 's/${pubsub_topic}/otel-otel-alerts/g' \
+  -e 's/${max_turn_input_tokens}/100000/g' \
+  -e 's/${max_turn_output_tokens}/32000/g' \
+  -e 's/${max_turn_duration_ms}/30000/g' \
   deploy/continuous-queries/tool_error_rate_alert.sql \
   | bq query --project_id=my-project --location=US --use_legacy_sql=false \
       --continuous=true --connection_property="service_account=${SA_EMAIL}"
@@ -166,36 +179,52 @@ SELECT
   span_id,
   TO_JSON(STRUCT(name AS span_name, status.code AS status_code)) AS payload
 FROM APPENDS(TABLE `my-project.otel.otel_spans`, CURRENT_TIMESTAMP() - INTERVAL 10 MINUTE)
-WHERE start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
-  AND (status.code = 2 OR JSON_VALUE(attributes, '$."error.type"') IS NOT NULL)
+WHERE (status.code = 2 OR JSON_VALUE(attributes, '$."error.type"') IS NOT NULL)
   AND (
     JSON_VALUE(attributes, '$."gen_ai.operation.name"') = 'execute_tool'
     OR JSON_VALUE(attributes, '$."gen_ai.tool.name"') IS NOT NULL
     OR JSON_VALUE(attributes, '$."mcp.method.name"') IS NOT NULL
-  );
+  )
+  AND start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY);
 ```
 
 ### Windowed Aggregation (`TUMBLE`, Preview)
 
 Where BigQuery Continuous Query windowing (Preview) is enabled, you can wrap
-`APPENDS` in `TUMBLE` over the `_CHANGE_TIMESTAMP` column to emit one alert per
-5-minute window instead of one per span:
+`APPENDS` in a CTE and pass `TABLE <cte_name>` to `TUMBLE` over an aliased
+`_CHANGE_TIMESTAMP` column to emit one row per 5-minute window into
+`otel_alerts`. Note that `TUMBLE` in Continuous Queries is Preview, requires the
+`TABLE` keyword on its CTE input, and emits a window only after a later event
+with a newer `_CHANGE_TIMESTAMP` advances the watermark past `window_end`:
 
 ```sql
-SELECT
-  window_start,
-  window_end,
-  service_name,
-  COUNT(*) AS error_spans
-FROM TUMBLE(
-  (
-    SELECT _CHANGE_TIMESTAMP, service_name
-    FROM APPENDS(TABLE `my-project.otel.otel_spans`, CURRENT_TIMESTAMP() - INTERVAL 10 MINUTE)
-    WHERE start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
-      AND status.code = 2
-  ),
-  '_CHANGE_TIMESTAMP',
-  INTERVAL 5 MINUTE
+INSERT INTO `my-project.otel.otel_alerts` (
+  alert_id, alert_kind, event_time, service_name, trace_id, span_id, payload
 )
-GROUP BY window_start, window_end, service_name;
+WITH raw_spans AS (
+  SELECT
+    start_time,
+    _CHANGE_TIMESTAMP AS change_ts,
+    service_name,
+    JSON_VALUE(attributes, '$."gen_ai.tool.name"') AS tool_name
+  FROM APPENDS(TABLE `my-project.otel.otel_spans`, CURRENT_TIMESTAMP() - INTERVAL 10 MINUTE)
+  WHERE (status.code = 2 OR JSON_VALUE(attributes, '$."error.type"') IS NOT NULL)
+    AND (
+      JSON_VALUE(attributes, '$."gen_ai.operation.name"') = 'execute_tool'
+      OR JSON_VALUE(attributes, '$."gen_ai.tool.name"') IS NOT NULL
+      OR JSON_VALUE(attributes, '$."mcp.method.name"') IS NOT NULL
+    )
+    AND start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+)
+SELECT
+  CONCAT('TOOL_ERROR_WINDOW:', service_name, ':', CAST(window_start AS STRING)) AS alert_id,
+  'TOOL_ERROR_WINDOW' AS alert_kind,
+  window_end AS event_time,
+  service_name,
+  '' AS trace_id,
+  '' AS span_id,
+  TO_JSON(STRUCT(tool_name, window_start, window_end, COUNT(*) AS error_spans)) AS payload
+FROM TUMBLE(TABLE raw_spans, 'change_ts', INTERVAL 5 MINUTE)
+GROUP BY window_start, window_end, service_name, tool_name
+HAVING COUNT(*) >= 5;
 ```
