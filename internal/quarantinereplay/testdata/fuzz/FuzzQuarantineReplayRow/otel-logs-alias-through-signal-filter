@@ -1,0 +1,9 @@
+go test fuzz v1
+string("OTEL_LOGS")
+string("metrics, logs")
+string("ROW_ERROR")
+string("kept by the logs filter")
+string("")
+string("")
+byte('\f')
+[]byte("")

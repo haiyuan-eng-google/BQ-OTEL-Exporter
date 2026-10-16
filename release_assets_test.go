@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/build/constraint"
 	"go/parser"
 	"go/token"
 	"io/fs"
@@ -1163,11 +1164,13 @@ func TestDependabotCombinesDockerEntries(t *testing.T) {
 // .github/workflows/bench-fuzz.yml in step with the fuzz targets in the code.
 // `go test -fuzz` takes one target per run, so the job lists its targets one by
 // one: a target missing from that list is never fuzzed in CI, and an entry whose
-// target was renamed or removed fuzzes nothing. Each target also needs a
-// committed seed corpus under <pkg>/testdata/fuzz/<target>/, which plain
-// `go test` replays on every run, and the job has to upload that directory when
-// fuzzing fails, because the failing input it writes there exists only on the
-// runner.
+// target was renamed or removed fuzzes nothing. The job runs `go test` without
+// build tags, so a target in a file with a build constraint would not even be
+// compiled, and its run would pass having fuzzed nothing. Each target also
+// needs a committed seed corpus under <pkg>/testdata/fuzz/<target>/, which
+// plain `go test` replays on every run, and the job has to upload that
+// directory when fuzzing fails, because the failing input it writes there
+// exists only on the runner.
 func TestBenchFuzzWorkflowListsEveryFuzzTarget(t *testing.T) {
 	const path = ".github/workflows/bench-fuzz.yml"
 	var workflow struct {
@@ -1214,6 +1217,12 @@ func TestBenchFuzzWorkflowListsEveryFuzzTarget(t *testing.T) {
 	for _, ft := range slices.SortedFunc(maps.Keys(declared), byName) {
 		if !listed[ft] {
 			t.Errorf("fuzz target %s (%s) is missing from jobs.fuzz.strategy.matrix.include in %s", ft, declared[ft], path)
+		}
+		if line, err := goBuildConstraint(declared[ft], nil); err != nil {
+			t.Errorf("reading the build constraints of %s: %v", declared[ft], err)
+		} else if line != "" {
+			t.Errorf("fuzz target %s is declared in %s, which has the build constraint %q: the untagged go test -fuzz in %s would compile nothing to fuzz and still pass",
+				ft, declared[ft], line, path)
 		}
 		corpus := filepath.Join(ft.pkg, "testdata", "fuzz", ft.name)
 		entries, err := os.ReadDir(corpus)
@@ -1329,5 +1338,50 @@ func isFuzzTarget(fn *ast.FuncDecl) bool {
 		return x.Sel.Name == "F"
 	default:
 		return false
+	}
+}
+
+// goBuildConstraint returns the first //go:build or // +build line among the
+// line comments above the package clause of a Go file, where the go command
+// reads build constraints, or "" if there is none. filename and src are as
+// for parser.ParseFile: a nil src reads filename.
+func goBuildConstraint(filename string, src any) (string, error) {
+	file, err := parser.ParseFile(token.NewFileSet(), filename, src, parser.PackageClauseOnly|parser.ParseComments)
+	if err != nil {
+		return "", err
+	}
+	for _, group := range file.Comments {
+		if group.Pos() > file.Package {
+			break
+		}
+		for _, c := range group.List {
+			if constraint.IsGoBuild(c.Text) || constraint.IsPlusBuild(c.Text) {
+				return c.Text, nil
+			}
+		}
+	}
+	return "", nil
+}
+
+func TestGoBuildConstraint(t *testing.T) {
+	const header = "// Copyright 2026 Google LLC\n// SPDX-License-Identifier: Apache-2.0\n\n"
+	for _, tc := range []struct {
+		name, src, want string
+	}{
+		{name: "no constraint", src: header + "package p\n"},
+		{name: "go:build after the license header", src: header + "//go:build integration\n\npackage p\n", want: "//go:build integration"},
+		{name: "+build line", src: "// +build linux\n\npackage p\n", want: "// +build linux"},
+		{name: "inside a block comment", src: "/*\n//go:build integration\n*/\n\npackage p\n"},
+		{name: "below the package clause", src: "package p\n\n//go:build integration\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := goBuildConstraint("p_test.go", tc.src)
+			if err != nil {
+				t.Fatalf("goBuildConstraint: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("goBuildConstraint = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

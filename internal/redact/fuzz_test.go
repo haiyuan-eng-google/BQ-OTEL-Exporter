@@ -6,6 +6,7 @@ package redact
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"math"
 	"regexp"
 	"slices"
@@ -21,9 +22,12 @@ import (
 )
 
 // fuzzSecretPatterns open every FuzzRedact rule set, ahead of any fuzzed
-// pattern. Each fully matches one of fuzzKnownSecrets wherever it appears:
-// none is anchored, none matches the empty string, and none can match inside
-// or across one of fuzzMasks.
+// pattern. Each matches the whole of one of fuzzKnownSecrets when that secret
+// stands on a line of its own, which is how FuzzRedact plants it: none
+// matches a line break, none is anchored, none matches the empty string, and
+// none can match inside or across one of fuzzMasks. Text next to a secret can
+// still end a match early: in "Bearer Bearer eyJ…" the bearer pattern matches
+// "Bearer Bearer" and leaves the token in cleartext.
 var fuzzSecretPatterns = []string{
 	`sk-ant-[A-Za-z0-9_-]{8,}`,
 	`Bearer [A-Za-z0-9._~+/=-]+`,
@@ -42,6 +46,10 @@ var fuzzKnownSecrets = []string{
 	"Bearer " + "eyJ" + "hbGciOiJIUzI1NiJ9.eyJzdWIiOiJmdXp6In0.c2lnbmF0dXJl",
 	"AIza" + "Sy" + strings.Repeat("Fuzz0-", 5) + "Q12",
 }
+
+// fuzzSecretPrefixes are what fuzzKnownSecrets start with. The rest of a
+// secret is its body, no part of which may survive redaction.
+var fuzzSecretPrefixes = []string{"sk-ant-", "Bearer ", "AIza"}
 
 // fuzzSensitiveKeys are blocked by DefaultBlockedKeys in each spelling the
 // redactor normalizes: exact names, upper case, padding, and suffix forms.
@@ -67,20 +75,29 @@ const (
 	fuzzMaxDepth = 4
 	// fuzzMaxEntries bounds the values fuzzAttrs builds for one map tree.
 	fuzzMaxEntries = 64
+	// fuzzSecretWindow is the length of the runs of a planted secret's body
+	// that FuzzRedact looks for in redacted text.
+	fuzzSecretWindow = 8
 )
 
 // FuzzRedact feeds arbitrary attribute trees and rule sets through the
 // copy-on-write and in-place redaction of every signal. Whatever the input,
 // redaction must not panic, must be deterministic, must leave its input
-// untouched, must mask every blocked key, and must leave no string value
-// that the secret patterns still match, so a planted credential can never
-// survive.
+// untouched, must mask every blocked key, must leave no string value that
+// the secret patterns still match, and must leave every log body, string or
+// map, exactly as it was unless RedactLogBody is set. A planted credential
+// must never survive whole. While only the fixed patterns are in force, its
+// line must become exactly the mask, and no 8-byte run of its body may be
+// left anywhere in the value. A fuzzed pattern may match across the line
+// break in front of the credential and end inside it, after which no
+// pattern matches the rest, so those two checks wait for the fixed rules.
 //
-// raw is an opcode stream for fuzzAttrs. carrier is arbitrary text that wraps
-// the planted secret and also appears as a value. customKey and customPattern
-// are an operator's extra blocked key and value pattern. sel picks the planted
-// secret (sel%3), the planted sensitive key (sel>>2) and the mask (bits 4-5);
-// bit 6 turns planting off and bit 7 turns log body redaction off.
+// raw is an opcode stream for fuzzAttrs. carrier is arbitrary text, line
+// breaks removed, that wraps the planted secret and also appears as a value.
+// customKey and customPattern are an operator's extra blocked key and value
+// pattern. sel picks the planted secret (sel%3), the planted sensitive key
+// (sel>>2) and the mask (bits 4-5); bit 6 turns planting off and bit 7 turns
+// log body redaction off.
 func FuzzRedact(f *testing.F) {
 	for i := range fuzzKnownSecrets {
 		f.Add([]byte(nil), "", "", "", uint8(i))
@@ -106,7 +123,7 @@ func FuzzRedact(f *testing.F) {
 		h := newFuzzRedactHarness(t, customKey, customPattern, sel)
 		in := fuzzRedactInput{
 			raw:       raw,
-			carrier:   carrier,
+			carrier:   strings.ReplaceAll(carrier, "\n", ""),
 			secret:    fuzzKnownSecrets[int(sel)%len(fuzzKnownSecrets)],
 			sensitive: fuzzSensitiveKeys[int(sel>>2)%len(fuzzSensitiveKeys)],
 			plant:     sel&0x40 == 0,
@@ -125,7 +142,7 @@ func FuzzRedact(f *testing.F) {
 			},
 		}
 		out := logs.check(t, h, in)
-		h.checkBody(t, in, out.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body())
+		h.checkBodies(t, in, out)
 
 		fuzzSignal[ptrace.Traces]{
 			name:    "traces",
@@ -153,12 +170,18 @@ func FuzzRedact(f *testing.F) {
 			maps: func(md pmetric.Metrics) []pcommon.Map {
 				rm := md.ResourceMetrics().At(0)
 				sm := rm.ScopeMetrics().At(0)
-				gauge := sm.Metrics().At(0)
-				dp := gauge.Gauge().DataPoints().At(0)
+				ms := sm.Metrics()
+				gauge := ms.At(0).Gauge().DataPoints().At(0)
+				sum := ms.At(1).Sum().DataPoints().At(0)
+				hist := ms.At(2).Histogram().DataPoints().At(0)
+				exp := ms.At(3).ExponentialHistogram().DataPoints().At(0)
 				return []pcommon.Map{
-					rm.Resource().Attributes(), sm.Scope().Attributes(), gauge.Metadata(),
-					dp.Attributes(), dp.Exemplars().At(0).FilteredAttributes(),
-					sm.Metrics().At(1).Summary().DataPoints().At(0).Attributes(),
+					rm.Resource().Attributes(), sm.Scope().Attributes(), ms.At(0).Metadata(),
+					gauge.Attributes(), gauge.Exemplars().At(0).FilteredAttributes(),
+					sum.Attributes(), sum.Exemplars().At(0).FilteredAttributes(),
+					hist.Attributes(), hist.Exemplars().At(0).FilteredAttributes(),
+					exp.Attributes(), exp.Exemplars().At(0).FilteredAttributes(),
+					ms.At(4).Summary().DataPoints().At(0).Attributes(),
 				}
 			},
 		}.check(t, h, in)
@@ -173,7 +196,8 @@ type fuzzRedactHarness struct {
 	logBody bool
 	// idempotent is false when a fuzzed value pattern is in force: such a
 	// pattern may match the mask, so a second pass may legitimately change
-	// the output.
+	// the output, and it may match across the line break in front of a
+	// planted secret and end inside it, so part of the secret may survive.
 	idempotent bool
 	// keys and values accumulate what OnRedact reported.
 	keys, values int
@@ -239,10 +263,46 @@ func (h *fuzzRedactHarness) checkMap(t *testing.T, where string, in fuzzRedactIn
 	if v, ok := m.Get(in.sensitive); !ok || v.Str() != h.mask {
 		t.Fatalf("%s: planted key %q = %q, want the mask %q", where, in.sensitive, v.AsString(), h.mask)
 	}
+	// A blocked fuzzCarrierKey holds nothing but the mask, as checkTree
+	// has already required.
 	v, _ := m.Get(fuzzCarrierKey)
-	if s := v.Str(); strings.Contains(s, in.secret) || !strings.Contains(s, h.mask) {
+	h.checkPlanted(t, where, in, v.Str(), h.idempotent && !h.r.KeyBlocked(fuzzCarrierKey))
+}
+
+// checkPlanted fails if s, the redacted form of in.planted, still holds the
+// planted secret whole or holds no mask. When strict, which needs only the
+// fixed patterns in force, the secret's own line must have become exactly
+// the mask, and no fuzzSecretWindow-byte run of the secret's body may be
+// left in s unless the carrier or the mask contains it.
+func (h *fuzzRedactHarness) checkPlanted(t *testing.T, where string, in fuzzRedactInput, s string, strict bool) {
+	t.Helper()
+	if strings.Contains(s, in.secret) || !strings.Contains(s, h.mask) {
 		t.Fatalf("%s: planted secret was not masked: %q", where, s)
 	}
+	if !strict {
+		return
+	}
+	body := fuzzSecretBody(in.secret)
+	explained := in.carrier + "\n" + h.mask + "\n" + in.carrier
+	for i := 0; i+fuzzSecretWindow <= len(body); i++ {
+		if run := body[i : i+fuzzSecretWindow]; strings.Contains(s, run) && !strings.Contains(explained, run) {
+			t.Errorf("%s: %q of the planted secret survived redaction in %q", where, run, s)
+			break
+		}
+	}
+	if parts := strings.Split(s, "\n"); len(parts) != 3 || parts[1] != h.mask {
+		t.Fatalf("%s: planted secret segment is not exactly the mask %q: %q", where, h.mask, s)
+	}
+}
+
+// fuzzSecretBody is secret without its prefix from fuzzSecretPrefixes.
+func fuzzSecretBody(secret string) string {
+	for _, p := range fuzzSecretPrefixes {
+		if body, ok := strings.CutPrefix(secret, p); ok {
+			return body
+		}
+	}
+	return secret
 }
 
 func (h *fuzzRedactHarness) checkTree(t *testing.T, where string, m pcommon.Map) {
@@ -274,23 +334,46 @@ func (h *fuzzRedactHarness) checkValue(t *testing.T, where string, v pcommon.Val
 	}
 }
 
-// checkBody checks the log body, which is redacted only when RedactLogBody
-// is set.
-func (h *fuzzRedactHarness) checkBody(t *testing.T, in fuzzRedactInput, body pcommon.Value) {
+// checkBodies checks the bodies of the redacted log records out holds, which
+// are redacted only when RedactLogBody is set. Otherwise every body, string
+// or map, must still be exactly the body the record was built with.
+func (h *fuzzRedactHarness) checkBodies(t *testing.T, in fuzzRedactInput, out plog.Logs) {
 	t.Helper()
-	switch {
-	case in.plant && h.logBody:
-		if s := body.Str(); strings.Contains(s, in.secret) || !strings.Contains(s, h.mask) {
-			t.Fatalf("log body secret was not masked: %q", s)
-		}
-		h.checkValue(t, "log body", body)
-	case in.plant:
-		if want := in.carrier + in.secret + in.carrier; body.Str() != want {
-			t.Fatalf("log body changed although RedactLogBody is off: %q, want %q", body.Str(), want)
-		}
-	case h.logBody:
-		h.checkValue(t, "log body", body)
+	got := out.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords()
+	want := in.logs().ResourceLogs().At(0).ScopeLogs().At(0).LogRecords()
+	if got.Len() != want.Len() {
+		t.Fatalf("redaction left %d log records, want %d", got.Len(), want.Len())
 	}
+	for i := range want.Len() {
+		where := fmt.Sprintf("log record %d body", i)
+		body := got.At(i).Body()
+		switch {
+		case !h.logBody:
+			if wantBody := want.At(i).Body(); !bytes.Equal(fuzzValueBytes(t, body), fuzzValueBytes(t, wantBody)) {
+				t.Fatalf("%s changed although RedactLogBody is off: %q, want %q", where, body.AsString(), wantBody.AsString())
+			}
+		case body.Type() == pcommon.ValueTypeMap:
+			h.checkMap(t, where, in, body.Map())
+		default:
+			h.checkValue(t, where, body)
+			if in.plant {
+				h.checkPlanted(t, where, in, body.Str(), h.idempotent)
+			}
+		}
+	}
+}
+
+// fuzzValueBytes encodes v as a log body, so that two values compare byte
+// for byte, NaN doubles included.
+func fuzzValueBytes(t *testing.T, v pcommon.Value) []byte {
+	t.Helper()
+	ld := plog.NewLogs()
+	v.CopyTo(ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body())
+	b, err := (&plog.ProtoMarshaler{}).MarshalLogs(ld)
+	if err != nil {
+		t.Fatalf("marshaling a log body: %v", err)
+	}
+	return b
 }
 
 // fuzzSignal is one OTLP signal type as FuzzRedact drives it.
@@ -364,11 +447,19 @@ func (s fuzzSignal[T]) check(t *testing.T, h *fuzzRedactHarness, in fuzzRedactIn
 type fuzzRedactInput struct {
 	raw     []byte
 	carrier string
-	// secret is planted under fuzzCarrierKey, wrapped in carrier.
+	// secret is planted under fuzzCarrierKey and as a log body, wrapped in
+	// carrier as planted describes.
 	secret string
 	// sensitive is a blocked key planted with carrier as its value.
 	sensitive string
 	plant     bool
+}
+
+// planted is the text that carries the secret: the secret on a line of its
+// own between two copies of carrier, which has no line breaks, so that no
+// fixed pattern can run from carrier into the secret or out of it.
+func (in fuzzRedactInput) planted() string {
+	return in.carrier + "\n" + in.secret + "\n" + in.carrier
 }
 
 // attrs builds the attribute tree raw describes and plants the secret and
@@ -377,15 +468,16 @@ func (in fuzzRedactInput) attrs() pcommon.Map {
 	m := pcommon.NewMap()
 	(&fuzzAttrs{data: in.raw, carrier: in.carrier, budget: fuzzMaxEntries}).fill(m, 0)
 	if in.plant {
-		m.PutStr(fuzzCarrierKey, in.carrier+in.secret+in.carrier)
+		m.PutStr(fuzzCarrierKey, in.planted())
 		m.PutStr(in.sensitive, in.carrier)
 	}
 	return m
 }
 
-// logs places the tree on the resource, the scope and the record. The body
-// carries the wrapped secret when planting, and an unplanted copy of the tree
-// otherwise.
+// logs places the tree on the resource, the scope and two records. The
+// first record carries the tree as attributes, and its body is the planted
+// text when planting and a copy of the tree otherwise. The second record's
+// body is always a copy of the tree, planted entries included.
 func (in fuzzRedactInput) logs() plog.Logs {
 	m := in.attrs()
 	ld := plog.NewLogs()
@@ -396,10 +488,11 @@ func (in fuzzRedactInput) logs() plog.Logs {
 	lr := sl.LogRecords().AppendEmpty()
 	m.CopyTo(lr.Attributes())
 	if in.plant {
-		lr.Body().SetStr(in.carrier + in.secret + in.carrier)
+		lr.Body().SetStr(in.planted())
 	} else {
 		m.CopyTo(lr.Body().SetEmptyMap())
 	}
+	m.CopyTo(sl.LogRecords().AppendEmpty().Body().SetEmptyMap())
 	return ld
 }
 
@@ -420,7 +513,8 @@ func (in fuzzRedactInput) traces() ptrace.Traces {
 }
 
 // metrics places the tree on the resource, the scope, a gauge's metadata,
-// point and exemplar, and a summary point, which has no exemplars.
+// a point and its exemplar of each of a gauge, a sum, a histogram and an
+// exponential histogram, and a summary point, which has no exemplars.
 func (in fuzzRedactInput) metrics() pmetric.Metrics {
 	m := in.attrs()
 	md := pmetric.NewMetrics()
@@ -428,12 +522,27 @@ func (in fuzzRedactInput) metrics() pmetric.Metrics {
 	m.CopyTo(rm.Resource().Attributes())
 	sm := rm.ScopeMetrics().AppendEmpty()
 	m.CopyTo(sm.Scope().Attributes())
+	point := func(attrs pcommon.Map, exemplars pmetric.ExemplarSlice) {
+		m.CopyTo(attrs)
+		m.CopyTo(exemplars.AppendEmpty().FilteredAttributes())
+	}
 	gauge := sm.Metrics().AppendEmpty()
 	gauge.SetName("fuzz.gauge")
 	m.CopyTo(gauge.Metadata())
 	dp := gauge.SetEmptyGauge().DataPoints().AppendEmpty()
-	m.CopyTo(dp.Attributes())
-	m.CopyTo(dp.Exemplars().AppendEmpty().FilteredAttributes())
+	point(dp.Attributes(), dp.Exemplars())
+	sum := sm.Metrics().AppendEmpty()
+	sum.SetName("fuzz.sum")
+	sdp := sum.SetEmptySum().DataPoints().AppendEmpty()
+	point(sdp.Attributes(), sdp.Exemplars())
+	hist := sm.Metrics().AppendEmpty()
+	hist.SetName("fuzz.histogram")
+	hdp := hist.SetEmptyHistogram().DataPoints().AppendEmpty()
+	point(hdp.Attributes(), hdp.Exemplars())
+	exp := sm.Metrics().AppendEmpty()
+	exp.SetName("fuzz.exponential_histogram")
+	edp := exp.SetEmptyExponentialHistogram().DataPoints().AppendEmpty()
+	point(edp.Attributes(), edp.Exemplars())
 	summary := sm.Metrics().AppendEmpty()
 	summary.SetName("fuzz.summary")
 	m.CopyTo(summary.SetEmptySummary().DataPoints().AppendEmpty().Attributes())

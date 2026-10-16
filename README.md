@@ -809,6 +809,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   commit at least one seed input under `<package>/testdata/fuzz/<FuzzTarget>/`:
   a `go test fuzz v1` header line followed by one Go literal per argument, as
   in the existing files. `TestBenchFuzzWorkflowListsEveryFuzzTarget` fails until
-  both are in place. When CI fuzzing fails, the job uploads the failing input
-  as the `fuzz-corpus-<FuzzTarget>` artifact; unzip it at the repository root
-  and run `go test ./<package> -run=<FuzzTarget>` to reproduce the failure.
+  both are in place. It also fails if the target's file has a `//go:build` or
+  `// +build` line, because CI fuzzes without build tags and would not compile
+  the target. When CI fuzzing fails, the job uploads the failing input as the
+  `fuzz-corpus-<FuzzTarget>` artifact; unzip it at the repository root and run
+  `go test ./<package> -run=<FuzzTarget>` to reproduce the failure.

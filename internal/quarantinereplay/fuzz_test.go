@@ -50,6 +50,20 @@ const (
 // code filter ignores.
 var replayFuzzErrorCodeFilter = []string{"OVERSIZE_ROW", " row_error "}
 
+// replayFuzzSignals maps each signal name and alias the replay tool accepts
+// to its canonical signal. The oracle keeps its own table rather than call
+// CanonicalSignal, so an alias Replay drops or misroutes shows up as a
+// disagreement.
+var replayFuzzSignals = map[string]string{
+	"spans":        schema.SignalSpans,
+	"traces":       schema.SignalSpans,
+	"otel_spans":   schema.SignalSpans,
+	"logs":         schema.SignalLogs,
+	"otel_logs":    schema.SignalLogs,
+	"metrics":      schema.SignalMetrics,
+	"otel_metrics": schema.SignalMetrics,
+}
+
 var (
 	replayFuzzSince = time.Date(2026, 10, 11, 0, 0, 0, 0, time.UTC)
 	replayFuzzUntil = time.Date(2026, 10, 12, 0, 0, 0, 0, time.UTC)
@@ -141,7 +155,7 @@ func newReplayFuzzHarness(t *testing.T, signal, signalFilter, rawPayload string,
 		payload:  rawPayload,
 	}
 	if flags&replayFuzzValidPayload != 0 {
-		h.payload, h.built = replayFuzzBatch(t, CanonicalSignal(signal), rawPayload)
+		h.payload, h.built = replayFuzzBatch(t, replayFuzzCanonical(signal), rawPayload)
 	}
 	if flags&replayFuzzSignalFilter != 0 {
 		h.opts.Filter.Signal = signalFilter
@@ -245,23 +259,26 @@ func (h *replayFuzzHarness) checkRows(t *testing.T, rows ...Record) {
 
 // expect predicts how Replay counts row, which must already have been
 // through the JSON decoding Replay applies. For a row that replays, it also
-// returns the protobuf encoding of the batch the sink must receive.
+// returns the protobuf encoding of the batch the sink must receive. It
+// applies the filters, the payload rules and the signal aliases itself
+// rather than call Filter.Matches or CanonicalSignal, which Replay uses.
 func (h *replayFuzzHarness) expect(t *testing.T, row Record) (Summary, []byte) {
 	t.Helper()
 	sum := Summary{TotalRead: 1}
 	f := h.opts.Filter
-	switch {
-	case !(Filter{Signal: f.Signal, ErrorCodes: f.ErrorCodes}).Matches(row):
+	if !replayFuzzSignalMatches(f.Signal, row.Signal) || !replayFuzzErrorCodeMatches(f.ErrorCodes, row.ErrorCode) {
 		sum.SkippedFiltered++
 		return sum, nil
-	case !f.Since.IsZero() || !f.Until.IsZero():
+	}
+	if !f.Since.IsZero() || !f.Until.IsZero() {
 		// A time window fails a row whose ingest_time does not parse
 		// rather than filtering it out.
-		if _, ok := row.ParsedIngestTime(); !ok {
+		ts, ok := row.ParsedIngestTime()
+		if !ok {
 			sum.FailedUnmarshal++
 			return sum, nil
 		}
-		if !f.Matches(row) {
+		if (!f.Since.IsZero() && ts.Before(f.Since)) || (!f.Until.IsZero() && ts.After(f.Until)) {
 			sum.SkippedFiltered++
 			return sum, nil
 		}
@@ -283,7 +300,7 @@ func (h *replayFuzzHarness) expect(t *testing.T, row Record) (Summary, []byte) {
 		return sum, nil
 	}
 
-	signal := CanonicalSignal(row.Signal)
+	signal := replayFuzzCanonical(row.Signal)
 	batch, ok := replayFuzzDecode(t, signal, payload)
 	switch {
 	case !ok:
@@ -300,6 +317,49 @@ func (h *replayFuzzHarness) expect(t *testing.T, row Record) (Summary, []byte) {
 		sum.ReplayedMetrics++
 	}
 	return sum, batch
+}
+
+// replayFuzzCanonical is the canonical signal raw names, ignoring case and
+// surrounding space, or "" when raw names none.
+func replayFuzzCanonical(raw string) string {
+	return replayFuzzSignals[strings.ToLower(strings.TrimSpace(raw))]
+}
+
+// replayFuzzSignalMatches reports whether a row with signal passes the
+// comma-separated signal filter. A blank filter passes every row. Otherwise
+// some non-blank name in it must stand for the same canonical signal as the
+// row, or equal the row's signal up to case.
+func replayFuzzSignalMatches(filter, signal string) bool {
+	if strings.TrimSpace(filter) == "" {
+		return true
+	}
+	row := replayFuzzCanonical(signal)
+	for _, name := range strings.Split(filter, ",") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if c := replayFuzzCanonical(name); (c != "" && c == row) || strings.EqualFold(name, signal) {
+			return true
+		}
+	}
+	return false
+}
+
+// replayFuzzErrorCodeMatches reports whether a row with error code code
+// passes the error code filter codes. An empty filter passes every row.
+// Otherwise some listed code, once trimmed, must equal code up to case; the
+// row's own code is not trimmed.
+func replayFuzzErrorCodeMatches(codes []string, code string) bool {
+	if len(codes) == 0 {
+		return true
+	}
+	for _, c := range codes {
+		if strings.EqualFold(strings.TrimSpace(c), code) {
+			return true
+		}
+	}
+	return false
 }
 
 // replayFuzzRun is the outcome of one Replay call.
