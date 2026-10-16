@@ -1451,6 +1451,33 @@ func stripSQLComments(sql string) string {
 	return regexp.MustCompile(`(?m)--.*$`).ReplaceAllString(noBlocks, "")
 }
 
+// topLevelWhere returns the last WHERE clause of a template's active SQL with
+// the contents of every parenthesized group left out, up to the parenthesis
+// that encloses the clause, so the text left holds only its top-level
+// conjuncts and operators.
+func topLevelWhere(activeSQL string) string {
+	i := strings.LastIndex(activeSQL, "WHERE")
+	if i < 0 {
+		return ""
+	}
+	var b strings.Builder
+	depth := 0
+	for _, r := range activeSQL[i:] {
+		switch {
+		case r == '(':
+			depth++
+		case r == ')':
+			depth--
+			if depth < 0 {
+				return b.String()
+			}
+		case depth == 0:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 // BigQuery Continuous Queries cannot read views built on QUALIFY or window
 // functions, so every SQL template in deploy/continuous-queries/ reads the
 // base spans table through APPENDS(TABLE ...) and exports to Cloud Pub/Sub.
@@ -1510,6 +1537,25 @@ func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
 			"duration_nano / 1e6 > ${max_turn_duration_ms}",
 		},
 	}
+	// Each per-span template builds the documented alert_id,
+	// <ALERT_KIND>:<trace_id>:<span_id>, which consumers deduplicate on.
+	alertKinds := map[string]string{
+		"tool_error_rate_alert.sql": "TOOL_ERROR",
+		"token_budget_burn.sql":     "TOKEN_BUDGET_BURN",
+		"agent_latency_p95.sql":     "AGENT_LATENCY_HIGH",
+	}
+	// The 7-day start_time predicate must stay a top-level AND conjunct of
+	// WHERE: moved into the last OR group it keeps the pinned text but binds to
+	// that operand only, which BigQuery rejects on a table that requires a
+	// partition filter. So the lines before it close the OR group or the IN
+	// list above it, and no OR stands outside parentheses.
+	const lookback = "AND start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)"
+	lookbackPrecededBy := map[string][]string{
+		"tool_error_rate_alert.sql": {")"},
+		"token_budget_burn.sql":     {")"},
+		"agent_latency_p95.sql":     {"'execute_tool'", ")"},
+	}
+	topLevelOr := regexp.MustCompile(`(?i)\bOR\b`)
 
 	placeholderRE := regexp.MustCompile(`\$\{([a-zA-Z0-9_]+)\}`)
 	readme := readRepoText(t, filepath.Join(dir, "README.md"))
@@ -1538,6 +1584,22 @@ func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
 			if !strings.Contains(activeSQL, want) {
 				t.Errorf("%s active SQL is missing template predicate %q", path, want)
 			}
+		}
+		if want := "CONCAT('" + alertKinds[name] + ":', trace_id, ':', span_id) AS alert_id"; !strings.Contains(activeSQL, want) {
+			t.Errorf("%s active SQL does not build the documented alert_id %q", path, want)
+		}
+		var lines []string
+		for _, line := range strings.Split(activeSQL, "\n") {
+			if line = strings.TrimSpace(line); line != "" {
+				lines = append(lines, line)
+			}
+		}
+		at, before := slices.Index(lines, lookback), lookbackPrecededBy[name]
+		if at < len(before) || !slices.Equal(lines[at-len(before):at], before) {
+			t.Errorf("%s: %q is not on its own line right after %q, so it may sit inside an OR group", path, lookback, before)
+		}
+		if top := topLevelWhere(activeSQL); !strings.Contains(top, "AND start_time >= TIMESTAMP_SUB") || topLevelOr.MatchString(top) {
+			t.Errorf("%s: the 7-day start_time predicate is not a top-level AND conjunct of WHERE (top level: %q)", path, top)
 		}
 		for _, banned := range []string{"_dedup", "v_gen_ai_", "v_mcp_", "duration_ns", "status.message"} {
 			if strings.Contains(activeSQL, banned) {
@@ -1568,6 +1630,9 @@ func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
 		"| bq query",
 		"INSERT INTO",
 		"TUMBLE",
+		// A window alert has no span, so its alert_id is keyed by service, tool
+		// and window, with NULL names coalesced so the key is never NULL.
+		"CONCAT('TOOL_ERROR_WINDOW:', COALESCE(service_name, ''), ':', COALESCE(tool_name, ''), ':', CAST(window_start AS STRING))",
 		"require_partition_filter",
 		"enable_column_level_security",
 	} {

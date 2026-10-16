@@ -41,9 +41,10 @@ aggregate or rate-limit alerts.
 - **`require_partition_filter` compatibility**: Every template includes
   `AND start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)` so
   partition pruning succeeds when `require_partition_filter = true` is set on
-  `otel_spans`. The 7-day window matches BigQuery's 7-day `APPENDS` time-travel
-  horizon, so long-running spans (>1 hour) and widened `APPENDS` lookback
-  offsets after multi-hour downtime are not dropped.
+  `otel_spans`. The 7-day window matches BigQuery's default 7-day time-travel
+  window, which bounds how far back an `APPENDS` start can reach (a dataset can
+  be configured with a shorter one), so long-running spans (>1 hour) and widened
+  `APPENDS` lookback offsets after multi-hour downtime are not dropped.
 - **Column-level security incompatibility**: BigQuery Continuous Queries do not
   support tables with column-level security policy tags or row-level security.
   `tool_error_rate_alert.sql` omits `status.message`, and `deploy/terraform`
@@ -62,8 +63,8 @@ aggregate or rate-limit alerts.
 - **10-minute lookback on start/restart**: Each template starts at
   `CURRENT_TIMESTAMP() - INTERVAL 10 MINUTE`. Starting or restarting a job
   replays the last 10 minutes of spans, while downtime longer than 10 minutes
-  skips older spans unless you widen that interval (within BigQuery's 7-day
-  time-travel window).
+  skips older spans unless you widen that interval (within the dataset's
+  time-travel window, which is 7 days by default).
 - **48-hour watermark lag and 150-day max runtime**: A Continuous Query fails
   if its processing watermark falls more than 48 hours behind, and a job run as
   a service account stops after 150 days (2 days for a user account). Both
@@ -192,10 +193,16 @@ WHERE (status.code = 2 OR JSON_VALUE(attributes, '$."error.type"') IS NOT NULL)
 
 Where BigQuery Continuous Query windowing (Preview) is enabled, you can wrap
 `APPENDS` in a CTE and pass `TABLE <cte_name>` to `TUMBLE` over an aliased
-`_CHANGE_TIMESTAMP` column to emit one row per 5-minute window into
-`otel_alerts`. Note that `TUMBLE` in Continuous Queries is Preview, requires the
-`TABLE` keyword on its CTE input, and emits a window only after a later event
-with a newer `_CHANGE_TIMESTAMP` advances the watermark past `window_end`:
+`_CHANGE_TIMESTAMP` column to emit one row per service, tool, and 5-minute
+window into `otel_alerts`. A window has no single span, so instead of
+`<ALERT_KIND>:<trace_id>:<span_id>` its `alert_id` is built from
+`COALESCE(service_name, '')`, `COALESCE(tool_name, '')`, and `window_start`:
+each `(service_name, tool_name, window_start)` group gets its own
+deduplication key, which is never NULL even when `service_name` or `tool_name`
+is (a NULL name keys as an empty string). Note that `TUMBLE` in Continuous
+Queries is Preview, requires the `TABLE` keyword on its CTE input, and emits a
+window only after a later event with a newer `_CHANGE_TIMESTAMP` advances the
+watermark past `window_end`:
 
 ```sql
 INSERT INTO `my-project.otel.otel_alerts` (
@@ -217,7 +224,7 @@ WITH raw_spans AS (
     AND start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
 )
 SELECT
-  CONCAT('TOOL_ERROR_WINDOW:', service_name, ':', CAST(window_start AS STRING)) AS alert_id,
+  CONCAT('TOOL_ERROR_WINDOW:', COALESCE(service_name, ''), ':', COALESCE(tool_name, ''), ':', CAST(window_start AS STRING)) AS alert_id,
   'TOOL_ERROR_WINDOW' AS alert_kind,
   window_end AS event_time,
   service_name,

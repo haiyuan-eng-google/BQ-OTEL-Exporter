@@ -355,7 +355,8 @@ ineligible, the templates read `otel_spans` directly rather than
 
 Each template includes an `AND start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)`
 filter so it runs when `require_partition_filter = true` while matching
-BigQuery's 7-day `APPENDS` time-travel window. BigQuery Continuous
+BigQuery's default 7-day time-travel window, which bounds the `APPENDS`
+lookback. BigQuery Continuous
 Queries do not support tables with column-level security policy tags, so
 Terraform enforces a precondition that `enable_column_level_security` is `false`
 when `enable_continuous_queries` is `true`.
