@@ -294,3 +294,16 @@ Some frameworks report the same tokens on an agent span and again on the model
 call spans beneath it. `v_gen_ai_model_costs` and `v_gen_ai_sessions` leave out
 a span that has a direct child reporting tokens, so each model call is counted
 once; the [README](../README.md) states the rule and its limits.
+
+## Synthetic scenario fixtures
+
+Beyond the single-framework captures in `testdata/otlp/`, the manifest lists
+synthetic multi-span scenario fixtures (`kind: scenario`, `provenance: synthetic`)
+that exercise delegation hierarchies, parallel tool calls, orphan spans, error
+types, and Model Context Protocol (MCP) telemetry against OpenTelemetry
+Semantic Conventions `1.40.0`.
+
+| Scenario ID | Semconv target | Signals | Fixture files | Coverage |
+| --- | --- | --- | --- | --- |
+| `multi_agent` | `1.40.0` | Traces, logs, metrics | `testdata/otlp/multi_agent/{traces,logs,metrics}.json` | Three-level `invoke_agent` delegation (`planner` -> `researcher`), `gen_ai.main_agent.*`, parallel `execute_tool` spans, failed `chat` and tool spans with `error.type`, orphan child span, both reasoning-token spellings, and legacy + v1.40+ GenAI client metric histograms with span exemplars. |
+| `mcp` | `1.40.0` | Traces | `testdata/otlp/mcp/traces.json` | MCP session lifecycle (`initialize`, `tools/list`, `tools/call`, `resources/read`), dual-tagged GenAI + MCP tool call vs. pure MCP protocol spans, `SERVER` span kind, and `error.type` on failed MCP calls. |

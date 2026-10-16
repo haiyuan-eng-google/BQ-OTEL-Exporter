@@ -31,6 +31,7 @@ type sdkManifest struct {
 	SchemaVersion string             `yaml:"schema_version"`
 	Provenance    string             `yaml:"provenance"`
 	Frameworks    []sdkManifestEntry `yaml:"frameworks"`
+	Scenarios     []sdkScenarioEntry `yaml:"scenarios"`
 }
 
 type sdkManifestEntry struct {
@@ -47,6 +48,18 @@ type sdkManifestEntry struct {
 	// gen_ai.* attributes, so v_gen_ai_logs does not select them and they are
 	// queried from otel_logs instead.
 	LogsOutsideGenAIView bool `yaml:"logs_outside_gen_ai_view"`
+}
+
+type sdkScenarioEntry struct {
+	ID             string   `yaml:"id"`
+	Kind           string   `yaml:"kind"`
+	Provenance     string   `yaml:"provenance"`
+	SemconvVersion string   `yaml:"semconv_version"`
+	Signals        []string `yaml:"signals"`
+	GenAISystem    string   `yaml:"gen_ai_system"`
+	TracesFile     string   `yaml:"traces_file"`
+	LogsFile       string   `yaml:"logs_file"`
+	MetricsFile    string   `yaml:"metrics_file"`
 }
 
 func loadSDKManifest(t *testing.T) sdkManifest {
@@ -70,6 +83,26 @@ func loadSDKManifest(t *testing.T) sdkManifest {
 	if len(m.Frameworks) != 7 {
 		t.Fatalf("manifest frameworks count = %d, want 7", len(m.Frameworks))
 	}
+	if len(m.Scenarios) != 2 {
+		t.Fatalf("manifest scenarios count = %d, want 2", len(m.Scenarios))
+	}
+	for _, sc := range m.Scenarios {
+		if sc.ID == "" {
+			t.Fatalf("scenario entry has empty id")
+		}
+		if sc.Kind != "scenario" {
+			t.Fatalf("scenario %s kind = %q, want %q", sc.ID, sc.Kind, "scenario")
+		}
+		if sc.Provenance != "synthetic" {
+			t.Fatalf("scenario %s provenance = %q, want %q", sc.ID, sc.Provenance, "synthetic")
+		}
+		if sc.SemconvVersion == "" {
+			t.Fatalf("scenario %s semconv_version is empty", sc.ID)
+		}
+		if len(sc.Signals) == 0 {
+			t.Fatalf("scenario %s signals list is empty", sc.ID)
+		}
+	}
 	return m
 }
 
@@ -87,6 +120,14 @@ func TestSDKManifestDocVersionParity(t *testing.T) {
 		}
 		if fw.CompanionVersion != "" && !strings.Contains(doc, fw.CompanionVersion) {
 			t.Errorf("framework %s companion_version %q not found in docs/agent-frameworks.md", fw.ID, fw.CompanionVersion)
+		}
+	}
+	for _, sc := range m.Scenarios {
+		if !strings.Contains(doc, sc.ID) {
+			t.Errorf("scenario %s id not found in docs/agent-frameworks.md", sc.ID)
+		}
+		if !strings.Contains(doc, sc.SemconvVersion) {
+			t.Errorf("scenario %s semconv_version %q not found in docs/agent-frameworks.md", sc.ID, sc.SemconvVersion)
 		}
 	}
 }
@@ -656,6 +697,375 @@ func TestAllSevenAgentFrameworkGoldenFixturesEndToEnd(t *testing.T) {
 			key := svc + "/" + kind
 			if pointsByKind[key] != 1 {
 				t.Errorf("service %q has %d %s points, want 1", svc, pointsByKind[key], kind)
+			}
+		}
+	}
+}
+
+// spanReasoningCount reads reasoning tokens off a span's attributes using the
+// v1.40+ key first and the earlier key second.
+func spanReasoningCount(attrs map[string]any) (float64, bool) {
+	for _, key := range []string{"gen_ai.usage.reasoning.output_tokens", "gen_ai.usage.reasoning_tokens"} {
+		switch v := attrs[key].(type) {
+		case float64:
+			return v, true
+		case string:
+			if n, err := strconv.ParseFloat(v, 64); err == nil {
+				return n, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func TestScenarioMetricsFixtureShapes(t *testing.T) {
+	m := loadSDKManifest(t)
+	var unmarshaler pmetric.JSONUnmarshaler
+	wantUnit := map[string]string{
+		"gen_ai.client.token.usage":                             "{token}",
+		"gen_ai.client.operation.duration":                      "s",
+		"gen_ai.client.inference.usage.input_tokens":            "{token}",
+		"gen_ai.client.inference.usage.output_tokens":           "{token}",
+		"gen_ai.client.inference.usage.reasoning.output_tokens": "{token}",
+	}
+
+	for _, sc := range m.Scenarios {
+		if !slices.Contains(sc.Signals, "metrics") {
+			continue
+		}
+		t.Run(sc.ID, func(t *testing.T) {
+			if sc.MetricsFile == "" {
+				t.Fatalf("scenario %s lists metrics signal without metrics_file", sc.ID)
+			}
+			path := filepath.Join("testdata", "otlp", sc.MetricsFile)
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read %s: %v", path, err)
+			}
+			md, err := unmarshaler.UnmarshalMetrics(raw)
+			if err != nil {
+				t.Fatalf("UnmarshalMetrics(%s): %v", path, err)
+			}
+			if md.ResourceMetrics().Len() != 1 || md.ResourceMetrics().At(0).ScopeMetrics().Len() != 1 {
+				t.Fatalf("%s must hold one resource with one scope", path)
+			}
+			metrics := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics()
+			if metrics.Len() != 5 {
+				t.Fatalf("%s holds %d metrics, want 5", path, metrics.Len())
+			}
+
+			seen := make(map[string]int)
+			for _, mt := range metrics.All() {
+				unit, known := wantUnit[mt.Name()]
+				if !known {
+					t.Fatalf("unexpected metric %q in %s", mt.Name(), path)
+				}
+				if mt.Unit() != unit {
+					t.Errorf("%s unit = %q, want %q", mt.Name(), mt.Unit(), unit)
+				}
+				if mt.Type() != pmetric.MetricTypeHistogram {
+					t.Fatalf("%s type = %v, want a histogram", mt.Name(), mt.Type())
+				}
+				if got := mt.Histogram().AggregationTemporality(); got != pmetric.AggregationTemporalityDelta {
+					t.Errorf("%s temporality = %v, want delta", mt.Name(), got)
+				}
+				for _, dp := range mt.Histogram().DataPoints().All() {
+					requireOneCallHistogramPoint(t, mt.Name(), dp)
+					key := mt.Name()
+					if tokenType, ok := dp.Attributes().Get("gen_ai.token.type"); ok {
+						key += "/" + tokenType.Str()
+					}
+					seen[key]++
+				}
+			}
+
+			for _, key := range []string{
+				"gen_ai.client.token.usage/input",
+				"gen_ai.client.token.usage/output",
+				"gen_ai.client.operation.duration",
+				"gen_ai.client.inference.usage.input_tokens",
+				"gen_ai.client.inference.usage.output_tokens",
+				"gen_ai.client.inference.usage.reasoning.output_tokens",
+			} {
+				if seen[key] != 2 {
+					t.Errorf("%s holds %d %s points, want 2", path, seen[key], key)
+				}
+			}
+			if len(seen) != 6 {
+				t.Errorf("%s holds points of kinds %v, want exactly 6 kinds", path, seen)
+			}
+		})
+	}
+}
+
+func TestScenarioGoldenFixturesEndToEnd(t *testing.T) {
+	m := loadSDKManifest(t)
+	srv := bqfake.NewServer(t)
+	wireFakeHooks(t, srv)
+
+	cfg := validConfig()
+	cfg.Project = "sdk-scenario-proj"
+	cfg.Dataset = "otel_sdk_scenarios"
+	cfg.AutoCreate.Dataset = true
+	cfg.AutoCreate.Tables = true
+	cfg.AutoCreate.CompanionViews = true
+	cfg.Quarantine.Enabled = true
+	cfg.Quarantine.Table = "otel_quarantine"
+
+	settings := component.TelemetrySettings{
+		Logger:        zap.NewNop(),
+		MeterProvider: noop.NewMeterProvider(),
+	}
+	tracesExp, err := newTracesExporter(settings, cfg)
+	if err != nil {
+		t.Fatalf("newTracesExporter: %v", err)
+	}
+	logsExp, err := newLogsExporter(settings, cfg)
+	if err != nil {
+		t.Fatalf("newLogsExporter: %v", err)
+	}
+	metricsExp, err := newMetricsExporter(settings, cfg)
+	if err != nil {
+		t.Fatalf("newMetricsExporter: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := tracesExp.start(ctx, nil); err != nil {
+		t.Fatalf("tracesExp.start: %v", err)
+	}
+	t.Cleanup(func() { _ = tracesExp.shutdown(context.Background()) })
+	if err := logsExp.start(ctx, nil); err != nil {
+		t.Fatalf("logsExp.start: %v", err)
+	}
+	t.Cleanup(func() { _ = logsExp.shutdown(context.Background()) })
+	if err := metricsExp.start(ctx, nil); err != nil {
+		t.Fatalf("metricsExp.start: %v", err)
+	}
+	t.Cleanup(func() { _ = metricsExp.shutdown(context.Background()) })
+
+	var traceUnmarshaler ptrace.JSONUnmarshaler
+	var logUnmarshaler plog.JSONUnmarshaler
+	var metricUnmarshaler pmetric.JSONUnmarshaler
+
+	totalExpectedSpans := 0
+	totalExpectedLogs := 0
+	totalExpectedPoints := 0
+	wantSpansByService := make(map[string]int)
+	wantLogsByService := make(map[string]int)
+	wantPointsByService := make(map[string]int)
+
+	for _, sc := range m.Scenarios {
+		t.Run(sc.ID, func(t *testing.T) {
+			if slices.Contains(sc.Signals, "traces") && sc.TracesFile != "" {
+				tracesPath := filepath.Join("testdata", "otlp", sc.TracesFile)
+				tracesRaw, err := os.ReadFile(tracesPath)
+				if err != nil {
+					t.Fatalf("read %s: %v", tracesPath, err)
+				}
+				td, err := traceUnmarshaler.UnmarshalTraces(tracesRaw)
+				if err != nil {
+					t.Fatalf("UnmarshalTraces(%s): %v", tracesPath, err)
+				}
+				totalExpectedSpans += td.SpanCount()
+				for _, rs := range td.ResourceSpans().All() {
+					svc, _ := rs.Resource().Attributes().Get("service.name")
+					for _, ss := range rs.ScopeSpans().All() {
+						wantSpansByService[svc.Str()] += ss.Spans().Len()
+					}
+				}
+				if err := tracesExp.pushTraceData(ctx, td); err != nil {
+					t.Fatalf("pushTraceData(%s): %v", sc.ID, err)
+				}
+			}
+
+			if slices.Contains(sc.Signals, "logs") && sc.LogsFile != "" {
+				logsPath := filepath.Join("testdata", "otlp", sc.LogsFile)
+				logsRaw, err := os.ReadFile(logsPath)
+				if err != nil {
+					t.Fatalf("read %s: %v", logsPath, err)
+				}
+				ld, err := logUnmarshaler.UnmarshalLogs(logsRaw)
+				if err != nil {
+					t.Fatalf("UnmarshalLogs(%s): %v", logsPath, err)
+				}
+				totalExpectedLogs += ld.LogRecordCount()
+				for _, rl := range ld.ResourceLogs().All() {
+					svc, _ := rl.Resource().Attributes().Get("service.name")
+					for _, sl := range rl.ScopeLogs().All() {
+						wantLogsByService[svc.Str()] += sl.LogRecords().Len()
+					}
+				}
+				if err := logsExp.pushLogData(ctx, ld); err != nil {
+					t.Fatalf("pushLogData(%s): %v", sc.ID, err)
+				}
+			}
+
+			if slices.Contains(sc.Signals, "metrics") && sc.MetricsFile != "" {
+				metricsPath := filepath.Join("testdata", "otlp", sc.MetricsFile)
+				metricsRaw, err := os.ReadFile(metricsPath)
+				if err != nil {
+					t.Fatalf("read %s: %v", metricsPath, err)
+				}
+				md, err := metricUnmarshaler.UnmarshalMetrics(metricsRaw)
+				if err != nil {
+					t.Fatalf("UnmarshalMetrics(%s): %v", metricsPath, err)
+				}
+				totalExpectedPoints += md.DataPointCount()
+				for _, rm := range md.ResourceMetrics().All() {
+					svc, _ := rm.Resource().Attributes().Get("service.name")
+					for _, sm := range rm.ScopeMetrics().All() {
+						for _, mt := range sm.Metrics().All() {
+							wantPointsByService[svc.Str()] += metricPointCount(mt)
+						}
+					}
+				}
+				if err := metricsExp.pushMetricsData(ctx, md); err != nil {
+					t.Fatalf("pushMetricsData(%s): %v", sc.ID, err)
+				}
+			}
+		})
+	}
+
+	if qRows := srv.Rows("otel_quarantine"); len(qRows) != 0 {
+		t.Fatalf("otel_quarantine rows = %d, want 0: %v", len(qRows), qRows)
+	}
+
+	spanRows := srv.Rows("otel_spans")
+	logRows := srv.Rows("otel_logs")
+	metricRows := srv.Rows("otel_metrics")
+	if len(spanRows) != totalExpectedSpans {
+		t.Fatalf("expected %d span rows across scenarios, got %d", totalExpectedSpans, len(spanRows))
+	}
+	if len(logRows) != totalExpectedLogs {
+		t.Fatalf("expected %d log rows across scenarios, got %d", totalExpectedLogs, len(logRows))
+	}
+	if len(metricRows) != totalExpectedPoints {
+		t.Fatalf("expected %d metric rows across scenarios, got %d", totalExpectedPoints, len(metricRows))
+	}
+
+	for _, sig := range []struct {
+		name string
+		rows []map[string]any
+		want map[string]int
+	}{
+		{"span", spanRows, wantSpansByService},
+		{"log", logRows, wantLogsByService},
+		{"metric", metricRows, wantPointsByService},
+	} {
+		got := make(map[string]int)
+		for _, r := range sig.rows {
+			svc, _ := r["service_name"].(string)
+			got[svc]++
+		}
+		for svc, n := range sig.want {
+			if got[svc] != n {
+				t.Errorf("%s rows for scenario service %q = %d, want %d", sig.name, svc, got[svc], n)
+			}
+		}
+	}
+
+	type joinKey struct {
+		serviceName string
+		traceID     string
+		spanID      string
+	}
+	type spanFixture struct {
+		row   map[string]any
+		attrs map[string]any
+	}
+	spansByKey := make(map[joinKey]spanFixture)
+	for _, r := range spanRows {
+		if r["schema_version"] != schema.Version {
+			t.Fatalf("span schema_version = %v, want %q", r["schema_version"], schema.Version)
+		}
+		attrs := decodeAttributes(t, r)
+		svc, _ := r["service_name"].(string)
+		tid, _ := r["trace_id"].(string)
+		sid, _ := r["span_id"].(string)
+		spansByKey[joinKey{serviceName: svc, traceID: tid, spanID: sid}] = spanFixture{row: r, attrs: attrs}
+	}
+
+	for _, l := range logRows {
+		if l["schema_version"] != schema.Version {
+			t.Fatalf("log schema_version = %v, want %q", l["schema_version"], schema.Version)
+		}
+		svc, _ := l["service_name"].(string)
+		tid, _ := l["trace_id"].(string)
+		sid, _ := l["span_id"].(string)
+		joined := false
+		for _, s := range spanRows {
+			if logJoinsSpan(l, s) {
+				joined = true
+				break
+			}
+		}
+		if !joined {
+			t.Errorf("scenario log row (service=%q, trace=%q, span=%q) did not join to any span", svc, tid, sid)
+		}
+	}
+
+	for _, r := range metricRows {
+		if r["schema_version"] != schema.Version {
+			t.Fatalf("metric schema_version = %v, want %q", r["schema_version"], schema.Version)
+		}
+		svc, _ := r["service_name"].(string)
+		name, _ := r["metric_name"].(string)
+		if !sqlLike(genAIMetricNamePattern, name) {
+			t.Errorf("metric %q of %q fails the v_gen_ai_metrics WHERE predicate", name, svc)
+		}
+		mAttrs := decodeAttributes(t, r)
+		exemplars, _ := r["exemplars"].([]map[string]any)
+		if len(exemplars) != 1 {
+			t.Errorf("%s point of %q carries %d exemplars, want 1", name, svc, len(exemplars))
+			continue
+		}
+		tid, _ := exemplars[0]["trace_id"].(string)
+		sid, _ := exemplars[0]["span_id"].(string)
+		sp, ok := spansByKey[joinKey{serviceName: svc, traceID: tid, spanID: sid}]
+		if !ok {
+			t.Errorf("exemplar of %s point of %q links trace %q span %q, not found in otel_spans", name, svc, tid, sid)
+			continue
+		}
+
+		sum, _ := r["sum"].(float64)
+		switch name {
+		case "gen_ai.client.token.usage":
+			tokenType, _ := mAttrs["gen_ai.token.type"].(string)
+			want, found := spanTokenCount(sp.attrs, tokenType)
+			if !found || sum != want {
+				t.Errorf("%s %q point sum = %v, want span token count %v (found=%v)", name, tokenType, sum, want, found)
+			}
+		case "gen_ai.client.inference.usage.input_tokens":
+			want, found := spanTokenCount(sp.attrs, "input")
+			if !found || sum != want {
+				t.Errorf("%s point sum = %v, want span input token count %v (found=%v)", name, sum, want, found)
+			}
+		case "gen_ai.client.inference.usage.output_tokens":
+			want, found := spanTokenCount(sp.attrs, "output")
+			if !found || sum != want {
+				t.Errorf("%s point sum = %v, want span output token count %v (found=%v)", name, sum, want, found)
+			}
+		case "gen_ai.client.inference.usage.reasoning.output_tokens":
+			want, found := spanReasoningCount(sp.attrs)
+			if !found || sum != want {
+				t.Errorf("%s point sum = %v, want span reasoning token count %v (found=%v)", name, sum, want, found)
+			}
+		case "gen_ai.client.operation.duration":
+			ns, _ := sp.row["duration_nano"].(int64)
+			if math.Abs(sum-float64(ns)/1e9) > 1e-9 {
+				t.Errorf("%s point sums to %vs, but its span lasted %vs", name, sum, float64(ns)/1e9)
+			}
+		default:
+			t.Errorf("unexpected metric %q of %q", name, svc)
+		}
+
+		for _, key := range []string{"gen_ai.operation.name", "gen_ai.system", "gen_ai.agent.name", "gen_ai.request.model", "gen_ai.response.model"} {
+			want, onSpan := sp.attrs[key]
+			if !onSpan {
+				continue
+			}
+			if got, onMetric := mAttrs[key]; onMetric && got != want {
+				t.Errorf("%s point of %q has %s = %v, but its span has %v", name, svc, key, got, want)
 			}
 		}
 	}
