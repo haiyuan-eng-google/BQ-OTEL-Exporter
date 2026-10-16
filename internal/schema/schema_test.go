@@ -630,9 +630,11 @@ func normalizeSQL(sql string) string {
 }
 
 // The reasoning token count arrives under gen_ai.usage.reasoning.output_tokens
-// and, from earlier instrumentation, under gen_ai.usage.reasoning_tokens, and
-// the current key must win. error.type and the v1.40+ main-agent,
-// agent-version, and response attributes are promoted as additive columns.
+// (semantic-conventions-genai@f3c6d0c9) and, from v1.40.0 instrumentation,
+// under gen_ai.usage.reasoning_tokens, and the current key must win.
+// error.type and the main-agent (semantic-conventions-genai@f3c6d0c9),
+// agent-version and response-id (v1.40.0), and time-to-first-chunk (v1.41.0)
+// attributes are promoted as additive columns.
 func TestGenAISpansViewPromotesReasoningTokensAndErrorType(t *testing.T) {
 	exprs := projectionExprs(t, GenAISpansViewQuery, "proj", "ds", "spans")
 	for col, want := range map[string][]string{
@@ -957,9 +959,10 @@ func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 			contract: SpansTableSchema(),
 			// 29 identity, timing and promoted columns, the six raw columns
 			// kept for anything not promoted, the 15 OTel GenAI
-			// v1.37+/v1.40+ promoted columns, error_type, and six v1.40+
-			// main-agent, agent-version, and response columns appended last
-			// so that no earlier column moved.
+			// v1.37.0+/v1.40.0 promoted columns, error_type, and six v1.40.0,
+			// v1.41.0, and semantic-conventions-genai@f3c6d0c9 main-agent,
+			// agent-version, and response columns appended last so that no
+			// earlier column moved.
 			want: []string{
 				"start_time", "end_time", "duration_nano", "duration_ms",
 				"trace_id", "span_id", "parent_span_id", "service_name",
@@ -1005,8 +1008,9 @@ func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 			contract: MetricsTableSchema(),
 			// 39 columns: the metric identity, seven promoted GenAI
 			// attributes, every point-value column of the table, the raw
-			// attribute, resource and scope bags, and three v1.40+ metric
-			// dimensions appended last.
+			// attribute, resource and scope bags, and three
+			// semantic-conventions-genai@f3c6d0c9 metric dimensions appended
+			// last.
 			want: []string{
 				"timestamp", "start_time", "receive_time", "service_name",
 				"metric_name", "metric_description", "metric_unit", "metric_type",

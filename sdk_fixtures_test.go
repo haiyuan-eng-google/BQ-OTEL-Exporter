@@ -752,6 +752,10 @@ func TestScenarioMetricsFixtureShapes(t *testing.T) {
 			if md.ResourceMetrics().Len() != 1 || md.ResourceMetrics().At(0).ScopeMetrics().Len() != 1 {
 				t.Fatalf("%s must hold one resource with one scope", path)
 			}
+			scope := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Scope()
+			if sc.ID == "multi_agent" && scope.Version() != "0.1.0" {
+				t.Errorf("%s scope.version = %q, want %q", path, scope.Version(), "0.1.0")
+			}
 			metrics := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics()
 			if metrics.Len() != 5 {
 				t.Fatalf("%s holds %d metrics, want 5", path, metrics.Len())
@@ -776,6 +780,7 @@ func TestScenarioMetricsFixtureShapes(t *testing.T) {
 					}
 					for _, dp := range mt.Histogram().DataPoints().All() {
 						requireOneCallHistogramPoint(t, mt.Name(), dp)
+						requireScenarioHistogramAttrs(t, mt.Name(), dp)
 						key := mt.Name()
 						if tokenType, ok := dp.Attributes().Get("gen_ai.token.type"); ok {
 							key += "/" + tokenType.Str()
@@ -815,14 +820,53 @@ func TestScenarioMetricsFixtureShapes(t *testing.T) {
 	}
 }
 
+func requireScenarioHistogramAttrs(t *testing.T, name string, dp pmetric.HistogramDataPoint) {
+	t.Helper()
+	for _, key := range []string{"gen_ai.operation.name", "gen_ai.request.model", "gen_ai.response.model"} {
+		val, ok := dp.Attributes().Get(key)
+		if !ok || val.Str() == "" {
+			t.Errorf("%s histogram point missing non-empty attribute %q", name, key)
+		}
+	}
+	switch name {
+	case "gen_ai.client.token.usage":
+		if val, ok := dp.Attributes().Get("gen_ai.system"); !ok || val.Str() == "" {
+			t.Errorf("%s histogram point missing non-empty gen_ai.system", name)
+		}
+		if val, ok := dp.Attributes().Get("gen_ai.token.type"); !ok || (val.Str() != "input" && val.Str() != "output") {
+			t.Errorf("%s histogram point gen_ai.token.type = %q, want input or output", name, val.Str())
+		}
+	case "gen_ai.client.operation.duration":
+		if val, ok := dp.Attributes().Get("gen_ai.provider.name"); !ok || val.Str() == "" {
+			t.Errorf("%s histogram point missing non-empty gen_ai.provider.name", name)
+		}
+	}
+}
+
 // requireOneCallSumPoint checks a monotonic delta Sum data point that records
-// one inference call's token count: an integer value > 0 and one exemplar
-// carrying the same integer value, a trace and span ID, and a timestamp inside
-// the point's interval.
+// one inference call's token count: an integer value > 0, all required GenAI
+// counter dimensions, and one exemplar carrying the same integer value, a
+// trace and span ID, and a timestamp inside the point's interval.
 func requireOneCallSumPoint(t *testing.T, name string, dp pmetric.NumberDataPoint) {
 	t.Helper()
 	if dp.ValueType() != pmetric.NumberDataPointValueTypeInt || dp.IntValue() <= 0 {
 		t.Errorf("%s value type/int = %v/%d, want positive int", name, dp.ValueType(), dp.IntValue())
+	}
+	for _, key := range []string{
+		"gen_ai.operation.name",
+		"gen_ai.provider.name",
+		"gen_ai.token.modality",
+		"gen_ai.request.model",
+		"gen_ai.response.model",
+		"gen_ai.agent.name",
+	} {
+		val, ok := dp.Attributes().Get(key)
+		if !ok || val.Str() == "" {
+			t.Errorf("%s sum point missing non-empty attribute %q", name, key)
+		}
+	}
+	if mod, ok := dp.Attributes().Get("gen_ai.token.modality"); ok && mod.Str() != "text" {
+		t.Errorf("%s sum point gen_ai.token.modality = %q, want %q", name, mod.Str(), "text")
 	}
 	if dp.Exemplars().Len() != 1 {
 		t.Fatalf("%s holds %d exemplars, want 1", name, dp.Exemplars().Len())
@@ -1048,8 +1092,9 @@ func TestScenarioGoldenFixturesEndToEnd(t *testing.T) {
 	}
 
 	// Verify scenario-defining trace attributes and shapes per span_id.
-	// 1. Multi-agent scenario: resource-level main_agent.*, delegation parent id,
-	//    agent version, and strictly overlapping parallel tool spans.
+	// 1. Multi-agent scenario: resource-level main_agent.*, span-tree delegation
+	//    via parent_span_id, agent version, scope.version, and strictly overlapping
+	//    parallel tool spans.
 	for _, sid := range []string{
 		"00f067aa0ba902b7", "00f067aa0ba902b8", "00f067aa0ba902b9", "00f067aa0ba902bb",
 		"00f067aa0ba902ba", "00f067aa0ba902bc", "00f067aa0ba902bd", "1122334455667788",
@@ -1063,9 +1108,28 @@ func TestScenarioGoldenFixturesEndToEnd(t *testing.T) {
 			sf.resAttrs["gen_ai.main_agent.description"] != "Top-level planner coordinating researcher and tool workers" {
 			t.Errorf("multi_agent span %s resource.attributes = %v, missing gen_ai.main_agent.{id,name,description}", sid, sf.resAttrs)
 		}
+		if scope, _ := sf.row["instrumentation_scope"].(map[string]any); scope["version"] != "0.1.0" {
+			t.Errorf("multi_agent span %s scope.version = %v, want %q", sid, scope["version"], "0.1.0")
+		}
 	}
-	if resSpan := spansByID["00f067aa0ba902b9"]; resSpan.attrs["gen_ai.agent.parent.id"] != "agent-planner-1" || resSpan.attrs["gen_ai.agent.version"] != "1.0.4" {
-		t.Errorf("delegated researcher span attrs = %v, want gen_ai.agent.parent.id=agent-planner-1 and gen_ai.agent.version=1.0.4", resSpan.attrs)
+	rootSpan := spansByID["00f067aa0ba902b7"]
+	if rootSpan.row["parent_span_id"] != nil ||
+		rootSpan.attrs["gen_ai.operation.name"] != "invoke_agent" ||
+		rootSpan.attrs["gen_ai.agent.name"] != "planner" ||
+		rootSpan.attrs["gen_ai.agent.id"] != "agent-planner-1" ||
+		rootSpan.attrs["gen_ai.agent.version"] != "1.2.0" {
+		t.Errorf("root planner span = (parent=%v, attrs=%v), want parent=nil, op=invoke_agent, name=planner, id=agent-planner-1, version=1.2.0",
+			rootSpan.row["parent_span_id"], rootSpan.attrs)
+	}
+	resSpan := spansByID["00f067aa0ba902b9"]
+	if resSpan.row["parent_span_id"] != "00f067aa0ba902b7" ||
+		resSpan.attrs["gen_ai.operation.name"] != "invoke_agent" ||
+		resSpan.attrs["gen_ai.agent.name"] != "researcher" ||
+		resSpan.attrs["gen_ai.agent.id"] != "agent-researcher-2" ||
+		resSpan.attrs["gen_ai.agent.version"] != "1.0.4" ||
+		resSpan.attrs["gen_ai.agent.parent.id"] != nil {
+		t.Errorf("delegated researcher span = (parent=%v, attrs=%v), want parent=00f067aa0ba902b7, op=invoke_agent, name=researcher, id=agent-researcher-2, version=1.0.4, and no gen_ai.agent.parent.id",
+			resSpan.row["parent_span_id"], resSpan.attrs)
 	}
 	tool1, tool2 := spansByID["00f067aa0ba902bc"], spansByID["00f067aa0ba902bd"]
 	start1, _ := tool1.row["start_time_unix_nano"].(int64)
@@ -1081,20 +1145,31 @@ func TestScenarioGoldenFixturesEndToEnd(t *testing.T) {
 
 	// 2. MCP scenario: protocol lifecycle, SERVER span kind, and failed tools/call
 	//    carrying gen_ai.tool.name + JSON-RPC error code without GenAI operation/provider.
-	for _, sid := range []string{"9f8e7d6c5b4a0001", "9f8e7d6c5b4a0002", "9f8e7d6c5b4a0003", "9f8e7d6c5b4a0004", "9f8e7d6c5b4a0005"} {
-		sf, ok := spansByID[sid]
+	for _, wantMCP := range []struct {
+		sid       string
+		parentSID any
+		method    string
+		reqID     string
+	}{
+		{sid: "9f8e7d6c5b4a0001", parentSID: nil, method: "initialize", reqID: "req-1"},
+		{sid: "9f8e7d6c5b4a0002", parentSID: "9f8e7d6c5b4a0001", method: "tools/list", reqID: "req-2"},
+		{sid: "9f8e7d6c5b4a0003", parentSID: "9f8e7d6c5b4a0001", method: "tools/call", reqID: "req-3"},
+		{sid: "9f8e7d6c5b4a0004", parentSID: "9f8e7d6c5b4a0001", method: "tools/call", reqID: "req-4"},
+		{sid: "9f8e7d6c5b4a0005", parentSID: "9f8e7d6c5b4a0001", method: "resources/read", reqID: "req-5"},
+	} {
+		sf, ok := spansByID[wantMCP.sid]
 		if !ok {
-			t.Fatalf("mcp span %s missing from otel_spans", sid)
+			t.Fatalf("mcp span %s missing from otel_spans", wantMCP.sid)
 		}
-		if sf.attrs["mcp.method.name"] == nil || sf.attrs["mcp.session.id"] != "mcp-sess-100" {
-			t.Errorf("mcp span %s attrs = %v, missing mcp.method.name or mcp.session.id=mcp-sess-100", sid, sf.attrs)
+		if sf.row["parent_span_id"] != wantMCP.parentSID {
+			t.Errorf("mcp span %s parent_span_id = %v, want %v", wantMCP.sid, sf.row["parent_span_id"], wantMCP.parentSID)
 		}
-		if sid == "9f8e7d6c5b4a0001" {
-			if sf.row["parent_span_id"] != nil {
-				t.Errorf("mcp root span parent_span_id = %v, want nil", sf.row["parent_span_id"])
-			}
-		} else if sf.row["parent_span_id"] != "9f8e7d6c5b4a0001" {
-			t.Errorf("mcp child span %s parent_span_id = %v, want 9f8e7d6c5b4a0001", sid, sf.row["parent_span_id"])
+		if sf.attrs["mcp.method.name"] != wantMCP.method ||
+			sf.attrs["mcp.protocol.version"] != "2025-06-18" ||
+			sf.attrs["mcp.session.id"] != "mcp-sess-100" ||
+			sf.attrs["jsonrpc.request.id"] != wantMCP.reqID {
+			t.Errorf("mcp span %s attrs = %v, want method=%q, protocol.version=2025-06-18, session.id=mcp-sess-100, jsonrpc.request.id=%q",
+				wantMCP.sid, sf.attrs, wantMCP.method, wantMCP.reqID)
 		}
 	}
 	mcpErr := spansByID["9f8e7d6c5b4a0004"]
@@ -1120,6 +1195,11 @@ func TestScenarioGoldenFixturesEndToEnd(t *testing.T) {
 			t.Fatalf("log schema_version = %v, want %q", l["schema_version"], schema.Version)
 		}
 		svc, _ := l["service_name"].(string)
+		if svc == "multi-agent-planner" {
+			if scope, _ := l["instrumentation_scope"].(map[string]any); scope["version"] != "0.1.0" {
+				t.Errorf("multi_agent log scope.version = %v, want %q", scope["version"], "0.1.0")
+			}
+		}
 		tid, _ := l["trace_id"].(string)
 		sid, _ := l["span_id"].(string)
 		joined := false
@@ -1139,6 +1219,11 @@ func TestScenarioGoldenFixturesEndToEnd(t *testing.T) {
 			t.Fatalf("metric schema_version = %v, want %q", r["schema_version"], schema.Version)
 		}
 		svc, _ := r["service_name"].(string)
+		if svc == "multi-agent-planner" {
+			if scope, _ := r["instrumentation_scope"].(map[string]any); scope["version"] != "0.1.0" {
+				t.Errorf("multi_agent metric scope.version = %v, want %q", scope["version"], "0.1.0")
+			}
+		}
 		name, _ := r["metric_name"].(string)
 		if !sqlLike(genAIMetricNamePattern, name) {
 			t.Errorf("metric %q of %q fails the v_gen_ai_metrics WHERE predicate", name, svc)
@@ -1164,6 +1249,20 @@ func TestScenarioGoldenFixturesEndToEnd(t *testing.T) {
 			t.Errorf("%s aggregation_temporality = %q, want DELTA", name, temporality)
 		}
 
+		spanOp, hasSpanOp := sp.attrs["gen_ai.operation.name"].(string)
+		spanReqModel, hasSpanReq := sp.attrs["gen_ai.request.model"].(string)
+		spanRespModel, hasSpanResp := sp.attrs["gen_ai.response.model"].(string)
+		spanAgent, hasSpanAgent := sp.attrs["gen_ai.agent.name"].(string)
+		spanProvider, hasSpanProvider := sp.attrs["gen_ai.provider.name"].(string)
+		if !hasSpanProvider || spanProvider == "" {
+			spanProvider, hasSpanProvider = sp.attrs["gen_ai.system"].(string)
+		}
+		if !hasSpanOp || spanOp == "" || !hasSpanReq || spanReqModel == "" ||
+			!hasSpanResp || spanRespModel == "" || !hasSpanAgent || spanAgent == "" ||
+			!hasSpanProvider || spanProvider == "" {
+			t.Fatalf("exemplar span %s of %s lacks required GenAI attributes: %v", sid, name, sp.attrs)
+		}
+
 		switch name {
 		case "gen_ai.client.token.usage":
 			if metricType != "HISTOGRAM" {
@@ -1175,6 +1274,12 @@ func TestScenarioGoldenFixturesEndToEnd(t *testing.T) {
 			if !found || sum != want {
 				t.Errorf("%s %q point sum = %v, want span token count %v (found=%v)", name, tokenType, sum, want, found)
 			}
+			requireMetricAttrsEqual(t, name, sid, mAttrs, map[string]string{
+				"gen_ai.operation.name": spanOp,
+				"gen_ai.system":         spanProvider,
+				"gen_ai.request.model":  spanReqModel,
+				"gen_ai.response.model": spanRespModel,
+			})
 		case "gen_ai.client.inference.usage.input_tokens":
 			if metricType != "SUM" || !monotonic {
 				t.Errorf("%s metric_type=%q is_monotonic=%v, want SUM and true", name, metricType, monotonic)
@@ -1185,6 +1290,14 @@ func TestScenarioGoldenFixturesEndToEnd(t *testing.T) {
 			if !found || val != int64(want) || exVal != int64(want) {
 				t.Errorf("%s value_int64=%d exemplar=%d, want span input token count %v (found=%v)", name, val, exVal, want, found)
 			}
+			requireMetricAttrsEqual(t, name, sid, mAttrs, map[string]string{
+				"gen_ai.operation.name": spanOp,
+				"gen_ai.provider.name":  spanProvider,
+				"gen_ai.agent.name":     spanAgent,
+				"gen_ai.token.modality": "text",
+				"gen_ai.request.model":  spanReqModel,
+				"gen_ai.response.model": spanRespModel,
+			})
 		case "gen_ai.client.inference.usage.output_tokens":
 			if metricType != "SUM" || !monotonic {
 				t.Errorf("%s metric_type=%q is_monotonic=%v, want SUM and true", name, metricType, monotonic)
@@ -1195,6 +1308,14 @@ func TestScenarioGoldenFixturesEndToEnd(t *testing.T) {
 			if !found || val != int64(want) || exVal != int64(want) {
 				t.Errorf("%s value_int64=%d exemplar=%d, want span output token count %v (found=%v)", name, val, exVal, want, found)
 			}
+			requireMetricAttrsEqual(t, name, sid, mAttrs, map[string]string{
+				"gen_ai.operation.name": spanOp,
+				"gen_ai.provider.name":  spanProvider,
+				"gen_ai.agent.name":     spanAgent,
+				"gen_ai.token.modality": "text",
+				"gen_ai.request.model":  spanReqModel,
+				"gen_ai.response.model": spanRespModel,
+			})
 		case "gen_ai.client.inference.usage.reasoning.output_tokens":
 			if metricType != "SUM" || !monotonic {
 				t.Errorf("%s metric_type=%q is_monotonic=%v, want SUM and true", name, metricType, monotonic)
@@ -1205,6 +1326,14 @@ func TestScenarioGoldenFixturesEndToEnd(t *testing.T) {
 			if !found || val != int64(want) || exVal != int64(want) {
 				t.Errorf("%s value_int64=%d exemplar=%d, want span reasoning token count %v (found=%v)", name, val, exVal, want, found)
 			}
+			requireMetricAttrsEqual(t, name, sid, mAttrs, map[string]string{
+				"gen_ai.operation.name": spanOp,
+				"gen_ai.provider.name":  spanProvider,
+				"gen_ai.agent.name":     spanAgent,
+				"gen_ai.token.modality": "text",
+				"gen_ai.request.model":  spanReqModel,
+				"gen_ai.response.model": spanRespModel,
+			})
 		case "gen_ai.client.operation.duration":
 			if metricType != "HISTOGRAM" {
 				t.Errorf("%s metric_type = %q, want HISTOGRAM", name, metricType)
@@ -1214,18 +1343,28 @@ func TestScenarioGoldenFixturesEndToEnd(t *testing.T) {
 			if math.Abs(sum-float64(ns)/1e9) > 1e-9 {
 				t.Errorf("%s point sums to %vs, but its span lasted %vs", name, sum, float64(ns)/1e9)
 			}
+			requireMetricAttrsEqual(t, name, sid, mAttrs, map[string]string{
+				"gen_ai.operation.name": spanOp,
+				"gen_ai.provider.name":  spanProvider,
+				"gen_ai.request.model":  spanReqModel,
+				"gen_ai.response.model": spanRespModel,
+			})
 		default:
 			t.Errorf("unexpected metric %q of %q", name, svc)
 		}
+	}
+}
 
-		for _, key := range []string{"gen_ai.operation.name", "gen_ai.system", "gen_ai.provider.name", "gen_ai.agent.name", "gen_ai.request.model", "gen_ai.response.model"} {
-			want, onSpan := sp.attrs[key]
-			if !onSpan {
-				continue
-			}
-			if got, onMetric := mAttrs[key]; onMetric && got != want {
-				t.Errorf("%s point of %q has %s = %v, but its span has %v", name, svc, key, got, want)
-			}
+func requireMetricAttrsEqual(t *testing.T, metricName, spanID string, mAttrs map[string]any, want map[string]string) {
+	t.Helper()
+	for key, wantVal := range want {
+		got, ok := mAttrs[key].(string)
+		if !ok || got == "" {
+			t.Errorf("%s (exemplar span %s) missing attribute %q (want %q)", metricName, spanID, key, wantVal)
+			continue
+		}
+		if got != wantVal {
+			t.Errorf("%s (exemplar span %s) %s = %q, want %q", metricName, spanID, key, got, wantVal)
 		}
 	}
 }

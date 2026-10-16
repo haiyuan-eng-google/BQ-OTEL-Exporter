@@ -75,7 +75,6 @@
                 {"key": "gen_ai.operation.name", "value": {"stringValue": "invoke_agent"}},
                 {"key": "gen_ai.agent.name", "value": {"stringValue": "researcher"}},
                 {"key": "gen_ai.agent.id", "value": {"stringValue": "agent-researcher-2"}},
-                {"key": "gen_ai.agent.parent.id", "value": {"stringValue": "agent-planner-1"}},
                 {"key": "gen_ai.agent.version", "value": {"stringValue": "1.0.4"}},
                 {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-multi-01"}},
                 {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-2.5-flash"}},

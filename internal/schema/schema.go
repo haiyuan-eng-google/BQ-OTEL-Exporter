@@ -534,7 +534,7 @@ FROM ` + "`%[1]s.%[2]s.%[3]s_dedup`" + `
 // gen_ai.operation.name, gen_ai.system, gen_ai.provider.name,
 // gcp.vertex.agent.invocation_id, gen_ai.main_agent.name or
 // gen_ai.main_agent.id, with the OpenTelemetry GenAI semantic
-// convention attributes (including v1.37+/v1.40+ provider, cache/reasoning
+// convention attributes (including v1.37.0+ and v1.40.0 provider, cache/reasoning
 // token, output, tool, agent, and data source fields) and the Agent
 // Development Kit gcp.vertex.agent.* attributes promoted out of the plain
 // JSON attributes into typed top-level columns. Where the same fact can arrive
@@ -543,11 +543,12 @@ FROM ` + "`%[1]s.%[2]s.%[3]s_dedup`" + `
 // gen_ai.usage.reasoning.output_tokens and its earlier name
 // gen_ai.usage.reasoning_tokens, the keys are coalesced in a fixed order, the
 // current key first. The error.type attribute is promoted as error_type,
-// followed by the v1.40+ main-agent, agent-version, and response attributes
-// (coalescing span attributes first and resource.attributes second for the
-// agent-entity fields), appended at the end so the position of every earlier
-// column is unchanged. The raw attribute, resource, scope, event and link
-// columns and payload_refs are kept for anything not promoted.
+// followed by the main-agent (semantic-conventions-genai@f3c6d0c9),
+// agent-version and response-id (v1.40.0), and time-to-first-chunk (v1.41.0)
+// attributes (coalescing span attributes first and resource.attributes second
+// for the agent-entity fields), appended at the end so the position of every
+// earlier column is unchanged. The raw attribute, resource, scope, event and
+// link columns and payload_refs are kept for anything not promoted.
 const GenAISpansViewDDL = `
 CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAISpansViewName + "`" + ` AS
 ` + GenAISpansViewQuery + `;
@@ -612,7 +613,7 @@ SELECT
   instrumentation_scope,
   events,
   links,
-  -- Promoted OTel GenAI v1.37+/v1.40+ semantic convention fields
+  -- Promoted OTel GenAI v1.37.0+, v1.40.0, v1.41.0, and semantic-conventions-genai@f3c6d0c9 fields
   JSON_VALUE(attributes, '$."gen_ai.provider.name"') AS gen_ai_provider_name,
   COALESCE(
     LAX_INT64(attributes['gen_ai.usage.cache_read.input_tokens']),
@@ -762,17 +763,20 @@ WHERE COALESCE(NULLIF(l.event_name, ''), JSON_VALUE(l.attributes, '$."event.name
 `
 
 // GenAIMetricsViewDDL creates v_gen_ai_metrics: the metric points whose name
-// starts with "gen_ai.", such as gen_ai.client.token.usage and
-// gen_ai.client.operation.duration, with the OpenTelemetry GenAI semantic
-// convention attributes promoted out of the plain JSON attributes into typed
-// columns. The system is coalesced from gen_ai.system and its successor
-// gen_ai.provider.name, the current key second as in v_gen_ai_spans, and the
-// token type (input or output) of a token usage point is promoted as
-// gen_ai_token_type. Every point-value column of the metrics table passes
-// through unchanged, so a histogram keeps its count, sum, bounds and bucket
-// counts, an exponential histogram its buckets, and each point its exemplars,
-// whose trace_id and span_id link a point to a trace. The raw attribute,
-// resource and scope columns are kept for anything not promoted.
+// starts with "gen_ai.", such as gen_ai.client.token.usage,
+// gen_ai.client.operation.duration, and gen_ai.client.inference.usage.*, with
+// the OpenTelemetry GenAI semantic convention attributes promoted out of the
+// plain JSON attributes into typed columns. The system is coalesced from
+// gen_ai.system and its successor gen_ai.provider.name, the current key second
+// as in v_gen_ai_spans, and the token type (input or output) of a token usage
+// point is promoted as gen_ai_token_type. Every point-value column of the
+// metrics table passes through unchanged, so a histogram keeps its count, sum,
+// bounds and bucket counts, an exponential histogram its buckets, and each
+// point its exemplars, whose trace_id and span_id link a point to a trace. The
+// raw attribute, resource and scope columns are kept for anything not promoted,
+// followed by gen_ai_token_modality, gen_ai_agent_name, and
+// gen_ai_inference_usage_dimension (semantic-conventions-genai@f3c6d0c9)
+// appended at the end.
 const GenAIMetricsViewDDL = `
 CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAIMetricsViewName + "`" + ` AS
 ` + GenAIMetricsViewQuery + `;

@@ -380,11 +380,11 @@ func TestScenarioMultiAgentViews(t *testing.T) {
 	if len(metrics) != 12 {
 		t.Fatalf("v_gen_ai_metrics rows = %d, want 12", len(metrics))
 	}
-	v140Input := rowsWhere(metrics, "metric_name", "gen_ai.client.inference.usage.input_tokens")
-	if len(v140Input) != 2 {
-		t.Fatalf("gen_ai.client.inference.usage.input_tokens rows = %d, want 2", len(v140Input))
+	inferenceInput := rowsWhere(metrics, "metric_name", "gen_ai.client.inference.usage.input_tokens")
+	if len(inferenceInput) != 2 {
+		t.Fatalf("gen_ai.client.inference.usage.input_tokens rows = %d, want 2", len(inferenceInput))
 	}
-	requireCols(t, "genai-dev input_tokens planner", onlyRow(t, "planner input", v140Input, "gen_ai_agent_name", "planner"), map[string]any{
+	requireCols(t, "semantic-conventions-genai@f3c6d0c9 input_tokens planner", onlyRow(t, "planner input", inferenceInput, "gen_ai_agent_name", "planner"), map[string]any{
 		"metric_type":                      "SUM",
 		"is_monotonic":                     true,
 		"aggregation_temporality":          "DELTA",
@@ -395,8 +395,8 @@ func TestScenarioMultiAgentViews(t *testing.T) {
 		"value_int64":                      int64(200),
 		"sum":                              nil,
 	})
-	v140Reasoning := rowsWhere(metrics, "metric_name", "gen_ai.client.inference.usage.reasoning.output_tokens")
-	requireCols(t, "genai-dev reasoning_output researcher", onlyRow(t, "researcher reasoning", v140Reasoning, "gen_ai_agent_name", "researcher"), map[string]any{
+	inferenceReasoning := rowsWhere(metrics, "metric_name", "gen_ai.client.inference.usage.reasoning.output_tokens")
+	requireCols(t, "semantic-conventions-genai@f3c6d0c9 reasoning_output researcher", onlyRow(t, "researcher reasoning", inferenceReasoning, "gen_ai_agent_name", "researcher"), map[string]any{
 		"metric_type":                      "SUM",
 		"is_monotonic":                     true,
 		"aggregation_temporality":          "DELTA",
