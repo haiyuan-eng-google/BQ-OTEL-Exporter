@@ -1,0 +1,7 @@
+go test fuzz v1
+string("evt\x00\n")
+string("line1\r\nline2\x1b[31m")
+string("s\xff")
+string("i\xfe")
+int64(-1)
+int64(-9223372036854775808)

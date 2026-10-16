@@ -1,0 +1,6 @@
+go test fuzz v1
+[]byte("\x00\x00\x00\x00\x04bad\xff\x04\xc3(xx\f\x04flag")
+string("x")
+string("")
+string("x*")
+byte('Å')

@@ -1,0 +1,9 @@
+go test fuzz v1
+string("spans")
+string("")
+string("ROW_ERROR")
+string("{\"resourceSpans\":[]}")
+string("not-a-timestamp")
+string("")
+byte(' ')
+[]byte("{\"ingest_time\":{\"seconds\":1},\"signal\":\"spans\"}\n{\"ingest_time\":1e400,\"signal\":\"logs\"}\n{\"ingest_time\":\"NaN\",\"signal\":\"metrics\"}\n")

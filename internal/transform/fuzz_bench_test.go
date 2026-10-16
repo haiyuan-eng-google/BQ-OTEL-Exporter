@@ -5,8 +5,10 @@ package transform
 
 import (
 	"bytes"
+	"encoding/binary"
 	"math"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -352,6 +354,13 @@ type metricFuzzInput struct {
 	ts, start            int64
 	flags, buckets       uint8
 	scale, offset        int32
+	// exemplarIDs holds every exemplar's trace ID in bytes 0-15 and its span
+	// ID in bytes 16-23, zero-padded, so a short or empty slice yields
+	// partial or empty IDs.
+	exemplarIDs []byte
+	// exemplars is the number of exemplars on each data point that has
+	// them, modulo 5. Their values alternate between double and int.
+	exemplars uint8
 	// withSecret adds blocked-key attributes to the resource and to every
 	// data point and exemplar, so a Redactor has something to scrub.
 	withSecret bool
@@ -387,13 +396,25 @@ func (in metricFuzzInput) build() pmetric.Metrics {
 			m.PutStr("x-api-key", in.val)
 		}
 	}
+	var traceID pcommon.TraceID
+	var spanID pcommon.SpanID
+	copy(traceID[:], in.exemplarIDs)
+	if len(in.exemplarIDs) > len(traceID) {
+		copy(spanID[:], in.exemplarIDs[len(traceID):])
+	}
 	exemplar := func(es pmetric.ExemplarSlice) {
-		ex := es.AppendEmpty()
-		ex.SetTimestamp(at)
-		ex.SetDoubleValue(in.dblVal)
-		ex.SetTraceID(pcommon.TraceID([16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}))
-		ex.SetSpanID(pcommon.SpanID([8]byte{1, 2, 3, 4, 5, 6, 7, 8}))
-		attrs(ex.FilteredAttributes())
+		for i := range int(in.exemplars % 5) {
+			ex := es.AppendEmpty()
+			ex.SetTimestamp(at)
+			if i%2 == 0 {
+				ex.SetDoubleValue(in.dblVal)
+			} else {
+				ex.SetIntValue(in.intVal)
+			}
+			ex.SetTraceID(traceID)
+			ex.SetSpanID(spanID)
+			attrs(ex.FilteredAttributes())
+		}
 	}
 	next := func() pmetric.Metric {
 		m := sm.Metrics().AppendEmpty()
@@ -534,16 +555,26 @@ func metricFingerprints(rows []Row) []string {
 }
 
 func FuzzMetricRows(f *testing.F) {
-	f.Add("gen_ai.client.token.usage", "{token}", "gen_ai.token.type", "input", int64(120), 0.5, uint64(3), int64(1700000000000000000), int64(1699999990000000000), uint8(0), uint8(4), int32(2), int32(-1))
-	f.Add("", "", "", "", int64(-10), math.NaN(), uint64(0), int64(0), int64(0), uint8(1), uint8(0), int32(0), int32(0))
-	f.Add("m\x00\xff", "\xffu", "k\xff", "secret-token 123-45-6789", int64(math.MaxInt64), math.Inf(1), uint64(math.MaxUint64), int64(1700000005000000000), int64(-1), uint8(255), uint8(255), int32(math.MinInt32), int32(math.MaxInt32))
+	// One exemplar per point with these IDs is what the seeds below used
+	// before exemplar IDs and counts were fuzzed.
+	fixedIDs := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 1, 2, 3, 4, 5, 6, 7, 8}
+	f.Add("gen_ai.client.token.usage", "{token}", "gen_ai.token.type", "input", int64(120), 0.5, uint64(3), int64(1700000000000000000), int64(1699999990000000000), uint8(0), uint8(4), int32(2), int32(-1), fixedIDs, uint8(1))
+	f.Add("", "", "", "", int64(-10), math.NaN(), uint64(0), int64(0), int64(0), uint8(1), uint8(0), int32(0), int32(0), fixedIDs, uint8(1))
+	f.Add("m\x00\xff", "\xffu", "k\xff", "secret-token 123-45-6789", int64(math.MaxInt64), math.Inf(1), uint64(math.MaxUint64), int64(1700000005000000000), int64(-1), uint8(255), uint8(255), int32(math.MinInt32), int32(math.MaxInt32), fixedIDs, uint8(1))
+	// GenAI token usage split by modality, with valid, empty, partial and
+	// overlong exemplar IDs and up to four exemplars per point.
+	f.Add("gen_ai.client.inference.usage.input_tokens", "{token}", "gen_ai.token.modality", "text", int64(2048), 2048.0, uint64(1), int64(1700000000000000000), int64(1699999990000000000), uint8(0), uint8(6), int32(0), int32(0), fixedIDs, uint8(2))
+	f.Add("gen_ai.client.inference.usage.reasoning.output_tokens", "{token}", "gen_ai.token.modality", "image", int64(512), 512.0, uint64(4), int64(1700000000000000000), int64(1699999990000000000), uint8(0), uint8(3), int32(1), int32(0), []byte(nil), uint8(3))
+	f.Add("gen_ai.client.inference.usage.input_tokens", "{token}", "gen_ai.token.modality", "audio", int64(96), 96.5, uint64(2), int64(1700000000000000000), int64(1699999990000000000), uint8(1), uint8(2), int32(-2), int32(3), []byte{0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0x0a}, uint8(4))
+	f.Add("gen_ai.client.inference.usage.reasoning.output_tokens", "{token}", "gen_ai.token.modality", "text", int64(7), 7.0, uint64(1), int64(1700000000000000000), int64(0), uint8(0), uint8(1), int32(0), int32(0), []byte("0123456789abcdefghij"), uint8(1))
 
-	f.Fuzz(func(t *testing.T, name, unit, key, val string, intVal int64, dblVal float64, count uint64, ts, start int64, flags, buckets uint8, scale, offset int32) {
+	f.Fuzz(func(t *testing.T, name, unit, key, val string, intVal int64, dblVal float64, count uint64, ts, start int64, flags, buckets uint8, scale, offset int32, exemplarIDs []byte, exemplars uint8) {
 		in := metricFuzzInput{
 			name: name, unit: unit, key: key, val: val,
 			intVal: intVal, dblVal: dblVal, count: count,
 			ts: ts, start: start, flags: flags, buckets: buckets,
 			scale: scale, offset: offset,
+			exemplarIDs: exemplarIDs, exemplars: exemplars,
 		}
 		md := in.build()
 		points := md.DataPointCount()
@@ -606,11 +637,29 @@ func FuzzMetricRows(f *testing.F) {
 		if !bytes.Equal(before, after) {
 			t.Fatal("MetricRows with a Redactor mutated the caller's batch")
 		}
+
+		// Redacted fingerprints are as reproducible as plain ones.
+		ragain, _ := MetricRows(secret, opts)
+		if !slices.Equal(metricFingerprints(rrows), metricFingerprints(ragain)) {
+			t.Fatal("a second redacted MetricRows over the same batch produced different fingerprints")
+		}
+
+		// MetricRows redacts before it reads anything, so its result matches
+		// that of a batch redacted up front and converted without a Redactor.
+		upfront := opts
+		upfront.Redactor = nil
+		urows, urejects := MetricRows(opts.Redactor.Metrics(secret), upfront)
+		if !slices.Equal(metricFingerprints(rrows), metricFingerprints(urows)) {
+			t.Fatal("redacting inside MetricRows and redacting up front produced different fingerprints")
+		}
+		if !slices.Equal(rrejects, urejects) {
+			t.Fatalf("redacting inside MetricRows rejected %v, redacting up front %v", rrejects, urejects)
+		}
 	})
 }
 
 func BenchmarkMetricRows(b *testing.B) {
-	md := benchMetrics()
+	md := benchMetrics(false)
 	opts := Options{
 		Limits: DefaultLimits(),
 		Now:    func() time.Time { return time.Unix(1700000000, 0).UTC() },
@@ -625,10 +674,116 @@ func BenchmarkMetricRows(b *testing.B) {
 	}
 }
 
-// benchMetrics is the ten-point GenAI batch the metric benchmark shares:
+// BenchmarkMetricRowsRedactionEnabled measures the redaction step on the same
+// fixture as BenchmarkMetricRows. "nomatch" is the hot path that must stay
+// allocation-neutral relative to the baseline; "match" pays one batch clone.
+func BenchmarkMetricRowsRedactionEnabled(b *testing.B) {
+	for _, tc := range []struct {
+		name       string
+		withSecret bool
+	}{
+		{"nomatch", false},
+		{"match", true},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			md := benchMetrics(tc.withSecret)
+			opts := Options{
+				Limits:   DefaultLimits(),
+				Now:      func() time.Time { return time.Unix(1700000000, 0).UTC() },
+				Redactor: fuzzRedactor(b),
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				rows, rejects := MetricRows(md, opts)
+				if len(rows) != 10 || len(rejects) != 0 {
+					b.Fatalf("unexpected result: rows=%d rejects=%d", len(rows), len(rejects))
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkMetricRowsHighCardinality measures a batch whose attribute values
+// never repeat: 1,000 histogram points in one metric, each with 50 attributes
+// whose values are unique to the point and 4 exemplars with distinct trace
+// and span IDs.
+func BenchmarkMetricRowsHighCardinality(b *testing.B) {
+	const points = 1000
+	md := benchHighCardinalityMetrics(points, 50, 4)
+	opts := Options{
+		Limits: DefaultLimits(),
+		Now:    func() time.Time { return time.Unix(1700000000, 0).UTC() },
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rows, rejects := MetricRows(md, opts)
+		if len(rows) != points || len(rejects) != 0 {
+			b.Fatalf("unexpected result: rows=%d rejects=%d", len(rows), len(rejects))
+		}
+	}
+}
+
+// benchHighCardinalityMetrics returns one GenAI token-usage histogram with
+// the given number of points, each carrying attrs attributes valued uniquely
+// for the point and exemplars exemplars whose IDs no other exemplar shares.
+func benchHighCardinalityMetrics(points, attrs, exemplars int) pmetric.Metrics {
+	md := pmetric.NewMetrics()
+	rm := md.ResourceMetrics().AppendEmpty()
+	rm.Resource().Attributes().PutStr("service.name", "bench-agent")
+	rm.Resource().Attributes().PutStr("service.version", "1.0.0")
+	sm := rm.ScopeMetrics().AppendEmpty()
+	sm.Scope().SetName("opentelemetry.instrumentation.genai")
+	m := sm.Metrics().AppendEmpty()
+	m.SetName("gen_ai.client.token.usage")
+	m.SetUnit("{token}")
+	h := m.SetEmptyHistogram()
+	h.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
+
+	const base = pcommon.Timestamp(1700000000000000000)
+	bounds := []float64{1, 4, 16, 64, 256, 1024, 4096, 16384, 65536}
+	counts := []uint64{0, 1, 3, 9, 20, 11, 4, 2, 1, 0}
+	keys := make([]string, attrs)
+	for k := range keys {
+		keys[k] = "bench.attribute." + strconv.Itoa(k)
+	}
+	for p := range points {
+		dp := h.DataPoints().AppendEmpty()
+		dp.SetStartTimestamp(base)
+		dp.SetTimestamp(base + pcommon.Timestamp(p+1)*1_000_000)
+		dp.SetCount(51)
+		dp.SetSum(4217)
+		dp.SetMin(1)
+		dp.SetMax(40000)
+		dp.ExplicitBounds().FromRaw(bounds)
+		dp.BucketCounts().FromRaw(counts)
+		suffix := "-point-" + strconv.Itoa(p)
+		for k, key := range keys {
+			dp.Attributes().PutStr(key, "value-"+strconv.Itoa(k)+suffix)
+		}
+		for e := range exemplars {
+			id := uint64(p*exemplars + e + 1)
+			var traceID pcommon.TraceID
+			var spanID pcommon.SpanID
+			binary.BigEndian.PutUint64(traceID[8:], id)
+			binary.BigEndian.PutUint64(spanID[:], id)
+			ex := dp.Exemplars().AppendEmpty()
+			ex.SetTimestamp(dp.Timestamp())
+			ex.SetDoubleValue(float64(512 + e))
+			ex.SetTraceID(traceID)
+			ex.SetSpanID(spanID)
+		}
+	}
+	return md
+}
+
+// benchMetrics is the ten-point GenAI batch the metric benchmarks share:
 // token-usage and operation-duration histograms that carry exemplars, plus one
-// point of each other metric type.
-func benchMetrics() pmetric.Metrics {
+// point of each other metric type. With withSecret every point also carries a
+// blocked key and a pattern-matching value so the redaction clone path is
+// exercised on every record.
+func benchMetrics(withSecret bool) pmetric.Metrics {
 	md := pmetric.NewMetrics()
 	rm := md.ResourceMetrics().AppendEmpty()
 	rm.Resource().Attributes().PutStr("service.name", "bench-agent")
@@ -646,6 +801,10 @@ func benchMetrics() pmetric.Metrics {
 		m.PutStr("gen_ai.operation.name", "chat")
 		m.PutStr("gen_ai.request.model", "gemini-2.5-pro")
 		m.PutStr("gen_ai.token.type", tokenTypes[i%2])
+		if withSecret {
+			m.PutStr("http.request.header.authorization", "Bearer secret-bench-token")
+			m.PutStr("api_key", "k-bench")
+		}
 	}
 
 	histogram := func(name, unit string, points int) {

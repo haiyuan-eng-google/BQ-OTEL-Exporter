@@ -1,0 +1,9 @@
+go test fuzz v1
+string("execute_tool list_tables")
+string("mcp")
+string("")
+int64(0)
+int64(0)
+byte('\x03')
+int64(1791720000000000000)
+int64(1791720000001000000)

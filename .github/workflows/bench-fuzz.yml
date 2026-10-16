@@ -15,6 +15,9 @@ jobs:
   bench:
     name: Benchmark Smoke & Budget
     runs-on: ubuntu-latest
+    env:
+      # Space-separated, so it is expanded unquoted below.
+      BENCH_PKGS: ./internal/otlpjson ./internal/transform ./internal/protoenc ./internal/bigquery ./internal/redact
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -23,7 +26,46 @@ jobs:
           cache: true
       - name: Run microbenchmarks
         run: |
-          go test -run='^$' -bench=. -benchmem -benchtime=100ms ./internal/otlpjson ./internal/transform ./internal/protoenc ./internal/bigquery
+          set -o pipefail
+          # Pull requests repeat each benchmark so benchstat has samples to
+          # compare against the base branch below.
+          COUNT=1
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            COUNT=6
+          fi
+          go test -run='^$' -bench=. -benchmem -benchtime=100ms -count="${COUNT}" ${BENCH_PKGS} | tee "${RUNNER_TEMP}/bench-head.txt"
+      # Shared runners are too noisy to gate on timings, so the comparison only
+      # reports: the table goes to the job summary, and a benchmark more than
+      # 20% slower than on the base branch raises a warning annotation.
+      - name: Compare with the base branch (warn-only)
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        run: |
+          git fetch --no-tags --depth=1 origin "+refs/heads/${GITHUB_BASE_REF}:refs/remotes/origin/${GITHUB_BASE_REF}"
+          git worktree add --detach "${RUNNER_TEMP}/base" "origin/${GITHUB_BASE_REF}"
+          if ! (cd "${RUNNER_TEMP}/base" && go test -run='^$' -bench=. -benchmem -benchtime=100ms -count=6 ${BENCH_PKGS}) > "${RUNNER_TEMP}/bench-base.txt"; then
+            echo "::warning::Benchmarks failed on ${GITHUB_BASE_REF}; the comparison covers only the benchmarks that ran there."
+          fi
+          go run golang.org/x/perf/cmd/benchstat@latest base="${RUNNER_TEMP}/bench-base.txt" head="${RUNNER_TEMP}/bench-head.txt" > "${RUNNER_TEMP}/benchstat.txt"
+          {
+            echo "### Benchmarks against ${GITHUB_BASE_REF} (warn-only)"
+            echo
+            echo '```'
+            cat "${RUNNER_TEMP}/benchstat.txt"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+          # Only the sec/op table counts; "~" marks a change benchstat does not
+          # consider significant, so only signed percentages are compared.
+          awk -v base="${GITHUB_BASE_REF}" '
+            /vs base/ { timing = ($0 ~ /sec\/op/); next }
+            timing && $1 != "geomean" {
+              for (i = 2; i <= NF; i++) {
+                if ($i ~ /^\+[0-9.]+%$/ && substr($i, 2) + 0 > 20) {
+                  printf "::warning::%s is %s slower than on %s\n", $1, $i, base
+                }
+              }
+            }
+          ' "${RUNNER_TEMP}/benchstat.txt"
 
   fuzz:
     name: Bounded Native Fuzzing
@@ -46,6 +88,10 @@ jobs:
             target: FuzzProtoEncRoundTrip
           - pkg: ./internal/bigquery
             target: FuzzSplitRequests
+          - pkg: ./internal/redact
+            target: FuzzRedact
+          - pkg: ./internal/quarantinereplay
+            target: FuzzQuarantineReplayRow
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -59,3 +105,13 @@ jobs:
             F_TIME="30s"
           fi
           go test "${{ matrix.pkg }}" -run="^${{ matrix.target }}$" -fuzz="^${{ matrix.target }}$" -fuzztime="${F_TIME}"
+      # A failing input is written to <pkg>/testdata/fuzz/<target>/ on the
+      # runner. Download the artifact into the repository root and rerun the
+      # target with plain `go test` to reproduce the failure.
+      - name: Upload failing fuzz corpus
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-corpus-${{ matrix.target }}
+          path: '**/testdata/fuzz/${{ matrix.target }}/**'
+          if-no-files-found: ignore

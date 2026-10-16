@@ -1,0 +1,6 @@
+go test fuzz v1
+[]byte("\x80\v\x03128\x80\f\x05input")
+string("Bearer ")
+string("*")
+string("\\Q(unterminated")
+byte('1')

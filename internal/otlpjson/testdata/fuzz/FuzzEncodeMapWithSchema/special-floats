@@ -1,0 +1,7 @@
+go test fuzz v1
+string("metric.value")
+string("NaN")
+int64(-9223372036854775808)
+float64(+Inf)
+bool(true)
+[]byte("\x00")

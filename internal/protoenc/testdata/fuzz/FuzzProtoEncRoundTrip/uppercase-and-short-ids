@@ -1,0 +1,7 @@
+go test fuzz v1
+string("4BF92F3577B34DA6")
+string("00F0")
+string("execute_tool list_tables")
+int64(1)
+int64(-1)
+string("[]")

@@ -1,0 +1,7 @@
+go test fuzz v1
+string("gen_ai.prompt")
+string("[{\"role\":\"user\",\"content\":\"Summarize Q3\"}]")
+int64(1024)
+float64(0.875)
+bool(true)
+[]byte("{\"k\":\"v\"}")

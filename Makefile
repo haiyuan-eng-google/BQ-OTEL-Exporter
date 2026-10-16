@@ -101,9 +101,53 @@ vuln:
 bench:
 	$(GOTEST) -run '^$$' -bench . -benchmem ./...
 
+# Compares benchmarks with benchstat. Given two saved `go test -bench` outputs,
+# it compares just those:
+#
+#   make bench-compare BASE=old.txt HEAD=new.txt
+#
+# Otherwise it runs the benchmarks in BENCH_PKGS BENCH_COUNT times each at
+# BASE_REF, checked out in a temporary worktree, and in the working tree, and
+# compares the two runs. On a branch of several commits, set BASE_REF to the
+# branch point, for example BASE_REF=origin/main. Set BENCHSTAT to an installed
+# benchstat binary to skip `go run`.
+BASE_REF    ?= HEAD~1
+BENCH_PKGS  ?= ./...
+BENCH_COUNT ?= 6
+BENCH_TIME  ?= 100ms
+BENCHSTAT   ?= $(GOCMD) run golang.org/x/perf/cmd/benchstat@latest
+.PHONY: bench-compare
+bench-compare:
+	@set -e; \
+	if [ -n "$(BASE)$(HEAD)" ]; then \
+		if [ -z "$(BASE)" ] || [ -z "$(HEAD)" ]; then \
+			echo "bench-compare: set both BASE and HEAD, or neither" >&2; \
+			exit 2; \
+		fi; \
+		$(BENCHSTAT) base="$(BASE)" head="$(HEAD)"; \
+		exit 0; \
+	fi; \
+	tmp=$$(mktemp -d); \
+	trap 'git worktree remove --force "$$tmp/base" 2>/dev/null; rm -rf "$$tmp"' EXIT; \
+	trap 'exit 130' HUP INT TERM; \
+	git worktree add --detach --quiet "$$tmp/base" "$(BASE_REF)"; \
+	echo "==> $(BASE_REF)"; \
+	if ! (cd "$$tmp/base" && $(GOTEST) -run '^$$' -bench . -benchmem -count $(BENCH_COUNT) -benchtime $(BENCH_TIME) $(BENCH_PKGS)) > "$$tmp/base.txt" 2>&1; then \
+		cat "$$tmp/base.txt" >&2; \
+		exit 1; \
+	fi; \
+	echo "==> working tree"; \
+	if ! $(GOTEST) -run '^$$' -bench . -benchmem -count $(BENCH_COUNT) -benchtime $(BENCH_TIME) $(BENCH_PKGS) > "$$tmp/head.txt" 2>&1; then \
+		cat "$$tmp/head.txt" >&2; \
+		exit 1; \
+	fi; \
+	$(BENCHSTAT) base="$$tmp/base.txt" head="$$tmp/head.txt"
+
 # Runs each fuzz target for FUZZTIME. Go fuzzes one target per invocation, so
 # the targets of every package are discovered with `go test -list`. Packages
-# without fuzz targets are skipped.
+# without fuzz targets are skipped. A new target needs no change here, but CI
+# fuzzes only the targets listed in .github/workflows/bench-fuzz.yml, which
+# TestBenchFuzzWorkflowListsEveryFuzzTarget keeps complete.
 FUZZTIME ?= 30s
 .PHONY: fuzz
 fuzz:

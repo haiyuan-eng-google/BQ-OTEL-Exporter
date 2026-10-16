@@ -1,0 +1,7 @@
+go test fuzz v1
+string("gen_ai.user.message")
+string("")
+string("")
+string("")
+int64(0)
+int64(1791720000000000000)

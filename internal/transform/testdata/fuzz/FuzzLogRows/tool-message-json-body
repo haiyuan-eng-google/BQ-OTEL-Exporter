@@ -1,0 +1,7 @@
+go test fuzz v1
+string("gen_ai.tool.message")
+string("{\"role\":\"tool\",\"id\":\"call_1\",\"content\":{\"rows\":42}}")
+string("sess-multi-agent-7")
+string("inv-planner-3")
+int64(1791720000000000000)
+int64(1791720000000100000)

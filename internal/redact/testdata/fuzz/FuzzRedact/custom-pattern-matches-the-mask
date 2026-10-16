@@ -1,0 +1,6 @@
+go test fuzz v1
+[]byte("\x00\x04note\x12[REDACTED] and ***\x81\x0e\x00\x11session.cookie_id\x03abc")
+string(" *** ")
+string("session.cookie_id")
+string("\\[REDACTED\\]|\\*{3}")
+byte('"')

@@ -1,0 +1,7 @@
+go test fuzz v1
+string("")
+string("")
+string("résumé ✓ 你好 🚀")
+int64(-1500000000)
+int64(1791720000000000)
+string("{\"emoji\":\"🚀\"}")

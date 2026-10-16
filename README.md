@@ -792,3 +792,23 @@ authorization result.
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+### Fuzzing and benchmarks
+
+- `make fuzz` runs every fuzz target in the module for `FUZZTIME` (default
+  `30s`) each, for example `make fuzz FUZZTIME=2m`. It finds the targets with
+  `go test -list`, so a new target needs no Makefile change.
+- `make bench-compare` runs the benchmarks `BENCH_COUNT` times (default 6) at
+  `BASE_REF` (default `HEAD~1`) and in the working tree, and compares the two
+  runs with `benchstat`. `make bench-compare BASE=old.txt HEAD=new.txt`
+  compares two saved `go test -bench` outputs instead. On pull requests, CI
+  writes the same comparison against the base branch to the job summary and
+  warns about benchmarks more than 20% slower, without failing the build.
+- To add a fuzz target, list it under `jobs.fuzz.strategy.matrix.include` in
+  [`.github/workflows/bench-fuzz.yml`](.github/workflows/bench-fuzz.yml), and
+  commit at least one seed input under `<package>/testdata/fuzz/<FuzzTarget>/`:
+  a `go test fuzz v1` header line followed by one Go literal per argument, as
+  in the existing files. `TestBenchFuzzWorkflowListsEveryFuzzTarget` fails until
+  both are in place. When CI fuzzing fails, the job uploads the failing input
+  as the `fuzz-corpus-<FuzzTarget>` artifact; unzip it at the repository root
+  and run `go test ./<package> -run=<FuzzTarget>` to reproduce the failure.
