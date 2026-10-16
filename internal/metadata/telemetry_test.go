@@ -53,14 +53,18 @@ func TestTelemetryRecordsEveryInstrument(t *testing.T) {
 	tel.RecordRedactedValues(ctx, "spans", "key", 4)
 	tel.RecordRedactedValues(ctx, "spans", "value", 2)
 	tel.RecordRedactedValues(ctx, "spans", "key", 0) // ignored
+	tel.RecordBackpressureLevel(ctx, "spans", "otel_spans", 0.5)
+	tel.RecordEffectiveRequestBytes(ctx, "spans", "otel_spans", 4194304)
+	tel.RecordEffectiveRequestBytes(ctx, "spans", "otel_spans", 0) // ignored
+	tel.RecordBackpressureEvent(ctx, "spans", "otel_spans", "throttle")
 
 	var resourceMetrics metricdata.ResourceMetrics
 	if err := reader.Collect(ctx, &resourceMetrics); err != nil {
 		t.Fatal(err)
 	}
 	metrics := metricsByName(resourceMetrics)
-	if len(metrics) != 17 {
-		t.Fatalf("collected %d metrics, want 17: %v", len(metrics), metricNames(metrics))
+	if len(metrics) != 20 {
+		t.Fatalf("collected %d metrics, want 20: %v", len(metrics), metricNames(metrics))
 	}
 
 	assertIntSum(t, metrics[nameAcknowledgedRows], 5, nil)
@@ -78,6 +82,19 @@ func TestTelemetryRecordsEveryInstrument(t *testing.T) {
 	assertIntSum(t, metrics[nameOffloadedBytes], 8192, nil)
 	assertIntSum(t, metrics[nameOffloadDedupHits], 3, []attribute.KeyValue{attribute.String(AttrSignal, "spans")})
 	assertIntSum(t, metrics[nameOffloadErrors], 1, []attribute.KeyValue{attribute.String(AttrClass, "unavailable")})
+	assertFloatGauge(t, metrics[nameBackpressureLevel], 0.5, []attribute.KeyValue{
+		attribute.String(AttrSignal, "spans"),
+		attribute.String(AttrTable, "otel_spans"),
+	})
+	assertIntGauge(t, metrics[nameEffectiveRequestBytes], 4194304, []attribute.KeyValue{
+		attribute.String(AttrSignal, "spans"),
+		attribute.String(AttrTable, "otel_spans"),
+	})
+	assertIntSum(t, metrics[nameBackpressureEvents], 1, []attribute.KeyValue{
+		attribute.String(AttrSignal, "spans"),
+		attribute.String(AttrTable, "otel_spans"),
+		attribute.String(AttrTrigger, "throttle"),
+	})
 	redacted, ok := metrics[nameRedactedValues].Data.(metricdata.Sum[int64])
 	if !ok || len(redacted.DataPoints) != 2 || !redacted.IsMonotonic {
 		t.Fatalf("redacted_values data = %#v, want a monotonic sum with one point per match type", metrics[nameRedactedValues].Data)
@@ -138,6 +155,9 @@ func TestNilTelemetryIsSafe(_ *testing.T) {
 	tel.RecordOffloadDedupHit(ctx, "spans", 1)
 	tel.RecordOffloadError(ctx, "y", 1)
 	tel.RecordRedactedValues(ctx, "spans", "key", 1)
+	tel.RecordBackpressureLevel(ctx, "spans", "otel_spans", 0.5)
+	tel.RecordEffectiveRequestBytes(ctx, "spans", "otel_spans", 1024)
+	tel.RecordBackpressureEvent(ctx, "spans", "otel_spans", "throttle")
 }
 
 // The instrument names in code must match the ones metadata.yaml documents.
@@ -168,6 +188,9 @@ func TestMetricNamesMatchMetadataYAML(t *testing.T) {
 		nameOffloadDedupHits,
 		nameOffloadErrors,
 		nameRedactedValues,
+		nameBackpressureLevel,
+		nameEffectiveRequestBytes,
+		nameBackpressureEvents,
 	} {
 		if !strings.Contains(doc, name+":") {
 			t.Errorf("metric %q is emitted in code but not declared in metadata.yaml", name)
@@ -202,6 +225,38 @@ func assertIntSum(t *testing.T, metric metricdata.Metrics, want int64, attrs []a
 	point := sum.DataPoints[0]
 	if point.Value != want {
 		t.Errorf("%s value = %d, want %d", metric.Name, point.Value, want)
+	}
+	wantAttrs := attribute.NewSet(attrs...)
+	if !point.Attributes.Equals(&wantAttrs) {
+		t.Errorf("%s attributes = %v, want %v", metric.Name, point.Attributes.ToSlice(), attrs)
+	}
+}
+
+func assertIntGauge(t *testing.T, metric metricdata.Metrics, want int64, attrs []attribute.KeyValue) {
+	t.Helper()
+	gauge, ok := metric.Data.(metricdata.Gauge[int64])
+	if !ok || len(gauge.DataPoints) != 1 {
+		t.Fatalf("%s data = %#v, want one int64 gauge point", metric.Name, metric.Data)
+	}
+	point := gauge.DataPoints[0]
+	if point.Value != want {
+		t.Errorf("%s value = %d, want %d", metric.Name, point.Value, want)
+	}
+	wantAttrs := attribute.NewSet(attrs...)
+	if !point.Attributes.Equals(&wantAttrs) {
+		t.Errorf("%s attributes = %v, want %v", metric.Name, point.Attributes.ToSlice(), attrs)
+	}
+}
+
+func assertFloatGauge(t *testing.T, metric metricdata.Metrics, want float64, attrs []attribute.KeyValue) {
+	t.Helper()
+	gauge, ok := metric.Data.(metricdata.Gauge[float64])
+	if !ok || len(gauge.DataPoints) != 1 {
+		t.Fatalf("%s data = %#v, want one float64 gauge point", metric.Name, metric.Data)
+	}
+	point := gauge.DataPoints[0]
+	if point.Value != want {
+		t.Errorf("%s value = %v, want %v", metric.Name, point.Value, want)
 	}
 	wantAttrs := attribute.NewSet(attrs...)
 	if !point.Attributes.Equals(&wantAttrs) {

@@ -57,6 +57,13 @@ const (
 	defaultEnableMultiplexing = true
 	defaultConnectionPoolSize = 4
 
+	// Defaults for optional adaptive AIMD write backpressure.
+	defaultBackpressureMinRequestBytes     = 1024 * 1024
+	defaultBackpressureMinInflightRequests = 1
+	defaultBackpressureDecreaseFactor      = 0.5
+	defaultBackpressureRecoveryInterval    = 10 * time.Second
+	defaultBackpressureLatencyThreshold    = 2 * time.Second
+
 	// defaultMaxElapsedTime sits deliberately above the ten-minute outage the
 	// reliability journey exercises. Horizon expiry is terminal — the
 	// persistent queue deletes the item — so a sub-outage horizon would break
@@ -101,6 +108,13 @@ func createDefaultConfig() component.Config {
 			MaxInflightBytes:    defaultMaxInflightBytes,
 			EnableMultiplexing:  defaultEnableMultiplexing,
 			ConnectionPoolSize:  defaultConnectionPoolSize,
+			Backpressure: BackpressureConfig{
+				MinRequestBytes:     defaultBackpressureMinRequestBytes,
+				MinInflightRequests: defaultBackpressureMinInflightRequests,
+				DecreaseFactor:      defaultBackpressureDecreaseFactor,
+				RecoveryInterval:    defaultBackpressureRecoveryInterval,
+				LatencyThreshold:    defaultBackpressureLatencyThreshold,
+			},
 		},
 		Limits: LimitsConfig{
 			MaxAttributeCount:    limits.MaxAttributeCount,

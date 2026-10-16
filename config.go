@@ -232,6 +232,32 @@ type WriteConfig struct {
 	// Keepalive configures gRPC client keepalive parameters for Storage
 	// Write streams.
 	Keepalive KeepaliveConfig `mapstructure:"keepalive"`
+	// Backpressure configures optional adaptive AIMD request sizing and
+	// in-flight concurrency control under Storage Write API congestion.
+	Backpressure BackpressureConfig `mapstructure:"backpressure"`
+}
+
+// BackpressureConfig configures optional adaptive AIMD batch sizing and
+// concurrency control for Storage Write API appends.
+type BackpressureConfig struct {
+	// Enabled turns on adaptive AIMD adjustment of effective request bytes
+	// and effective in-flight request count.
+	Enabled bool `mapstructure:"enabled"`
+	// MinRequestBytes is the AIMD floor for the effective per-request byte
+	// split threshold. Must be positive and <= write.max_request_bytes.
+	MinRequestBytes int `mapstructure:"min_request_bytes"`
+	// MinInflightRequests is the AIMD floor for effective concurrent
+	// AppendRows sub-requests. Must be >= 1 and <= write.max_inflight_requests.
+	MinInflightRequests int `mapstructure:"min_inflight_requests"`
+	// DecreaseFactor is the multiplicative decrease factor applied on
+	// throttle or slow-ack signals. Must be in (0.0, 1.0).
+	DecreaseFactor float64 `mapstructure:"decrease_factor"`
+	// RecoveryInterval is the minimum elapsed time between additive recovery
+	// steps on clean acknowledgements. Must be positive.
+	RecoveryInterval time.Duration `mapstructure:"recovery_interval"`
+	// LatencyThreshold triggers a multiplicative decrease when an AppendResult
+	// acknowledgement exceeds this duration (0 disables latency-based decrease).
+	LatencyThreshold time.Duration `mapstructure:"latency_threshold"`
 }
 
 // KeepaliveConfig configures gRPC client keepalive parameters.
@@ -417,6 +443,7 @@ func (cfg *Config) Validate() error {
 
 	errs = append(errs, cfg.validateGovernance()...)
 	errs = append(errs, cfg.validateWrite()...)
+	errs = append(errs, cfg.validateBackpressure()...)
 	errs = append(errs, cfg.validateCredentials()...)
 	errs = append(errs, cfg.validateEndpoint()...)
 	errs = append(errs, cfg.validateQuarantine()...)
@@ -601,6 +628,51 @@ func (cfg *Config) validateWrite() []error {
 	}
 	if w.Keepalive.Timeout < 0 {
 		errs = append(errs, errors.New("write.keepalive.timeout must not be negative"))
+	}
+	return errs
+}
+
+func (cfg *Config) validateBackpressure() []error {
+	var errs []error
+	w := cfg.Write
+	b := w.Backpressure
+
+	if b.MinRequestBytes < 0 {
+		errs = append(errs, errors.New("write.backpressure.min_request_bytes must not be negative"))
+	}
+	if b.MinInflightRequests < 0 {
+		errs = append(errs, errors.New("write.backpressure.min_inflight_requests must not be negative"))
+	}
+	if b.RecoveryInterval < 0 {
+		errs = append(errs, errors.New("write.backpressure.recovery_interval must not be negative"))
+	}
+	if b.LatencyThreshold < 0 {
+		errs = append(errs, errors.New("write.backpressure.latency_threshold must not be negative"))
+	}
+	if !b.Enabled {
+		return errs
+	}
+	if b.MinRequestBytes <= 0 {
+		errs = append(errs, errors.New("write.backpressure.min_request_bytes must be positive when write.backpressure.enabled is set"))
+	} else if w.MaxRequestBytes > 0 && b.MinRequestBytes > w.MaxRequestBytes {
+		errs = append(errs, fmt.Errorf(
+			"write.backpressure.min_request_bytes (%d) must not exceed write.max_request_bytes (%d)",
+			b.MinRequestBytes, w.MaxRequestBytes))
+	}
+	if b.MinInflightRequests < 1 {
+		errs = append(errs, errors.New("write.backpressure.min_inflight_requests must be at least 1 when write.backpressure.enabled is set"))
+	} else if w.MaxInflightRequests > 0 && b.MinInflightRequests > w.MaxInflightRequests {
+		errs = append(errs, fmt.Errorf(
+			"write.backpressure.min_inflight_requests (%d) must not exceed write.max_inflight_requests (%d)",
+			b.MinInflightRequests, w.MaxInflightRequests))
+	}
+	if b.DecreaseFactor <= 0 || b.DecreaseFactor >= 1.0 {
+		errs = append(errs, fmt.Errorf(
+			"write.backpressure.decrease_factor (%v) must be strictly between 0 and 1",
+			b.DecreaseFactor))
+	}
+	if b.RecoveryInterval <= 0 {
+		errs = append(errs, errors.New("write.backpressure.recovery_interval must be positive when write.backpressure.enabled is set"))
 	}
 	return errs
 }

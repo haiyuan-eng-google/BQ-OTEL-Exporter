@@ -103,11 +103,14 @@ type fakeStream struct {
 type fakeObserver struct {
 	mu sync.Mutex
 
-	inflight    int64
-	unresolved  int64
-	waits       int
-	timeouts    int
-	retirements int
+	inflight           int64
+	unresolved         int64
+	waits              int
+	timeouts           int
+	retirements        int
+	backpressureEvents []string
+	backpressureLevel  float64
+	effectiveBytes     int64
 }
 
 func (o *fakeObserver) RecordInflightRequests(_ context.Context, delta int64) {
@@ -138,6 +141,24 @@ func (o *fakeObserver) RecordStreamRetirement(context.Context) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.retirements++
+}
+
+func (o *fakeObserver) RecordBackpressureLevel(_ context.Context, _, _ string, level float64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.backpressureLevel = level
+}
+
+func (o *fakeObserver) RecordEffectiveRequestBytes(_ context.Context, _, _ string, bytes int64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.effectiveBytes = bytes
+}
+
+func (o *fakeObserver) RecordBackpressureEvent(_ context.Context, _, _, trigger string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.backpressureEvents = append(o.backpressureEvents, trigger)
 }
 
 func (o *fakeObserver) snapshot() (inflight, unresolved int64, waits, timeouts, retirements int) {
@@ -1384,13 +1405,13 @@ func TestCanceledManagedStreamIsDistinguishedFromShutdown(t *testing.T) {
 	lifetimeCtx, cancelLifetime := context.WithCancel(context.Background())
 	w := &Writer{lifetimeCtx: lifetimeCtx}
 
-	v, ended := w.classifyAppendFailure(context.Background(), context.Canceled)
+	v, ended := w.classifyAppendFailure(context.Background(), context.Canceled, 1)
 	if ended || v.Label != LabelCanceled {
 		t.Fatalf("runtime cancellation = %s ended=%v, want %s/false", v.Label, ended, LabelCanceled)
 	}
 
 	cancelLifetime()
-	v, ended = w.classifyAppendFailure(context.Background(), context.Canceled)
+	v, ended = w.classifyAppendFailure(context.Background(), context.Canceled, 1)
 	if ended || v.Label != LabelShutdown {
 		t.Fatalf("shutdown cancellation = %s ended=%v, want %s/false", v.Label, ended, LabelShutdown)
 	}
@@ -1586,4 +1607,129 @@ func TestAppendStreamRecreateOutranksPermanentAndStopsDispatch(t *testing.T) {
 				out.Verdict, LabelSchemaMismatch)
 		}
 	})
+}
+
+func TestWriterAdaptiveBackpressureThrottleAndRecovery(t *testing.T) {
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	bp := NewBackpressureController(BackpressureOptions{
+		MinRequestBytes:     200,
+		MaxRequestBytes:     800,
+		MinInflightRequests: 1,
+		MaxInflightRequests: 4,
+		DecreaseFactor:      0.5,
+		RecoveryInterval:    10 * time.Second,
+		LatencyThreshold:    2 * time.Second,
+		Now:                 func() time.Time { return now },
+	})
+	obs := &fakeObserver{}
+
+	quotaErr := status.Error(codes.ResourceExhausted, throughputQuotaPrefix+" for project x")
+	s := &fakeStream{
+		results: []appendResult{
+			fakeResult{err: quotaErr},
+			fakeResult{},
+			fakeResult{},
+		},
+	}
+	w := &Writer{
+		opts: WriterOptions{
+			Project:             "p",
+			Dataset:             "d",
+			Table:               "otel_spans",
+			Signal:              "spans",
+			MaxRequestBytes:     800,
+			MaxInflightRequests: 4,
+			Observer:            obs,
+			Backpressure:        bp,
+		},
+		factory: func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+			return s, nil
+		},
+	}
+	defer func() { _ = w.Close() }()
+
+	// 4 rows of 120 bytes each -> fits in one 800-byte request initially.
+	row := make([]byte, 120)
+	first := w.Append(context.Background(), [][]byte{row, row, row, row})
+	if first.Err == nil || first.Verdict.Class != Retryable || first.Verdict.Label != LabelQuota {
+		t.Fatalf("first Append outcome = %+v, want retryable quota_exhausted", first)
+	}
+	if s.calls != 1 {
+		t.Fatalf("AppendRows calls on 1st attempt = %d, want 1 (no internal retry)", s.calls)
+	}
+	if got := bp.EffectiveRequestBytes(); got != 400 {
+		t.Fatalf("EffectiveRequestBytes() after throttle = %d, want 400", got)
+	}
+	if got := bp.EffectiveInflightRequests(); got != 2 {
+		t.Fatalf("EffectiveInflightRequests() after throttle = %d, want 2", got)
+	}
+
+	// Second attempt (simulating exporterhelper retry) splits the same 4 rows
+	// under the 400-byte effective limit into 2 sub-requests of 2 rows each.
+	now = now.Add(11 * time.Second)
+	second := w.Append(context.Background(), [][]byte{row, row, row, row})
+	if second.Err != nil || second.AcknowledgedRows != 4 {
+		t.Fatalf("second Append outcome = %+v, want 4 acknowledged rows", second)
+	}
+	if s.calls != 3 {
+		t.Fatalf("total AppendRows calls = %d, want 3 (1 failed + 2 split sub-requests)", s.calls)
+	}
+	// Clean ack after RecoveryInterval stepped effective bytes up from 400 to 460 (+10% of 600 span).
+	if got := bp.EffectiveRequestBytes(); got != 460 {
+		t.Fatalf("EffectiveRequestBytes() after recovery = %d, want 460", got)
+	}
+
+	obs.mu.Lock()
+	events := append([]string(nil), obs.backpressureEvents...)
+	obs.mu.Unlock()
+	if !reflect.DeepEqual(events, []string{"throttle", "recovery"}) {
+		t.Fatalf("backpressure events = %v, want [throttle recovery]", events)
+	}
+}
+
+func TestWriterAdaptiveBackpressureOversizeMultiRowRetryable(t *testing.T) {
+	bp := NewBackpressureController(BackpressureOptions{
+		MinRequestBytes:     200,
+		MaxRequestBytes:     800,
+		MinInflightRequests: 1,
+		MaxInflightRequests: 4,
+		DecreaseFactor:      0.5,
+		RecoveryInterval:    10 * time.Second,
+	})
+	oversizeErr := status.Error(codes.ResourceExhausted, "Request payload size exceeds the limit: 10485760 bytes.")
+	s := &fakeStream{
+		results: []appendResult{
+			fakeResult{err: oversizeErr},
+			fakeResult{err: oversizeErr},
+		},
+	}
+	w := &Writer{
+		opts: WriterOptions{
+			Project:             "p",
+			Dataset:             "d",
+			Table:               "otel_spans",
+			Signal:              "spans",
+			MaxRequestBytes:     800,
+			MaxInflightRequests: 4,
+			Backpressure:        bp,
+		},
+		factory: func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+			return s, nil
+		},
+	}
+	defer func() { _ = w.Close() }()
+
+	row := make([]byte, 100)
+	multiOut := w.Append(context.Background(), [][]byte{row, row})
+	if multiOut.Verdict.Class != Retryable || multiOut.Verdict.Label != LabelOversizeRequest {
+		t.Fatalf("multi-row oversize verdict = %+v, want Retryable/oversize_request", multiOut.Verdict)
+	}
+	if got := bp.EffectiveRequestBytes(); got != 400 {
+		t.Fatalf("EffectiveRequestBytes() after multi-row oversize = %d, want 400", got)
+	}
+
+	singleOut := w.Append(context.Background(), [][]byte{row})
+	if singleOut.Verdict.Class != Permanent || singleOut.Verdict.Label != LabelQuota {
+		t.Fatalf("single-row oversize verdict = %+v, want Permanent/quota_exhausted", singleOut.Verdict)
+	}
 }

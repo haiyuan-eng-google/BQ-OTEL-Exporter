@@ -505,16 +505,34 @@ func (e *signalExporter) start(ctx context.Context, host component.Host) (err er
 	}
 	e.enc = enc
 
+	signal := signalForSchema(e.schema)
+	var bp *bqi.BackpressureController
+	if e.cfg.Write.Backpressure.Enabled {
+		bp = bqi.NewBackpressureController(bqi.BackpressureOptions{
+			MinRequestBytes:     e.cfg.Write.Backpressure.MinRequestBytes,
+			MaxRequestBytes:     e.cfg.Write.MaxRequestBytes,
+			MinInflightRequests: e.cfg.Write.Backpressure.MinInflightRequests,
+			MaxInflightRequests: e.cfg.Write.MaxInflightRequests,
+			DecreaseFactor:      e.cfg.Write.Backpressure.DecreaseFactor,
+			RecoveryInterval:    e.cfg.Write.Backpressure.RecoveryInterval,
+			LatencyThreshold:    e.cfg.Write.Backpressure.LatencyThreshold,
+		})
+		e.tel.RecordBackpressureLevel(lifetimeCtx, signal, e.table, bp.Level())
+		e.tel.RecordEffectiveRequestBytes(lifetimeCtx, signal, e.table, int64(bp.EffectiveRequestBytes()))
+	}
+
 	e.writer = bqi.NewWriter(lifetimeCtx, client, bqi.WriterOptions{
 		Project:             e.cfg.Project,
 		Dataset:             e.cfg.Dataset,
 		Table:               e.table,
+		Signal:              signal,
 		Descriptor:          enc.Descriptor(),
 		MaxRequestBytes:     e.cfg.Write.MaxRequestBytes,
 		MaxInflightRequests: e.cfg.Write.MaxInflightRequests,
 		MaxInflightBytes:    e.cfg.Write.MaxInflightBytes,
 		TraceID:             writeAPITraceID,
 		Observer:            e.tel,
+		Backpressure:        bp,
 	})
 
 	startedFields := []zap.Field{

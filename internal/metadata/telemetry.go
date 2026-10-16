@@ -74,6 +74,18 @@ type Telemetry struct {
 	// labels name the signal and whether a key or a value matched; the key
 	// name and the value itself are never recorded.
 	RedactedValues metric.Int64Counter
+
+	// BackpressureLevel reports the current AIMD backpressure level in
+	// [0.0, 1.0] for each signal and destination table.
+	BackpressureLevel metric.Float64Gauge
+
+	// EffectiveRequestBytes reports the current AIMD per-request byte split
+	// threshold for each signal and destination table.
+	EffectiveRequestBytes metric.Int64Gauge
+
+	// BackpressureEvents counts AIMD step-down and recovery transitions by
+	// signal, destination table, and trigger.
+	BackpressureEvents metric.Int64Counter
 }
 
 // Metric names, matching metadata.yaml.
@@ -95,6 +107,9 @@ const (
 	nameOffloadDedupHits      = "otelcol_exporter_bigquery_offload_dedup_hits"
 	nameOffloadErrors         = "otelcol_exporter_bigquery_offload_errors"
 	nameRedactedValues        = "otelcol_exporter_bigquery_redacted_values"
+	nameBackpressureLevel     = "otelcol_exporter_bigquery_backpressure_level"
+	nameEffectiveRequestBytes = "otelcol_exporter_bigquery_effective_request_bytes"
+	nameBackpressureEvents    = "otelcol_exporter_bigquery_backpressure_events"
 )
 
 // Label keys.
@@ -103,6 +118,8 @@ const (
 	AttrClass     = "class"
 	AttrSignal    = "signal"
 	AttrMatchType = "match_type"
+	AttrTable     = "table"
+	AttrTrigger   = "trigger"
 )
 
 // NewTelemetry builds the instrument set.
@@ -196,6 +213,21 @@ func NewTelemetry(mp metric.MeterProvider) (*Telemetry, error) {
 		metric.WithDescription("Attribute keys and string values masked by redaction before offload, fingerprinting, or quarantine, by signal and match type."),
 		metric.WithUnit("{value}")); err != nil {
 		return nil, fmt.Errorf("creating %s: %w", nameRedactedValues, err)
+	}
+	if t.BackpressureLevel, err = m.Float64Gauge(nameBackpressureLevel,
+		metric.WithDescription("Current adaptive AIMD backpressure level in [0.0, 1.0]."),
+		metric.WithUnit("1")); err != nil {
+		return nil, fmt.Errorf("creating %s: %w", nameBackpressureLevel, err)
+	}
+	if t.EffectiveRequestBytes, err = m.Int64Gauge(nameEffectiveRequestBytes,
+		metric.WithDescription("Current effective per-request byte split threshold."),
+		metric.WithUnit("By")); err != nil {
+		return nil, fmt.Errorf("creating %s: %w", nameEffectiveRequestBytes, err)
+	}
+	if t.BackpressureEvents, err = m.Int64Counter(nameBackpressureEvents,
+		metric.WithDescription("Count of adaptive AIMD backpressure step-down and recovery transitions."),
+		metric.WithUnit("{event}")); err != nil {
+		return nil, fmt.Errorf("creating %s: %w", nameBackpressureEvents, err)
 	}
 	return t, nil
 }
@@ -346,5 +378,39 @@ func (t *Telemetry) RecordRedactedValues(ctx context.Context, signal, matchType 
 	t.RedactedValues.Add(ctx, n, metric.WithAttributes(
 		attribute.String(AttrSignal, signal),
 		attribute.String(AttrMatchType, matchType),
+	))
+}
+
+// RecordBackpressureLevel records the current AIMD backpressure level in [0.0, 1.0].
+func (t *Telemetry) RecordBackpressureLevel(ctx context.Context, signal, table string, level float64) {
+	if t == nil {
+		return
+	}
+	t.BackpressureLevel.Record(ctx, level, metric.WithAttributes(
+		attribute.String(AttrSignal, signal),
+		attribute.String(AttrTable, table),
+	))
+}
+
+// RecordEffectiveRequestBytes records the current AIMD per-request byte split threshold.
+func (t *Telemetry) RecordEffectiveRequestBytes(ctx context.Context, signal, table string, bytes int64) {
+	if t == nil || bytes <= 0 {
+		return
+	}
+	t.EffectiveRequestBytes.Record(ctx, bytes, metric.WithAttributes(
+		attribute.String(AttrSignal, signal),
+		attribute.String(AttrTable, table),
+	))
+}
+
+// RecordBackpressureEvent records one AIMD step-down or recovery transition.
+func (t *Telemetry) RecordBackpressureEvent(ctx context.Context, signal, table, trigger string) {
+	if t == nil {
+		return
+	}
+	t.BackpressureEvents.Add(ctx, 1, metric.WithAttributes(
+		attribute.String(AttrSignal, signal),
+		attribute.String(AttrTable, table),
+		attribute.String(AttrTrigger, trigger),
 	))
 }

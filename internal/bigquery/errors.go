@@ -85,6 +85,7 @@ type Verdict struct {
 // Metric labels. Bounded by construction: this list is the whole domain.
 const (
 	LabelQuota           = "quota_exhausted"
+	LabelOversizeRequest = "oversize_request"
 	LabelUnavailable     = "unavailable"
 	LabelInternal        = "internal"
 	LabelPermission      = "permission_denied"
@@ -233,6 +234,22 @@ func Classify(err error) Verdict {
 	default:
 		return Verdict{Permanent, OwnerExporter, LabelUnknown, false}
 	}
+}
+
+// ClassifySubRequest classifies an AppendRows sub-request error. When adaptive
+// backpressure is enabled and a multi-row sub-request hits a request-size
+// ResourceExhausted error, it returns a Retryable verdict owned by
+// exporterhelper so the batch is replayed at a smaller split threshold. A
+// single-row oversize error or a disabled backpressure configuration keeps the
+// permanent Classify verdict.
+func ClassifySubRequest(err error, rowCount int, backpressureEnabled bool) Verdict {
+	v := Classify(err)
+	if backpressureEnabled && rowCount > 1 && v.Class == Permanent && v.Label == LabelQuota {
+		if s, ok := status.FromError(err); ok && s.Code() == codes.ResourceExhausted && isOversizeResourceExhausted(s.Message()) {
+			return Verdict{Retryable, OwnerExporterHelper, LabelOversizeRequest, false}
+		}
+	}
+	return v
 }
 
 // PermissionHint renders an actionable message for an authorization failure,

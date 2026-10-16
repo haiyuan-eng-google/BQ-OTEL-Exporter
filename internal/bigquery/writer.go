@@ -28,6 +28,7 @@ type WriterOptions struct {
 	Project string
 	Dataset string
 	Table   string
+	Signal  string
 
 	// Descriptor describes the row message, derived from the destination
 	// table's schema.
@@ -51,6 +52,10 @@ type WriterOptions struct {
 
 	// Observer receives bounded, content-free stream lifecycle telemetry.
 	Observer Observer
+
+	// Backpressure optionally adjusts the effective per-request byte split
+	// threshold and in-flight dispatch concurrency using AIMD control.
+	Backpressure *BackpressureController
 }
 
 // Observer is the delivery-critical stream telemetry surface. The exporter
@@ -62,6 +67,9 @@ type Observer interface {
 	RecordAppendResultWait(context.Context, time.Duration)
 	RecordTimeoutAfterDispatch(context.Context)
 	RecordStreamRetirement(context.Context)
+	RecordBackpressureLevel(ctx context.Context, signal, table string, level float64)
+	RecordEffectiveRequestBytes(ctx context.Context, signal, table string, bytes int64)
+	RecordBackpressureEvent(ctx context.Context, signal, table, trigger string)
 }
 
 // TableRef renders the fully qualified destination table path.
@@ -129,12 +137,13 @@ type streamCreation struct {
 // generation only while it is still the writer's current stream.
 type streamGeneration struct {
 	stream
-	users         int
-	pending       int
-	retired       bool
-	slotHeld      bool
-	dispatchSlots chan struct{}
-	retiredDone   chan struct{}
+	users       int
+	pending     int
+	dispatched  int
+	slotSignal  chan struct{}
+	retired     bool
+	slotHeld    bool
+	retiredDone chan struct{}
 }
 
 // NewWriter builds a writer whose managed streams retain lifetimeCtx for their
@@ -250,15 +259,10 @@ func (w *Writer) startStreamCreationLocked() {
 			}
 			w.activeGenerations--
 		default:
-			window := w.opts.MaxInflightRequests
-			if window <= 0 {
-				window = 1
-			}
 			w.ms = &streamGeneration{
-				stream:        ms,
-				slotHeld:      true,
-				dispatchSlots: make(chan struct{}, window),
-				retiredDone:   make(chan struct{}),
+				stream:      ms,
+				slotHeld:    true,
+				retiredDone: make(chan struct{}),
 			}
 		}
 		if w.creation == creation {
@@ -363,61 +367,96 @@ func (w *Writer) markGenerationRetiredLocked(gen *streamGeneration) {
 	close(gen.retiredDone)
 }
 
+// EffectiveMaxRequestBytes returns the current request split threshold,
+// reading from the adaptive BackpressureController when configured.
+func (w *Writer) EffectiveMaxRequestBytes() int {
+	if w.opts.Backpressure != nil {
+		if n := w.opts.Backpressure.EffectiveRequestBytes(); n > 0 {
+			return n
+		}
+	}
+	return w.opts.MaxRequestBytes
+}
+
+// EffectiveMaxInflightRequests returns the current concurrent dispatch limit,
+// reading from the adaptive BackpressureController when configured.
+func (w *Writer) EffectiveMaxInflightRequests() int {
+	if w.opts.Backpressure != nil {
+		if n := w.opts.Backpressure.EffectiveInflightRequests(); n >= 1 {
+			return n
+		}
+	}
+	if w.opts.MaxInflightRequests >= 1 {
+		return w.opts.MaxInflightRequests
+	}
+	return 1
+}
+
+func (w *Writer) slotSignalLocked(gen *streamGeneration) <-chan struct{} {
+	if gen.slotSignal == nil {
+		gen.slotSignal = make(chan struct{})
+	}
+	return gen.slotSignal
+}
+
+func (w *Writer) notifySlotChangeLocked(gen *streamGeneration) {
+	if gen.slotSignal != nil {
+		close(gen.slotSignal)
+		gen.slotSignal = nil
+	}
+}
+
 func (w *Writer) tryAcquireDispatchSlot(
 	ctx context.Context, gen *streamGeneration,
 ) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	select {
-	case <-gen.retiredDone:
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if gen.retired {
 		return false, errStreamRetired
-	default:
 	}
-	select {
-	case gen.dispatchSlots <- struct{}{}:
-		if err := ctx.Err(); err != nil {
-			w.releaseDispatchSlot(gen)
-			return false, err
-		}
-		select {
-		case <-gen.retiredDone:
-			w.releaseDispatchSlot(gen)
-			return false, errStreamRetired
-		default:
-			return true, nil
-		}
-	default:
+	if gen.dispatched >= w.EffectiveMaxInflightRequests() {
 		return false, nil
 	}
+	gen.dispatched++
+	return true, nil
 }
 
 func (w *Writer) waitForDispatchSlot(ctx context.Context, gen *streamGeneration) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	select {
-	case gen.dispatchSlots <- struct{}{}:
+	for {
 		if err := ctx.Err(); err != nil {
-			w.releaseDispatchSlot(gen)
 			return err
 		}
-		select {
-		case <-gen.retiredDone:
-			w.releaseDispatchSlot(gen)
+		w.mu.Lock()
+		if gen.retired {
+			w.mu.Unlock()
 			return errStreamRetired
-		default:
+		}
+		if gen.dispatched < w.EffectiveMaxInflightRequests() {
+			gen.dispatched++
+			w.mu.Unlock()
 			return nil
 		}
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-gen.retiredDone:
-		return errStreamRetired
+		sig := w.slotSignalLocked(gen)
+		w.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-gen.retiredDone:
+			return errStreamRetired
+		case <-sig:
+		}
 	}
 }
 
 func (w *Writer) releaseDispatchSlot(gen *streamGeneration) {
-	<-gen.dispatchSlots
+	w.mu.Lock()
+	gen.dispatched--
+	w.notifySlotChangeLocked(gen)
+	w.mu.Unlock()
 }
 
 func (w *Writer) registerResult(gen *streamGeneration) {
@@ -429,9 +468,10 @@ func (w *Writer) registerResult(gen *streamGeneration) {
 func (w *Writer) releaseResult(gen *streamGeneration) {
 	w.mu.Lock()
 	gen.pending--
+	gen.dispatched--
+	w.notifySlotChangeLocked(gen)
 	w.releaseGenerationSlotLocked(gen)
 	w.mu.Unlock()
-	w.releaseDispatchSlot(gen)
 }
 
 func (w *Writer) releaseGenerationUser(gen *streamGeneration) {
@@ -474,6 +514,56 @@ func (w *Writer) observeTimeoutAfterDispatch() {
 	}
 }
 
+func (w *Writer) observeBackpressureTransition(trigger string) {
+	if w.opts.Observer == nil || w.opts.Backpressure == nil {
+		return
+	}
+	ctx := context.Background()
+	w.opts.Observer.RecordBackpressureEvent(ctx, w.opts.Signal, w.opts.Table, trigger)
+	w.opts.Observer.RecordBackpressureLevel(ctx, w.opts.Signal, w.opts.Table, w.opts.Backpressure.Level())
+	w.opts.Observer.RecordEffectiveRequestBytes(ctx, w.opts.Signal, w.opts.Table, int64(w.opts.Backpressure.EffectiveRequestBytes()))
+}
+
+func isBackpressureThrottle(v Verdict) bool {
+	if v.Class == Permanent {
+		return false
+	}
+	switch v.Label {
+	case LabelQuota, LabelOversizeRequest, LabelUnavailable, LabelUncertainAck:
+		return true
+	default:
+		return false
+	}
+}
+
+func (w *Writer) recordThrottle(v Verdict) {
+	if w.opts.Backpressure == nil || !isBackpressureThrottle(v) {
+		return
+	}
+	if w.opts.Backpressure.OnThrottle() {
+		w.observeBackpressureTransition("throttle")
+	}
+}
+
+func (w *Writer) recordCleanOrSlowAck(elapsed time.Duration, gen *streamGeneration) {
+	bp := w.opts.Backpressure
+	if bp == nil {
+		return
+	}
+	if bp.LatencyThreshold() > 0 && elapsed > bp.LatencyThreshold() {
+		if bp.OnSlowAck(elapsed) {
+			w.observeBackpressureTransition("latency")
+		}
+		return
+	}
+	if bp.OnCleanAck(elapsed) {
+		w.mu.Lock()
+		w.notifySlotChangeLocked(gen)
+		w.mu.Unlock()
+		w.observeBackpressureTransition("recovery")
+	}
+}
+
 func (w *Writer) finishResult(gen *streamGeneration, started time.Time) {
 	w.observeInflight(-1)
 	w.observeResultWait(started)
@@ -481,9 +571,9 @@ func (w *Writer) finishResult(gen *streamGeneration, started time.Time) {
 }
 
 func (w *Writer) classifyAndRetire(
-	ctx context.Context, err error, gen *streamGeneration,
+	ctx context.Context, err error, gen *streamGeneration, rowCount int,
 ) (Verdict, bool) {
-	verdict, attemptEnded := w.classifyAppendFailure(ctx, err)
+	verdict, attemptEnded := w.classifyAppendFailure(ctx, err, rowCount)
 	if !attemptEnded && verdict.Label != LabelShutdown && isTeardown(err) && w.isRetired(gen) {
 		// Another attempt retired this generation and closed the connection
 		// under this request. It may already have reached the service, so the
@@ -598,7 +688,7 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 	}
 	defer w.releaseGenerationUser(gen)
 
-	requests := SplitRequests(rows, w.opts.MaxRequestBytes)
+	requests := SplitRequests(rows, w.EffectiveMaxRequestBytes())
 
 	type pending struct {
 		res        appendResult
@@ -639,17 +729,20 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 				out.RowErrors = append(out.RowErrors, rowErrs...)
 				return
 			}
-			v, attemptEnded := w.classifyAndRetire(ctx, rerr, gen)
+			v, attemptEnded := w.classifyAndRetire(ctx, rerr, gen, p.count)
 			if attemptEnded {
 				w.trackResult(gen, p.res, p.dispatched)
 			} else {
 				w.finishResult(gen, p.dispatched)
 			}
+			w.recordThrottle(v)
 			// Keep draining all other results already dispatched by this call.
 			fail(v, rerr)
 			return
 		}
+		elapsed := time.Since(p.dispatched)
 		w.finishResult(gen, p.dispatched)
+		w.recordCleanOrSlowAck(elapsed, gen)
 		out.AcknowledgedRows += p.count
 		out.AckedRanges = append(out.AckedRanges, [2]int{p.start, p.start + p.count})
 	}
@@ -701,7 +794,8 @@ dispatch:
 			// AppendRows can return the attempt-context error after handing a
 			// request to the bidirectional stream. Its acknowledgement is then
 			// ambiguous, and this generation cannot safely be reused.
-			v, _ := w.classifyAndRetire(ctx, aerr, gen)
+			v, _ := w.classifyAndRetire(ctx, aerr, gen, len(req))
+			w.recordThrottle(v)
 			fail(v, aerr)
 			continue
 		}
@@ -724,7 +818,7 @@ dispatch:
 // applied the rows even though the caller did not observe the acknowledgement.
 // Once the writer's lifecycle has ended, a teardown failure is shutdown however
 // managedwriter reports it.
-func (w *Writer) classifyAppendFailure(ctx context.Context, err error) (Verdict, bool) {
+func (w *Writer) classifyAppendFailure(ctx context.Context, err error, rowCount int) (Verdict, bool) {
 	ctxErr := ctx.Err()
 	if ctxErr != nil && errors.Is(err, ctxErr) {
 		return Verdict{Uncertain, OwnerExporterHelper, LabelUncertainAck, false}, true
@@ -738,7 +832,7 @@ func (w *Writer) classifyAppendFailure(ctx context.Context, err error) (Verdict,
 	if ownedCtx != nil && ownedCtx.Err() != nil && isTeardown(err) {
 		return Verdict{Retryable, OwnerExporterHelper, LabelShutdown, false}, false
 	}
-	return Classify(err), false
+	return ClassifySubRequest(err, rowCount, w.opts.Backpressure != nil), false
 }
 
 // isTeardown reports whether err is how managedwriter fails a request whose

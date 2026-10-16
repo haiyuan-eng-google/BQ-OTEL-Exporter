@@ -240,6 +240,12 @@ as log events rather than span attributes.
 | `write.max_row_bytes`           | `1048576` (1 MiB)     | Rejects individual serialized signal rows above this size and bounds quarantine rows by truncating `raw_payload`. |
 | `write.max_inflight_requests`   | `8`                   | Bounds asynchronous in-flight appends. |
 | `write.max_inflight_bytes`      | `67108864` (64 MiB)   | Bounds memory held by in-flight appends. |
+| `write.backpressure.enabled`    | `false`               | Enable adaptive AIMD adjustment of the effective request byte split threshold and in-flight concurrency under Storage Write API congestion. |
+| `write.backpressure.min_request_bytes` | `1048576` (1 MiB) | AIMD floor for the effective per-request byte split threshold (`<= write.max_request_bytes`). |
+| `write.backpressure.min_inflight_requests` | `1`           | AIMD floor for effective concurrent `AppendRows` sub-requests (`>= 1` and `<= write.max_inflight_requests`). |
+| `write.backpressure.decrease_factor` | `0.5`               | Multiplicative decrease factor in `(0.0, 1.0)` applied on throttle or slow acknowledgements. |
+| `write.backpressure.recovery_interval` | `10s`             | Minimum elapsed duration between additive recovery steps on clean acknowledgements. |
+| `write.backpressure.latency_threshold` | `2s`              | Acknowledgement latency above which a clean `AppendResult` triggers a multiplicative step-down (`0s` disables latency triggers). |
 | `limits.*`                      | see below             | Structural bounds applied before serialization. |
 | `sending_queue`                 | 8 consumers           | Standard `exporterhelper` queue, including the persistent queue. Consumer concurrency defaults to the managedwriter request window. |
 | `retry_on_failure`              | `max_elapsed_time: 900s` | Standard `exporterhelper` retry. The horizon must be finite. |
@@ -706,6 +712,9 @@ Use these content-free self-telemetry instruments to detect a stuck path:
 | `otelcol_exporter_bigquery_offload_errors` | Object storage offload failures (`{signal, stage}`). |
 | `otelcol_exporter_bigquery_offload_dedup_hits` | Offload attempts satisfied from the cross-batch LRU cache (`offload.cache_size` entries) instead of uploading (`{signal}`). |
 | `otelcol_exporter_bigquery_redacted_values` | Attribute keys and string values masked by [redaction](#redaction) (`{signal, match_type}`); never records key names or values. |
+| `otelcol_exporter_bigquery_backpressure_level` | Current adaptive AIMD backpressure level in `[0.0, 1.0]` (`{signal, table}`). |
+| `otelcol_exporter_bigquery_effective_request_bytes` | Current effective per-request byte split threshold (`{signal, table}`). |
+| `otelcol_exporter_bigquery_backpressure_events` | Count of adaptive AIMD step-down and recovery transitions (`{signal, table, trigger}`). |
 
 Both current-value instruments should return to zero after recovery or clean
 shutdown. A sustained nonzero value, rising timeout/retirement counters, or

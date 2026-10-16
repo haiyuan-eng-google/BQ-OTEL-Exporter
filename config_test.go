@@ -685,3 +685,152 @@ func TestValidateOffloadCacheSize(t *testing.T) {
 		t.Fatalf("Offload.CacheSize = -1 error = %v, want offload.cache_size must not be negative", err)
 	}
 }
+
+func TestValidateBackpressure(t *testing.T) {
+	t.Run("defaults are disabled with expected tuning", func(t *testing.T) {
+		cfg := validConfig()
+		b := cfg.Write.Backpressure
+		if b.Enabled {
+			t.Fatal("write.backpressure.enabled must be false by default")
+		}
+		if b.MinRequestBytes != 1024*1024 {
+			t.Fatalf("default min_request_bytes = %d, want 1048576", b.MinRequestBytes)
+		}
+		if b.MinInflightRequests != 1 {
+			t.Fatalf("default min_inflight_requests = %d, want 1", b.MinInflightRequests)
+		}
+		if b.DecreaseFactor != 0.5 {
+			t.Fatalf("default decrease_factor = %v, want 0.5", b.DecreaseFactor)
+		}
+		if b.RecoveryInterval != 10*time.Second {
+			t.Fatalf("default recovery_interval = %v, want 10s", b.RecoveryInterval)
+		}
+		if b.LatencyThreshold != 2*time.Second {
+			t.Fatalf("default latency_threshold = %v, want 2s", b.LatencyThreshold)
+		}
+	})
+
+	t.Run("enabled with defaults validates", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.Write.Backpressure.Enabled = true
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("enabled backpressure with defaults failed Validate(): %v", err)
+		}
+	})
+
+	t.Run("enabled with zero latency threshold validates", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.Write.Backpressure.Enabled = true
+		cfg.Write.Backpressure.LatencyThreshold = 0
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("enabled backpressure with latency_threshold=0 failed Validate(): %v", err)
+		}
+	})
+
+	rejects := map[string]struct {
+		mutate func(*Config)
+		want   string
+	}{
+		"negative min_request_bytes when disabled": {
+			func(c *Config) { c.Write.Backpressure.MinRequestBytes = -1 },
+			"write.backpressure.min_request_bytes must not be negative",
+		},
+		"negative min_inflight_requests when disabled": {
+			func(c *Config) { c.Write.Backpressure.MinInflightRequests = -1 },
+			"write.backpressure.min_inflight_requests must not be negative",
+		},
+		"negative recovery_interval when disabled": {
+			func(c *Config) { c.Write.Backpressure.RecoveryInterval = -time.Second },
+			"write.backpressure.recovery_interval must not be negative",
+		},
+		"negative latency_threshold when disabled": {
+			func(c *Config) { c.Write.Backpressure.LatencyThreshold = -time.Second },
+			"write.backpressure.latency_threshold must not be negative",
+		},
+		"zero min_request_bytes when enabled": {
+			func(c *Config) {
+				c.Write.Backpressure.Enabled = true
+				c.Write.Backpressure.MinRequestBytes = 0
+			},
+			"write.backpressure.min_request_bytes must be positive",
+		},
+		"min_request_bytes exceeds max_request_bytes": {
+			func(c *Config) {
+				c.Write.Backpressure.Enabled = true
+				c.Write.Backpressure.MinRequestBytes = c.Write.MaxRequestBytes + 1
+			},
+			"write.backpressure.min_request_bytes",
+		},
+		"zero min_inflight_requests when enabled": {
+			func(c *Config) {
+				c.Write.Backpressure.Enabled = true
+				c.Write.Backpressure.MinInflightRequests = 0
+			},
+			"write.backpressure.min_inflight_requests must be at least 1",
+		},
+		"min_inflight_requests exceeds max_inflight_requests": {
+			func(c *Config) {
+				c.Write.Backpressure.Enabled = true
+				c.Write.Backpressure.MinInflightRequests = c.Write.MaxInflightRequests + 1
+			},
+			"write.backpressure.min_inflight_requests",
+		},
+		"decrease_factor zero": {
+			func(c *Config) {
+				c.Write.Backpressure.Enabled = true
+				c.Write.Backpressure.DecreaseFactor = 0
+			},
+			"write.backpressure.decrease_factor (0) must be strictly between 0 and 1",
+		},
+		"decrease_factor one": {
+			func(c *Config) {
+				c.Write.Backpressure.Enabled = true
+				c.Write.Backpressure.DecreaseFactor = 1.0
+			},
+			"write.backpressure.decrease_factor (1) must be strictly between 0 and 1",
+		},
+		"zero recovery_interval when enabled": {
+			func(c *Config) {
+				c.Write.Backpressure.Enabled = true
+				c.Write.Backpressure.RecoveryInterval = 0
+			},
+			"write.backpressure.recovery_interval must be positive",
+		},
+	}
+	for name, tc := range rejects {
+		t.Run(name, func(t *testing.T) {
+			cfg := validConfig()
+			tc.mutate(cfg)
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate() = %v, want error containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestBackpressureConfigKeys(t *testing.T) {
+	writeType := reflect.TypeOf(WriteConfig{})
+	top, ok := writeType.FieldByName("Backpressure")
+	if !ok || top.Tag.Get("mapstructure") != "backpressure" {
+		t.Fatalf("WriteConfig.Backpressure mapstructure tag = %q, want %q", top.Tag.Get("mapstructure"), "backpressure")
+	}
+	want := map[string]string{
+		"Enabled":             "enabled",
+		"MinRequestBytes":     "min_request_bytes",
+		"MinInflightRequests": "min_inflight_requests",
+		"DecreaseFactor":      "decrease_factor",
+		"RecoveryInterval":    "recovery_interval",
+		"LatencyThreshold":    "latency_threshold",
+	}
+	bt := reflect.TypeOf(BackpressureConfig{})
+	if bt.NumField() != len(want) {
+		t.Fatalf("BackpressureConfig has %d fields, want %d; document and pin any new option here", bt.NumField(), len(want))
+	}
+	for field, key := range want {
+		f, ok := bt.FieldByName(field)
+		if !ok || f.Tag.Get("mapstructure") != key {
+			t.Errorf("BackpressureConfig.%s mapstructure tag = %q, want %q", field, f.Tag.Get("mapstructure"), key)
+		}
+	}
+}
