@@ -736,6 +736,17 @@ every acknowledgement.
 - **Timeout before dispatch** (waiting for the stream or a slot): nothing of
   that request was sent, and the stream is kept. If no earlier request of the
   batch was sent either, the batch goes back to exporterhelper as retryable.
+- **Adaptive backpressure (`write.backpressure.enabled`).** When enabled, AIMD
+  congestion control steps the per-request byte split threshold down toward
+  `write.backpressure.min_request_bytes` and the concurrent dispatch window down
+  toward `write.backpressure.min_inflight_requests` on `quota_exhausted`,
+  multi-row `oversize_request`, `unavailable`, `uncertain_ack`, or
+  acknowledgements slower than `write.backpressure.latency_threshold`, and steps
+  them back up every `write.backpressure.recovery_interval` on clean
+  acknowledgements. When the reduced window is full, callers wait for a slot
+  until `timeout` expires rather than shedding batches early, so queued batches
+  drain cleanly during collector `Shutdown` and when `retry_on_failure.enabled`
+  is `false`.
 - **Timeout after dispatch:** the rows may already be applied. The batch goes
   back as `uncertain_ack` (counted in `uncertain_ack_replays`), the stream
   generation is retired, and the next attempt opens a new one. Requests still

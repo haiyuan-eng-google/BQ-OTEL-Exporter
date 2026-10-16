@@ -125,9 +125,8 @@ type Writer struct {
 const maxActiveStreamGenerations = 2
 
 var (
-	errStreamRetired              = errors.New("write stream generation is retired")
-	errWriterClosed               = errors.New("writer is closed")
-	errInsufficientDeadlineBudget = errors.New("remaining attempt deadline is below adaptive backpressure reserve")
+	errStreamRetired = errors.New("write stream generation is retired")
+	errWriterClosed  = errors.New("writer is closed")
 )
 
 type streamCreation struct {
@@ -427,35 +426,6 @@ func (w *Writer) tryAcquireDispatchSlot(
 	return true, nil
 }
 
-func (w *Writer) slotWaitReserve() time.Duration {
-	if w.opts.Backpressure == nil {
-		return 0
-	}
-	if w.EffectiveMaxInflightRequests() >= w.opts.MaxInflightRequests {
-		return 0
-	}
-	maxAck := w.opts.Backpressure.MaxAckLatency()
-	if maxAck <= 0 {
-		return 0
-	}
-	return maxAck + maxAck/2
-}
-
-func (w *Writer) deadlineReserve(maxBatchAck time.Duration) time.Duration {
-	if w.opts.Backpressure == nil {
-		return 0
-	}
-	if w.EffectiveMaxInflightRequests() >= w.opts.MaxInflightRequests &&
-		w.EffectiveMaxRequestBytes() >= w.opts.MaxRequestBytes {
-		return 0
-	}
-	ack := max(maxBatchAck, w.opts.Backpressure.MaxAckLatency())
-	if ack <= 0 {
-		return 0
-	}
-	return ack + ack/2
-}
-
 func (w *Writer) waitForDispatchSlot(ctx context.Context, gen *streamGeneration) error {
 	for {
 		if err := ctx.Err(); err != nil {
@@ -467,12 +437,6 @@ func (w *Writer) waitForDispatchSlot(ctx context.Context, gen *streamGeneration)
 			return errStreamRetired
 		}
 		if gen.dispatched < w.EffectiveMaxInflightRequests() {
-			if reserve := w.slotWaitReserve(); reserve > 0 {
-				if deadline, ok := ctx.Deadline(); ok && deadline.Sub(w.now()) <= reserve {
-					w.mu.Unlock()
-					return errInsufficientDeadlineBudget
-				}
-			}
 			gen.dispatched++
 			w.mu.Unlock()
 			return nil
@@ -480,38 +444,12 @@ func (w *Writer) waitForDispatchSlot(ctx context.Context, gen *streamGeneration)
 		sig := w.slotSignalLocked(gen)
 		w.mu.Unlock()
 
-		var (
-			budgetC <-chan time.Time
-			timer   *time.Timer
-		)
-		if reserve := w.slotWaitReserve(); reserve > 0 {
-			if deadline, ok := ctx.Deadline(); ok {
-				wait := deadline.Sub(w.now()) - reserve
-				if wait <= 0 {
-					return errInsufficientDeadlineBudget
-				}
-				timer = time.NewTimer(wait)
-				budgetC = timer.C
-			}
-		}
-
 		select {
 		case <-ctx.Done():
-			if timer != nil {
-				timer.Stop()
-			}
 			return ctx.Err()
 		case <-gen.retiredDone:
-			if timer != nil {
-				timer.Stop()
-			}
 			return errStreamRetired
-		case <-budgetC:
-			return errInsufficientDeadlineBudget
 		case <-sig:
-			if timer != nil {
-				timer.Stop()
-			}
 		}
 	}
 }
@@ -717,8 +655,6 @@ func classifyPreDispatchFailure(err error) Verdict {
 		return Verdict{Retryable, OwnerExporterHelper, LabelCanceled, false}
 	case errors.Is(err, errStreamRetired):
 		return Verdict{Retryable, OwnerExporterHelper, LabelInvalidStream, false}
-	case errors.Is(err, errInsufficientDeadlineBudget):
-		return Verdict{Retryable, OwnerExporterHelper, LabelBackpressure, false}
 	default:
 		return Classify(err)
 	}
@@ -859,8 +795,6 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 	defer w.releaseGenerationUser(gen)
 
 	requests := splitRequestSlices(rows, w.EffectiveMaxRequestBytes())
-	deadline, hasDeadline := ctx.Deadline()
-	var maxBatchAck time.Duration
 
 	inflight := make([]*pendingAppend, 0, len(requests))
 	out := AppendOutcome{}
@@ -911,9 +845,6 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 			fail(v, rerr)
 			return
 		}
-		if elapsed > maxBatchAck {
-			maxBatchAck = elapsed
-		}
 		if w.opts.Backpressure != nil {
 			w.opts.Backpressure.ObserveAckLatency(elapsed)
 		}
@@ -931,12 +862,6 @@ dispatch:
 		for {
 			if replayOwed() {
 				break dispatch
-			}
-			if start > 0 && hasDeadline {
-				if reserve := w.deadlineReserve(maxBatchAck); reserve > 0 && deadline.Sub(w.now()) <= reserve {
-					fail(Verdict{Retryable, OwnerExporterHelper, LabelBackpressure, false}, errInsufficientDeadlineBudget)
-					break dispatch
-				}
 			}
 			acquired, acquireErr := w.tryAcquireDispatchSlot(ctx, gen)
 			if acquireErr != nil {
