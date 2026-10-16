@@ -234,7 +234,8 @@ as log events rather than span attributes.
 | `endpoint.without_authentication` | `false`             | Sends no credentials. Refused unless the endpoint is loopback. |
 | `auto_create.dataset`           | `false`               | Create the dataset if absent. Requires `location`. |
 | `auto_create.tables`            | `false`               | Create the active signal's destination table (plus `quarantine.table` when enabled) and `_dedup` view if absent, and reconcile additive nullable columns on existing tables (`ReconcileAdditiveSchema`). An existing `_dedup` view is reconciled to the current definition (the query only, best effort), which needs `bigquery.tables.update`. |
-| `auto_create.companion_views`   | `false`               | Create the companion views if absent and reconcile existing ones to the current definition (the query only, best effort): `otel_spans_as_allspans`, `v_gen_ai_spans`, `v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_gen_ai_tool_usage`, `v_gen_ai_logs`, and `v_gen_ai_metrics` for the metrics signal. Requires `auto_create.tables`. |
+| `auto_create.companion_views`   | `false`               | Create the companion views if absent and reconcile existing ones to the current definition (the query only, best effort): `otel_spans_as_allspans`, `v_gen_ai_spans`, `v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_gen_ai_tool_usage`, `v_gen_ai_logs`, `v_gen_ai_metrics`, and `v_gen_ai_metric_exemplars`. Requires `auto_create.tables`. |
+| `auto_create.allow_unprunable_views` | `false`          | Allow `auto_create.companion_views` together with `traces.require_partition_filter: true`. By default startup refuses that combination because BigQuery rejects queries over `v_gen_ai_logs` and `v_gen_ai_metric_exemplars` when `otel_spans` requires a partition filter. |
 | `auto_create.search_indexes`    | `false`               | Execute `CREATE SEARCH INDEX IF NOT EXISTS ... OPTIONS (analyzer = 'NO_OP_ANALYZER')` on `(trace_id, span_id)` for `otel_spans` and `otel_logs` and on `(ALL COLUMNS)` for `otel_metrics`. Requires `auto_create.tables` and `bigquery.jobs.create`. |
 | `write.max_request_bytes`       | `8388608` (8 MiB)     | Our request-size headroom threshold, enforced after protobuf serialization and before `AppendRows`. Distinct from, and below, the API's own per-request limit. |
 | `write.max_row_bytes`           | `1048576` (1 MiB)     | Rejects individual serialized signal rows above this size and bounds quarantine rows by truncating `raw_payload`. |
@@ -494,6 +495,19 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
     `gen_ai.client.inference.usage.*` metrics, falling back to `gen_ai.token.type`)
     next to every point-value column, including the `exemplars` whose `trace_id`
     and `span_id` link a point back to a trace.
+  - `v_gen_ai_metric_exemplars`: unnests `exemplars` from `v_gen_ai_metrics`,
+    keeps exemplars with non-empty `trace_id` and `span_id`, and left-joins
+    `otel_spans_dedup` on `(trace_id, span_id)` and a null-safe `service_name`
+    match within 24 hours before to 1 hour after the metric point's `timestamp`
+    to expose exemplar latency/token values alongside span duration, status,
+    `span_gen_ai_agent_name` (from `gen_ai.agent.name` or
+    `gcp.vertex.agent.name` on span `attributes`, `gen_ai.agent.name` on span
+    `resource.attributes`, then `gen_ai.main_agent.name` on span or resource
+    `attributes`), `span_gen_ai_tool_name`, `adk_session_id` (from
+    `gcp.vertex.agent.session_id` then `gen_ai.conversation.id`), and
+    `span_error_type`. An exemplar whose span is absent or outside that window
+    remains in the view with `NULL` `span_*` columns. Like `v_gen_ai_logs`, it
+    cannot be queried when `traces.require_partition_filter` is `true`.
   - The two rollup views, `v_gen_ai_model_costs` and `v_gen_ai_sessions`, read
     `v_gen_ai_spans` once. A window function over that read finds the parents
     that report the sum of their children's tokens, and each view computes one
@@ -615,25 +629,27 @@ ON `my-project.otel.otel_metrics` (ALL COLUMNS) OPTIONS (analyzer = 'NO_OP_ANALY
   its children only within one `PARTITION BY` partition of the rollup's window
   (see the notes under each rollup above), so a pair that straddles the
   boundary of a partition counts both spans.
-- **Time-bounded `v_gen_ai_logs` span enrichment.** `v_gen_ai_logs` left-joins
+- **Time-bounded `v_gen_ai_logs` and `v_gen_ai_metric_exemplars` span enrichment.** `v_gen_ai_logs` left-joins
   `otel_logs_dedup` (`PARTITION BY DATE(timestamp)`) with `otel_spans_dedup`
   (`PARTITION BY TIMESTAMP_TRUNC(start_time, HOUR)`) on `(trace_id, span_id)`
   and on `service_name`, compared null-safely so that a log record and a span
-  that both lack a service name still match. The join also carries a range
+  that both lack a service name still match, and `v_gen_ai_metric_exemplars`
+  joins `UNNEST(v_gen_ai_metrics.exemplars)` to `otel_spans_dedup` by the same
+  rule. Both joins carry a range
   predicate on `otel_spans.start_time`: only a span that started from 24 hours
-  before to 1 hour after the log record's `timestamp` enriches the record. A
-  record whose span started outside that window is still returned with its own
-  attributes, but without the columns that come from the span. The predicate
-  compares `otel_spans.start_time` with each log row's `timestamp`, and BigQuery
+  before to 1 hour after the log or metric row's `timestamp` enriches the row. A
+  row whose span started outside that window is still returned with its own
+  fields, but without the columns that come from the span. The predicate
+  compares `otel_spans.start_time` with each left-side row's `timestamp`, and BigQuery
   does not use such a predicate to skip span partitions. In dry runs over ten
   daily partitions of test log rows, a one-day filter on `timestamp` cut the
   part of the estimate that comes from `otel_logs` to a tenth, so the filter
   prunes daily partitions there, and left the part that comes from `otel_spans`
   unchanged. No filter that BigQuery can use for partition elimination reaches
-  the span scan, so a query over `v_gen_ai_logs` is rejected when
+  the span scan, so queries over `v_gen_ai_logs` and `v_gen_ai_metric_exemplars` are rejected when
   `traces.require_partition_filter` is `true`, with or without a filter on
-  `timestamp`. Leave that option off for a deployment that queries the view, or
-  join `otel_logs_dedup` against a `start_time`-bounded `otel_spans_dedup`
+  `timestamp` or `metric_timestamp`. To surface that conflict at startup rather than at query time, the exporter rejects `auto_create.companion_views: true` with `traces.require_partition_filter: true` unless `auto_create.allow_unprunable_views: true` is also set. Leave `traces.require_partition_filter` off for a deployment that queries those views, or
+  join `otel_logs_dedup` / `v_gen_ai_metrics` against a `start_time`-bounded `otel_spans_dedup`
   subquery directly, which also lets a query choose its own window.
 
 ## Delivery semantics

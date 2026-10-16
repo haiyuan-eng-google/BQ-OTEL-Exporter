@@ -4,8 +4,9 @@
 package bigqueryexporter
 
 // This file checks the GenAI companion views (v_gen_ai_spans, v_gen_ai_logs,
-// v_gen_ai_metrics, v_gen_ai_model_costs and v_gen_ai_sessions) against the rows
-// the exporters really write, using the golden fixtures under testdata/otlp.
+// v_gen_ai_metrics, v_gen_ai_metric_exemplars, v_gen_ai_model_costs and
+// v_gen_ai_sessions) against the rows the exporters really write, using the
+// golden fixtures under testdata/otlp.
 //
 // The tests cannot run SQL: no BigQuery is available to them. Instead a
 // reference model, written in Go, evaluates each view over the rows that the
@@ -87,6 +88,12 @@ const (
 	logJoinBefore = 24 * time.Hour
 	logJoinAfter  = time.Hour
 
+	// v_gen_ai_metric_exemplars enriches an exemplar with the span it points to
+	// only when the span started from exemplarJoinBefore before to
+	// exemplarJoinAfter after the metric point's timestamp, ends included.
+	exemplarJoinBefore = 24 * time.Hour
+	exemplarJoinAfter  = time.Hour
+
 	// v_gen_ai_metrics keeps the metrics whose name matches this LIKE pattern,
 	// and v_gen_ai_logs the log records whose event name does.
 	genAIMetricNamePattern = "gen_ai.%"
@@ -100,41 +107,61 @@ var (
 	agentToolOps = []string{"invoke_agent", "create_agent", "execute_tool"}
 )
 
+// attrStep is one attribute lookup inside an attrChain, either from the row's
+// attributes column or from its resource.attributes column.
+type attrStep struct {
+	resource bool
+	key      string
+}
+
 // attrChain is one projection of a view out of the plain-JSON attributes
-// column (and, when resourceKeys is non-empty, resource.attributes): the first
-// non-NULL of the listed keys, then of resourceKeys, then of the fallback
-// column.
+// column (and, when resourceKeys or steps is non-empty, resource.attributes):
+// the first non-NULL of steps (when set) or of keys followed by resourceKeys,
+// then of the fallback column.
 type attrChain struct {
 	alias        string
 	keys         []string
-	resourceKeys []string // keys read from resource.attributes after attributes
-	asInt        bool     // LAX_INT64(attributes['key']) rather than JSON_VALUE(attributes, '$."key"')
-	asFloat      bool     // LAX_FLOAT64(attributes['key']) rather than JSON_VALUE(attributes, '$."key"')
-	fallback     string   // a column of the row that ends the COALESCE
+	resourceKeys []string   // keys read from resource.attributes after attributes
+	steps        []attrStep // interleaved attributes / resource.attributes order when set
+	asInt        bool       // LAX_INT64(attributes['key']) rather than JSON_VALUE(attributes, '$."key"')
+	asFloat      bool       // LAX_FLOAT64(attributes['key']) rather than JSON_VALUE(attributes, '$."key"')
+	fallback     string     // a column of the row that ends the COALESCE
 }
 
 // sql renders the select item the view is expected to hold for the chain over
 // the given attribute sources: a table alias prefix such as "l." and "s.", or
 // "" for a view with one source. Sources are tried in order, and within a
-// source the keys are tried in order, followed by resourceKeys on
-// resource.attributes.
+// source either steps are tried in order, or keys are tried in order followed
+// by resourceKeys on resource.attributes.
 func (c attrChain) sql(srcs ...string) string {
 	var els []string
-	for _, src := range srcs {
-		for _, k := range c.keys {
-			switch {
-			case c.asInt:
-				els = append(els, fmt.Sprintf("LAX_INT64(%sattributes['%s'])", src, k))
-			case c.asFloat:
-				els = append(els, fmt.Sprintf("LAX_FLOAT64(%sattributes['%s'])", src, k))
-			default:
-				els = append(els, fmt.Sprintf("JSON_VALUE(%sattributes, '$.\"%s\"')", src, k))
+	if len(c.steps) > 0 {
+		for _, src := range srcs {
+			for _, st := range c.steps {
+				prefix := src
+				if st.resource {
+					prefix += "resource."
+				}
+				els = append(els, fmt.Sprintf("JSON_VALUE(%sattributes, '$.\"%s\"')", prefix, st.key))
 			}
 		}
-	}
-	for _, src := range srcs {
-		for _, k := range c.resourceKeys {
-			els = append(els, fmt.Sprintf("JSON_VALUE(%sresource.attributes, '$.\"%s\"')", src, k))
+	} else {
+		for _, src := range srcs {
+			for _, k := range c.keys {
+				switch {
+				case c.asInt:
+					els = append(els, fmt.Sprintf("LAX_INT64(%sattributes['%s'])", src, k))
+				case c.asFloat:
+					els = append(els, fmt.Sprintf("LAX_FLOAT64(%sattributes['%s'])", src, k))
+				default:
+					els = append(els, fmt.Sprintf("JSON_VALUE(%sattributes, '$.\"%s\"')", src, k))
+				}
+			}
+		}
+		for _, src := range srcs {
+			for _, k := range c.resourceKeys {
+				els = append(els, fmt.Sprintf("JSON_VALUE(%sresource.attributes, '$.\"%s\"')", src, k))
+			}
 		}
 	}
 	if c.fallback != "" {
@@ -150,6 +177,25 @@ func (c attrChain) sql(srcs ...string) string {
 // eval is the chain's value for a row whose attributes, in source order, are
 // srcs: a string, an int64, a float64, or nil for NULL.
 func (c attrChain) eval(row map[string]any, srcs ...attrs) any {
+	if len(c.steps) > 0 {
+		var resAttrs attrs
+		var resParsed bool
+		for _, src := range srcs {
+			for _, st := range c.steps {
+				bag := src
+				if st.resource {
+					if !resParsed {
+						resAttrs = parseResourceAttrs(row)
+						resParsed = true
+					}
+					bag = resAttrs
+				}
+				if v, ok := bag.jsonValue(st.key); ok {
+					return v
+				}
+			}
+		}
+	}
 	for _, src := range srcs {
 		for _, k := range c.keys {
 			switch {
@@ -240,6 +286,24 @@ var metricChains = []attrChain{
 	{alias: "error_type", keys: []string{"error.type"}},
 	{alias: "gen_ai_token_modality", keys: []string{"gen_ai.token.modality"}},
 	{alias: "gen_ai_agent_name", keys: []string{"gen_ai.agent.name", "gen_ai.main_agent.name"}, resourceKeys: []string{"gen_ai.main_agent.name"}},
+}
+
+// exemplarSpanChains are the columns of v_gen_ai_metric_exemplars read from
+// the joined span's attributes and resource.attributes.
+var exemplarSpanChains = []attrChain{
+	{
+		alias: "span_gen_ai_agent_name",
+		steps: []attrStep{
+			{key: "gen_ai.agent.name"},
+			{key: "gcp.vertex.agent.name"},
+			{resource: true, key: "gen_ai.agent.name"},
+			{key: "gen_ai.main_agent.name"},
+			{resource: true, key: "gen_ai.main_agent.name"},
+		},
+	},
+	{alias: "span_gen_ai_tool_name", keys: []string{"gen_ai.tool.name"}},
+	{alias: "adk_session_id", keys: []string{"gcp.vertex.agent.session_id", "gen_ai.conversation.id"}},
+	{alias: "span_error_type", keys: []string{"error.type"}},
 }
 
 // attrs is the parsed plain-JSON attributes column of one row.
@@ -388,6 +452,32 @@ func logJoinsSpan(l, s map[string]any) bool {
 		return false
 	}
 	return spanStart >= logAt-logJoinBefore.Microseconds() && spanStart <= logAt+logJoinAfter.Microseconds()
+}
+
+// exemplarJoinsSpan reports whether the ON clause of v_gen_ai_metric_exemplars
+// holds for a metric row m, an unnested exemplar ex, and a span row s of the
+// dedup view: equal trace and span IDs, service names on m and s that are
+// equal or both NULL, and a span that started within the bounded window around
+// the metric point's timestamp.
+func exemplarJoinsSpan(m, ex, s map[string]any) bool {
+	for _, col := range []string{"trace_id", "span_id"} {
+		ev, eok := colString(ex, col)
+		sv, sok := colString(s, col)
+		if !eok || !sok || ev != sv {
+			return false
+		}
+	}
+	msvc, mok := colString(m, "service_name")
+	ssvc, sok := colString(s, "service_name")
+	if mok != sok || msvc != ssvc {
+		return false
+	}
+	metricAt, mok := colInt(m, "timestamp")
+	spanStart, sok := colInt(s, "start_time")
+	if !mok || !sok {
+		return false
+	}
+	return spanStart >= metricAt-exemplarJoinBefore.Microseconds() && spanStart <= metricAt+exemplarJoinAfter.Microseconds()
 }
 
 // sql is the window that the dedup view is expected to hold.
@@ -930,6 +1020,93 @@ func genAIMetricsView(t testing.TB, rawMetrics []map[string]any) []map[string]an
 	return out
 }
 
+// genAIMetricExemplarsView is v_gen_ai_metric_exemplars over the rows of the
+// metrics and spans tables. It unnests exemplars from v_gen_ai_metrics, filters
+// out exemplars without a non-empty trace_id and span_id, and left-joins
+// otel_spans_dedup within the 25-hour window around m.timestamp.
+func genAIMetricExemplarsView(t testing.TB, rawMetrics, rawSpans []map[string]any) []map[string]any {
+	t.Helper()
+	spans := spansDedup.apply(rawSpans)
+	var out []map[string]any
+	for _, m := range genAIMetricsView(t, rawMetrics) {
+		exemplars, _ := m["exemplars"].([]map[string]any)
+		for _, ex := range exemplars {
+			traceID, tok := colString(ex, "trace_id")
+			spanID, sok := colString(ex, "span_id")
+			if !tok || !sok || traceID == "" || spanID == "" {
+				continue
+			}
+
+			matches := []map[string]any{nil}
+			if joined := slices.DeleteFunc(slices.Clone(spans), func(s map[string]any) bool { return !exemplarJoinsSpan(m, ex, s) }); len(joined) > 0 {
+				matches = joined
+			}
+			for _, s := range matches {
+				row := make(map[string]any)
+				if v, ok := m["timestamp"]; ok {
+					row["metric_timestamp"] = v
+				}
+				for _, col := range []string{
+					"service_name", "metric_name", "metric_unit", "metric_type",
+					"gen_ai_operation_name", "gen_ai_system", "gen_ai_request_model",
+					"gen_ai_response_model", "gen_ai_agent_name", "gen_ai_token_type",
+					"gen_ai_token_modality",
+				} {
+					if v, ok := m[col]; ok {
+						row[col] = v
+					}
+				}
+				if v, ok := m["error_type"]; ok {
+					row["metric_error_type"] = v
+				}
+				for src, dst := range map[string]string{
+					"time":                "exemplar_timestamp",
+					"value_double":        "exemplar_value_double",
+					"value_int64":         "exemplar_value_int64",
+					"trace_id":            "trace_id",
+					"span_id":             "span_id",
+					"filtered_attributes": "exemplar_filtered_attributes",
+				} {
+					if v, ok := ex[src]; ok {
+						row[dst] = v
+					}
+				}
+				if s != nil {
+					for src, dst := range map[string]string{
+						"start_time":    "span_start_time",
+						"end_time":      "span_end_time",
+						"duration_nano": "span_duration_nano",
+						"name":          "span_name",
+					} {
+						if v, ok := s[src]; ok {
+							row[dst] = v
+						}
+					}
+					if ns, ok := colInt(s, "duration_nano"); ok {
+						row["span_duration_ms"] = math.Round(float64(ns)/1e6*1000) / 1000
+					}
+					if st, ok := s["status"].(map[string]any); ok {
+						if code, ok := st["code"]; ok {
+							row["span_status_code"] = code
+						}
+						if msg, ok := st["message"]; ok {
+							row["span_status_message"] = msg
+						}
+					}
+					sa := parseAttrs(t, s)
+					for _, c := range exemplarSpanChains {
+						if v := c.eval(s, sa); v != nil {
+							row[c.alias] = v
+						}
+					}
+				}
+				out = append(out, row)
+			}
+		}
+	}
+	return out
+}
+
 // rowsWhere returns the rows whose column equals want.
 func rowsWhere(rows []map[string]any, col string, want any) []map[string]any {
 	var out []map[string]any
@@ -1094,6 +1271,37 @@ func TestViewModelMatchesViewSQL(t *testing.T) {
 		metricFragments = append(metricFragments, c.sql(""))
 	}
 	requireSQL(t, "v_gen_ai_metrics", render(schema.GenAIMetricsViewQuery, confProject, confDataset, confMetrics), metricFragments...)
+
+	exemplarFragments := []string{
+		"m.timestamp AS metric_timestamp",
+		"m.service_name, m.metric_name, m.metric_unit, m.metric_type",
+		"m.gen_ai_operation_name, m.gen_ai_system, m.gen_ai_request_model, m.gen_ai_response_model, m.gen_ai_agent_name, m.gen_ai_token_type, m.gen_ai_token_modality",
+		"m.error_type AS metric_error_type",
+		"ex.time AS exemplar_timestamp",
+		"ex.value_double AS exemplar_value_double",
+		"ex.value_int64 AS exemplar_value_int64",
+		"ex.trace_id AS trace_id",
+		"ex.span_id AS span_id",
+		"ex.filtered_attributes AS exemplar_filtered_attributes",
+		"s.start_time AS span_start_time",
+		"s.end_time AS span_end_time",
+		"s.duration_nano AS span_duration_nano",
+		"ROUND(s.duration_nano / 1e6, 3) AS span_duration_ms",
+		"s.name AS span_name",
+		"s.status.code AS span_status_code",
+		"s.status.message AS span_status_message",
+		"FROM `" + confProject + "." + confDataset + ".v_gen_ai_metrics` m, UNNEST(m.exemplars) AS ex" +
+			" LEFT JOIN `" + confProject + "." + confDataset + "." + confSpans + "_dedup` s" +
+			" ON s.trace_id = ex.trace_id AND s.span_id = ex.span_id" +
+			" AND s.service_name IS NOT DISTINCT FROM m.service_name" +
+			fmt.Sprintf(" AND s.start_time BETWEEN TIMESTAMP_SUB(m.timestamp, INTERVAL %d HOUR) AND TIMESTAMP_ADD(m.timestamp, INTERVAL %d HOUR)",
+				int(exemplarJoinBefore.Hours()), int(exemplarJoinAfter.Hours())),
+		"WHERE ex.trace_id IS NOT NULL AND ex.span_id IS NOT NULL AND ex.trace_id != '' AND ex.span_id != ''",
+	}
+	for _, c := range exemplarSpanChains {
+		exemplarFragments = append(exemplarFragments, c.sql("s."))
+	}
+	requireSQL(t, "v_gen_ai_metric_exemplars", render(schema.GenAIMetricExemplarsViewQuery, confProject, confDataset, confSpans), exemplarFragments...)
 
 	// Both rollups read v_gen_ai_spans once, and a window over that read finds the
 	// token parents; the window's PARTITION BY list is the matching rule.
@@ -2280,6 +2488,88 @@ func TestMetricsViewKeepsOnlyGenAIMetrics(t *testing.T) {
 	}
 }
 
+// Every exemplar across all seven framework metric fixtures joins to its span
+// in otel_spans_dedup, and corrupting a span_id breaks the join for that row.
+func TestFrameworkFixturesMetricExemplarsView(t *testing.T) {
+	rig := newConformanceRig(t)
+	pushFrameworkFixtures(t, rig)
+
+	const pointsPerFramework = 3
+	rawMetrics := rig.srv.Rows(confMetrics)
+	rawSpans := rig.srv.Rows(confSpans)
+	view := genAIMetricExemplarsView(t, rawMetrics, rawSpans)
+	if want := pointsPerFramework * len(frameworkGoldens); len(view) != want {
+		t.Fatalf("v_gen_ai_metric_exemplars holds %d rows, want %d", len(view), want)
+	}
+
+	for _, g := range frameworkGoldens {
+		rows := rowsWhere(view, "service_name", g.service)
+		if len(rows) != pointsPerFramework {
+			t.Errorf("%s: %d rows in v_gen_ai_metric_exemplars, want %d", g.id, len(rows), pointsPerFramework)
+			continue
+		}
+		for _, row := range rows {
+			if row["span_name"] == nil || row["span_start_time"] == nil {
+				t.Errorf("%s: exemplar row did not join to its span: %v", g.id, row)
+				continue
+			}
+			if row["gen_ai_operation_name"] != g.op {
+				t.Errorf("%s: gen_ai_operation_name = %v, want %q", g.id, row["gen_ai_operation_name"], g.op)
+			}
+			if got, want := asFloat(row["span_duration_ms"]), float64(g.durationMS); math.Abs(got-want) > 1e-9 {
+				t.Errorf("%s: span_duration_ms = %v, want %v", g.id, got, want)
+			}
+			if g.noSpanView {
+				// CrewAI's span carries OpenInference attributes rather than gen_ai.*,
+				// so it joins in otel_spans_dedup with NULL promoted gen_ai_* span columns.
+				requireCols(t, g.id+" exemplar span", row, map[string]any{
+					"span_name":              "Crew.kickoff",
+					"span_gen_ai_agent_name": nil,
+					"adk_session_id":         nil,
+				})
+			} else {
+				requireCols(t, g.id+" exemplar span", row, map[string]any{
+					"span_gen_ai_agent_name": g.agent,
+					"adk_session_id":         g.session,
+				})
+			}
+		}
+	}
+
+	// Mutation check: corrupting span_id on one exemplar leaves 21 rows in the
+	// left join, with span_name == nil on the mutated exemplar and non-nil on
+	// the remaining 20.
+	mutatedMetrics := slices.Clone(rawMetrics)
+	firstMetric := make(map[string]any, len(mutatedMetrics[0]))
+	for k, v := range mutatedMetrics[0] {
+		firstMetric[k] = v
+	}
+	origEx, _ := firstMetric["exemplars"].([]map[string]any)
+	clonedEx := slices.Clone(origEx)
+	badEx := make(map[string]any, len(clonedEx[0]))
+	for k, v := range clonedEx[0] {
+		badEx[k] = v
+	}
+	badEx["span_id"] = "ffffffffffffffff"
+	clonedEx[0] = badEx
+	firstMetric["exemplars"] = clonedEx
+	mutatedMetrics[0] = firstMetric
+
+	mutatedView := genAIMetricExemplarsView(t, mutatedMetrics, rawSpans)
+	if len(mutatedView) != len(view) {
+		t.Fatalf("mutated v_gen_ai_metric_exemplars holds %d rows, want %d", len(mutatedView), len(view))
+	}
+	nilSpanNames := 0
+	for _, row := range mutatedView {
+		if row["span_name"] == nil {
+			nilSpanNames++
+		}
+	}
+	if nilSpanNames != 1 {
+		t.Errorf("corrupting one exemplar span_id yielded %d rows with span_name == nil, want 1", nilSpanNames)
+	}
+}
+
 func asFloat(v any) float64 {
 	f, _ := v.(float64)
 	return f
@@ -2373,4 +2663,280 @@ func TestLLMCallPredicate(t *testing.T) {
 		"agent_invocation_count": int64(3), // every invoke_agent span, whether or not it is a call
 		"tool_call_count":        int64(1),
 	})
+}
+
+type specExemplar struct {
+	trace, span string
+	at          time.Time
+	valDouble   *float64
+	valInt      *int64
+	attrs       map[string]any
+}
+
+type specMetricPoint struct {
+	name      string
+	unit      string
+	at        time.Time
+	valDouble *float64
+	valInt    *int64
+	attrs     map[string]any
+	exemplars []specExemplar
+}
+
+func buildExemplarMetrics(t testing.TB, service string, points ...specMetricPoint) pmetric.Metrics {
+	t.Helper()
+	md := pmetric.NewMetrics()
+	rm := md.ResourceMetrics().AppendEmpty()
+	if service != "" {
+		rm.Resource().Attributes().PutStr("service.name", service)
+	}
+	sm := rm.ScopeMetrics().AppendEmpty()
+	sm.Scope().SetName("synthetic.view.conformance")
+	for _, pt := range points {
+		m := sm.Metrics().AppendEmpty()
+		m.SetName(pt.name)
+		m.SetUnit(pt.unit)
+		var exList pmetric.ExemplarSlice
+		if pt.valInt != nil {
+			sum := m.SetEmptySum()
+			sum.SetIsMonotonic(true)
+			sum.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
+			dp := sum.DataPoints().AppendEmpty()
+			dp.SetTimestamp(pcommon.NewTimestampFromTime(pt.at))
+			dp.SetIntValue(*pt.valInt)
+			putAttrs(t, dp.Attributes(), pt.attrs)
+			exList = dp.Exemplars()
+		} else {
+			hist := m.SetEmptyHistogram()
+			hist.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
+			dp := hist.DataPoints().AppendEmpty()
+			dp.SetTimestamp(pcommon.NewTimestampFromTime(pt.at))
+			dp.SetCount(1)
+			if pt.valDouble != nil {
+				dp.SetSum(*pt.valDouble)
+			}
+			putAttrs(t, dp.Attributes(), pt.attrs)
+			exList = dp.Exemplars()
+		}
+		for _, ex := range pt.exemplars {
+			e := exList.AppendEmpty()
+			e.SetTimestamp(pcommon.NewTimestampFromTime(ex.at))
+			if ex.trace != "" {
+				e.SetTraceID(mustTraceID(t, ex.trace))
+			}
+			if ex.span != "" {
+				e.SetSpanID(mustSpanID(t, ex.span))
+			}
+			if ex.valDouble != nil {
+				e.SetDoubleValue(*ex.valDouble)
+			}
+			if ex.valInt != nil {
+				e.SetIntValue(*ex.valInt)
+			}
+			putAttrs(t, e.FilteredAttributes(), ex.attrs)
+		}
+	}
+	return md
+}
+
+// v_gen_ai_metric_exemplars keeps only exemplars with non-empty trace_id and
+// span_id, and enriches them with their span only when the span started within
+// [m.timestamp - 24h, m.timestamp + 1h] under the same service_name.
+func TestMetricExemplarsViewJoinAndFiltering(t *testing.T) {
+	rig := newConformanceRig(t)
+	t0 := time.Date(2024, 8, 12, 12, 0, 0, 0, time.UTC)
+	valD := func(v float64) *float64 { return &v }
+	valI := func(v int64) *int64 { return &v }
+
+	rig.pushTraces(t, buildTraces(t, "exemplar-agent",
+		// Span 1: inside window, failed tool call with attributes.
+		specSpan{
+			trace: traceHex(1), id: spanHex(1), name: "execute_tool search",
+			start: t0.Add(-10 * time.Minute), end: t0.Add(-10*time.Minute + 250*time.Millisecond),
+			failed: true,
+			attrs: map[string]any{
+				"gen_ai.operation.name":  "execute_tool",
+				"gen_ai.agent.name":      "tool_bot",
+				"gen_ai.tool.name":       "search",
+				"gen_ai.conversation.id": "conv-ex-1",
+				"error.type":             "ToolTimeout",
+			},
+		},
+		// Span 2: exactly 24h before m.timestamp (inclusive lower boundary).
+		specSpan{
+			trace: traceHex(2), id: spanHex(2), name: "chat lower_edge",
+			start: t0.Add(-24 * time.Hour), end: t0.Add(-24*time.Hour + time.Second),
+			attrs: map[string]any{
+				"gen_ai.operation.name":  "chat",
+				"gen_ai.main_agent.name": "main_bot",
+				"gen_ai.conversation.id": "conv-edge-low",
+			},
+		},
+		// Span 3: exactly 1h after m.timestamp (inclusive upper boundary).
+		// Carries gcp.vertex.agent.name and both session ID keys to verify
+		// gcp.vertex.agent.session_id takes precedence over gen_ai.conversation.id.
+		specSpan{
+			trace: traceHex(3), id: spanHex(3), name: "chat upper_edge",
+			start: t0.Add(time.Hour), end: t0.Add(time.Hour + time.Second),
+			attrs: map[string]any{
+				"gen_ai.operation.name":       "chat",
+				"gcp.vertex.agent.name":       "vertex_bot",
+				"gcp.vertex.agent.session_id": "adk-1",
+				"gen_ai.conversation.id":      "conv-1",
+			},
+		},
+		// Span 4: 24h + 1s before m.timestamp (outside lower boundary).
+		specSpan{
+			trace: traceHex(4), id: spanHex(4), name: "chat too_old",
+			start: t0.Add(-24*time.Hour - time.Second), end: t0.Add(-24 * time.Hour),
+			attrs: map[string]any{"gen_ai.operation.name": "chat", "gen_ai.agent.name": "old_bot"},
+		},
+		// Span 5: 1h + 1s after m.timestamp (outside upper boundary).
+		specSpan{
+			trace: traceHex(5), id: spanHex(5), name: "chat too_new",
+			start: t0.Add(time.Hour + time.Second), end: t0.Add(time.Hour + 2*time.Second),
+			attrs: map[string]any{"gen_ai.operation.name": "chat", "gen_ai.agent.name": "new_bot"},
+		},
+	))
+	// Span 6: different service_name ("other-agent").
+	rig.pushTraces(t, buildTraces(t, "other-agent", specSpan{
+		trace: traceHex(6), id: spanHex(6), name: "chat wrong_service",
+		start: t0, end: t0.Add(time.Second),
+		attrs: map[string]any{"gen_ai.operation.name": "chat", "gen_ai.agent.name": "other_bot"},
+	}))
+	// Span 7: both metric and span have NULL service_name (IS NOT DISTINCT FROM).
+	rig.pushTraces(t, buildTraces(t, "", specSpan{
+		trace: traceHex(7), id: spanHex(7), name: "chat null_service",
+		start: t0, end: t0.Add(time.Second),
+		attrs: map[string]any{"gen_ai.operation.name": "chat", "gen_ai.agent.name": "null_svc_bot"},
+	}))
+
+	rig.pushMetrics(t, buildExemplarMetrics(t, "exemplar-agent",
+		specMetricPoint{
+			name: "gen_ai.client.operation.duration", unit: "s", at: t0, valDouble: valD(0.25),
+			attrs: map[string]any{
+				"gen_ai.system":         "gcp.vertex.agent",
+				"gen_ai.operation.name": "execute_tool",
+				"gen_ai.request.model":  "gemini-2.5-pro",
+				"gen_ai.agent.name":     "tool_bot",
+				"error.type":            "ToolTimeout",
+			},
+			exemplars: []specExemplar{
+				{trace: traceHex(1), span: spanHex(1), at: t0.Add(-5 * time.Minute), valDouble: valD(0.25), attrs: map[string]any{"case": "matched_inside"}},
+				{trace: traceHex(2), span: spanHex(2), at: t0, valDouble: valD(1.0), attrs: map[string]any{"case": "edge_24h_before"}},
+				{trace: traceHex(3), span: spanHex(3), at: t0, valDouble: valD(1.0), attrs: map[string]any{"case": "edge_1h_after"}},
+				{trace: traceHex(4), span: spanHex(4), at: t0, valDouble: valD(1.0), attrs: map[string]any{"case": "too_old"}},
+				{trace: traceHex(5), span: spanHex(5), at: t0, valDouble: valD(1.0), attrs: map[string]any{"case": "too_new"}},
+				{trace: traceHex(6), span: spanHex(6), at: t0, valDouble: valD(1.0), attrs: map[string]any{"case": "service_mismatch"}},
+				{trace: traceHex(99), span: spanHex(99), at: t0, valDouble: valD(1.0), attrs: map[string]any{"case": "missing_span"}},
+				// Excluded by WHERE: empty trace_id or empty span_id.
+				{trace: "", span: spanHex(1), at: t0, valDouble: valD(1.0), attrs: map[string]any{"case": "empty_trace"}},
+				{trace: traceHex(1), span: "", at: t0, valDouble: valD(1.0), attrs: map[string]any{"case": "empty_span"}},
+			},
+		},
+		// Non-gen_ai metric: excluded by v_gen_ai_metrics before unnesting.
+		specMetricPoint{
+			name: "http.server.request.duration", unit: "s", at: t0, valDouble: valD(0.1),
+			exemplars: []specExemplar{
+				{trace: traceHex(1), span: spanHex(1), at: t0, valDouble: valD(0.1), attrs: map[string]any{"case": "non_gen_ai_metric"}},
+			},
+		},
+	))
+	rig.pushMetrics(t, buildExemplarMetrics(t, "",
+		specMetricPoint{
+			name: "gen_ai.client.inference.usage.input_tokens", unit: "{token}", at: t0, valInt: valI(42),
+			attrs: map[string]any{
+				"gen_ai.provider.name":  "gcp.vertex.agent",
+				"gen_ai.operation.name": "chat",
+				"gen_ai.token.modality": "text",
+			},
+			exemplars: []specExemplar{
+				{trace: traceHex(7), span: spanHex(7), at: t0, valInt: valI(42), attrs: map[string]any{"case": "null_service_match"}},
+				{trace: traceHex(1), span: spanHex(1), at: t0, valInt: valI(42), attrs: map[string]any{"case": "null_vs_named_service"}},
+			},
+		},
+	))
+
+	rows := genAIMetricExemplarsView(t, rig.srv.Rows(confMetrics), rig.srv.Rows(confSpans))
+	if len(rows) != 9 {
+		t.Fatalf("v_gen_ai_metric_exemplars has %d rows, want 9 (empty IDs and non-gen_ai metrics excluded)", len(rows))
+	}
+
+	byCase := make(map[string]map[string]any, len(rows))
+	for _, r := range rows {
+		raw, _ := r["exemplar_filtered_attributes"].(string)
+		var m map[string]string
+		if err := json.Unmarshal([]byte(raw), &m); err != nil {
+			t.Fatalf("unmarshal exemplar_filtered_attributes %q: %v", raw, err)
+		}
+		byCase[m["case"]] = r
+	}
+
+	requireCols(t, "matched_inside", byCase["matched_inside"], map[string]any{
+		"metric_timestamp":       t0.UnixMicro(),
+		"service_name":           "exemplar-agent",
+		"metric_name":            "gen_ai.client.operation.duration",
+		"metric_unit":            "s",
+		"metric_type":            "HISTOGRAM",
+		"gen_ai_operation_name":  "execute_tool",
+		"gen_ai_system":          "gcp.vertex.agent",
+		"gen_ai_request_model":   "gemini-2.5-pro",
+		"gen_ai_agent_name":      "tool_bot",
+		"metric_error_type":      "ToolTimeout",
+		"exemplar_timestamp":     t0.Add(-5 * time.Minute).UnixMicro(),
+		"exemplar_value_double":  0.25,
+		"exemplar_value_int64":   nil,
+		"trace_id":               traceHex(1),
+		"span_id":                spanHex(1),
+		"span_start_time":        t0.Add(-10 * time.Minute).UnixMicro(),
+		"span_end_time":          t0.Add(-10*time.Minute + 250*time.Millisecond).UnixMicro(),
+		"span_duration_nano":     int64(250_000_000),
+		"span_duration_ms":       250.0,
+		"span_name":              "execute_tool search",
+		"span_status_code":       int64(2),
+		"span_gen_ai_agent_name": "tool_bot",
+		"span_gen_ai_tool_name":  "search",
+		"adk_session_id":         "conv-ex-1",
+		"span_error_type":        "ToolTimeout",
+	})
+	requireCols(t, "edge_24h_before", byCase["edge_24h_before"], map[string]any{
+		"span_name":              "chat lower_edge",
+		"span_gen_ai_agent_name": "main_bot", // falls back to gen_ai.main_agent.name
+		"adk_session_id":         "conv-edge-low",
+	})
+	requireCols(t, "edge_1h_after", byCase["edge_1h_after"], map[string]any{
+		"span_name":              "chat upper_edge",
+		"span_gen_ai_agent_name": "vertex_bot", // falls back to gcp.vertex.agent.name
+		"adk_session_id":         "adk-1",      // gcp.vertex.agent.session_id wins over gen_ai.conversation.id
+	})
+	requireCols(t, "null_service_match", byCase["null_service_match"], map[string]any{
+		"service_name":           nil,
+		"metric_type":            "SUM",
+		"gen_ai_token_modality":  "text",
+		"exemplar_value_int64":   int64(42),
+		"exemplar_value_double":  nil,
+		"span_name":              "chat null_service",
+		"span_gen_ai_agent_name": "null_svc_bot",
+	})
+
+	for _, unmatched := range []string{"too_old", "too_new", "service_mismatch", "missing_span", "null_vs_named_service"} {
+		requireCols(t, unmatched, byCase[unmatched], map[string]any{
+			"span_start_time":        nil,
+			"span_end_time":          nil,
+			"span_duration_nano":     nil,
+			"span_duration_ms":       nil,
+			"span_name":              nil,
+			"span_status_code":       nil,
+			"span_status_message":    nil,
+			"span_gen_ai_agent_name": nil,
+			"span_gen_ai_tool_name":  nil,
+			"adk_session_id":         nil,
+			"span_error_type":        nil,
+		})
+	}
+	for _, excluded := range []string{"empty_trace", "empty_span", "non_gen_ai_metric"} {
+		if _, found := byCase[excluded]; found {
+			t.Errorf("case %q should have been filtered out of v_gen_ai_metric_exemplars", excluded)
+		}
+	}
 }

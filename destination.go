@@ -496,27 +496,40 @@ func (e *signalExporter) createDedupView(
 // this option on, the exporter therefore owns these fixed-name views, and a
 // customized definition under one of their names is replaced.
 //
-// v_gen_ai_logs joins the log and span dedup views, which belong to separate
-// signal exporters, so whichever exporter starts second creates v_gen_ai_logs
-// once the peer signal's dedup view exists. When the peer dedup view does not
-// exist yet (or in a single-signal deployment), v_gen_ai_logs is skipped with
-// a notice rather than failing startup, and a later start creates it. An
-// unreadable peer dedup view is skipped with a warning because companion views
-// are a convenience and must not block export.
-//
-// The metrics signal has one companion view, v_gen_ai_metrics, which reads the
-// metric dedup view only and so needs no peer probe.
+// v_gen_ai_logs joins the log and span dedup views, and
+// v_gen_ai_metric_exemplars joins v_gen_ai_metrics with the span dedup view.
+// Their inputs belong to separate signal exporters, so whichever exporter
+// starts second creates the cross-signal view once the peer signal's dedup view
+// exists. When a peer dedup view does not exist yet (or in a single-signal
+// deployment), the cross-signal view is skipped with a notice rather than
+// failing startup, and a later start creates it. An unreadable peer dedup view
+// is skipped with a warning because companion views are a convenience and must
+// not block export.
 func (e *signalExporter) createCompanionViews(ctx context.Context, admin destinationAdmin) error {
 	if proto.Equal(e.schema, schema.MetricsTableSchema()) {
 		views := schema.MetricsCompanionViewsMetadata(e.cfg.Project, e.cfg.Dataset, e.table)
-		return e.ensureCompanionViews(ctx, admin,
-			slices.Sorted(maps.Keys(views)), views, e.destinationOptions().Labels)
+		preserved, err := e.ensureCompanionViews(ctx, admin,
+			slices.Sorted(maps.Keys(views)), views, e.destinationOptions().Labels, false)
+		if err != nil {
+			return err
+		}
+		ok, err := e.probePeerDedupView(ctx, admin, "span", e.cfg.Traces.Table, schema.GenAIMetricExemplarsViewName)
+		if err != nil || !ok {
+			return err
+		}
+		exemplarViews := map[string]*bq.TableMetadata{
+			schema.GenAIMetricExemplarsViewName: schema.MetricExemplarsCompanionViewMetadata(
+				e.cfg.Project, e.cfg.Dataset, e.cfg.Traces.Table),
+		}
+		_, err = e.ensureCompanionViews(ctx, admin,
+			[]string{schema.GenAIMetricExemplarsViewName}, exemplarViews, e.destinationOptions().Labels, preserved)
+		return err
 	}
 	isSpans := proto.Equal(e.schema, schema.SpansTableSchema())
 	spansTable, logsTable := e.table, e.cfg.Logs.Table
 	if !isSpans {
 		spansTable, logsTable = e.cfg.Traces.Table, e.table
-		ok, err := e.probePeerDedupView(ctx, admin, "span", spansTable)
+		ok, err := e.probePeerDedupView(ctx, admin, "span", spansTable, schema.GenAILogsViewName)
 		if err != nil || !ok {
 			return err
 		}
@@ -527,18 +540,34 @@ func (e *signalExporter) createCompanionViews(ctx context.Context, admin destina
 	if isSpans {
 		order = schema.SpanCompanionViewOrder
 	}
-	if err := e.ensureCompanionViews(ctx, admin, order, views, e.destinationOptions().Labels); err != nil {
+	if _, err := e.ensureCompanionViews(ctx, admin, order, views, e.destinationOptions().Labels, false); err != nil {
 		return err
 	}
 
 	if isSpans {
-		ok, err := e.probePeerDedupView(ctx, admin, "log", logsTable)
+		ok, err := e.probePeerDedupView(ctx, admin, "log", logsTable, schema.GenAILogsViewName)
+		if err != nil {
+			return err
+		}
+		if ok {
+			logViews := schema.CompanionViewsMetadata(e.cfg.Project, e.cfg.Dataset, spansTable, logsTable, false)
+			if _, err := e.ensureCompanionViews(ctx, admin,
+				slices.Sorted(maps.Keys(logViews)), logViews, e.effectiveLabels(e.cfg.Logs.Labels), false); err != nil {
+				return err
+			}
+		}
+
+		ok, err = e.probePeerDedupView(ctx, admin, "metric", e.cfg.Metrics.Table, schema.GenAIMetricExemplarsViewName)
 		if err != nil || !ok {
 			return err
 		}
-		logViews := schema.CompanionViewsMetadata(e.cfg.Project, e.cfg.Dataset, spansTable, logsTable, false)
-		return e.ensureCompanionViews(ctx, admin,
-			slices.Sorted(maps.Keys(logViews)), logViews, e.effectiveLabels(e.cfg.Logs.Labels))
+		metricViews := schema.MetricsCompanionViewsMetadata(e.cfg.Project, e.cfg.Dataset, e.cfg.Metrics.Table)
+		metricViews[schema.GenAIMetricExemplarsViewName] = schema.MetricExemplarsCompanionViewMetadata(
+			e.cfg.Project, e.cfg.Dataset, spansTable)
+		_, err = e.ensureCompanionViews(ctx, admin,
+			[]string{schema.GenAIMetricsViewName, schema.GenAIMetricExemplarsViewName},
+			metricViews, e.effectiveLabels(e.cfg.Metrics.Labels), false)
+		return err
 	}
 	return nil
 }
@@ -554,8 +583,8 @@ func (e *signalExporter) ensureCompanionViews(
 	order []string,
 	views map[string]*bq.TableMetadata,
 	labels map[string]string,
-) error {
-	var companionViewsPreserved bool
+	companionViewsPreserved bool,
+) (bool, error) {
 	for _, id := range order {
 		md, ok := views[id]
 		if !ok {
@@ -572,20 +601,21 @@ func (e *signalExporter) ensureCompanionViews(
 					zap.Error(err))
 				continue
 			}
-			return err
+			return companionViewsPreserved, err
 		}
 		if preserved {
 			companionViewsPreserved = true
 		}
 	}
-	return nil
+	return companionViewsPreserved, nil
 }
 
 func isRollupView(id string) bool {
 	switch id {
 	case schema.GenAIModelCostsViewName,
 		schema.GenAISessionsViewName,
-		schema.GenAIToolUsageViewName:
+		schema.GenAIToolUsageViewName,
+		schema.GenAIMetricExemplarsViewName:
 		return true
 	default:
 		return false
@@ -593,20 +623,20 @@ func isRollupView(id string) bool {
 }
 
 func (e *signalExporter) probePeerDedupView(
-	ctx context.Context, admin destinationAdmin, peerSignal, peerTable string,
+	ctx context.Context, admin destinationAdmin, peerSignal, peerTable, dependentView string,
 ) (bool, error) {
 	peerView := e.cfg.Project + "." + e.cfg.Dataset + "." + peerTable + "_dedup"
-	logsView := e.cfg.Project + "." + e.cfg.Dataset + "." + schema.GenAILogsViewName
+	viewName := e.cfg.Project + "." + e.cfg.Dataset + "." + dependentView
 	if _, err := admin.TableMetadata(ctx, peerTable+"_dedup"); err != nil {
 		switch {
 		case isContextError(err):
 			return false, fmt.Errorf("reading %s deduplication view metadata for %s: %w", peerSignal, peerView, err)
 		case isNotFound(err):
 			e.logger.Info(peerSignal+" deduplication view does not exist; skipping companion view until a later start",
-				zap.String("view", logsView), zap.String("requires", peerView))
+				zap.String("view", viewName), zap.String("requires", peerView))
 		default:
 			e.logger.Warn(peerSignal+" deduplication view metadata is unreadable; skipping companion view",
-				zap.String("view", logsView), zap.String("requires", peerView), zap.Error(err))
+				zap.String("view", viewName), zap.String("requires", peerView), zap.Error(err))
 		}
 		return false, nil
 	}

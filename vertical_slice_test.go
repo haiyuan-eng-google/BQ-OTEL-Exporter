@@ -1071,6 +1071,7 @@ func assertMetricsProvisioned(t *testing.T, srv *bqfake.Server, cfg *Config) {
 		schema.SpansAsAllSpansViewName, schema.GenAISpansViewName,
 		schema.GenAIModelCostsViewName, schema.GenAISessionsViewName,
 		schema.GenAIToolUsageViewName, schema.GenAILogsViewName,
+		schema.GenAIMetricExemplarsViewName,
 	} {
 		if _, ok := srv.Table(project, dataset, id); ok {
 			t.Errorf("the metrics exporter created %s, which belongs to another signal", id)
@@ -1211,6 +1212,7 @@ func exporterOwnedViews(cfg *Config) map[string]string {
 	for id, md := range schema.MetricsCompanionViewsMetadata(p, d, cfg.Metrics.Table) {
 		views[id] = md.ViewQuery
 	}
+	views[schema.GenAIMetricExemplarsViewName] = schema.MetricExemplarsCompanionViewMetadata(p, d, cfg.Traces.Table).ViewQuery
 	return views
 }
 

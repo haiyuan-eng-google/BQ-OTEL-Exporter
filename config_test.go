@@ -184,6 +184,66 @@ func TestValidateAcceptsCompanionViewsWithTableCreation(t *testing.T) {
 	}
 }
 
+// Cross-signal companion views (v_gen_ai_logs, v_gen_ai_metric_exemplars) join
+// the span dedup view on a row-dependent timestamp window, which BigQuery does
+// not accept as a constant partition filter on otel_spans.start_time. Enabling
+// both auto_create.companion_views and traces.require_partition_filter
+// therefore requires auto_create.allow_unprunable_views.
+func TestValidateCompanionViewPruning(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr string
+	}{
+		{
+			name: "rejected when traces require_partition_filter and companion_views are both on",
+			mutate: func(c *Config) {
+				c.AutoCreate.Tables = true
+				c.AutoCreate.CompanionViews = true
+				c.Traces.RequirePartitionFilter = true
+			},
+			wantErr: "auto_create.allow_unprunable_views",
+		},
+		{
+			name: "accepted with allow_unprunable_views escape hatch",
+			mutate: func(c *Config) {
+				c.AutoCreate.Tables = true
+				c.AutoCreate.CompanionViews = true
+				c.Traces.RequirePartitionFilter = true
+				c.AutoCreate.AllowUnprunableViews = true
+			},
+		},
+		{
+			name: "accepted when companion_views is false",
+			mutate: func(c *Config) {
+				c.AutoCreate.Tables = true
+				c.Traces.RequirePartitionFilter = true
+			},
+		},
+		{
+			name: "accepted when only logs and metrics require_partition_filter",
+			mutate: func(c *Config) {
+				c.AutoCreate.Tables = true
+				c.AutoCreate.CompanionViews = true
+				c.Logs.RequirePartitionFilter = true
+				c.Metrics.RequirePartitionFilter = true
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validConfig()
+			tc.mutate(cfg)
+			err := cfg.Validate()
+			if tc.wantErr == "" && err != nil {
+				t.Fatalf("Validate() = %v, want nil", err)
+			}
+			if tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
+				t.Fatalf("Validate() = %v, want error containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestValidateAcceptsEnterpriseAndLifecycleSettings(t *testing.T) {
 	cfg := validConfig()
 	cfg.Traces.PartitionExpirationDays = 365

@@ -507,8 +507,8 @@ func TestPrepareDestinationCreatesSpanCompanionViews(t *testing.T) {
 			t.Errorf("createdTableOrder = %v, want v_gen_ai_spans before %s", admin.createdTableOrder, rollup)
 		}
 	}
-	if !equalStrings(admin.tableReadIDs, []string{cfg.Traces.Table, cfg.Logs.Table + "_dedup"}) {
-		t.Errorf("table reads = %v, want the destination table probe and the log dedup view probe", admin.tableReadIDs)
+	if !equalStrings(admin.tableReadIDs, []string{cfg.Traces.Table, cfg.Logs.Table + "_dedup", cfg.Metrics.Table + "_dedup"}) {
+		t.Errorf("table reads = %v, want the destination table probe, the log dedup view probe, and the metric dedup view probe", admin.tableReadIDs)
 	}
 }
 
@@ -722,8 +722,139 @@ func TestPrepareDestinationCreatesMetricsCompanionView(t *testing.T) {
 	if wantLabels := map[string]string{"env": "prod", "signal": "metrics"}; !maps.Equal(md.Labels, wantLabels) {
 		t.Errorf("v_gen_ai_metrics labels = %v, want %v", md.Labels, wantLabels)
 	}
-	if !equalStrings(admin.tableReadIDs, []string{cfg.Metrics.Table}) {
-		t.Errorf("table reads = %v, want only the destination table probe", admin.tableReadIDs)
+	if !equalStrings(admin.tableReadIDs, []string{cfg.Metrics.Table, cfg.Traces.Table + "_dedup"}) {
+		t.Errorf("table reads = %v, want the destination table probe and the span dedup view probe", admin.tableReadIDs)
+	}
+}
+
+func TestPrepareDestinationCreatesMetricExemplarsCompanionViewOverSpanDedupView(t *testing.T) {
+	cfg := companionViewConfig()
+	cfg.Labels = map[string]string{"env": "prod"}
+	cfg.Metrics.Labels = map[string]string{"signal": "metrics"}
+	admin := &fakeDestinationAdmin{
+		datasetMetadata:  &bq.DatasetMetadata{},
+		tableMetadataErr: notFound(),
+		tableMetadataByID: map[string]fakeTableMetadataResponse{
+			cfg.Traces.Table + "_dedup": {metadata: &bq.TableMetadata{Type: bq.ViewTable}},
+		},
+	}
+	e := newTestSignalExporter(cfg, cfg.Metrics.Table, schema.MetricsTableSchema())
+
+	if err := e.prepareDestination(context.Background(), admin); err != nil {
+		t.Fatal(err)
+	}
+	wantOrder := []string{
+		cfg.Metrics.Table,
+		cfg.Metrics.Table + "_dedup",
+		schema.GenAIMetricsViewName,
+		schema.GenAIMetricExemplarsViewName,
+	}
+	if !equalStrings(admin.createdTableOrder, wantOrder) {
+		t.Errorf("created %v, want %v", admin.createdTableOrder, wantOrder)
+	}
+	want := fmt.Sprintf(schema.GenAIMetricExemplarsViewQuery, "my-project", "otel", cfg.Traces.Table)
+	md := admin.createdTables[schema.GenAIMetricExemplarsViewName]
+	if md == nil || md.ViewQuery != want || md.UseLegacySQL {
+		t.Fatalf("v_gen_ai_metric_exemplars = %#v, want the join of v_gen_ai_metrics and the span dedup view", md)
+	}
+	if wantLabels := map[string]string{"env": "prod", "signal": "metrics"}; !maps.Equal(md.Labels, wantLabels) {
+		t.Errorf("v_gen_ai_metric_exemplars labels = %v, want %v", md.Labels, wantLabels)
+	}
+}
+
+func TestPrepareDestinationCreatesMetricExemplarsCompanionViewWhenTracesStartsSecond(t *testing.T) {
+	cfg := companionViewConfig()
+	cfg.Labels = map[string]string{"env": "prod"}
+	cfg.Metrics.Labels = map[string]string{"signal": "metrics"}
+	admin := &fakeDestinationAdmin{
+		datasetMetadata:  &bq.DatasetMetadata{},
+		tableMetadataErr: notFound(),
+		tableMetadataByID: map[string]fakeTableMetadataResponse{
+			cfg.Metrics.Table + "_dedup": {metadata: &bq.TableMetadata{Type: bq.ViewTable}},
+		},
+	}
+	e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+
+	if err := e.prepareDestination(context.Background(), admin); err != nil {
+		t.Fatal(err)
+	}
+	wantMetrics := fmt.Sprintf(schema.GenAIMetricsViewQuery, "my-project", "otel", cfg.Metrics.Table)
+	if md := admin.createdTables[schema.GenAIMetricsViewName]; md == nil || md.ViewQuery != wantMetrics {
+		t.Fatalf("v_gen_ai_metrics = %#v, want traces startup to ensure v_gen_ai_metrics before v_gen_ai_metric_exemplars", md)
+	}
+	wantExemplars := fmt.Sprintf(schema.GenAIMetricExemplarsViewQuery, "my-project", "otel", cfg.Traces.Table)
+	md := admin.createdTables[schema.GenAIMetricExemplarsViewName]
+	if md == nil || md.ViewQuery != wantExemplars {
+		t.Fatalf("v_gen_ai_metric_exemplars = %#v, want traces startup to create v_gen_ai_metric_exemplars when metric dedup view already exists", md)
+	}
+	metricsIdx := slices.Index(admin.createdTableOrder, schema.GenAIMetricsViewName)
+	exemplarsIdx := slices.Index(admin.createdTableOrder, schema.GenAIMetricExemplarsViewName)
+	if metricsIdx < 0 || exemplarsIdx < 0 || exemplarsIdx < metricsIdx {
+		t.Errorf("createdTableOrder = %v, want %s before %s",
+			admin.createdTableOrder, schema.GenAIMetricsViewName, schema.GenAIMetricExemplarsViewName)
+	}
+	if wantLabels := map[string]string{"env": "prod", "signal": "metrics"}; !maps.Equal(md.Labels, wantLabels) {
+		t.Errorf("v_gen_ai_metric_exemplars labels = %v, want %v", md.Labels, wantLabels)
+	}
+	if _, ok := admin.createdTables[schema.GenAILogsViewName]; ok {
+		t.Error("v_gen_ai_logs must not be created when the log dedup view does not exist")
+	}
+}
+
+func TestPrepareDestinationMetricExemplarsCompanionViewNeedsPeerDedupView(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		probeErr error
+		wantErr  error
+	}{
+		{name: "absent", probeErr: notFound()},
+		{name: "unreadable", probeErr: forbidden()},
+		{name: "deadline", probeErr: context.DeadlineExceeded, wantErr: context.DeadlineExceeded},
+	} {
+		t.Run("metrics_"+tc.name, func(t *testing.T) {
+			cfg := companionViewConfig()
+			admin := &fakeDestinationAdmin{
+				datasetMetadata:  &bq.DatasetMetadata{},
+				tableMetadataErr: notFound(),
+				tableMetadataByID: map[string]fakeTableMetadataResponse{
+					cfg.Traces.Table + "_dedup": {err: tc.probeErr},
+				},
+			}
+			e := newTestSignalExporter(cfg, cfg.Metrics.Table, schema.MetricsTableSchema())
+
+			err := e.prepareDestination(context.Background(), admin)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tc.wantErr)
+			}
+			if _, ok := admin.createdTables[schema.GenAIMetricExemplarsViewName]; ok {
+				t.Error("v_gen_ai_metric_exemplars must not be created without a readable span dedup view")
+			}
+			if admin.createdTables[schema.GenAIMetricsViewName] == nil {
+				t.Error("v_gen_ai_metrics must still be created")
+			}
+		})
+		t.Run("traces_"+tc.name, func(t *testing.T) {
+			cfg := companionViewConfig()
+			admin := &fakeDestinationAdmin{
+				datasetMetadata:  &bq.DatasetMetadata{},
+				tableMetadataErr: notFound(),
+				tableMetadataByID: map[string]fakeTableMetadataResponse{
+					cfg.Metrics.Table + "_dedup": {err: tc.probeErr},
+				},
+			}
+			e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+
+			err := e.prepareDestination(context.Background(), admin)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tc.wantErr)
+			}
+			if _, ok := admin.createdTables[schema.GenAIMetricExemplarsViewName]; ok {
+				t.Error("v_gen_ai_metric_exemplars must not be created without a readable metric dedup view")
+			}
+			if admin.createdTables[schema.GenAISpansViewName] == nil {
+				t.Error("span companion views must still be created")
+			}
+		})
 	}
 }
 
@@ -776,6 +907,14 @@ func reconcileTargets() []reconcileTarget {
 			name: "metric companion view", table: defaultMetricsTable, tableSchema: schema.MetricsTableSchema(),
 			viewID: schema.GenAIMetricsViewName,
 			query:  fmt.Sprintf(schema.GenAIMetricsViewQuery, project, dataset, defaultMetricsTable),
+		},
+		{
+			name: "metric exemplars companion view", table: defaultMetricsTable, tableSchema: schema.MetricsTableSchema(),
+			viewID: schema.GenAIMetricExemplarsViewName,
+			query:  fmt.Sprintf(schema.GenAIMetricExemplarsViewQuery, project, dataset, defaultSpansTable),
+			peers: map[string]fakeTableMetadataResponse{
+				defaultSpansTable + "_dedup": {metadata: &bq.TableMetadata{Type: bq.ViewTable}},
+			},
 		},
 	}
 }

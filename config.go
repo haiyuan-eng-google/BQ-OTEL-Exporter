@@ -201,9 +201,17 @@ type AutoCreateConfig struct {
 	// only, best effort): otel_spans_as_allspans, v_gen_ai_spans,
 	// v_gen_ai_model_costs, v_gen_ai_sessions, and v_gen_ai_tool_usage with the
 	// traces table, v_gen_ai_logs with the logs table once the traces dedup
-	// view exists, and v_gen_ai_metrics with the metrics table.
+	// view exists, and v_gen_ai_metrics and v_gen_ai_metric_exemplars with the
+	// metrics table (the latter once the traces dedup view exists).
 	// Requires tables.
 	CompanionViews bool `mapstructure:"companion_views"`
+	// AllowUnprunableViews permits auto_create.companion_views when
+	// traces.require_partition_filter is enabled. Cross-signal companion views
+	// (v_gen_ai_logs, v_gen_ai_metric_exemplars) join the span deduplication
+	// view on a row-dependent timestamp window rather than a constant
+	// start_time filter, so BigQuery rejects queries over those views when the
+	// spans table requires a partition filter.
+	AllowUnprunableViews bool `mapstructure:"allow_unprunable_views"`
 	// SearchIndexes runs CREATE SEARCH INDEX IF NOT EXISTS on signal tables
 	// at startup. Requires tables and bigquery.jobs.create.
 	SearchIndexes bool `mapstructure:"search_indexes"`
@@ -433,6 +441,9 @@ func (cfg *Config) Validate() error {
 	if cfg.AutoCreate.CompanionViews && !cfg.AutoCreate.Tables {
 		errs = append(errs, errors.New("auto_create.companion_views requires auto_create.tables"))
 	}
+	if err := cfg.validateCompanionViewPruning(); err != nil {
+		errs = append(errs, err)
+	}
 	if cfg.AutoCreate.SearchIndexes && !cfg.AutoCreate.Tables {
 		errs = append(errs, errors.New("auto_create.search_indexes requires auto_create.tables"))
 	}
@@ -464,6 +475,20 @@ func (cfg *Config) Validate() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+func (cfg *Config) validateCompanionViewPruning() error {
+	if cfg.AutoCreate.Tables && cfg.AutoCreate.CompanionViews &&
+		cfg.Traces.RequirePartitionFilter && !cfg.AutoCreate.AllowUnprunableViews {
+		return errors.New(
+			"auto_create.companion_views with traces.require_partition_filter requires " +
+				"auto_create.allow_unprunable_views: cross-signal views (v_gen_ai_logs, " +
+				"v_gen_ai_metric_exemplars) join the span deduplication view without a constant " +
+				"start_time partition filter, so BigQuery rejects queries over them when the " +
+				"spans table requires a partition filter; set traces.require_partition_filter: false, " +
+				"auto_create.companion_views: false, or auto_create.allow_unprunable_views: true")
+	}
+	return nil
 }
 
 func (cfg *Config) validateGovernance() []error {

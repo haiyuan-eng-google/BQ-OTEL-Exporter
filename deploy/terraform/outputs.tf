@@ -28,6 +28,11 @@ output "v_gen_ai_metrics_table_id" {
   value       = google_bigquery_table.v_gen_ai_metrics.id
 }
 
+output "v_gen_ai_metric_exemplars_table_id" {
+  description = "Fully-qualified v_gen_ai_metric_exemplars view ID"
+  value       = google_bigquery_table.v_gen_ai_metric_exemplars.id
+}
+
 output "service_account_email" {
   description = "Service account email for the collector"
   value       = google_service_account.otel_collector.email

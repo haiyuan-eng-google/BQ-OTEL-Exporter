@@ -987,6 +987,70 @@ resource "google_bigquery_table" "v_gen_ai_metrics" {
   }
 }
 
+resource "google_bigquery_table" "v_gen_ai_metric_exemplars" {
+  dataset_id = google_bigquery_dataset.otel.dataset_id
+  table_id   = "v_gen_ai_metric_exemplars"
+
+  labels = var.labels
+
+  view {
+    use_legacy_sql = false
+    query          = <<EOT
+      SELECT
+        m.timestamp AS metric_timestamp,
+        m.service_name,
+        m.metric_name,
+        m.metric_unit,
+        m.metric_type,
+        m.gen_ai_operation_name,
+        m.gen_ai_system,
+        m.gen_ai_request_model,
+        m.gen_ai_response_model,
+        m.gen_ai_agent_name,
+        m.gen_ai_token_type,
+        m.gen_ai_token_modality,
+        m.error_type AS metric_error_type,
+        ex.time AS exemplar_timestamp,
+        ex.value_double AS exemplar_value_double,
+        ex.value_int64 AS exemplar_value_int64,
+        ex.trace_id AS trace_id,
+        ex.span_id AS span_id,
+        ex.filtered_attributes AS exemplar_filtered_attributes,
+        s.start_time AS span_start_time,
+        s.end_time AS span_end_time,
+        s.duration_nano AS span_duration_nano,
+        ROUND(s.duration_nano / 1e6, 3) AS span_duration_ms,
+        s.name AS span_name,
+        s.status.code AS span_status_code,
+        s.status.message AS span_status_message,
+        COALESCE(
+          JSON_VALUE(s.attributes, '$."gen_ai.agent.name"'),
+          JSON_VALUE(s.attributes, '$."gcp.vertex.agent.name"'),
+          JSON_VALUE(s.resource.attributes, '$."gen_ai.agent.name"'),
+          JSON_VALUE(s.attributes, '$."gen_ai.main_agent.name"'),
+          JSON_VALUE(s.resource.attributes, '$."gen_ai.main_agent.name"')
+        ) AS span_gen_ai_agent_name,
+        JSON_VALUE(s.attributes, '$."gen_ai.tool.name"') AS span_gen_ai_tool_name,
+        COALESCE(
+          JSON_VALUE(s.attributes, '$."gcp.vertex.agent.session_id"'),
+          JSON_VALUE(s.attributes, '$."gen_ai.conversation.id"')
+        ) AS adk_session_id,
+        JSON_VALUE(s.attributes, '$."error.type"') AS span_error_type
+      FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.v_gen_ai_metrics.table_id}` m,
+      UNNEST(m.exemplars) AS ex
+      LEFT JOIN `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.otel_spans_dedup.table_id}` s
+        ON s.trace_id = ex.trace_id
+        AND s.span_id = ex.span_id
+        AND s.service_name IS NOT DISTINCT FROM m.service_name
+        AND s.start_time BETWEEN TIMESTAMP_SUB(m.timestamp, INTERVAL 24 HOUR) AND TIMESTAMP_ADD(m.timestamp, INTERVAL 1 HOUR)
+      WHERE ex.trace_id IS NOT NULL
+        AND ex.span_id IS NOT NULL
+        AND ex.trace_id != ''
+        AND ex.span_id != ''
+    EOT
+  }
+}
+
 resource "google_bigquery_table" "v_gen_ai_tool_usage" {
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "v_gen_ai_tool_usage"

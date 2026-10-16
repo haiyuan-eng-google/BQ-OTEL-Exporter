@@ -479,13 +479,14 @@ ON ` + "`%[1]s.%[2]s.%[3]s`" + ` (ALL COLUMNS) OPTIONS (analyzer = 'NO_OP_ANALYZ
 // Their names are fixed rather than derived from the table names, so one
 // dataset holds one set of them.
 const (
-	SpansAsAllSpansViewName = "otel_spans_as_allspans"
-	GenAISpansViewName      = "v_gen_ai_spans"
-	GenAILogsViewName       = "v_gen_ai_logs"
-	GenAIMetricsViewName    = "v_gen_ai_metrics"
-	GenAIModelCostsViewName = "v_gen_ai_model_costs"
-	GenAISessionsViewName   = "v_gen_ai_sessions"
-	GenAIToolUsageViewName  = "v_gen_ai_tool_usage"
+	SpansAsAllSpansViewName      = "otel_spans_as_allspans"
+	GenAISpansViewName           = "v_gen_ai_spans"
+	GenAILogsViewName            = "v_gen_ai_logs"
+	GenAIMetricsViewName         = "v_gen_ai_metrics"
+	GenAIMetricExemplarsViewName = "v_gen_ai_metric_exemplars"
+	GenAIModelCostsViewName      = "v_gen_ai_model_costs"
+	GenAISessionsViewName        = "v_gen_ai_sessions"
+	GenAIToolUsageViewName       = "v_gen_ai_tool_usage"
 )
 
 // SpansAsAllSpansViewDDL creates otel_spans_as_allspans, which presents the
@@ -846,6 +847,73 @@ SELECT
   END AS gen_ai_inference_usage_dimension
 FROM ` + "`%[1]s.%[2]s.%[3]s_dedup`" + `
 WHERE metric_name LIKE 'gen_ai.%%'
+`
+
+// GenAIMetricExemplarsViewDDL creates v_gen_ai_metric_exemplars: one row per
+// exemplar on a GenAI metric point that carries a non-empty trace_id and
+// span_id, left-joined to the span deduplication view within a 25-hour window
+// around the metric point timestamp. An exemplar whose span is absent or
+// outside the window stays in the view with NULL span_* columns.
+const GenAIMetricExemplarsViewDDL = `
+CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAIMetricExemplarsViewName + "`" + ` AS
+` + GenAIMetricExemplarsViewQuery + `;
+`
+
+// GenAIMetricExemplarsViewQuery is shared by operator-run DDL and metadata-API
+// view creation. It takes (project, dataset, spans table), reads
+// v_gen_ai_metrics, unnests exemplars, and left-joins the span dedup view.
+const GenAIMetricExemplarsViewQuery = `
+SELECT
+  m.timestamp AS metric_timestamp,
+  m.service_name,
+  m.metric_name,
+  m.metric_unit,
+  m.metric_type,
+  m.gen_ai_operation_name,
+  m.gen_ai_system,
+  m.gen_ai_request_model,
+  m.gen_ai_response_model,
+  m.gen_ai_agent_name,
+  m.gen_ai_token_type,
+  m.gen_ai_token_modality,
+  m.error_type AS metric_error_type,
+  ex.time AS exemplar_timestamp,
+  ex.value_double AS exemplar_value_double,
+  ex.value_int64 AS exemplar_value_int64,
+  ex.trace_id AS trace_id,
+  ex.span_id AS span_id,
+  ex.filtered_attributes AS exemplar_filtered_attributes,
+  s.start_time AS span_start_time,
+  s.end_time AS span_end_time,
+  s.duration_nano AS span_duration_nano,
+  ROUND(s.duration_nano / 1e6, 3) AS span_duration_ms,
+  s.name AS span_name,
+  s.status.code AS span_status_code,
+  s.status.message AS span_status_message,
+  COALESCE(
+    JSON_VALUE(s.attributes, '$."gen_ai.agent.name"'),
+    JSON_VALUE(s.attributes, '$."gcp.vertex.agent.name"'),
+    JSON_VALUE(s.resource.attributes, '$."gen_ai.agent.name"'),
+    JSON_VALUE(s.attributes, '$."gen_ai.main_agent.name"'),
+    JSON_VALUE(s.resource.attributes, '$."gen_ai.main_agent.name"')
+  ) AS span_gen_ai_agent_name,
+  JSON_VALUE(s.attributes, '$."gen_ai.tool.name"') AS span_gen_ai_tool_name,
+  COALESCE(
+    JSON_VALUE(s.attributes, '$."gcp.vertex.agent.session_id"'),
+    JSON_VALUE(s.attributes, '$."gen_ai.conversation.id"')
+  ) AS adk_session_id,
+  JSON_VALUE(s.attributes, '$."error.type"') AS span_error_type
+FROM ` + "`%[1]s.%[2]s." + GenAIMetricsViewName + "`" + ` m,
+UNNEST(m.exemplars) AS ex
+LEFT JOIN ` + "`%[1]s.%[2]s.%[3]s_dedup`" + ` s
+  ON s.trace_id = ex.trace_id
+  AND s.span_id = ex.span_id
+  AND s.service_name IS NOT DISTINCT FROM m.service_name
+  AND s.start_time BETWEEN TIMESTAMP_SUB(m.timestamp, INTERVAL 24 HOUR) AND TIMESTAMP_ADD(m.timestamp, INTERVAL 1 HOUR)
+WHERE ex.trace_id IS NOT NULL
+  AND ex.span_id IS NOT NULL
+  AND ex.trace_id != ''
+  AND ex.span_id != ''
 `
 
 // GenAIModelCostsViewDDL creates v_gen_ai_model_costs: hourly token and

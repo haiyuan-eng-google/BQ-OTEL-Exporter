@@ -78,6 +78,7 @@ exporters:
       dataset: true
       tables: true
       companion_views: true
+      allow_unprunable_views: true
       search_indexes: true
     # Enterprise governance.
     kms_key_name: projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/bq

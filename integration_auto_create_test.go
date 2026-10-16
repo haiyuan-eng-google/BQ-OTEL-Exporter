@@ -160,6 +160,7 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 		"v_gen_ai_spans",
 		"v_gen_ai_logs",
 		"v_gen_ai_metrics",
+		"v_gen_ai_metric_exemplars",
 		"v_gen_ai_model_costs",
 		"v_gen_ai_sessions",
 		"v_gen_ai_tool_usage",
@@ -255,6 +256,11 @@ func oneIntegrationMetrics() pmetric.Metrics {
 	dp.Attributes().PutStr("gen_ai.system", "gcp.vertex.agent")
 	dp.Attributes().PutStr("gen_ai.token.modality", "text")
 	dp.Attributes().PutStr("gen_ai.agent.name", "planner")
+	ex := dp.Exemplars().AppendEmpty()
+	ex.SetTimestamp(pcommon.NewTimestampFromTime(now))
+	ex.SetIntValue(10)
+	ex.SetTraceID(pcommon.TraceID{1})
+	ex.SetSpanID(pcommon.SpanID{1})
 	return md
 }
 
@@ -282,6 +288,11 @@ func assertIntegrationViewColumns(ctx context.Context, t *testing.T, client *bq.
 			name: "v_gen_ai_metrics",
 			sql:  fmt.Sprintf("SELECT gen_ai_token_modality, gen_ai_agent_name, gen_ai_inference_usage_dimension FROM `%s.%s.v_gen_ai_metrics` LIMIT 1", project, dataset),
 			want: []bq.Value{"text", "planner", "input"},
+		},
+		{
+			name: "v_gen_ai_metric_exemplars",
+			sql:  fmt.Sprintf("SELECT exemplar_value_int64, span_name, span_error_type FROM `%s.%s.v_gen_ai_metric_exemplars` LIMIT 1", project, dataset),
+			want: []bq.Value{int64(10), "chat gemini-2.5-pro", "rate_limited"},
 		},
 		{
 			name: "v_gen_ai_model_costs",

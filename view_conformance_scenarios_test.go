@@ -419,6 +419,61 @@ func TestScenarioMultiAgentViews(t *testing.T) {
 			"gen_ai_inference_usage_dimension": nil,
 		})
 	}
+
+	// 7. v_gen_ai_metric_exemplars: all 12 metric points carry 1 exemplar each
+	// (6 pointing to planner chat 00f067aa0ba902b8, 6 to researcher retry chat
+	// 00f067aa0ba902ba).
+	exemplarRows := genAIMetricExemplarsView(t, rawMetrics, rawSpans)
+	if len(exemplarRows) != 12 {
+		t.Fatalf("v_gen_ai_metric_exemplars rows = %d, want 12", len(exemplarRows))
+	}
+	plannerEx := rowsWhere(exemplarRows, "span_id", "00f067aa0ba902b8")
+	if len(plannerEx) != 6 {
+		t.Fatalf("planner exemplar rows = %d, want 6", len(plannerEx))
+	}
+	requireCols(t, "planner duration exemplar", onlyRow(t, "planner duration", plannerEx, "metric_name", "gen_ai.client.operation.duration"), map[string]any{
+		"service_name":           "multi-agent-planner",
+		"metric_unit":            "s",
+		"metric_type":            "HISTOGRAM",
+		"gen_ai_operation_name":  "chat",
+		"gen_ai_system":          "gcp.vertex.agent",
+		"gen_ai_request_model":   "gemini-2.5-pro",
+		"gen_ai_response_model":  "gemini-2.5-pro-001",
+		"gen_ai_agent_name":      "planner",
+		"exemplar_value_double":  1.0,
+		"exemplar_value_int64":   nil,
+		"trace_id":               "4bf92f3577b34da6a3ce929d0e0e4736",
+		"span_name":              "chat gemini-2.5-pro",
+		"span_duration_ms":       1000.0,
+		"span_status_code":       int64(1),
+		"span_gen_ai_agent_name": "planner",
+		"adk_session_id":         "conv-multi-01",
+		"span_error_type":        nil,
+	})
+	researcherEx := rowsWhere(exemplarRows, "span_id", "00f067aa0ba902ba")
+	if len(researcherEx) != 6 {
+		t.Fatalf("researcher exemplar rows = %d, want 6", len(researcherEx))
+	}
+	requireCols(t, "researcher reasoning exemplar", onlyRow(t, "researcher reasoning", researcherEx, "metric_name", "gen_ai.client.inference.usage.reasoning.output_tokens"), map[string]any{
+		"service_name":           "multi-agent-planner",
+		"metric_unit":            "{token}",
+		"metric_type":            "SUM",
+		"gen_ai_operation_name":  "chat",
+		"gen_ai_system":          "gcp.vertex.agent",
+		"gen_ai_request_model":   "gemini-2.5-flash",
+		"gen_ai_response_model":  "gemini-2.5-flash-001",
+		"gen_ai_agent_name":      "researcher",
+		"gen_ai_token_modality":  "text",
+		"exemplar_value_int64":   int64(70),
+		"exemplar_value_double":  nil,
+		"trace_id":               "4bf92f3577b34da6a3ce929d0e0e4736",
+		"span_name":              "chat gemini-2.5-flash",
+		"span_duration_ms":       400.0,
+		"span_status_code":       int64(1),
+		"span_gen_ai_agent_name": "researcher",
+		"adk_session_id":         "conv-multi-01",
+		"span_error_type":        nil,
+	})
 }
 
 func TestScenarioMCPViews(t *testing.T) {

@@ -550,7 +550,7 @@ func helmEnterpriseValues(maskReplacement string) map[string]any {
 	signal := func(name string) map[string]any {
 		return map[string]any{
 			"partitionExpirationDays": int64(90),
-			"requirePartitionFilter":  true,
+			"requirePartitionFilter":  name != "traces",
 			"kmsKeyName":              key + name,
 			"labels":                  map[string]any{"signal": name},
 			"maxStaleness":            "15m",
@@ -688,6 +688,19 @@ func TestHelmConfigMapDecodesAndValidates(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("traces requirePartitionFilter without companionViews", func(t *testing.T) {
+		overrides := helmEnterpriseValues("[REDACTED]")
+		bq := overrides["bigquery"].(map[string]any)
+		bq["autoCreateCompanionViews"] = false
+		bq["traces"].(map[string]any)["requirePartitionFilter"] = true
+		conf := confmap.NewFromStringMap(helmCollectorConfig(t, overrides))
+		cfg := decodeExporterConfig(t, "traces requirePartitionFilter", exporterBlock(t, conf, "bigquery"))
+		if !cfg.Traces.RequirePartitionFilter || cfg.AutoCreate.CompanionViews {
+			t.Errorf("decoded traces.require_partition_filter = %v, auto_create.companion_views = %v, want true and false",
+				cfg.Traces.RequirePartitionFilter, cfg.AutoCreate.CompanionViews)
+		}
+	})
 }
 
 // An offload.cacheSize of 0 disables the cross-batch cache, whose exporter
@@ -770,10 +783,14 @@ var helmUnexposedExporterKeys = map[string]string{
 
 	"logs.log_name_attribute":  "the exporter falls back to well-known attributes, then the service name",
 	"logs.insert_id_attribute": "the exporter falls back to well-known attributes, then the record fingerprint",
+
+	"auto_create.allow_unprunable_views": "cross-signal companion view partition-filter opt-out is set directly on the exporter",
 }
 
 func TestHelmChartExposesExporterOptions(t *testing.T) {
-	conf := confmap.NewFromStringMap(helmCollectorConfig(t, helmEnterpriseValues("[REDACTED]")))
+	overrides := helmEnterpriseValues("[REDACTED]")
+	overrides["bigquery"].(map[string]any)["traces"].(map[string]any)["requirePartitionFilter"] = true
+	conf := confmap.NewFromStringMap(helmCollectorConfig(t, overrides))
 	section := exporterBlock(t, conf, "bigquery")
 	exposed := map[string]bool{}
 	for _, key := range presentExporterKeys(section, exporterKeySet(), "") {
@@ -937,6 +954,7 @@ var terraformViewReplacer = strings.NewReplacer(
 	"${google_bigquery_table.otel_logs_dedup.table_id}", "otel_logs_dedup",
 	"${google_bigquery_table.otel_metrics_dedup.table_id}", "otel_metrics_dedup",
 	"${google_bigquery_table.v_gen_ai_spans.table_id}", "v_gen_ai_spans",
+	"${google_bigquery_table.v_gen_ai_metrics.table_id}", "v_gen_ai_metrics",
 )
 
 func normalizeCompanionViewSQL(sql string) string {
@@ -967,6 +985,7 @@ func TestTerraformCompanionViewsMatchExporter(t *testing.T) {
 		{schema.GenAISpansViewName, schema.GenAISpansViewQuery, []any{"p", "d", "otel_spans"}},
 		{schema.GenAILogsViewName, schema.GenAILogsViewQuery, []any{"p", "d", "otel_logs", "otel_spans"}},
 		{schema.GenAIMetricsViewName, schema.GenAIMetricsViewQuery, []any{"p", "d", "otel_metrics"}},
+		{schema.GenAIMetricExemplarsViewName, schema.GenAIMetricExemplarsViewQuery, []any{"p", "d", "otel_spans"}},
 		{schema.GenAIModelCostsViewName, schema.GenAIModelCostsViewQuery, []any{"p", "d"}},
 		{schema.GenAISessionsViewName, schema.GenAISessionsViewQuery, []any{"p", "d"}},
 		{schema.GenAIToolUsageViewName, schema.GenAIToolUsageViewQuery, []any{"p", "d"}},

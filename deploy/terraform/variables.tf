@@ -159,7 +159,7 @@ variable "quarantine_partition_expiration_days" {
 }
 
 variable "require_partition_filter" {
-  description = "Require a partition filter on queries against the partitioned signal and quarantine tables. A query over a view must then filter on a column BigQuery can use to skip partitions, and a query over v_gen_ai_logs is rejected (see deploy/README.md)."
+  description = "Require a partition filter on queries against the partitioned signal and quarantine tables. A query over a view must then filter on a column BigQuery can use to skip partitions, and a query over v_gen_ai_logs or v_gen_ai_metric_exemplars is rejected (see deploy/README.md)."
   type        = bool
   default     = false
 }

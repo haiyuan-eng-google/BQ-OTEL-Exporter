@@ -199,9 +199,9 @@ With `require_partition_filter=true`, BigQuery rejects a query over these
 tables, or over the views built on them, that has no filter BigQuery can use
 to skip partitions. See "Filtering the GenAI views by time" under
 [Operating v0alpha2 tables](../README.md#operating-v0alpha2-tables) for the
-columns the views take. A query over `v_gen_ai_logs` is rejected even with a
-filter, because no such filter reaches its scan of `otel_spans`, so leave the
-option off for a deployment that queries that view.
+columns the views take. Queries over `v_gen_ai_logs` and `v_gen_ai_metric_exemplars` are rejected even with a
+filter, because no such filter reaches their scan of `otel_spans`, so leave the
+option off for a deployment that queries those views.
 
 ### Labels
 
