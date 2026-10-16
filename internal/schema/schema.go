@@ -543,10 +543,11 @@ FROM ` + "`%[1]s.%[2]s.%[3]s_dedup`" + `
 // gen_ai.usage.reasoning.output_tokens and its earlier name
 // gen_ai.usage.reasoning_tokens, the keys are coalesced in a fixed order, the
 // current key first. The error.type attribute is promoted as error_type,
-// followed by the v1.40+ main-agent, agent-version, and response attributes,
-// appended at the end so the position of every earlier column is unchanged. The
-// raw attribute, resource, scope, event and link columns and payload_refs are
-// kept for anything not promoted.
+// followed by the v1.40+ main-agent, agent-version, and response attributes
+// (coalescing span attributes first and resource.attributes second for the
+// agent-entity fields), appended at the end so the position of every earlier
+// column is unchanged. The raw attribute, resource, scope, event and link
+// columns and payload_refs are kept for anything not promoted.
 const GenAISpansViewDDL = `
 CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAISpansViewName + "`" + ` AS
 ` + GenAISpansViewQuery + `;
@@ -640,10 +641,22 @@ SELECT
     LAX_FLOAT64(attributes['gen_ai.evaluation.score'])
   ) AS gen_ai_evaluation_score,
   JSON_VALUE(attributes, '$."error.type"') AS error_type,
-  JSON_VALUE(attributes, '$."gen_ai.main_agent.id"') AS gen_ai_main_agent_id,
-  JSON_VALUE(attributes, '$."gen_ai.main_agent.name"') AS gen_ai_main_agent_name,
-  JSON_VALUE(attributes, '$."gen_ai.main_agent.description"') AS gen_ai_main_agent_description,
-  JSON_VALUE(attributes, '$."gen_ai.agent.version"') AS gen_ai_agent_version,
+  COALESCE(
+    JSON_VALUE(attributes, '$."gen_ai.main_agent.id"'),
+    JSON_VALUE(resource.attributes, '$."gen_ai.main_agent.id"')
+  ) AS gen_ai_main_agent_id,
+  COALESCE(
+    JSON_VALUE(attributes, '$."gen_ai.main_agent.name"'),
+    JSON_VALUE(resource.attributes, '$."gen_ai.main_agent.name"')
+  ) AS gen_ai_main_agent_name,
+  COALESCE(
+    JSON_VALUE(attributes, '$."gen_ai.main_agent.description"'),
+    JSON_VALUE(resource.attributes, '$."gen_ai.main_agent.description"')
+  ) AS gen_ai_main_agent_description,
+  COALESCE(
+    JSON_VALUE(attributes, '$."gen_ai.agent.version"'),
+    JSON_VALUE(resource.attributes, '$."gen_ai.agent.version"')
+  ) AS gen_ai_agent_version,
   JSON_VALUE(attributes, '$."gen_ai.response.id"') AS gen_ai_response_id,
   LAX_FLOAT64(attributes['gen_ai.response.time_to_first_chunk']) AS gen_ai_response_time_to_first_chunk
 FROM ` + "`%[1]s.%[2]s.%[3]s_dedup`" + `
@@ -653,6 +666,8 @@ WHERE JSON_VALUE(attributes, '$."gen_ai.operation.name"') IS NOT NULL
    OR JSON_VALUE(attributes, '$."gcp.vertex.agent.invocation_id"') IS NOT NULL
    OR JSON_VALUE(attributes, '$."gen_ai.main_agent.name"') IS NOT NULL
    OR JSON_VALUE(attributes, '$."gen_ai.main_agent.id"') IS NOT NULL
+   OR JSON_VALUE(resource.attributes, '$."gen_ai.main_agent.name"') IS NOT NULL
+   OR JSON_VALUE(resource.attributes, '$."gen_ai.main_agent.id"') IS NOT NULL
 `
 
 // GenAILogsViewDDL creates v_gen_ai_logs: the log records whose event name
@@ -816,7 +831,8 @@ SELECT
   JSON_VALUE(attributes, '$."gen_ai.token.modality"') AS gen_ai_token_modality,
   COALESCE(
     JSON_VALUE(attributes, '$."gen_ai.agent.name"'),
-    JSON_VALUE(attributes, '$."gen_ai.main_agent.name"')
+    JSON_VALUE(attributes, '$."gen_ai.main_agent.name"'),
+    JSON_VALUE(resource.attributes, '$."gen_ai.main_agent.name"')
   ) AS gen_ai_agent_name,
   CASE
     WHEN metric_name = 'gen_ai.client.inference.usage.input_tokens' THEN 'input'

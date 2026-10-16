@@ -101,19 +101,23 @@ var (
 )
 
 // attrChain is one projection of a view out of the plain-JSON attributes
-// column: the first non-NULL of the listed keys, then of the fallback column.
+// column (and, when resourceKeys is non-empty, resource.attributes): the first
+// non-NULL of the listed keys, then of resourceKeys, then of the fallback
+// column.
 type attrChain struct {
-	alias    string
-	keys     []string
-	asInt    bool   // LAX_INT64(attributes['key']) rather than JSON_VALUE(attributes, '$."key"')
-	asFloat  bool   // LAX_FLOAT64(attributes['key']) rather than JSON_VALUE(attributes, '$."key"')
-	fallback string // a column of the row that ends the COALESCE
+	alias        string
+	keys         []string
+	resourceKeys []string // keys read from resource.attributes after attributes
+	asInt        bool     // LAX_INT64(attributes['key']) rather than JSON_VALUE(attributes, '$."key"')
+	asFloat      bool     // LAX_FLOAT64(attributes['key']) rather than JSON_VALUE(attributes, '$."key"')
+	fallback     string   // a column of the row that ends the COALESCE
 }
 
 // sql renders the select item the view is expected to hold for the chain over
 // the given attribute sources: a table alias prefix such as "l." and "s.", or
 // "" for a view with one source. Sources are tried in order, and within a
-// source the keys are tried in order.
+// source the keys are tried in order, followed by resourceKeys on
+// resource.attributes.
 func (c attrChain) sql(srcs ...string) string {
 	var els []string
 	for _, src := range srcs {
@@ -126,6 +130,11 @@ func (c attrChain) sql(srcs ...string) string {
 			default:
 				els = append(els, fmt.Sprintf("JSON_VALUE(%sattributes, '$.\"%s\"')", src, k))
 			}
+		}
+	}
+	for _, src := range srcs {
+		for _, k := range c.resourceKeys {
+			els = append(els, fmt.Sprintf("JSON_VALUE(%sresource.attributes, '$.\"%s\"')", src, k))
 		}
 	}
 	if c.fallback != "" {
@@ -159,6 +168,14 @@ func (c attrChain) eval(row map[string]any, srcs ...attrs) any {
 			}
 		}
 	}
+	if len(c.resourceKeys) > 0 {
+		resAttrs := parseResourceAttrs(row)
+		for _, k := range c.resourceKeys {
+			if v, ok := resAttrs.jsonValue(k); ok {
+				return v
+			}
+		}
+	}
 	if c.fallback != "" {
 		if v, ok := row[c.fallback]; ok {
 			return v
@@ -187,10 +204,10 @@ var spanChains = []attrChain{
 	{alias: "gen_ai_usage_cache_creation_input_tokens", keys: []string{"gen_ai.usage.cache_creation.input_tokens", "gen_ai.usage.cache_creation_input_tokens"}, asInt: true},
 	{alias: "gen_ai_usage_reasoning_tokens", keys: []string{"gen_ai.usage.reasoning.output_tokens", "gen_ai.usage.reasoning_tokens"}, asInt: true},
 	{alias: "error_type", keys: []string{"error.type"}},
-	{alias: "gen_ai_main_agent_id", keys: []string{"gen_ai.main_agent.id"}},
-	{alias: "gen_ai_main_agent_name", keys: []string{"gen_ai.main_agent.name"}},
-	{alias: "gen_ai_main_agent_description", keys: []string{"gen_ai.main_agent.description"}},
-	{alias: "gen_ai_agent_version", keys: []string{"gen_ai.agent.version"}},
+	{alias: "gen_ai_main_agent_id", keys: []string{"gen_ai.main_agent.id"}, resourceKeys: []string{"gen_ai.main_agent.id"}},
+	{alias: "gen_ai_main_agent_name", keys: []string{"gen_ai.main_agent.name"}, resourceKeys: []string{"gen_ai.main_agent.name"}},
+	{alias: "gen_ai_main_agent_description", keys: []string{"gen_ai.main_agent.description"}, resourceKeys: []string{"gen_ai.main_agent.description"}},
+	{alias: "gen_ai_agent_version", keys: []string{"gen_ai.agent.version"}, resourceKeys: []string{"gen_ai.agent.version"}},
 	{alias: "gen_ai_response_id", keys: []string{"gen_ai.response.id"}},
 	{alias: "gen_ai_response_time_to_first_chunk", keys: []string{"gen_ai.response.time_to_first_chunk"}, asFloat: true},
 }
@@ -222,7 +239,7 @@ var metricChains = []attrChain{
 	{alias: "gen_ai_token_type", keys: []string{"gen_ai.token.type"}},
 	{alias: "error_type", keys: []string{"error.type"}},
 	{alias: "gen_ai_token_modality", keys: []string{"gen_ai.token.modality"}},
-	{alias: "gen_ai_agent_name", keys: []string{"gen_ai.agent.name", "gen_ai.main_agent.name"}},
+	{alias: "gen_ai_agent_name", keys: []string{"gen_ai.agent.name", "gen_ai.main_agent.name"}, resourceKeys: []string{"gen_ai.main_agent.name"}},
 }
 
 // attrs is the parsed plain-JSON attributes column of one row.
@@ -241,6 +258,26 @@ func parseAttrs(t testing.TB, row map[string]any) attrs {
 	var a attrs
 	if err := dec.Decode(&a); err != nil {
 		t.Fatalf("attributes column is not a JSON object (%v): %s", err, raw)
+	}
+	return a
+}
+
+// parseResourceAttrs parses resource.attributes of a decoded row, returning an
+// empty map when the row or its resource struct lacks attributes.
+func parseResourceAttrs(row map[string]any) attrs {
+	res, ok := row["resource"].(map[string]any)
+	if !ok {
+		return attrs{}
+	}
+	raw, ok := res["attributes"].(string)
+	if !ok || raw == "" {
+		return attrs{}
+	}
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+	var a attrs
+	if err := dec.Decode(&a); err != nil {
+		return attrs{}
 	}
 	return a
 }
@@ -1012,7 +1049,9 @@ func TestViewModelMatchesViewSQL(t *testing.T) {
 			" OR JSON_VALUE(attributes, '$.\"gen_ai.provider.name\"') IS NOT NULL" +
 			" OR JSON_VALUE(attributes, '$.\"gcp.vertex.agent.invocation_id\"') IS NOT NULL" +
 			" OR JSON_VALUE(attributes, '$.\"gen_ai.main_agent.name\"') IS NOT NULL" +
-			" OR JSON_VALUE(attributes, '$.\"gen_ai.main_agent.id\"') IS NOT NULL",
+			" OR JSON_VALUE(attributes, '$.\"gen_ai.main_agent.id\"') IS NOT NULL" +
+			" OR JSON_VALUE(resource.attributes, '$.\"gen_ai.main_agent.name\"') IS NOT NULL" +
+			" OR JSON_VALUE(resource.attributes, '$.\"gen_ai.main_agent.id\"') IS NOT NULL",
 	}
 	for _, c := range spanChains {
 		spanFragments = append(spanFragments, c.sql(""))

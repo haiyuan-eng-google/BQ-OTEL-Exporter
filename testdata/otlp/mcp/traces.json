@@ -63,7 +63,7 @@
                 {"key": "gen_ai.operation.name", "value": {"stringValue": "execute_tool"}},
                 {"key": "gen_ai.tool.name", "value": {"stringValue": "query_bigquery"}},
                 {"key": "gen_ai.tool.call.id", "value": {"stringValue": "call-mcp-03"}},
-                {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}}
+                {"key": "gen_ai.provider.name", "value": {"stringValue": "gcp.vertex.agent"}}
               ],
               "status": {"code": 1}
             },
@@ -80,7 +80,8 @@
                 {"key": "mcp.protocol.version", "value": {"stringValue": "2025-06-18"}},
                 {"key": "mcp.session.id", "value": {"stringValue": "mcp-sess-100"}},
                 {"key": "jsonrpc.request.id", "value": {"stringValue": "req-4"}},
-                {"key": "error.type", "value": {"stringValue": "McpToolExecutionError"}},
+                {"key": "gen_ai.tool.name", "value": {"stringValue": "run_untrusted_query"}},
+                {"key": "error.type", "value": {"stringValue": "-32603"}},
                 {"key": "rpc.response.status_code", "value": {"stringValue": "-32603"}}
               ],
               "status": {"code": 2, "message": "internal tool error"}

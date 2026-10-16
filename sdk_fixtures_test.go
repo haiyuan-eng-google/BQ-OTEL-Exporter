@@ -721,12 +721,15 @@ func spanReasoningCount(attrs map[string]any) (float64, bool) {
 func TestScenarioMetricsFixtureShapes(t *testing.T) {
 	m := loadSDKManifest(t)
 	var unmarshaler pmetric.JSONUnmarshaler
-	wantUnit := map[string]string{
-		"gen_ai.client.token.usage":                             "{token}",
-		"gen_ai.client.operation.duration":                      "s",
-		"gen_ai.client.inference.usage.input_tokens":            "{token}",
-		"gen_ai.client.inference.usage.output_tokens":           "{token}",
-		"gen_ai.client.inference.usage.reasoning.output_tokens": "{token}",
+	wantSpec := map[string]struct {
+		unit string
+		typ  pmetric.MetricType
+	}{
+		"gen_ai.client.token.usage":                             {unit: "{token}", typ: pmetric.MetricTypeHistogram},
+		"gen_ai.client.operation.duration":                      {unit: "s", typ: pmetric.MetricTypeHistogram},
+		"gen_ai.client.inference.usage.input_tokens":            {unit: "{token}", typ: pmetric.MetricTypeSum},
+		"gen_ai.client.inference.usage.output_tokens":           {unit: "{token}", typ: pmetric.MetricTypeSum},
+		"gen_ai.client.inference.usage.reasoning.output_tokens": {unit: "{token}", typ: pmetric.MetricTypeSum},
 	}
 
 	for _, sc := range m.Scenarios {
@@ -756,26 +759,40 @@ func TestScenarioMetricsFixtureShapes(t *testing.T) {
 
 			seen := make(map[string]int)
 			for _, mt := range metrics.All() {
-				unit, known := wantUnit[mt.Name()]
+				spec, known := wantSpec[mt.Name()]
 				if !known {
 					t.Fatalf("unexpected metric %q in %s", mt.Name(), path)
 				}
-				if mt.Unit() != unit {
-					t.Errorf("%s unit = %q, want %q", mt.Name(), mt.Unit(), unit)
+				if mt.Unit() != spec.unit {
+					t.Errorf("%s unit = %q, want %q", mt.Name(), mt.Unit(), spec.unit)
 				}
-				if mt.Type() != pmetric.MetricTypeHistogram {
-					t.Fatalf("%s type = %v, want a histogram", mt.Name(), mt.Type())
+				if mt.Type() != spec.typ {
+					t.Fatalf("%s type = %v, want %v", mt.Name(), mt.Type(), spec.typ)
 				}
-				if got := mt.Histogram().AggregationTemporality(); got != pmetric.AggregationTemporalityDelta {
-					t.Errorf("%s temporality = %v, want delta", mt.Name(), got)
-				}
-				for _, dp := range mt.Histogram().DataPoints().All() {
-					requireOneCallHistogramPoint(t, mt.Name(), dp)
-					key := mt.Name()
-					if tokenType, ok := dp.Attributes().Get("gen_ai.token.type"); ok {
-						key += "/" + tokenType.Str()
+				switch spec.typ {
+				case pmetric.MetricTypeHistogram:
+					if got := mt.Histogram().AggregationTemporality(); got != pmetric.AggregationTemporalityDelta {
+						t.Errorf("%s temporality = %v, want delta", mt.Name(), got)
 					}
-					seen[key]++
+					for _, dp := range mt.Histogram().DataPoints().All() {
+						requireOneCallHistogramPoint(t, mt.Name(), dp)
+						key := mt.Name()
+						if tokenType, ok := dp.Attributes().Get("gen_ai.token.type"); ok {
+							key += "/" + tokenType.Str()
+						}
+						seen[key]++
+					}
+				case pmetric.MetricTypeSum:
+					if got := mt.Sum().AggregationTemporality(); got != pmetric.AggregationTemporalityDelta {
+						t.Errorf("%s temporality = %v, want delta", mt.Name(), got)
+					}
+					if !mt.Sum().IsMonotonic() {
+						t.Errorf("%s isMonotonic = false, want true", mt.Name())
+					}
+					for _, dp := range mt.Sum().DataPoints().All() {
+						requireOneCallSumPoint(t, mt.Name(), dp)
+						seen[mt.Name()]++
+					}
 				}
 			}
 
@@ -796,6 +813,46 @@ func TestScenarioMetricsFixtureShapes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// requireOneCallSumPoint checks a monotonic delta Sum data point that records
+// one inference call's token count: an integer value > 0 and one exemplar
+// carrying the same integer value, a trace and span ID, and a timestamp inside
+// the point's interval.
+func requireOneCallSumPoint(t *testing.T, name string, dp pmetric.NumberDataPoint) {
+	t.Helper()
+	if dp.ValueType() != pmetric.NumberDataPointValueTypeInt || dp.IntValue() <= 0 {
+		t.Errorf("%s value type/int = %v/%d, want positive int", name, dp.ValueType(), dp.IntValue())
+	}
+	if dp.Exemplars().Len() != 1 {
+		t.Fatalf("%s holds %d exemplars, want 1", name, dp.Exemplars().Len())
+	}
+	ex := dp.Exemplars().At(0)
+	if ex.ValueType() != pmetric.ExemplarValueTypeInt || ex.IntValue() != dp.IntValue() {
+		t.Errorf("%s exemplar value = %v/%d, want int %d", name, ex.ValueType(), ex.IntValue(), dp.IntValue())
+	}
+	if ex.TraceID().IsEmpty() || ex.SpanID().IsEmpty() {
+		t.Errorf("%s exemplar must carry a trace ID and a span ID", name)
+	}
+	if ex.Timestamp() < dp.StartTimestamp() || ex.Timestamp() > dp.Timestamp() {
+		t.Errorf("%s exemplar timestamp %v lies outside the point's interval [%v, %v]",
+			name, ex.Timestamp(), dp.StartTimestamp(), dp.Timestamp())
+	}
+}
+
+// decodeResourceAttributes decodes resource.attributes of a row.
+func decodeResourceAttributes(t *testing.T, row map[string]any) map[string]any {
+	t.Helper()
+	res, ok := row["resource"].(map[string]any)
+	if !ok {
+		t.Fatalf("row missing resource struct: %v", row)
+	}
+	raw, _ := res["attributes"].(string)
+	var attrs map[string]any
+	if err := json.Unmarshal([]byte(raw), &attrs); err != nil {
+		t.Fatalf("unmarshal resource.attributes JSON %q: %v", raw, err)
+	}
+	return attrs
 }
 
 func TestScenarioGoldenFixturesEndToEnd(t *testing.T) {
@@ -970,19 +1027,92 @@ func TestScenarioGoldenFixturesEndToEnd(t *testing.T) {
 		spanID      string
 	}
 	type spanFixture struct {
-		row   map[string]any
-		attrs map[string]any
+		row      map[string]any
+		attrs    map[string]any
+		resAttrs map[string]any
 	}
 	spansByKey := make(map[joinKey]spanFixture)
+	spansByID := make(map[string]spanFixture)
 	for _, r := range spanRows {
 		if r["schema_version"] != schema.Version {
 			t.Fatalf("span schema_version = %v, want %q", r["schema_version"], schema.Version)
 		}
 		attrs := decodeAttributes(t, r)
+		resAttrs := decodeResourceAttributes(t, r)
 		svc, _ := r["service_name"].(string)
 		tid, _ := r["trace_id"].(string)
 		sid, _ := r["span_id"].(string)
-		spansByKey[joinKey{serviceName: svc, traceID: tid, spanID: sid}] = spanFixture{row: r, attrs: attrs}
+		sf := spanFixture{row: r, attrs: attrs, resAttrs: resAttrs}
+		spansByKey[joinKey{serviceName: svc, traceID: tid, spanID: sid}] = sf
+		spansByID[sid] = sf
+	}
+
+	// Verify scenario-defining trace attributes and shapes per span_id.
+	// 1. Multi-agent scenario: resource-level main_agent.*, delegation parent id,
+	//    agent version, and strictly overlapping parallel tool spans.
+	for _, sid := range []string{
+		"00f067aa0ba902b7", "00f067aa0ba902b8", "00f067aa0ba902b9", "00f067aa0ba902bb",
+		"00f067aa0ba902ba", "00f067aa0ba902bc", "00f067aa0ba902bd", "1122334455667788",
+	} {
+		sf, ok := spansByID[sid]
+		if !ok {
+			t.Fatalf("multi_agent span %s missing from otel_spans", sid)
+		}
+		if sf.resAttrs["gen_ai.main_agent.id"] != "agent-planner-1" ||
+			sf.resAttrs["gen_ai.main_agent.name"] != "planner" ||
+			sf.resAttrs["gen_ai.main_agent.description"] != "Top-level planner coordinating researcher and tool workers" {
+			t.Errorf("multi_agent span %s resource.attributes = %v, missing gen_ai.main_agent.{id,name,description}", sid, sf.resAttrs)
+		}
+	}
+	if resSpan := spansByID["00f067aa0ba902b9"]; resSpan.attrs["gen_ai.agent.parent.id"] != "agent-planner-1" || resSpan.attrs["gen_ai.agent.version"] != "1.0.4" {
+		t.Errorf("delegated researcher span attrs = %v, want gen_ai.agent.parent.id=agent-planner-1 and gen_ai.agent.version=1.0.4", resSpan.attrs)
+	}
+	tool1, tool2 := spansByID["00f067aa0ba902bc"], spansByID["00f067aa0ba902bd"]
+	start1, _ := tool1.row["start_time_unix_nano"].(int64)
+	end1, _ := tool1.row["end_time_unix_nano"].(int64)
+	start2, _ := tool2.row["start_time_unix_nano"].(int64)
+	end2, _ := tool2.row["end_time_unix_nano"].(int64)
+	if !(start2 < end1 && start1 < end2) {
+		t.Errorf("parallel tool spans [%d,%d] and [%d,%d] do not strictly overlap", start1, end1, start2, end2)
+	}
+	if tool1.row["parent_span_id"] != "00f067aa0ba902b9" || tool2.row["parent_span_id"] != "00f067aa0ba902b9" {
+		t.Errorf("parallel tool spans parent_span_id = (%v, %v), want both 00f067aa0ba902b9", tool1.row["parent_span_id"], tool2.row["parent_span_id"])
+	}
+
+	// 2. MCP scenario: protocol lifecycle, SERVER span kind, and failed tools/call
+	//    carrying gen_ai.tool.name + JSON-RPC error code without GenAI operation/provider.
+	for _, sid := range []string{"9f8e7d6c5b4a0001", "9f8e7d6c5b4a0002", "9f8e7d6c5b4a0003", "9f8e7d6c5b4a0004", "9f8e7d6c5b4a0005"} {
+		sf, ok := spansByID[sid]
+		if !ok {
+			t.Fatalf("mcp span %s missing from otel_spans", sid)
+		}
+		if sf.attrs["mcp.method.name"] == nil || sf.attrs["mcp.session.id"] != "mcp-sess-100" {
+			t.Errorf("mcp span %s attrs = %v, missing mcp.method.name or mcp.session.id=mcp-sess-100", sid, sf.attrs)
+		}
+		if sid == "9f8e7d6c5b4a0001" {
+			if sf.row["parent_span_id"] != nil {
+				t.Errorf("mcp root span parent_span_id = %v, want nil", sf.row["parent_span_id"])
+			}
+		} else if sf.row["parent_span_id"] != "9f8e7d6c5b4a0001" {
+			t.Errorf("mcp child span %s parent_span_id = %v, want 9f8e7d6c5b4a0001", sid, sf.row["parent_span_id"])
+		}
+	}
+	mcpErr := spansByID["9f8e7d6c5b4a0004"]
+	mcpErrStatus, _ := mcpErr.row["status"].(map[string]any)
+	if mcpErrStatus["code"] != int64(2) || mcpErrStatus["message"] != "internal tool error" {
+		t.Errorf("mcp failed tools/call status = %v, want code=2 and message='internal tool error'", mcpErrStatus)
+	}
+	if mcpErr.attrs["error.type"] != "-32603" ||
+		mcpErr.attrs["rpc.response.status_code"] != "-32603" ||
+		mcpErr.attrs["gen_ai.tool.name"] != "run_untrusted_query" ||
+		mcpErr.attrs["gen_ai.operation.name"] != nil ||
+		mcpErr.attrs["gen_ai.provider.name"] != nil ||
+		mcpErr.attrs["gen_ai.system"] != nil {
+		t.Errorf("mcp failed tools/call attrs = %v, want error.type=-32603, gen_ai.tool.name=run_untrusted_query, and no gen_ai.{operation.name,provider.name,system}", mcpErr.attrs)
+	}
+	mcpRes := spansByID["9f8e7d6c5b4a0005"]
+	if mcpRes.row["kind"] != int64(2) || mcpRes.attrs["mcp.resource.uri"] != "bq://analytics-prod/otel/schema" {
+		t.Errorf("mcp resources/read kind=%v uri=%v, want kind=2 (SERVER) and uri=bq://analytics-prod/otel/schema", mcpRes.row["kind"], mcpRes.attrs["mcp.resource.uri"])
 	}
 
 	for _, l := range logRows {
@@ -1027,30 +1157,59 @@ func TestScenarioGoldenFixturesEndToEnd(t *testing.T) {
 			continue
 		}
 
-		sum, _ := r["sum"].(float64)
+		metricType, _ := r["metric_type"].(string)
+		temporality, _ := r["aggregation_temporality"].(string)
+		monotonic, _ := r["is_monotonic"].(bool)
+		if temporality != "DELTA" {
+			t.Errorf("%s aggregation_temporality = %q, want DELTA", name, temporality)
+		}
+
 		switch name {
 		case "gen_ai.client.token.usage":
+			if metricType != "HISTOGRAM" {
+				t.Errorf("%s metric_type = %q, want HISTOGRAM", name, metricType)
+			}
+			sum, _ := r["sum"].(float64)
 			tokenType, _ := mAttrs["gen_ai.token.type"].(string)
 			want, found := spanTokenCount(sp.attrs, tokenType)
 			if !found || sum != want {
 				t.Errorf("%s %q point sum = %v, want span token count %v (found=%v)", name, tokenType, sum, want, found)
 			}
 		case "gen_ai.client.inference.usage.input_tokens":
+			if metricType != "SUM" || !monotonic {
+				t.Errorf("%s metric_type=%q is_monotonic=%v, want SUM and true", name, metricType, monotonic)
+			}
+			val, _ := r["value_int64"].(int64)
+			exVal, _ := exemplars[0]["value_int64"].(int64)
 			want, found := spanTokenCount(sp.attrs, "input")
-			if !found || sum != want {
-				t.Errorf("%s point sum = %v, want span input token count %v (found=%v)", name, sum, want, found)
+			if !found || val != int64(want) || exVal != int64(want) {
+				t.Errorf("%s value_int64=%d exemplar=%d, want span input token count %v (found=%v)", name, val, exVal, want, found)
 			}
 		case "gen_ai.client.inference.usage.output_tokens":
+			if metricType != "SUM" || !monotonic {
+				t.Errorf("%s metric_type=%q is_monotonic=%v, want SUM and true", name, metricType, monotonic)
+			}
+			val, _ := r["value_int64"].(int64)
+			exVal, _ := exemplars[0]["value_int64"].(int64)
 			want, found := spanTokenCount(sp.attrs, "output")
-			if !found || sum != want {
-				t.Errorf("%s point sum = %v, want span output token count %v (found=%v)", name, sum, want, found)
+			if !found || val != int64(want) || exVal != int64(want) {
+				t.Errorf("%s value_int64=%d exemplar=%d, want span output token count %v (found=%v)", name, val, exVal, want, found)
 			}
 		case "gen_ai.client.inference.usage.reasoning.output_tokens":
+			if metricType != "SUM" || !monotonic {
+				t.Errorf("%s metric_type=%q is_monotonic=%v, want SUM and true", name, metricType, monotonic)
+			}
+			val, _ := r["value_int64"].(int64)
+			exVal, _ := exemplars[0]["value_int64"].(int64)
 			want, found := spanReasoningCount(sp.attrs)
-			if !found || sum != want {
-				t.Errorf("%s point sum = %v, want span reasoning token count %v (found=%v)", name, sum, want, found)
+			if !found || val != int64(want) || exVal != int64(want) {
+				t.Errorf("%s value_int64=%d exemplar=%d, want span reasoning token count %v (found=%v)", name, val, exVal, want, found)
 			}
 		case "gen_ai.client.operation.duration":
+			if metricType != "HISTOGRAM" {
+				t.Errorf("%s metric_type = %q, want HISTOGRAM", name, metricType)
+			}
+			sum, _ := r["sum"].(float64)
 			ns, _ := sp.row["duration_nano"].(int64)
 			if math.Abs(sum-float64(ns)/1e9) > 1e-9 {
 				t.Errorf("%s point sums to %vs, but its span lasted %vs", name, sum, float64(ns)/1e9)
@@ -1059,7 +1218,7 @@ func TestScenarioGoldenFixturesEndToEnd(t *testing.T) {
 			t.Errorf("unexpected metric %q of %q", name, svc)
 		}
 
-		for _, key := range []string{"gen_ai.operation.name", "gen_ai.system", "gen_ai.agent.name", "gen_ai.request.model", "gen_ai.response.model"} {
+		for _, key := range []string{"gen_ai.operation.name", "gen_ai.system", "gen_ai.provider.name", "gen_ai.agent.name", "gen_ai.request.model", "gen_ai.response.model"} {
 			want, onSpan := sp.attrs[key]
 			if !onSpan {
 				continue

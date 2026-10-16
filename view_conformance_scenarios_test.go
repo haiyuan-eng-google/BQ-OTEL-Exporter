@@ -141,6 +141,7 @@ func TestScenarioMultiAgentViews(t *testing.T) {
 		"gen_ai_agent_version":          "1.2.0",
 		"gen_ai_main_agent_id":          "agent-planner-1",
 		"gen_ai_main_agent_name":        "planner",
+		"gen_ai_main_agent_description": "Top-level planner coordinating researcher and tool workers",
 		"gen_ai_conversation_id":        "conv-multi-01",
 		"gen_ai_usage_input_tokens":     int64(500),
 		"gen_ai_usage_output_tokens":    int64(300),
@@ -154,6 +155,7 @@ func TestScenarioMultiAgentViews(t *testing.T) {
 		"gen_ai_agent_name":             "planner",
 		"gen_ai_main_agent_id":          "agent-planner-1",
 		"gen_ai_main_agent_name":        "planner",
+		"gen_ai_main_agent_description": "Top-level planner coordinating researcher and tool workers",
 		"gen_ai_request_model":          "gemini-2.5-pro",
 		"gen_ai_response_model":         "gemini-2.5-pro-001",
 		"gen_ai_response_id":            "resp-chat-01",
@@ -170,6 +172,7 @@ func TestScenarioMultiAgentViews(t *testing.T) {
 		"gen_ai_agent_version":          "1.0.4",
 		"gen_ai_main_agent_id":          "agent-planner-1",
 		"gen_ai_main_agent_name":        "planner",
+		"gen_ai_main_agent_description": "Top-level planner coordinating researcher and tool workers",
 		"gen_ai_usage_input_tokens":     int64(300),
 		"gen_ai_usage_output_tokens":    int64(200),
 		"gen_ai_usage_reasoning_tokens": int64(70),
@@ -370,7 +373,8 @@ func TestScenarioMultiAgentViews(t *testing.T) {
 		"error_type":            "rate_limited",
 	})
 
-	// 6. v_gen_ai_metrics: all 12 histogram points match LIKE 'gen_ai.%'.
+	// 6. v_gen_ai_metrics: all 12 points (6 legacy/duration histograms + 6
+	// monotonic delta Sum inference counters) match LIKE 'gen_ai.%'.
 	metrics := genAIMetricsView(t, rawMetrics)
 	if len(metrics) != 12 {
 		t.Fatalf("v_gen_ai_metrics rows = %d, want 12", len(metrics))
@@ -380,15 +384,27 @@ func TestScenarioMultiAgentViews(t *testing.T) {
 		t.Fatalf("gen_ai.client.inference.usage.input_tokens rows = %d, want 2", len(v140Input))
 	}
 	requireCols(t, "v1.40 input_tokens planner", onlyRow(t, "planner input", v140Input, "gen_ai_agent_name", "planner"), map[string]any{
+		"metric_type":                      "SUM",
+		"is_monotonic":                     true,
+		"aggregation_temporality":          "DELTA",
+		"gen_ai_provider_name":             "gcp.vertex.agent",
+		"gen_ai_system":                    "gcp.vertex.agent",
 		"gen_ai_token_modality":            "text",
 		"gen_ai_inference_usage_dimension": "input",
-		"sum":                              float64(200),
+		"value_int64":                      int64(200),
+		"sum":                              nil,
 	})
 	v140Reasoning := rowsWhere(metrics, "metric_name", "gen_ai.client.inference.usage.reasoning.output_tokens")
 	requireCols(t, "v1.40 reasoning_output researcher", onlyRow(t, "researcher reasoning", v140Reasoning, "gen_ai_agent_name", "researcher"), map[string]any{
+		"metric_type":                      "SUM",
+		"is_monotonic":                     true,
+		"aggregation_temporality":          "DELTA",
+		"gen_ai_provider_name":             "gcp.vertex.agent",
+		"gen_ai_system":                    "gcp.vertex.agent",
 		"gen_ai_token_modality":            "text",
 		"gen_ai_inference_usage_dimension": "reasoning_output",
-		"sum":                              float64(70),
+		"value_int64":                      int64(70),
+		"sum":                              nil,
 	})
 	legacyToken := rowsWhere(metrics, "metric_name", "gen_ai.client.token.usage")
 	for _, r := range legacyToken {
@@ -413,9 +429,12 @@ func TestScenarioMCPViews(t *testing.T) {
 		t.Fatalf("otel_spans rows = %d, want 5", len(rawSpans))
 	}
 
-	// Only the dual-tagged execute_tool span carries gen_ai.* attributes; the
-	// four pure MCP spans (initialize, tools/list, failed pure tools/call,
-	// resources/read) stay in otel_spans and out of v_gen_ai_spans.
+	// Only the dual-tagged execute_tool span passes the v_gen_ai_spans WHERE
+	// filter (via gen_ai.operation.name and gen_ai.provider.name). Failed
+	// tools/call span 9f8e7d6c5b4a0004 carries gen_ai.tool.name = "run_untrusted_query"
+	// and error.type = "-32603", but no gen_ai.{operation.name,provider.name,system}
+	// or gen_ai.main_agent.*, so it stays in otel_spans alongside initialize,
+	// tools/list, and resources/read.
 	spans := genAISpansView(t, rawSpans)
 	if len(spans) != 1 {
 		t.Fatalf("v_gen_ai_spans rows = %d, want 1 (pure MCP spans excluded)", len(spans))
@@ -426,10 +445,23 @@ func TestScenarioMCPViews(t *testing.T) {
 		"service_name":          "mcp-bigquery-gateway",
 		"gen_ai_operation_name": "execute_tool",
 		"gen_ai_tool_name":      "query_bigquery",
+		"gen_ai_provider_name":  "gcp.vertex.agent",
 		"gen_ai_system":         "gcp.vertex.agent",
 		"gen_ai_agent_name":     "mcp-bigquery-gateway",
 		"status_code":           int64(1),
 	})
+
+	// Verify failed pure MCP tools/call span 9f8e7d6c5b4a0004 kept its tool
+	// name and JSON-RPC error code in otel_spans even though v_gen_ai_spans
+	// excluded it.
+	rawErrSpan := onlyRow(t, "otel_spans 9f8e7d6c5b4a0004", rawSpans, "span_id", "9f8e7d6c5b4a0004")
+	rawErrAttrs := parseAttrs(t, rawErrSpan)
+	if got, _ := rawErrAttrs.jsonValue("gen_ai.tool.name"); got != "run_untrusted_query" {
+		t.Errorf("span 9f8e7d6c5b4a0004 gen_ai.tool.name = %q, want run_untrusted_query", got)
+	}
+	if got, _ := rawErrAttrs.jsonValue("error.type"); got != "-32603" {
+		t.Errorf("span 9f8e7d6c5b4a0004 error.type = %q, want -32603", got)
+	}
 
 	// Pure tool/MCP spans contribute 0 LLM cost rows and 0 GenAI session rows.
 	if costs := modelCostsView(spans); len(costs) != 0 {
@@ -504,9 +536,29 @@ func TestGenAIViewNewColumnsAndMainAgentOnlyFilter(t *testing.T) {
 		"gen_ai.client.inference.usage.cache_write.input_tokens",
 	))
 
+	// Push a second resource whose gen_ai.main_agent.* and gen_ai.agent.version
+	// live on resource.attributes rather than span/point attributes.
+	resTraces := buildTraces(t, "res-agent-svc",
+		specSpan{
+			trace: traceHex(4), id: spanHex(4), name: "resource main agent",
+			start: at, end: at.Add(time.Second),
+			attrs: map[string]any{"http.request.method": "POST"},
+		},
+	)
+	resAttrs := resTraces.ResourceSpans().At(0).Resource().Attributes()
+	resAttrs.PutStr("gen_ai.main_agent.id", "res-main-1")
+	resAttrs.PutStr("gen_ai.main_agent.name", "res-orchestrator")
+	resAttrs.PutStr("gen_ai.main_agent.description", "Resource-scoped orchestrator")
+	resAttrs.PutStr("gen_ai.agent.version", "2.0.0")
+	rig.pushTraces(t, resTraces)
+
+	resMetrics := buildGaugeMetrics("res-agent-svc", at, "gen_ai.client.inference.usage.input_tokens")
+	resMetrics.ResourceMetrics().At(0).Resource().Attributes().PutStr("gen_ai.main_agent.name", "res-orchestrator")
+	rig.pushMetrics(t, resMetrics)
+
 	spans := genAISpansView(t, rig.srv.Rows(confSpans))
-	if len(spans) != 3 {
-		t.Fatalf("v_gen_ai_spans rows = %d, want 3 (main_agent.name and main_agent.id admit spans)", len(spans))
+	if len(spans) != 4 {
+		t.Fatalf("v_gen_ai_spans rows = %d, want 4 (span and resource main_agent.* admit spans)", len(spans))
 	}
 	requireCols(t, "span 1 (main_agent.name + ttfc)", onlyRow(t, "span 1", spans, "span_id", spanHex(1)), map[string]any{
 		"gen_ai_main_agent_name":              "orchestrator",
@@ -516,6 +568,13 @@ func TestGenAIViewNewColumnsAndMainAgentOnlyFilter(t *testing.T) {
 	})
 	requireCols(t, "span 2 (main_agent.id)", onlyRow(t, "span 2", spans, "span_id", spanHex(2)), map[string]any{
 		"gen_ai_main_agent_id": "main-agent-99",
+	})
+	requireCols(t, "span 4 (resource.attributes main_agent.* + agent.version)", onlyRow(t, "span 4", spans, "span_id", spanHex(4)), map[string]any{
+		"gen_ai_main_agent_id":          "res-main-1",
+		"gen_ai_main_agent_name":        "res-orchestrator",
+		"gen_ai_main_agent_description": "Resource-scoped orchestrator",
+		"gen_ai_agent_version":          "2.0.0",
+		"gen_ai_operation_name":         nil,
 	})
 
 	// v_gen_ai_logs reads error_type from l.attributes only, never s.attributes.
@@ -534,5 +593,9 @@ func TestGenAIViewNewColumnsAndMainAgentOnlyFilter(t *testing.T) {
 	})
 	requireCols(t, "cache_write_input dim", onlyRow(t, "cache_write", metrics, "metric_name", "gen_ai.client.inference.usage.cache_write.input_tokens"), map[string]any{
 		"gen_ai_inference_usage_dimension": "cache_write_input",
+	})
+	requireCols(t, "resource main_agent.name fallback on metrics", onlyRow(t, "res_metric", metrics, "service_name", "res-agent-svc"), map[string]any{
+		"gen_ai_agent_name":                "res-orchestrator",
+		"gen_ai_inference_usage_dimension": "input",
 	})
 }

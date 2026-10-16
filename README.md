@@ -404,7 +404,8 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
   - `otel_spans_as_allspans`: projects `otel_spans_dedup` into the 25-column
     Cloud Trace `_AllSpans` layout (`status` narrowed to `STRUCT<code INT64, message STRING>`).
   - `v_gen_ai_spans`: filters `otel_spans_dedup` to GenAI/agent spans (including
-    spans carrying only `gen_ai.main_agent.name` or `gen_ai.main_agent.id`) and
+    spans carrying only `gen_ai.main_agent.name` or `gen_ai.main_agent.id` on
+    span `attributes` or `resource.attributes`) and
     promotes `gen_ai.*`, `error.type`, and `gcp.vertex.agent.*` attributes (`gen_ai_operation_name`,
     `gen_ai_system`, `gen_ai_request_model`, `gen_ai_response_model`,
     `gen_ai_agent_name`, `gen_ai_agent_id`, `gen_ai_conversation_id`,
@@ -421,8 +422,9 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
     `gen_ai_response_time_to_first_chunk`) into top-level columns.
     `gen_ai_usage_reasoning_tokens` reads the current
     `gen_ai.usage.reasoning.output_tokens` attribute first and the earlier
-    `gen_ai.usage.reasoning_tokens` spelling second; `error_type` is the
-    `error.type` attribute.
+    `gen_ai.usage.reasoning_tokens` spelling second; `gen_ai_main_agent_*` and
+    `gen_ai_agent_version` read span `attributes` first and `resource.attributes`
+    second; `error_type` is the `error.type` attribute.
   - `v_gen_ai_model_costs`: hourly token, cache-read/write, reasoning, latency
     (`APPROX_QUANTILES`), and error-count (`error_count`, `typed_error_count`,
     and `top_error_types` via `APPROX_TOP_COUNT(error_type, 5)`) rollups over
@@ -485,8 +487,9 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
     `gen_ai_operation_name`, `gen_ai_system` (from `gen_ai.system`, then
     `gen_ai.provider.name`), `gen_ai_provider_name`, `gen_ai_request_model`,
     `gen_ai_response_model`, `gen_ai_token_type`, `error_type`,
-    `gen_ai_token_modality`, `gen_ai_agent_name` (from `gen_ai.agent.name`, then
-    `gen_ai.main_agent.name`), and `gen_ai_inference_usage_dimension` (`input`,
+    `gen_ai_token_modality`, `gen_ai_agent_name` (from `gen_ai.agent.name` then
+    `gen_ai.main_agent.name` on point `attributes`, then `gen_ai.main_agent.name`
+    on `resource.attributes`), and `gen_ai_inference_usage_dimension` (`input`,
     `output`, `cache_read_input`, `cache_write_input`, or `reasoning_output` for
     `gen_ai.client.inference.usage.*` metrics, falling back to `gen_ai.token.type`)
     next to every point-value column, including the `exemplars` whose `trace_id`

@@ -638,10 +638,10 @@ func TestGenAISpansViewPromotesReasoningTokensAndErrorType(t *testing.T) {
 	for col, want := range map[string][]string{
 		"gen_ai_usage_reasoning_tokens":       {"gen_ai.usage.reasoning.output_tokens", "gen_ai.usage.reasoning_tokens"},
 		"error_type":                          {"error.type"},
-		"gen_ai_main_agent_id":                {"gen_ai.main_agent.id"},
-		"gen_ai_main_agent_name":              {"gen_ai.main_agent.name"},
-		"gen_ai_main_agent_description":       {"gen_ai.main_agent.description"},
-		"gen_ai_agent_version":                {"gen_ai.agent.version"},
+		"gen_ai_main_agent_id":                {"gen_ai.main_agent.id", "resource:gen_ai.main_agent.id"},
+		"gen_ai_main_agent_name":              {"gen_ai.main_agent.name", "resource:gen_ai.main_agent.name"},
+		"gen_ai_main_agent_description":       {"gen_ai.main_agent.description", "resource:gen_ai.main_agent.description"},
+		"gen_ai_agent_version":                {"gen_ai.agent.version", "resource:gen_ai.agent.version"},
 		"gen_ai_response_id":                  {"gen_ai.response.id"},
 		"gen_ai_response_time_to_first_chunk": {"gen_ai.response.time_to_first_chunk"},
 	} {
@@ -656,6 +656,8 @@ func TestGenAISpansViewPromotesReasoningTokensAndErrorType(t *testing.T) {
 	for _, want := range []string{
 		`OR JSON_VALUE(attributes, '$."gen_ai.main_agent.name"') IS NOT NULL`,
 		`OR JSON_VALUE(attributes, '$."gen_ai.main_agent.id"') IS NOT NULL`,
+		`OR JSON_VALUE(resource.attributes, '$."gen_ai.main_agent.name"') IS NOT NULL`,
+		`OR JSON_VALUE(resource.attributes, '$."gen_ai.main_agent.id"') IS NOT NULL`,
 	} {
 		if !strings.Contains(query, want) {
 			t.Errorf("v_gen_ai_spans WHERE clause must contain %q, got:\n%s", want, query)
@@ -893,7 +895,7 @@ func TestGenAIMetricsView(t *testing.T) {
 		"gen_ai_token_type":     {"gen_ai.token.type"},
 		"error_type":            {"error.type"},
 		"gen_ai_token_modality": {"gen_ai.token.modality"},
-		"gen_ai_agent_name":     {"gen_ai.agent.name", "gen_ai.main_agent.name"},
+		"gen_ai_agent_name":     {"gen_ai.agent.name", "gen_ai.main_agent.name", "resource:gen_ai.main_agent.name"},
 	} {
 		if got := attributeKeys(exprs[col]); !slices.Equal(got, want) {
 			t.Errorf("v_gen_ai_metrics.%s reads %v, want %v", col, got, want)

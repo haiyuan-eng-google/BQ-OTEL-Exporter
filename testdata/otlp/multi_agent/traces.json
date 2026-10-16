@@ -4,14 +4,17 @@
       "resource": {
         "attributes": [
           {"key": "service.name", "value": {"stringValue": "multi-agent-planner"}},
-          {"key": "service.version", "value": {"stringValue": "1.2.0"}}
+          {"key": "service.version", "value": {"stringValue": "1.2.0"}},
+          {"key": "gen_ai.main_agent.id", "value": {"stringValue": "agent-planner-1"}},
+          {"key": "gen_ai.main_agent.name", "value": {"stringValue": "planner"}},
+          {"key": "gen_ai.main_agent.description", "value": {"stringValue": "Top-level planner coordinating researcher and tool workers"}}
         ]
       },
       "scopeSpans": [
         {
           "scope": {
             "name": "synthetic.gen_ai.multi_agent",
-            "version": "1.40.0"
+            "version": "1.40.0+1.41.0+genai-dev"
           },
           "spans": [
             {
@@ -23,13 +26,11 @@
               "startTimeUnixNano": "1723420950000000000",
               "endTimeUnixNano": "1723420954000000000",
               "attributes": [
-                {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                {"key": "gen_ai.provider.name", "value": {"stringValue": "gcp.vertex.agent"}},
                 {"key": "gen_ai.operation.name", "value": {"stringValue": "invoke_agent"}},
                 {"key": "gen_ai.agent.name", "value": {"stringValue": "planner"}},
                 {"key": "gen_ai.agent.id", "value": {"stringValue": "agent-planner-1"}},
                 {"key": "gen_ai.agent.version", "value": {"stringValue": "1.2.0"}},
-                {"key": "gen_ai.main_agent.name", "value": {"stringValue": "planner"}},
-                {"key": "gen_ai.main_agent.id", "value": {"stringValue": "agent-planner-1"}},
                 {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-multi-01"}},
                 {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-2.5-pro"}},
                 {"key": "gen_ai.usage.input_tokens", "value": {"intValue": "500"}},
@@ -47,12 +48,10 @@
               "startTimeUnixNano": "1723420950100000000",
               "endTimeUnixNano": "1723420951100000000",
               "attributes": [
-                {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                {"key": "gen_ai.provider.name", "value": {"stringValue": "gcp.vertex.agent"}},
                 {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
                 {"key": "gen_ai.agent.name", "value": {"stringValue": "planner"}},
                 {"key": "gen_ai.agent.id", "value": {"stringValue": "agent-planner-1"}},
-                {"key": "gen_ai.main_agent.name", "value": {"stringValue": "planner"}},
-                {"key": "gen_ai.main_agent.id", "value": {"stringValue": "agent-planner-1"}},
                 {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-multi-01"}},
                 {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-2.5-pro"}},
                 {"key": "gen_ai.response.model", "value": {"stringValue": "gemini-2.5-pro-001"}},
@@ -72,13 +71,12 @@
               "startTimeUnixNano": "1723420951200000000",
               "endTimeUnixNano": "1723420953800000000",
               "attributes": [
-                {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                {"key": "gen_ai.provider.name", "value": {"stringValue": "gcp.vertex.agent"}},
                 {"key": "gen_ai.operation.name", "value": {"stringValue": "invoke_agent"}},
                 {"key": "gen_ai.agent.name", "value": {"stringValue": "researcher"}},
                 {"key": "gen_ai.agent.id", "value": {"stringValue": "agent-researcher-2"}},
+                {"key": "gen_ai.agent.parent.id", "value": {"stringValue": "agent-planner-1"}},
                 {"key": "gen_ai.agent.version", "value": {"stringValue": "1.0.4"}},
-                {"key": "gen_ai.main_agent.name", "value": {"stringValue": "planner"}},
-                {"key": "gen_ai.main_agent.id", "value": {"stringValue": "agent-planner-1"}},
                 {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-multi-01"}},
                 {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-2.5-flash"}},
                 {"key": "gen_ai.usage.input_tokens", "value": {"intValue": "300"}},
@@ -96,12 +94,10 @@
               "startTimeUnixNano": "1723420951300000000",
               "endTimeUnixNano": "1723420951500000000",
               "attributes": [
-                {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                {"key": "gen_ai.provider.name", "value": {"stringValue": "gcp.vertex.agent"}},
                 {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
                 {"key": "gen_ai.agent.name", "value": {"stringValue": "researcher"}},
                 {"key": "gen_ai.agent.id", "value": {"stringValue": "agent-researcher-2"}},
-                {"key": "gen_ai.main_agent.name", "value": {"stringValue": "planner"}},
-                {"key": "gen_ai.main_agent.id", "value": {"stringValue": "agent-planner-1"}},
                 {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-multi-01"}},
                 {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-2.5-flash"}},
                 {"key": "error.type", "value": {"stringValue": "rate_limited"}}
@@ -121,8 +117,6 @@
                 {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
                 {"key": "gen_ai.agent.name", "value": {"stringValue": "researcher"}},
                 {"key": "gen_ai.agent.id", "value": {"stringValue": "agent-researcher-2"}},
-                {"key": "gen_ai.main_agent.name", "value": {"stringValue": "planner"}},
-                {"key": "gen_ai.main_agent.id", "value": {"stringValue": "agent-planner-1"}},
                 {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-multi-01"}},
                 {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-2.5-flash"}},
                 {"key": "gen_ai.response.model", "value": {"stringValue": "gemini-2.5-flash-001"}},
@@ -142,12 +136,10 @@
               "startTimeUnixNano": "1723420952000000000",
               "endTimeUnixNano": "1723420952600000000",
               "attributes": [
-                {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                {"key": "gen_ai.provider.name", "value": {"stringValue": "gcp.vertex.agent"}},
                 {"key": "gen_ai.operation.name", "value": {"stringValue": "execute_tool"}},
                 {"key": "gen_ai.agent.name", "value": {"stringValue": "researcher"}},
                 {"key": "gen_ai.agent.id", "value": {"stringValue": "agent-researcher-2"}},
-                {"key": "gen_ai.main_agent.name", "value": {"stringValue": "planner"}},
-                {"key": "gen_ai.main_agent.id", "value": {"stringValue": "agent-planner-1"}},
                 {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-multi-01"}},
                 {"key": "gen_ai.tool.name", "value": {"stringValue": "execute_sql"}},
                 {"key": "gen_ai.tool.call.id", "value": {"stringValue": "call-01"}},
@@ -165,12 +157,10 @@
               "startTimeUnixNano": "1723420952100000000",
               "endTimeUnixNano": "1723420952800000000",
               "attributes": [
-                {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                {"key": "gen_ai.provider.name", "value": {"stringValue": "gcp.vertex.agent"}},
                 {"key": "gen_ai.operation.name", "value": {"stringValue": "execute_tool"}},
                 {"key": "gen_ai.agent.name", "value": {"stringValue": "researcher"}},
                 {"key": "gen_ai.agent.id", "value": {"stringValue": "agent-researcher-2"}},
-                {"key": "gen_ai.main_agent.name", "value": {"stringValue": "planner"}},
-                {"key": "gen_ai.main_agent.id", "value": {"stringValue": "agent-planner-1"}},
                 {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-multi-01"}},
                 {"key": "gen_ai.tool.name", "value": {"stringValue": "search_docs"}},
                 {"key": "gen_ai.tool.call.id", "value": {"stringValue": "call-02"}},
@@ -193,8 +183,6 @@
                 {"key": "gen_ai.operation.name", "value": {"stringValue": "invoke_agent"}},
                 {"key": "gen_ai.agent.name", "value": {"stringValue": "late_worker"}},
                 {"key": "gen_ai.agent.id", "value": {"stringValue": "agent-late-3"}},
-                {"key": "gen_ai.main_agent.name", "value": {"stringValue": "planner"}},
-                {"key": "gen_ai.main_agent.id", "value": {"stringValue": "agent-planner-1"}},
                 {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-multi-02"}}
               ],
               "status": {"code": 1}

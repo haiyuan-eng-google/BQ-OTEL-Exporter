@@ -83,7 +83,7 @@ scenarios:
   - id: multi_agent
     kind: scenario
     provenance: synthetic
-    semconv_version: "1.40.0"
+    semconv_version: "1.40.0+1.41.0+genai-dev"
     signals: [traces, logs, metrics]
     gen_ai_system: gcp.vertex.agent
     traces_file: multi_agent/traces.json
@@ -92,6 +92,6 @@ scenarios:
   - id: mcp
     kind: scenario
     provenance: synthetic
-    semconv_version: "1.40.0"
+    semconv_version: "1.40.0+1.41.0+genai-dev"
     signals: [traces]
     traces_file: mcp/traces.json

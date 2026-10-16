@@ -614,10 +614,22 @@ resource "google_bigquery_table" "v_gen_ai_spans" {
           LAX_FLOAT64(attributes['gen_ai.evaluation.score'])
         ) AS gen_ai_evaluation_score,
         JSON_VALUE(attributes, '$."error.type"') AS error_type,
-        JSON_VALUE(attributes, '$."gen_ai.main_agent.id"') AS gen_ai_main_agent_id,
-        JSON_VALUE(attributes, '$."gen_ai.main_agent.name"') AS gen_ai_main_agent_name,
-        JSON_VALUE(attributes, '$."gen_ai.main_agent.description"') AS gen_ai_main_agent_description,
-        JSON_VALUE(attributes, '$."gen_ai.agent.version"') AS gen_ai_agent_version,
+        COALESCE(
+          JSON_VALUE(attributes, '$."gen_ai.main_agent.id"'),
+          JSON_VALUE(resource.attributes, '$."gen_ai.main_agent.id"')
+        ) AS gen_ai_main_agent_id,
+        COALESCE(
+          JSON_VALUE(attributes, '$."gen_ai.main_agent.name"'),
+          JSON_VALUE(resource.attributes, '$."gen_ai.main_agent.name"')
+        ) AS gen_ai_main_agent_name,
+        COALESCE(
+          JSON_VALUE(attributes, '$."gen_ai.main_agent.description"'),
+          JSON_VALUE(resource.attributes, '$."gen_ai.main_agent.description"')
+        ) AS gen_ai_main_agent_description,
+        COALESCE(
+          JSON_VALUE(attributes, '$."gen_ai.agent.version"'),
+          JSON_VALUE(resource.attributes, '$."gen_ai.agent.version"')
+        ) AS gen_ai_agent_version,
         JSON_VALUE(attributes, '$."gen_ai.response.id"') AS gen_ai_response_id,
         LAX_FLOAT64(attributes['gen_ai.response.time_to_first_chunk']) AS gen_ai_response_time_to_first_chunk
       FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.otel_spans_dedup.table_id}`
@@ -627,6 +639,8 @@ resource "google_bigquery_table" "v_gen_ai_spans" {
          OR JSON_VALUE(attributes, '$."gcp.vertex.agent.invocation_id"') IS NOT NULL
          OR JSON_VALUE(attributes, '$."gen_ai.main_agent.name"') IS NOT NULL
          OR JSON_VALUE(attributes, '$."gen_ai.main_agent.id"') IS NOT NULL
+         OR JSON_VALUE(resource.attributes, '$."gen_ai.main_agent.name"') IS NOT NULL
+         OR JSON_VALUE(resource.attributes, '$."gen_ai.main_agent.id"') IS NOT NULL
     EOT
   }
 }
@@ -934,7 +948,8 @@ resource "google_bigquery_table" "v_gen_ai_metrics" {
         JSON_VALUE(attributes, '$."gen_ai.token.modality"') AS gen_ai_token_modality,
         COALESCE(
           JSON_VALUE(attributes, '$."gen_ai.agent.name"'),
-          JSON_VALUE(attributes, '$."gen_ai.main_agent.name"')
+          JSON_VALUE(attributes, '$."gen_ai.main_agent.name"'),
+          JSON_VALUE(resource.attributes, '$."gen_ai.main_agent.name"')
         ) AS gen_ai_agent_name,
         CASE
           WHEN metric_name = 'gen_ai.client.inference.usage.input_tokens' THEN 'input'
