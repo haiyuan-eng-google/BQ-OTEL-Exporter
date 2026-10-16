@@ -261,7 +261,8 @@ func (h *replayFuzzHarness) checkRows(t *testing.T, rows ...Record) {
 // through the JSON decoding Replay applies. For a row that replays, it also
 // returns the protobuf encoding of the batch the sink must receive. It
 // applies the filters, the payload rules and the signal aliases itself
-// rather than call Filter.Matches or CanonicalSignal, which Replay uses.
+// rather than call CanonicalSignal, which Replay calls, or Filter.Matches,
+// which shares Replay's signal and error code check.
 func (h *replayFuzzHarness) expect(t *testing.T, row Record) (Summary, []byte) {
 	t.Helper()
 	sum := Summary{TotalRead: 1}
