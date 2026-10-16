@@ -73,7 +73,7 @@ func NewBackpressureController(opts BackpressureOptions) *BackpressureController
 	if opts.MinInflightRequests > opts.MaxInflightRequests {
 		opts.MinInflightRequests = opts.MaxInflightRequests
 	}
-	if opts.DecreaseFactor <= 0 || opts.DecreaseFactor >= 1.0 {
+	if math.IsNaN(opts.DecreaseFactor) || opts.DecreaseFactor <= 0 || opts.DecreaseFactor >= 1.0 {
 		opts.DecreaseFactor = defaultBackpressureDecreaseFactor
 	}
 	if opts.RecoveryInterval <= 0 {
@@ -99,6 +99,12 @@ func NewBackpressureController(opts BackpressureOptions) *BackpressureController
 // EffectiveRequestBytes returns the current request split threshold in bytes.
 func (c *BackpressureController) EffectiveRequestBytes() int {
 	return int(c.effectiveBytes.Load())
+}
+
+// MinRequestBytes returns the configured floor for the request split threshold
+// in bytes.
+func (c *BackpressureController) MinRequestBytes() int {
+	return c.opts.MinRequestBytes
 }
 
 // EffectiveInflightRequests returns the current concurrent dispatch limit.
@@ -163,6 +169,9 @@ func (c *BackpressureController) OnCleanAck(d time.Duration) bool {
 	if c.opts.LatencyThreshold > 0 && d > c.opts.LatencyThreshold {
 		return false
 	}
+	if c.effectiveBytes.Load() >= int64(c.opts.MaxRequestBytes) && c.effectiveInflight.Load() >= int64(c.opts.MaxInflightRequests) {
+		return false
+	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -194,11 +203,11 @@ func (c *BackpressureController) decrease(now time.Time) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.lastEvent = now
 	if !c.lastDecrease.IsZero() && now.Sub(c.lastDecrease) < c.cooldown {
 		return false
 	}
 	c.lastDecrease = now
+	c.lastEvent = now
 
 	curBytes := c.effectiveBytes.Load()
 	curInflight := c.effectiveInflight.Load()

@@ -4,6 +4,7 @@
 package bigquery
 
 import (
+	"math"
 	"math/rand/v2"
 	"sync"
 	"testing"
@@ -248,5 +249,47 @@ func TestBackpressureControllerConcurrentRace(t *testing.T) {
 	wg.Wait()
 	if got := ctrl.EffectiveRequestBytes(); got < 1024 || got > 64*1024 {
 		t.Fatalf("EffectiveRequestBytes() after concurrent test = %d, want in [1024, 65536]", got)
+	}
+}
+
+func TestBackpressureControllerCooldownDoesNotDelayRecoveryAndNaNFallback(t *testing.T) {
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	ctrl := NewBackpressureController(BackpressureOptions{
+		MinRequestBytes:     1000,
+		MaxRequestBytes:     4000,
+		MinInflightRequests: 1,
+		MaxInflightRequests: 4,
+		DecreaseFactor:      math.NaN(),
+		RecoveryInterval:    10 * time.Second,
+		Now:                 func() time.Time { return now },
+	})
+
+	if got := ctrl.MinRequestBytes(); got != 1000 {
+		t.Fatalf("MinRequestBytes() = %d, want 1000", got)
+	}
+
+	// NaN DecreaseFactor falls back to 0.5x default.
+	if !ctrl.OnThrottle() {
+		t.Fatal("OnThrottle() = false, want true")
+	}
+	if got := ctrl.EffectiveRequestBytes(); got != 2000 {
+		t.Fatalf("EffectiveRequestBytes() after NaN-fallback throttle = %d, want 2000", got)
+	}
+
+	// A second throttle inside the 250ms cooldown is absorbed and must not
+	// push back the recovery clock.
+	now = now.Add(100 * time.Millisecond)
+	if ctrl.OnThrottle() {
+		t.Fatal("OnThrottle() inside cooldown = true, want false")
+	}
+
+	// Exactly 10s after the real decrease (9.9s after the absorbed throttle),
+	// a clean ack must recover.
+	now = now.Add(9900 * time.Millisecond)
+	if !ctrl.OnCleanAck(50 * time.Millisecond) {
+		t.Fatal("OnCleanAck() 10s after real decrease = false, want true (cooldown throttle must not reset lastEvent)")
+	}
+	if got := ctrl.EffectiveRequestBytes(); got != 2300 {
+		t.Fatalf("EffectiveRequestBytes() after recovery = %d, want 2300", got)
 	}
 }

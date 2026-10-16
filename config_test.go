@@ -5,6 +5,7 @@ package bigqueryexporter
 
 import (
 	"fmt"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -788,6 +789,13 @@ func TestValidateBackpressure(t *testing.T) {
 				c.Write.Backpressure.DecreaseFactor = 1.0
 			},
 			"write.backpressure.decrease_factor (1) must be strictly between 0 and 1",
+		},
+		"decrease_factor NaN": {
+			func(c *Config) {
+				c.Write.Backpressure.Enabled = true
+				c.Write.Backpressure.DecreaseFactor = math.NaN()
+			},
+			"write.backpressure.decrease_factor (NaN) must be strictly between 0 and 1",
 		},
 		"zero recovery_interval when enabled": {
 			func(c *Config) {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"net"
 	"net/url"
 	"regexp"
@@ -666,7 +667,7 @@ func (cfg *Config) validateBackpressure() []error {
 			"write.backpressure.min_inflight_requests (%d) must not exceed write.max_inflight_requests (%d)",
 			b.MinInflightRequests, w.MaxInflightRequests))
 	}
-	if b.DecreaseFactor <= 0 || b.DecreaseFactor >= 1.0 {
+	if math.IsNaN(b.DecreaseFactor) || b.DecreaseFactor <= 0 || b.DecreaseFactor >= 1.0 {
 		errs = append(errs, fmt.Errorf(
 			"write.backpressure.decrease_factor (%v) must be strictly between 0 and 1",
 			b.DecreaseFactor))

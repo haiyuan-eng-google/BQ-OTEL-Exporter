@@ -213,24 +213,24 @@ func TestPermissionHintNamesThePermission(t *testing.T) {
 func TestClassifySubRequestOversizeWithBackpressure(t *testing.T) {
 	oversizeErr := status.Error(codes.ResourceExhausted, "Request payload size exceeds the limit: 10485760 bytes.")
 
-	t.Run("multi-row oversize with backpressure enabled is retryable", func(t *testing.T) {
+	t.Run("multi-row oversize when split can still shrink is retryable", func(t *testing.T) {
 		v := ClassifySubRequest(oversizeErr, 4, true)
 		if v.Class != Retryable || v.Owner != OwnerExporterHelper || v.Label != LabelOversizeRequest {
-			t.Fatalf("ClassifySubRequest(multi-row, enabled) = %+v, want {Retryable, OwnerExporterHelper, oversize_request}", v)
+			t.Fatalf("ClassifySubRequest(multi-row, canSplitSmaller=true) = %+v, want {Retryable, OwnerExporterHelper, oversize_request}", v)
 		}
 	})
 
-	t.Run("single-row oversize with backpressure enabled stays permanent", func(t *testing.T) {
+	t.Run("single-row oversize when split can still shrink stays permanent", func(t *testing.T) {
 		v := ClassifySubRequest(oversizeErr, 1, true)
 		if v.Class != Permanent || v.Owner != OwnerExporter || v.Label != LabelQuota {
-			t.Fatalf("ClassifySubRequest(single-row, enabled) = %+v, want {Permanent, OwnerExporter, quota_exhausted}", v)
+			t.Fatalf("ClassifySubRequest(single-row, canSplitSmaller=true) = %+v, want {Permanent, OwnerExporter, quota_exhausted}", v)
 		}
 	})
 
-	t.Run("multi-row oversize with backpressure disabled stays permanent", func(t *testing.T) {
+	t.Run("multi-row oversize at floor or with backpressure disabled stays permanent", func(t *testing.T) {
 		v := ClassifySubRequest(oversizeErr, 4, false)
 		if v.Class != Permanent || v.Owner != OwnerExporter || v.Label != LabelQuota {
-			t.Fatalf("ClassifySubRequest(multi-row, disabled) = %+v, want {Permanent, OwnerExporter, quota_exhausted}", v)
+			t.Fatalf("ClassifySubRequest(multi-row, canSplitSmaller=false) = %+v, want {Permanent, OwnerExporter, quota_exhausted}", v)
 		}
 	})
 

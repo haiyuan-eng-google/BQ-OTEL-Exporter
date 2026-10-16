@@ -1378,6 +1378,33 @@ func TestVerticalSliceAdaptiveBackpressureThrottleAndRecovery(t *testing.T) {
 		t.Fatalf("otel_spans rows after throttled attempt = %d, want 0", got)
 	}
 
+	var rmThrottled metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &rmThrottled); err != nil {
+		t.Fatalf("reader.Collect after throttle: %v", err)
+	}
+	var throttledLevel float64
+	var throttledBytes int64
+	for _, sm := range rmThrottled.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			switch m.Name {
+			case "otelcol_exporter_bigquery_backpressure_level":
+				if g, ok := m.Data.(metricdata.Gauge[float64]); ok && len(g.DataPoints) > 0 {
+					throttledLevel = g.DataPoints[0].Value
+				}
+			case "otelcol_exporter_bigquery_effective_request_bytes":
+				if g, ok := m.Data.(metricdata.Gauge[int64]); ok && len(g.DataPoints) > 0 {
+					throttledBytes = g.DataPoints[0].Value
+				}
+			}
+		}
+	}
+	if throttledLevel <= 0 {
+		t.Fatalf("backpressure_level gauge after throttle = %v, want > 0", throttledLevel)
+	}
+	if throttledBytes != 4000 {
+		t.Fatalf("effective_request_bytes gauge after throttle = %d, want 4000", throttledBytes)
+	}
+
 	time.Sleep(10 * time.Millisecond)
 
 	if err := tracesExp.pushTraceData(ctx, td); err != nil {
@@ -1393,10 +1420,16 @@ func TestVerticalSliceAdaptiveBackpressureThrottleAndRecovery(t *testing.T) {
 	}
 	seenMetrics := map[string]bool{}
 	var throttleEvents, recoveryEvents int64
+	var recoveredBytes int64
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
 			seenMetrics[m.Name] = true
-			if m.Name == "otelcol_exporter_bigquery_backpressure_events" {
+			switch m.Name {
+			case "otelcol_exporter_bigquery_effective_request_bytes":
+				if g, ok := m.Data.(metricdata.Gauge[int64]); ok && len(g.DataPoints) > 0 {
+					recoveredBytes = g.DataPoints[0].Value
+				}
+			case "otelcol_exporter_bigquery_backpressure_events":
 				sum, ok := m.Data.(metricdata.Sum[int64])
 				if !ok {
 					t.Fatalf("backpressure_events data = %T, want Sum[int64]", m.Data)
@@ -1427,5 +1460,8 @@ func TestVerticalSliceAdaptiveBackpressureThrottleAndRecovery(t *testing.T) {
 	}
 	if recoveryEvents < 1 {
 		t.Errorf("recovery backpressure events = %d, want >= 1", recoveryEvents)
+	}
+	if recoveredBytes <= throttledBytes {
+		t.Errorf("effective_request_bytes after recovery = %d, want > %d", recoveredBytes, throttledBytes)
 	}
 }

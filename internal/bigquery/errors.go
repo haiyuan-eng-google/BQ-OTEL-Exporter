@@ -86,6 +86,7 @@ type Verdict struct {
 const (
 	LabelQuota           = "quota_exhausted"
 	LabelOversizeRequest = "oversize_request"
+	LabelBackpressure    = "backpressure"
 	LabelUnavailable     = "unavailable"
 	LabelInternal        = "internal"
 	LabelPermission      = "permission_denied"
@@ -237,14 +238,15 @@ func Classify(err error) Verdict {
 }
 
 // ClassifySubRequest classifies an AppendRows sub-request error. When adaptive
-// backpressure is enabled and a multi-row sub-request hits a request-size
-// ResourceExhausted error, it returns a Retryable verdict owned by
-// exporterhelper so the batch is replayed at a smaller split threshold. A
-// single-row oversize error or a disabled backpressure configuration keeps the
-// permanent Classify verdict.
-func ClassifySubRequest(err error, rowCount int, backpressureEnabled bool) Verdict {
+// backpressure can still split the batch smaller (canSplitSmaller is true) and
+// a multi-row sub-request hits a request-size ResourceExhausted error, it
+// returns a Retryable verdict owned by exporterhelper so the batch is replayed
+// at a smaller split threshold. A single-row oversize error, an oversize error
+// already at the minimum split threshold, or a disabled backpressure
+// configuration keeps the permanent Classify verdict.
+func ClassifySubRequest(err error, rowCount int, canSplitSmaller bool) Verdict {
 	v := Classify(err)
-	if backpressureEnabled && rowCount > 1 && v.Class == Permanent && v.Label == LabelQuota {
+	if canSplitSmaller && rowCount > 1 && v.Class == Permanent && v.Label == LabelQuota {
 		if s, ok := status.FromError(err); ok && s.Code() == codes.ResourceExhausted && isOversizeResourceExhausted(s.Message()) {
 			return Verdict{Retryable, OwnerExporterHelper, LabelOversizeRequest, false}
 		}

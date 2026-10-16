@@ -271,6 +271,7 @@ attributes:
     enum:
       - quota_exhausted
       - oversize_request
+      - backpressure
       - unavailable
       - internal
       - permission_denied

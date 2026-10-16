@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
@@ -94,6 +95,7 @@ type stream interface {
 
 // appendResult is the slice of AppendResult the writer depends on.
 type appendResult interface {
+	Ready() <-chan struct{}
 	GetResult(ctx context.Context) (int64, error)
 	FullResponse(ctx context.Context) (*storagepb.AppendRowsResponse, error)
 }
@@ -123,8 +125,10 @@ type Writer struct {
 const maxActiveStreamGenerations = 2
 
 var (
-	errStreamRetired = errors.New("write stream generation is retired")
-	errWriterClosed  = errors.New("writer is closed")
+	errStreamRetired      = errors.New("write stream generation is retired")
+	errWriterClosed       = errors.New("writer is closed")
+	errBackpressureShed   = errors.New("adaptive backpressure window is busy")
+	errBackpressureBudget = errors.New("remaining attempt deadline is below adaptive backpressure ack budget")
 )
 
 type streamCreation struct {
@@ -502,9 +506,16 @@ func (w *Writer) observeUnresolved(delta int64) {
 	}
 }
 
+func (w *Writer) now() time.Time {
+	if w.opts.Backpressure != nil && w.opts.Backpressure.now != nil {
+		return w.opts.Backpressure.now()
+	}
+	return time.Now()
+}
+
 func (w *Writer) observeResultWait(started time.Time) {
 	if w.opts.Observer != nil {
-		w.opts.Observer.RecordAppendResultWait(context.Background(), time.Since(started))
+		w.opts.Observer.RecordAppendResultWait(context.Background(), w.now().Sub(started))
 	}
 }
 
@@ -536,11 +547,27 @@ func isBackpressureThrottle(v Verdict) bool {
 	}
 }
 
-func (w *Writer) recordThrottle(v Verdict) {
-	if w.opts.Backpressure == nil || !isBackpressureThrottle(v) {
+// recordFailureFeedback updates the adaptive backpressure controller after a
+// sub-request failure. Client-side attempt expiry (attemptEnded) is measured
+// only by elapsed latency so callers with nearly-spent deadlines do not pin
+// the controller at its floor, and sibling stream teardown is ignored.
+func (w *Writer) recordFailureFeedback(
+	v Verdict, attemptEnded, siblingTeardown bool, elapsed time.Duration,
+) {
+	bp := w.opts.Backpressure
+	if bp == nil || siblingTeardown {
 		return
 	}
-	if w.opts.Backpressure.OnThrottle() {
+	if attemptEnded {
+		if bp.OnSlowAck(elapsed) {
+			w.observeBackpressureTransition("latency")
+		}
+		return
+	}
+	if !isBackpressureThrottle(v) {
+		return
+	}
+	if bp.OnThrottle() {
 		w.observeBackpressureTransition("throttle")
 	}
 }
@@ -572,14 +599,16 @@ func (w *Writer) finishResult(gen *streamGeneration, started time.Time) {
 
 func (w *Writer) classifyAndRetire(
 	ctx context.Context, err error, gen *streamGeneration, rowCount int,
-) (Verdict, bool) {
+) (Verdict, bool, bool) {
 	verdict, attemptEnded := w.classifyAppendFailure(ctx, err, rowCount)
+	siblingTeardown := false
 	if !attemptEnded && verdict.Label != LabelShutdown && isTeardown(err) && w.isRetired(gen) {
 		// Another attempt retired this generation and closed the connection
 		// under this request. It may already have reached the service, so the
 		// outcome is as ambiguous as an expired attempt's and its replay can
 		// duplicate.
 		verdict = Verdict{Uncertain, OwnerExporterHelper, LabelUncertainAck, false}
+		siblingTeardown = true
 	}
 	if verdict.StreamRecreate || attemptEnded || verdict.Class == Uncertain {
 		w.retireStream(gen)
@@ -587,7 +616,7 @@ func (w *Writer) classifyAndRetire(
 	if attemptEnded {
 		w.observeTimeoutAfterDispatch()
 	}
-	return verdict, attemptEnded
+	return verdict, attemptEnded, siblingTeardown
 }
 
 // deliveryRank orders verdicts by what a batch still owes its rows:
@@ -667,6 +696,70 @@ func (o AppendOutcome) IsAcked(rowIndex int) bool {
 	return false
 }
 
+// pendingAppend tracks one in-flight AppendRows sub-request and stamps its
+// completion time as soon as Ready() closes so later local dispatch or drain
+// delays do not inflate acknowledgement latency.
+type pendingAppend struct {
+	res               appendResult
+	start             int
+	count             int
+	dispatched        time.Time
+	completedUnixNano atomic.Int64
+	done              chan struct{}
+	stopOnce          sync.Once
+}
+
+func stampNano(t time.Time) int64 {
+	if ns := t.UnixNano(); ns != 0 {
+		return ns
+	}
+	return 1
+}
+
+func (p *pendingAppend) pollReady(nowFn func() time.Time) bool {
+	if p.completedUnixNano.Load() != 0 {
+		return true
+	}
+	ready := p.res.Ready()
+	if ready == nil {
+		return false
+	}
+	select {
+	case <-ready:
+		p.completedUnixNano.CompareAndSwap(0, stampNano(nowFn()))
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *pendingAppend) stopWatcher() {
+	if p.done == nil {
+		return
+	}
+	p.stopOnce.Do(func() { close(p.done) })
+}
+
+func (p *pendingAppend) ackDuration(nowFn func() time.Time) time.Duration {
+	p.pollReady(nowFn)
+	if completed := p.completedUnixNano.Load(); completed != 0 {
+		if d := time.Duration(completed - p.dispatched.UnixNano()); d >= 0 {
+			return d
+		}
+		return 0
+	}
+	if d := nowFn().Sub(p.dispatched); d >= 0 {
+		return d
+	}
+	return 0
+}
+
+func pollInflightReady(inflight []*pendingAppend, nowFn func() time.Time) {
+	for _, p := range inflight {
+		p.pollReady(nowFn)
+	}
+}
+
 // Append splits rows into requests under the size threshold and sends them,
 // then waits for every acknowledgement.
 //
@@ -689,14 +782,10 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 	defer w.releaseGenerationUser(gen)
 
 	requests := SplitRequests(rows, w.EffectiveMaxRequestBytes())
+	deadline, hasDeadline := ctx.Deadline()
+	var maxBatchAck time.Duration
 
-	type pending struct {
-		res        appendResult
-		start      int
-		count      int
-		dispatched time.Time
-	}
-	inflight := make([]pending, 0, len(requests))
+	inflight := make([]*pendingAppend, 0, len(requests))
 	out := AppendOutcome{}
 	// fail folds one request's failure into the batch. Err keeps the first
 	// failure for diagnosis, but the verdict follows delivery precedence
@@ -719,8 +808,13 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 	replayOwed := func() bool {
 		return out.Err != nil && (out.Verdict.Class != Permanent || out.Verdict.StreamRecreate)
 	}
-	drainOne := func(p pending) {
-		if _, rerr := p.res.GetResult(ctx); rerr != nil {
+	drainOne := func(p *pendingAppend) {
+		defer p.stopWatcher()
+		pollInflightReady(inflight, w.now)
+		_, rerr := p.res.GetResult(ctx)
+		pollInflightReady(inflight, w.now)
+		elapsed := p.ackDuration(w.now)
+		if rerr != nil {
 			// Row errors arrive alongside the error; the whole request is not
 			// appended when any row in it fails.
 			rowErrs := extractRowErrors(ctx, p.res, p.start)
@@ -729,18 +823,20 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 				out.RowErrors = append(out.RowErrors, rowErrs...)
 				return
 			}
-			v, attemptEnded := w.classifyAndRetire(ctx, rerr, gen, p.count)
+			v, attemptEnded, siblingTeardown := w.classifyAndRetire(ctx, rerr, gen, p.count)
 			if attemptEnded {
 				w.trackResult(gen, p.res, p.dispatched)
 			} else {
 				w.finishResult(gen, p.dispatched)
 			}
-			w.recordThrottle(v)
+			w.recordFailureFeedback(v, attemptEnded, siblingTeardown, elapsed)
 			// Keep draining all other results already dispatched by this call.
 			fail(v, rerr)
 			return
 		}
-		elapsed := time.Since(p.dispatched)
+		if elapsed > maxBatchAck {
+			maxBatchAck = elapsed
+		}
 		w.finishResult(gen, p.dispatched)
 		w.recordCleanOrSlowAck(elapsed, gen)
 		out.AcknowledgedRows += p.count
@@ -756,6 +852,15 @@ dispatch:
 			if replayOwed() {
 				break dispatch
 			}
+			if hasDeadline && maxBatchAck > 0 && w.opts.Backpressure != nil &&
+				(w.EffectiveMaxInflightRequests() < w.opts.MaxInflightRequests ||
+					w.EffectiveMaxRequestBytes() < w.opts.MaxRequestBytes) {
+				minBudget := maxBatchAck + maxBatchAck/2
+				if deadline.Sub(w.now()) < minBudget {
+					fail(Verdict{Retryable, OwnerExporterHelper, LabelBackpressure, false}, errBackpressureBudget)
+					break dispatch
+				}
+			}
 			acquired, acquireErr := w.tryAcquireDispatchSlot(ctx, gen)
 			if acquireErr != nil {
 				fail(classifyPreDispatchFailure(acquireErr), acquireErr)
@@ -769,14 +874,21 @@ dispatch:
 				inflight = inflight[1:]
 				continue
 			}
+			if hasDeadline && w.opts.Backpressure != nil &&
+				w.EffectiveMaxInflightRequests() < w.opts.MaxInflightRequests {
+				fail(Verdict{Retryable, OwnerExporterHelper, LabelBackpressure, false}, errBackpressureShed)
+				break dispatch
+			}
 			if acquireErr := w.waitForDispatchSlot(ctx, gen); acquireErr != nil {
 				fail(classifyPreDispatchFailure(acquireErr), acquireErr)
 				break dispatch
 			}
 			break
 		}
-		dispatched := time.Now()
+		pollInflightReady(inflight, w.now)
+		dispatched := w.now()
 		res, aerr := gen.AppendRows(ctx, req)
+		pollInflightReady(inflight, w.now)
 		if aerr == nil {
 			// managedwriter's AppendRows can report success for a request it
 			// never sent when the call races the end of the attempt or the
@@ -794,16 +906,29 @@ dispatch:
 			// AppendRows can return the attempt-context error after handing a
 			// request to the bidirectional stream. Its acknowledgement is then
 			// ambiguous, and this generation cannot safely be reused.
-			v, _ := w.classifyAndRetire(ctx, aerr, gen, len(req))
-			w.recordThrottle(v)
+			v, attemptEnded, siblingTeardown := w.classifyAndRetire(ctx, aerr, gen, len(req))
+			w.recordFailureFeedback(v, attemptEnded, siblingTeardown, w.now().Sub(dispatched))
 			fail(v, aerr)
 			continue
 		}
 		w.registerResult(gen)
 		w.observeInflight(1)
-		inflight = append(inflight, pending{
+		p := &pendingAppend{
 			res: res, start: start, count: len(req), dispatched: dispatched,
-		})
+			done: make(chan struct{}),
+		}
+		if !p.pollReady(w.now) {
+			if ready := res.Ready(); ready != nil {
+				go func() {
+					select {
+					case <-ready:
+						p.completedUnixNano.CompareAndSwap(0, stampNano(w.now()))
+					case <-p.done:
+					}
+				}()
+			}
+		}
+		inflight = append(inflight, p)
 	}
 
 	for _, p := range inflight {
@@ -832,7 +957,9 @@ func (w *Writer) classifyAppendFailure(ctx context.Context, err error, rowCount 
 	if ownedCtx != nil && ownedCtx.Err() != nil && isTeardown(err) {
 		return Verdict{Retryable, OwnerExporterHelper, LabelShutdown, false}, false
 	}
-	return ClassifySubRequest(err, rowCount, w.opts.Backpressure != nil), false
+	canSplitSmaller := w.opts.Backpressure != nil &&
+		w.opts.Backpressure.EffectiveRequestBytes() > w.opts.Backpressure.MinRequestBytes()
+	return ClassifySubRequest(err, rowCount, canSplitSmaller), false
 }
 
 // isTeardown reports whether err is how managedwriter fails a request whose
