@@ -102,16 +102,17 @@ func TestToolUsageViewModelMatchesViewSQL(t *testing.T) {
 		toolTypeChain.sql(""),
 	)
 	requireSQL(t, "v_gen_ai_tool_usage", render(schema.GenAIToolUsageViewQuery, confProject, confDataset),
-		"SELECT TIMESTAMP_TRUNC(start_time, HOUR) AS usage_hour,",
+		"WITH tool_agg AS ( SELECT TIMESTAMP_TRUNC(start_time, HOUR) AS usage_hour,",
 		"service_name, gen_ai_agent_name, gen_ai_tool_name, gen_ai_tool_type,",
 		"COUNT(*) AS call_count,",
 		"COUNTIF(status_code = 2) AS error_count,",
 		"SAFE_DIVIDE(COUNTIF(status_code = 2), COUNT(*)) AS error_rate,",
 		"COUNTIF(error_type IS NOT NULL) AS typed_error_count,",
-		"ARRAY( SELECT x FROM UNNEST(APPROX_TOP_COUNT(error_type, 6)) AS x WHERE x.value IS NOT NULL LIMIT 5 ) AS top_error_types",
+		"APPROX_TOP_COUNT(error_type, 6) AS raw_top_error_types",
 		"FROM `"+confProject+"."+confDataset+".v_gen_ai_spans`",
 		"WHERE gen_ai_tool_name IS NOT NULL OR gen_ai_operation_name = 'execute_tool'",
-		"GROUP BY 1, 2, 3, 4, 5",
+		"GROUP BY 1, 2, 3, 4, 5 )",
+		"SELECT * EXCEPT (raw_top_error_types), ARRAY( SELECT AS STRUCT x.value, x.count FROM UNNEST(raw_top_error_types) AS x WHERE x.value IS NOT NULL ORDER BY x.count DESC, x.value ASC LIMIT 5 ) AS top_error_types FROM tool_agg",
 	)
 }
 
@@ -149,7 +150,7 @@ func TestScenarioMultiAgentViews(t *testing.T) {
 		"status_code":                   int64(1),
 		"error_type":                    nil,
 	})
-	requireCols(t, "span_02 (planner chat, v1.40 reasoning)", onlyRow(t, "span_02", spans, "span_id", "00f067aa0ba902b8"), map[string]any{
+	requireCols(t, "span_02 (planner chat, v1.41 reasoning)", onlyRow(t, "span_02", spans, "span_id", "00f067aa0ba902b8"), map[string]any{
 		"parent_span_id":                "00f067aa0ba902b7",
 		"gen_ai_operation_name":         "chat",
 		"gen_ai_agent_name":             "planner",
@@ -383,7 +384,7 @@ func TestScenarioMultiAgentViews(t *testing.T) {
 	if len(v140Input) != 2 {
 		t.Fatalf("gen_ai.client.inference.usage.input_tokens rows = %d, want 2", len(v140Input))
 	}
-	requireCols(t, "v1.40 input_tokens planner", onlyRow(t, "planner input", v140Input, "gen_ai_agent_name", "planner"), map[string]any{
+	requireCols(t, "genai-dev input_tokens planner", onlyRow(t, "planner input", v140Input, "gen_ai_agent_name", "planner"), map[string]any{
 		"metric_type":                      "SUM",
 		"is_monotonic":                     true,
 		"aggregation_temporality":          "DELTA",
@@ -395,7 +396,7 @@ func TestScenarioMultiAgentViews(t *testing.T) {
 		"sum":                              nil,
 	})
 	v140Reasoning := rowsWhere(metrics, "metric_name", "gen_ai.client.inference.usage.reasoning.output_tokens")
-	requireCols(t, "v1.40 reasoning_output researcher", onlyRow(t, "researcher reasoning", v140Reasoning, "gen_ai_agent_name", "researcher"), map[string]any{
+	requireCols(t, "genai-dev reasoning_output researcher", onlyRow(t, "researcher reasoning", v140Reasoning, "gen_ai_agent_name", "researcher"), map[string]any{
 		"metric_type":                      "SUM",
 		"is_monotonic":                     true,
 		"aggregation_temporality":          "DELTA",

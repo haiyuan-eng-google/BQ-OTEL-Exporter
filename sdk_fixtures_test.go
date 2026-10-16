@@ -703,7 +703,7 @@ func TestAllSevenAgentFrameworkGoldenFixturesEndToEnd(t *testing.T) {
 }
 
 // spanReasoningCount reads reasoning tokens off a span's attributes using the
-// v1.40+ key first and the earlier key second.
+// v1.41+ key first and the earlier key second.
 func spanReasoningCount(attrs map[string]any) (float64, bool) {
 	for _, key := range []string{"gen_ai.usage.reasoning.output_tokens", "gen_ai.usage.reasoning_tokens"} {
 		switch v := attrs[key].(type) {
@@ -1072,7 +1072,7 @@ func TestScenarioGoldenFixturesEndToEnd(t *testing.T) {
 	end1, _ := tool1.row["end_time_unix_nano"].(int64)
 	start2, _ := tool2.row["start_time_unix_nano"].(int64)
 	end2, _ := tool2.row["end_time_unix_nano"].(int64)
-	if !(start2 < end1 && start1 < end2) {
+	if start2 >= end1 || start1 >= end2 {
 		t.Errorf("parallel tool spans [%d,%d] and [%d,%d] do not strictly overlap", start1, end1, start2, end2)
 	}
 	if tool1.row["parent_span_id"] != "00f067aa0ba902b9" || tool2.row["parent_span_id"] != "00f067aa0ba902b9" {

@@ -14,7 +14,7 @@
         {
           "scope": {
             "name": "synthetic.gen_ai.multi_agent",
-            "version": "1.40.0+1.41.0+genai-dev"
+            "version": "0.1.0"
           },
           "logRecords": [
             {

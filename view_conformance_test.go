@@ -592,11 +592,13 @@ func groupKey(vals ...any) string {
 	return b.String()
 }
 
-// topErrorTypes models ARRAY(SELECT x FROM UNNEST(APPROX_TOP_COUNT(error_type, 6)) AS x WHERE x.value IS NOT NULL LIMIT 5):
-// an array of {"value": string, "count": int64} entries for non-NULL error_type
-// values, ordered by count descending and then value ascending. BigQuery's raw
-// APPROX_TOP_COUNT counts NULL as a bucket, so the SQL requests 6 buckets,
-// drops the NULL bucket, and limits to 5.
+// topErrorTypes models the rollup views' outer ARRAY(SELECT AS STRUCT x.value, x.count FROM UNNEST(raw_top_error_types) AS x WHERE x.value IS NOT NULL ORDER BY x.count DESC, x.value ASC LIMIT 5)
+// over raw_top_error_types = APPROX_TOP_COUNT(error_type, 6): an array of
+// {"value": string, "count": int64} entries for non-NULL error_type values,
+// ordered by count descending and then value ascending. BigQuery rejects
+// UNNEST(APPROX_TOP_COUNT(...)) inside the aggregating SELECT and counts NULL
+// as a bucket, so the SQL computes 6 buckets in the aggregating CTE and drops
+// the NULL bucket in the outer SELECT.
 func topErrorTypes(counts map[string]int64, limit int) []map[string]any {
 	if len(counts) == 0 {
 		return []map[string]any{}
@@ -880,7 +882,7 @@ func genAILogsView(t testing.TB, rawLogs, rawSpans []map[string]any) []map[strin
 	return out
 }
 
-// inferenceUsageDimension maps a v1.40+ gen_ai.client.inference.usage.* metric
+// inferenceUsageDimension maps a genai-dev gen_ai.client.inference.usage.* metric
 // name to its token dimension label, or falls back to gen_ai.token.type.
 func inferenceUsageDimension(metricName string, a attrs) (string, bool) {
 	switch metricName {
@@ -1112,7 +1114,8 @@ func TestViewModelMatchesViewSQL(t *testing.T) {
 		"SUM(COALESCE(s.gen_ai_usage_cache_creation_input_tokens, 0)) AS total_cache_creation_input_tokens",
 		"SUM(COALESCE(s.gen_ai_usage_reasoning_tokens, 0)) AS total_reasoning_tokens",
 		"COUNTIF(s.error_type IS NOT NULL) AS typed_error_count",
-		"ARRAY( SELECT x FROM UNNEST(APPROX_TOP_COUNT(s.error_type, 6)) AS x WHERE x.value IS NOT NULL LIMIT 5 ) AS top_error_types",
+		"APPROX_TOP_COUNT(s.error_type, 6) AS raw_top_error_types",
+		"SELECT * EXCEPT (raw_top_error_types), ARRAY( SELECT AS STRUCT x.value, x.count FROM UNNEST(raw_top_error_types) AS x WHERE x.value IS NOT NULL ORDER BY x.count DESC, x.value ASC LIMIT 5 ) AS top_error_types FROM cost_agg",
 	)
 
 	requireSQL(t, "v_gen_ai_sessions", render(schema.GenAISessionsViewQuery, confProject, confDataset),
@@ -1141,7 +1144,8 @@ func TestViewModelMatchesViewSQL(t *testing.T) {
 		"COUNTIF(is_llm_call) AS llm_call_count",
 		"COUNTIF(gen_ai_operation_name = 'invoke_agent') AS agent_invocation_count",
 		"COUNTIF(error_type IS NOT NULL) AS typed_error_count",
-		"ARRAY( SELECT x FROM UNNEST(APPROX_TOP_COUNT(error_type, 6)) AS x WHERE x.value IS NOT NULL LIMIT 5 ) AS top_error_types",
+		"APPROX_TOP_COUNT(error_type, 6) AS raw_top_error_types",
+		"SELECT * EXCEPT (raw_top_error_types), ARRAY( SELECT AS STRUCT x.value, x.count FROM UNNEST(raw_top_error_types) AS x WHERE x.value IS NOT NULL ORDER BY x.count DESC, x.value ASC LIMIT 5 ) AS top_error_types FROM session_agg",
 		"GROUP BY service_name, session_start_date, session_id",
 	)
 }

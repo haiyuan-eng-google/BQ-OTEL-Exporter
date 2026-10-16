@@ -289,9 +289,11 @@ attribute variants into typed top-level columns over `otel_spans_dedup` and
 `otel_metrics_dedup`. For reasoning tokens, `v_gen_ai_spans` reads
 `gen_ai.usage.reasoning.output_tokens` first and the earlier
 `gen_ai.usage.reasoning_tokens` spelling second. Against OpenTelemetry Semantic Conventions `1.40.0+1.41.0+genai-dev` (`1.40.0`
-GenAI spans, logs, and client metrics, `1.41.0` `gen_ai.agent.version`, and
-`genai-dev` `gen_ai.main_agent.*`, `gen_ai.agent.parent.id`,
-`gen_ai.client.inference.usage.*`, and MCP conventions), `v_gen_ai_spans` also
+GenAI spans, logs, client metrics, `gen_ai.agent.version`, and MCP conventions;
+`1.41.0` `gen_ai.response.time_to_first_chunk` and
+`gen_ai.usage.reasoning.output_tokens`; and `genai-dev` `gen_ai.main_agent.*`
+and `gen_ai.client.inference.usage.*`, plus parent-agent correlation via
+`gen_ai.agent.parent.id`), `v_gen_ai_spans` also
 promotes `gen_ai.main_agent.{id,name,description}` and `gen_ai.agent.version`
 (coalescing span `attributes` first and `resource.attributes` second),
 `gen_ai.response.id`, and `gen_ai.response.time_to_first_chunk` (and admits
@@ -305,7 +307,7 @@ from the log record's own `error.type` attribute; `v_gen_ai_metrics` promotes
 `output`, `cache_read_input`, `cache_write_input`, or `reasoning_output` for
 `gen_ai.client.inference.usage.*` metrics, falling back to `gen_ai.token.type`);
 and `v_gen_ai_model_costs`, `v_gen_ai_sessions`, and `v_gen_ai_tool_usage` expose
-`typed_error_count` and `top_error_types` (top 5 non-null `error_type` values via `APPROX_TOP_COUNT(error_type, 6)` filtered to `x.value IS NOT NULL`).
+`typed_error_count` and `top_error_types` (top 5 non-null `error_type` entries via `APPROX_TOP_COUNT(error_type, 6)` in the aggregating CTE and `UNNEST(raw_top_error_types)` filtered to `x.value IS NOT NULL ORDER BY x.count DESC, x.value ASC LIMIT 5` in the outer `SELECT * EXCEPT (raw_top_error_types)`).
 
 Some frameworks report the same tokens on an agent span and again on the model
 call spans beneath it. `v_gen_ai_model_costs` and `v_gen_ai_sessions` leave out
@@ -319,8 +321,10 @@ synthetic multi-span scenario fixtures (`kind: scenario`, `provenance: synthetic
 that exercise delegation hierarchies, parallel tool calls, orphan spans, error
 types, and Model Context Protocol (MCP) telemetry against OpenTelemetry
 Semantic Conventions `1.40.0+1.41.0+genai-dev` (`1.40.0` GenAI baseline,
-`1.41.0` `gen_ai.agent.version`, and `genai-dev` `gen_ai.main_agent.*` /
-`gen_ai.agent.parent.id` / `gen_ai.client.inference.usage.*` / MCP attributes).
+`gen_ai.agent.version`, and `mcp.*`; `1.41.0` `gen_ai.response.time_to_first_chunk`
+and `gen_ai.usage.reasoning.output_tokens`; and `genai-dev` `gen_ai.main_agent.*`
+and `gen_ai.client.inference.usage.*`, plus parent-agent correlation via
+`gen_ai.agent.parent.id`).
 
 | Scenario ID | Semconv target | Signals | Fixture files | Coverage |
 | --- | --- | --- | --- | --- |

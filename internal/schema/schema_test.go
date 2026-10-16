@@ -1207,32 +1207,63 @@ type selectItem struct {
 	passthrough bool   // the entry is a bare, possibly qualified, column
 }
 
+var exceptRE = regexp.MustCompile(`^\* EXCEPT \(([a-z_]+)\)$`)
+
 // selectList parses the projection of a query laid out as the companion views
 // are: SELECT alone on a line, entries separated by top-level commas, "--"
-// comment lines, and FROM at the start of the first line after the
+// comment lines, and FROM at the start of the first top-level line after the
 // projection. A query that opens with common table expressions has one such
-// block per SELECT, and the last one is the projection of the view itself. An
-// entry is a column, optionally qualified, or an expression ending in "AS
-// alias".
+// block per SELECT, and the last one is the projection of the view itself.
+// When the outer SELECT starts with "* EXCEPT (col)", it expands the remaining
+// columns from the immediately preceding CTE SELECT block.
 func selectList(query string) ([]selectItem, error) {
-	var lines, last []string
+	var blocks [][]string
+	var lines []string
 	inSelect := false
+	depth := 0
 	for _, line := range strings.Split(query, "\n") {
 		trimmed := strings.TrimSpace(line)
-		switch {
-		case trimmed == "SELECT":
+		if strings.HasPrefix(trimmed, "--") {
+			continue
+		}
+		if depth == 0 && trimmed == "SELECT" {
 			inSelect, lines = true, nil
-		case !inSelect || strings.HasPrefix(trimmed, "--"):
-		case strings.HasPrefix(trimmed, "FROM "):
-			inSelect, last = false, lines
-		default:
-			lines = append(lines, trimmed)
+			continue
+		}
+		if !inSelect {
+			continue
+		}
+		if depth == 0 && strings.HasPrefix(trimmed, "FROM ") {
+			inSelect = false
+			blocks = append(blocks, lines)
+			continue
+		}
+		lines = append(lines, trimmed)
+		for i := 0; i < len(trimmed); i++ {
+			switch trimmed[i] {
+			case '(', '[':
+				depth++
+			case ')', ']':
+				depth--
+			}
 		}
 	}
-	if len(last) == 0 {
+	if len(blocks) == 0 {
 		return nil, fmt.Errorf("no SELECT ... FROM projection in %q", query)
 	}
-	return splitSelectList(strings.Join(last, " "))
+	items, err := splitSelectList(strings.Join(blocks[len(blocks)-1], " "))
+	if err != nil {
+		return nil, err
+	}
+	if len(items) > 0 && items[0].alias == "*" && len(blocks) >= 2 {
+		prev, err := splitSelectList(strings.Join(blocks[len(blocks)-2], " "))
+		if err != nil {
+			return nil, err
+		}
+		prev = slices.DeleteFunc(prev, func(it selectItem) bool { return it.alias == items[0].qualifier })
+		items = slices.Concat(prev, items[1:])
+	}
+	return items, nil
 }
 
 // splitSelectList splits a projection on the commas that are outside quotes,
@@ -1266,6 +1297,9 @@ func splitSelectList(list string) ([]selectItem, error) {
 }
 
 func parseSelectItem(entry string) (selectItem, error) {
+	if m := exceptRE.FindStringSubmatch(entry); m != nil {
+		return selectItem{alias: "*", expr: entry, qualifier: m[1]}, nil
+	}
 	if i := strings.LastIndex(entry, " AS "); i >= 0 {
 		if alias := entry[i+len(" AS "):]; isColumnName(alias) {
 			return selectItem{alias: alias, expr: entry[:i]}, nil

@@ -754,44 +754,52 @@ resource "google_bigquery_table" "v_gen_ai_model_costs" {
             PARTITION BY s.usage_hour, s.service_name, s.trace_id
           ) AS token_parent_span_ids
         FROM cost_spans AS s
+      ),
+      cost_agg AS (
+        SELECT
+          s.usage_hour,
+          s.service_name,
+          s.gen_ai_agent_name,
+          COALESCE(s.gen_ai_provider_name, s.gen_ai_system) AS provider,
+          COALESCE(s.gen_ai_response_model, s.gen_ai_request_model) AS model,
+          COUNT(*) AS call_count,
+          COUNTIF(s.status_code = 2) AS error_count,
+          SUM(COALESCE(s.gen_ai_usage_input_tokens, 0)) AS total_input_tokens,
+          SUM(COALESCE(s.gen_ai_usage_output_tokens, 0)) AS total_output_tokens,
+          SUM(COALESCE(s.gen_ai_usage_cache_read_input_tokens, 0)) AS total_cache_read_input_tokens,
+          SUM(COALESCE(s.gen_ai_usage_cache_creation_input_tokens, 0)) AS total_cache_creation_input_tokens,
+          SUM(COALESCE(s.gen_ai_usage_reasoning_tokens, 0)) AS total_reasoning_tokens,
+          APPROX_QUANTILES(s.duration_ms, 100)[OFFSET(50)] AS p50_duration_ms,
+          APPROX_QUANTILES(s.duration_ms, 100)[OFFSET(95)] AS p95_duration_ms,
+          APPROX_QUANTILES(s.duration_ms, 100)[OFFSET(99)] AS p99_duration_ms,
+          COUNTIF(s.error_type IS NOT NULL) AS typed_error_count,
+          APPROX_TOP_COUNT(s.error_type, 6) AS raw_top_error_types
+        FROM cost_windows AS s
+        WHERE NOT EXISTS (
+            SELECT 1 FROM UNNEST(s.token_parent_span_ids) AS token_parent_span_id
+            WHERE token_parent_span_id = s.span_id
+          )
+          AND (
+            s.gen_ai_operation_name IN ('chat', 'generate_content', 'text_completion', 'embeddings')
+            OR s.gen_ai_request_model IS NOT NULL
+          )
+          AND (
+            COALESCE(s.gen_ai_operation_name, '') NOT IN ('invoke_agent', 'create_agent', 'execute_tool')
+            OR s.gen_ai_usage_input_tokens IS NOT NULL
+            OR s.gen_ai_usage_output_tokens IS NOT NULL
+          )
+        GROUP BY 1, 2, 3, 4, 5
       )
       SELECT
-        s.usage_hour,
-        s.service_name,
-        s.gen_ai_agent_name,
-        COALESCE(s.gen_ai_provider_name, s.gen_ai_system) AS provider,
-        COALESCE(s.gen_ai_response_model, s.gen_ai_request_model) AS model,
-        COUNT(*) AS call_count,
-        COUNTIF(s.status_code = 2) AS error_count,
-        SUM(COALESCE(s.gen_ai_usage_input_tokens, 0)) AS total_input_tokens,
-        SUM(COALESCE(s.gen_ai_usage_output_tokens, 0)) AS total_output_tokens,
-        SUM(COALESCE(s.gen_ai_usage_cache_read_input_tokens, 0)) AS total_cache_read_input_tokens,
-        SUM(COALESCE(s.gen_ai_usage_cache_creation_input_tokens, 0)) AS total_cache_creation_input_tokens,
-        SUM(COALESCE(s.gen_ai_usage_reasoning_tokens, 0)) AS total_reasoning_tokens,
-        APPROX_QUANTILES(s.duration_ms, 100)[OFFSET(50)] AS p50_duration_ms,
-        APPROX_QUANTILES(s.duration_ms, 100)[OFFSET(95)] AS p95_duration_ms,
-        APPROX_QUANTILES(s.duration_ms, 100)[OFFSET(99)] AS p99_duration_ms,
-        COUNTIF(s.error_type IS NOT NULL) AS typed_error_count,
+        * EXCEPT (raw_top_error_types),
         ARRAY(
-          SELECT x FROM UNNEST(APPROX_TOP_COUNT(s.error_type, 6)) AS x
+          SELECT AS STRUCT x.value, x.count
+          FROM UNNEST(raw_top_error_types) AS x
           WHERE x.value IS NOT NULL
+          ORDER BY x.count DESC, x.value ASC
           LIMIT 5
         ) AS top_error_types
-      FROM cost_windows AS s
-      WHERE NOT EXISTS (
-          SELECT 1 FROM UNNEST(s.token_parent_span_ids) AS token_parent_span_id
-          WHERE token_parent_span_id = s.span_id
-        )
-        AND (
-          s.gen_ai_operation_name IN ('chat', 'generate_content', 'text_completion', 'embeddings')
-          OR s.gen_ai_request_model IS NOT NULL
-        )
-        AND (
-          COALESCE(s.gen_ai_operation_name, '') NOT IN ('invoke_agent', 'create_agent', 'execute_tool')
-          OR s.gen_ai_usage_input_tokens IS NOT NULL
-          OR s.gen_ai_usage_output_tokens IS NOT NULL
-        )
-      GROUP BY 1, 2, 3, 4, 5
+      FROM cost_agg
     EOT
   }
 }
@@ -869,35 +877,43 @@ resource "google_bigquery_table" "v_gen_ai_sessions" {
             ), FALSE
           ) AS is_llm_call
         FROM session_windows AS s
+      ),
+      session_agg AS (
+        SELECT
+          session_id,
+          ANY_VALUE(adk_user_id) AS user_id,
+          service_name,
+          ANY_VALUE(gen_ai_agent_name) AS agent_name,
+          MIN(start_time) AS session_start_time,
+          MAX(end_time) AS session_end_time,
+          TIMESTAMP_DIFF(MAX(end_time), MIN(start_time), MILLISECOND) AS session_duration_ms,
+          COUNT(DISTINCT trace_id) AS turn_count,
+          COUNT(DISTINCT adk_invocation_id) AS invocation_count,
+          COUNTIF(gen_ai_operation_name = 'execute_tool' OR gen_ai_tool_name IS NOT NULL) AS tool_call_count,
+          COUNTIF(status_code = 2) AS error_count,
+          SUM(IF(is_token_leaf, COALESCE(gen_ai_usage_input_tokens, 0), 0)) AS total_input_tokens,
+          SUM(IF(is_token_leaf, COALESCE(gen_ai_usage_output_tokens, 0), 0)) AS total_output_tokens,
+          SUM(IF(is_token_leaf, COALESCE(gen_ai_usage_cache_read_input_tokens, 0), 0)) AS total_cache_read_input_tokens,
+          SUM(IF(is_token_leaf, COALESCE(gen_ai_usage_reasoning_tokens, 0), 0)) AS total_reasoning_tokens,
+          session_start_date,
+          SUM(IF(is_token_leaf, COALESCE(gen_ai_usage_cache_creation_input_tokens, 0), 0)) AS total_cache_creation_input_tokens,
+          COUNTIF(is_llm_call) AS llm_call_count,
+          COUNTIF(gen_ai_operation_name = 'invoke_agent') AS agent_invocation_count,
+          COUNTIF(error_type IS NOT NULL) AS typed_error_count,
+          APPROX_TOP_COUNT(error_type, 6) AS raw_top_error_types
+        FROM session_calls
+        GROUP BY service_name, session_start_date, session_id
       )
       SELECT
-        session_id,
-        ANY_VALUE(adk_user_id) AS user_id,
-        service_name,
-        ANY_VALUE(gen_ai_agent_name) AS agent_name,
-        MIN(start_time) AS session_start_time,
-        MAX(end_time) AS session_end_time,
-        TIMESTAMP_DIFF(MAX(end_time), MIN(start_time), MILLISECOND) AS session_duration_ms,
-        COUNT(DISTINCT trace_id) AS turn_count,
-        COUNT(DISTINCT adk_invocation_id) AS invocation_count,
-        COUNTIF(gen_ai_operation_name = 'execute_tool' OR gen_ai_tool_name IS NOT NULL) AS tool_call_count,
-        COUNTIF(status_code = 2) AS error_count,
-        SUM(IF(is_token_leaf, COALESCE(gen_ai_usage_input_tokens, 0), 0)) AS total_input_tokens,
-        SUM(IF(is_token_leaf, COALESCE(gen_ai_usage_output_tokens, 0), 0)) AS total_output_tokens,
-        SUM(IF(is_token_leaf, COALESCE(gen_ai_usage_cache_read_input_tokens, 0), 0)) AS total_cache_read_input_tokens,
-        SUM(IF(is_token_leaf, COALESCE(gen_ai_usage_reasoning_tokens, 0), 0)) AS total_reasoning_tokens,
-        session_start_date,
-        SUM(IF(is_token_leaf, COALESCE(gen_ai_usage_cache_creation_input_tokens, 0), 0)) AS total_cache_creation_input_tokens,
-        COUNTIF(is_llm_call) AS llm_call_count,
-        COUNTIF(gen_ai_operation_name = 'invoke_agent') AS agent_invocation_count,
-        COUNTIF(error_type IS NOT NULL) AS typed_error_count,
+        * EXCEPT (raw_top_error_types),
         ARRAY(
-          SELECT x FROM UNNEST(APPROX_TOP_COUNT(error_type, 6)) AS x
+          SELECT AS STRUCT x.value, x.count
+          FROM UNNEST(raw_top_error_types) AS x
           WHERE x.value IS NOT NULL
+          ORDER BY x.count DESC, x.value ASC
           LIMIT 5
         ) AS top_error_types
-      FROM session_calls
-      GROUP BY service_name, session_start_date, session_id
+      FROM session_agg
     EOT
   }
 }
@@ -980,26 +996,34 @@ resource "google_bigquery_table" "v_gen_ai_tool_usage" {
   view {
     use_legacy_sql = false
     query          = <<EOT
+      WITH tool_agg AS (
+        SELECT
+          TIMESTAMP_TRUNC(start_time, HOUR) AS usage_hour,
+          service_name,
+          gen_ai_agent_name,
+          gen_ai_tool_name,
+          gen_ai_tool_type,
+          COUNT(*) AS call_count,
+          COUNTIF(status_code = 2) AS error_count,
+          SAFE_DIVIDE(COUNTIF(status_code = 2), COUNT(*)) AS error_rate,
+          APPROX_QUANTILES(duration_ms, 100)[OFFSET(50)] AS p50_duration_ms,
+          APPROX_QUANTILES(duration_ms, 100)[OFFSET(95)] AS p95_duration_ms,
+          COUNTIF(error_type IS NOT NULL) AS typed_error_count,
+          APPROX_TOP_COUNT(error_type, 6) AS raw_top_error_types
+        FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.v_gen_ai_spans.table_id}`
+        WHERE gen_ai_tool_name IS NOT NULL OR gen_ai_operation_name = 'execute_tool'
+        GROUP BY 1, 2, 3, 4, 5
+      )
       SELECT
-        TIMESTAMP_TRUNC(start_time, HOUR) AS usage_hour,
-        service_name,
-        gen_ai_agent_name,
-        gen_ai_tool_name,
-        gen_ai_tool_type,
-        COUNT(*) AS call_count,
-        COUNTIF(status_code = 2) AS error_count,
-        SAFE_DIVIDE(COUNTIF(status_code = 2), COUNT(*)) AS error_rate,
-        APPROX_QUANTILES(duration_ms, 100)[OFFSET(50)] AS p50_duration_ms,
-        APPROX_QUANTILES(duration_ms, 100)[OFFSET(95)] AS p95_duration_ms,
-        COUNTIF(error_type IS NOT NULL) AS typed_error_count,
+        * EXCEPT (raw_top_error_types),
         ARRAY(
-          SELECT x FROM UNNEST(APPROX_TOP_COUNT(error_type, 6)) AS x
+          SELECT AS STRUCT x.value, x.count
+          FROM UNNEST(raw_top_error_types) AS x
           WHERE x.value IS NOT NULL
+          ORDER BY x.count DESC, x.value ASC
           LIMIT 5
         ) AS top_error_types
-      FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.v_gen_ai_spans.table_id}`
-      WHERE gen_ai_tool_name IS NOT NULL OR gen_ai_operation_name = 'execute_tool'
-      GROUP BY 1, 2, 3, 4, 5
+      FROM tool_agg
     EOT
   }
 }
