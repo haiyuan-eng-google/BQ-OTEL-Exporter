@@ -485,8 +485,9 @@ func (cfg *Config) validateCompanionViewPruning() error {
 				"auto_create.allow_unprunable_views: cross-signal views (v_gen_ai_logs, " +
 				"v_gen_ai_metric_exemplars) join the span deduplication view without a constant " +
 				"start_time partition filter, so BigQuery rejects queries over them when the " +
-				"spans table requires a partition filter; set traces.require_partition_filter: false, " +
-				"auto_create.companion_views: false, or auto_create.allow_unprunable_views: true")
+				"spans table requires a partition filter; set auto_create.allow_unprunable_views: true, " +
+				"auto_create.companion_views: false, or traces.require_partition_filter: false " +
+				"(traces.require_partition_filter: false applies only when creating a new spans table)")
 	}
 	return nil
 }

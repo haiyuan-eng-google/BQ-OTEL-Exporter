@@ -17,6 +17,7 @@ bigquery:
   autoCreateDataset: false
   autoCreateTables: false
   autoCreateCompanionViews: false
+  autoCreateAllowUnprunableViews: false
   autoCreateSearchIndexes: false
   # Enterprise governance: CMEK key and labels for the dataset and tables.
   # These and the table options below, quarantine's included, take effect only

@@ -1037,7 +1037,7 @@ resource "google_bigquery_table" "v_gen_ai_metric_exemplars" {
         ) AS adk_session_id,
         JSON_VALUE(s.attributes, '$."error.type"') AS span_error_type
       FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.v_gen_ai_metrics.table_id}` m,
-      UNNEST(m.exemplars) AS ex
+      UNNEST(m.exemplars) AS ex WITH OFFSET AS exemplar_ordinal
       LEFT JOIN `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.otel_spans_dedup.table_id}` s
         ON s.trace_id = ex.trace_id
         AND s.span_id = ex.span_id
@@ -1047,6 +1047,10 @@ resource "google_bigquery_table" "v_gen_ai_metric_exemplars" {
         AND ex.span_id IS NOT NULL
         AND ex.trace_id != ''
         AND ex.span_id != ''
+      QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY m.timestamp, m.start_time, m.receive_time, m.service_name, m.metric_name, m.metric_type, TO_JSON_STRING(m.attributes), TO_JSON_STRING(m.resource), TO_JSON_STRING(m.instrumentation_scope), exemplar_ordinal
+        ORDER BY s.end_time DESC, s.start_time DESC, s.receive_time DESC, s.name ASC
+      ) = 1
     EOT
   }
 }

@@ -24,6 +24,7 @@ package bigqueryexporter
 // v_gen_ai_model_costs, which are approximate by definition.
 
 import (
+	"cmp"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -1022,8 +1023,26 @@ func genAIMetricsView(t testing.TB, rawMetrics []map[string]any) []map[string]an
 
 // genAIMetricExemplarsView is v_gen_ai_metric_exemplars over the rows of the
 // metrics and spans tables. It unnests exemplars from v_gen_ai_metrics, filters
-// out exemplars without a non-empty trace_id and span_id, and left-joins
-// otel_spans_dedup within the 25-hour window around m.timestamp.
+// compareExemplarSpanCandidate orders matching spans for one exemplar by
+// end_time DESC, start_time DESC, receive_time DESC, then name ASC, matching
+// the QUALIFY ROW_NUMBER() window of v_gen_ai_metric_exemplars.
+func compareExemplarSpanCandidate(a, b map[string]any) int {
+	for _, col := range []string{"end_time", "start_time", "receive_time"} {
+		av, _ := colInt(a, col)
+		bv, _ := colInt(b, col)
+		if c := cmp.Compare(bv, av); c != 0 {
+			return c
+		}
+	}
+	an, _ := colString(a, "name")
+	bn, _ := colString(b, "name")
+	return cmp.Compare(an, bn)
+}
+
+// genAIMetricExemplarsView unnests v_gen_ai_metrics.exemplars with its array
+// offset, filters out exemplars without a non-empty trace_id and span_id,
+// left-joins otel_spans_dedup within the 25-hour window around m.timestamp, and
+// picks at most one span row per exemplar slot.
 func genAIMetricExemplarsView(t testing.TB, rawMetrics, rawSpans []map[string]any) []map[string]any {
 	t.Helper()
 	spans := spansDedup.apply(rawSpans)
@@ -1037,71 +1056,70 @@ func genAIMetricExemplarsView(t testing.TB, rawMetrics, rawSpans []map[string]an
 				continue
 			}
 
-			matches := []map[string]any{nil}
-			if joined := slices.DeleteFunc(slices.Clone(spans), func(s map[string]any) bool { return !exemplarJoinsSpan(m, ex, s) }); len(joined) > 0 {
-				matches = joined
+			var s map[string]any
+			if joined := slices.DeleteFunc(slices.Clone(spans), func(cand map[string]any) bool { return !exemplarJoinsSpan(m, ex, cand) }); len(joined) > 0 {
+				slices.SortFunc(joined, compareExemplarSpanCandidate)
+				s = joined[0]
 			}
-			for _, s := range matches {
-				row := make(map[string]any)
-				if v, ok := m["timestamp"]; ok {
-					row["metric_timestamp"] = v
+			row := make(map[string]any)
+			if v, ok := m["timestamp"]; ok {
+				row["metric_timestamp"] = v
+			}
+			for _, col := range []string{
+				"service_name", "metric_name", "metric_unit", "metric_type",
+				"gen_ai_operation_name", "gen_ai_system", "gen_ai_request_model",
+				"gen_ai_response_model", "gen_ai_agent_name", "gen_ai_token_type",
+				"gen_ai_token_modality",
+			} {
+				if v, ok := m[col]; ok {
+					row[col] = v
 				}
-				for _, col := range []string{
-					"service_name", "metric_name", "metric_unit", "metric_type",
-					"gen_ai_operation_name", "gen_ai_system", "gen_ai_request_model",
-					"gen_ai_response_model", "gen_ai_agent_name", "gen_ai_token_type",
-					"gen_ai_token_modality",
-				} {
-					if v, ok := m[col]; ok {
-						row[col] = v
-					}
+			}
+			if v, ok := m["error_type"]; ok {
+				row["metric_error_type"] = v
+			}
+			for src, dst := range map[string]string{
+				"time":                "exemplar_timestamp",
+				"value_double":        "exemplar_value_double",
+				"value_int64":         "exemplar_value_int64",
+				"trace_id":            "trace_id",
+				"span_id":             "span_id",
+				"filtered_attributes": "exemplar_filtered_attributes",
+			} {
+				if v, ok := ex[src]; ok {
+					row[dst] = v
 				}
-				if v, ok := m["error_type"]; ok {
-					row["metric_error_type"] = v
-				}
+			}
+			if s != nil {
 				for src, dst := range map[string]string{
-					"time":                "exemplar_timestamp",
-					"value_double":        "exemplar_value_double",
-					"value_int64":         "exemplar_value_int64",
-					"trace_id":            "trace_id",
-					"span_id":             "span_id",
-					"filtered_attributes": "exemplar_filtered_attributes",
+					"start_time":    "span_start_time",
+					"end_time":      "span_end_time",
+					"duration_nano": "span_duration_nano",
+					"name":          "span_name",
 				} {
-					if v, ok := ex[src]; ok {
+					if v, ok := s[src]; ok {
 						row[dst] = v
 					}
 				}
-				if s != nil {
-					for src, dst := range map[string]string{
-						"start_time":    "span_start_time",
-						"end_time":      "span_end_time",
-						"duration_nano": "span_duration_nano",
-						"name":          "span_name",
-					} {
-						if v, ok := s[src]; ok {
-							row[dst] = v
-						}
+				if ns, ok := colInt(s, "duration_nano"); ok {
+					row["span_duration_ms"] = math.Round(float64(ns)/1e6*1000) / 1000
+				}
+				if st, ok := s["status"].(map[string]any); ok {
+					if code, ok := st["code"]; ok {
+						row["span_status_code"] = code
 					}
-					if ns, ok := colInt(s, "duration_nano"); ok {
-						row["span_duration_ms"] = math.Round(float64(ns)/1e6*1000) / 1000
-					}
-					if st, ok := s["status"].(map[string]any); ok {
-						if code, ok := st["code"]; ok {
-							row["span_status_code"] = code
-						}
-						if msg, ok := st["message"]; ok {
-							row["span_status_message"] = msg
-						}
-					}
-					sa := parseAttrs(t, s)
-					for _, c := range exemplarSpanChains {
-						if v := c.eval(s, sa); v != nil {
-							row[c.alias] = v
-						}
+					if msg, ok := st["message"]; ok {
+						row["span_status_message"] = msg
 					}
 				}
-				out = append(out, row)
+				sa := parseAttrs(t, s)
+				for _, c := range exemplarSpanChains {
+					if v := c.eval(s, sa); v != nil {
+						row[c.alias] = v
+					}
+				}
 			}
+			out = append(out, row)
 		}
 	}
 	return out
@@ -1290,13 +1308,18 @@ func TestViewModelMatchesViewSQL(t *testing.T) {
 		"s.name AS span_name",
 		"s.status.code AS span_status_code",
 		"s.status.message AS span_status_message",
-		"FROM `" + confProject + "." + confDataset + ".v_gen_ai_metrics` m, UNNEST(m.exemplars) AS ex" +
+		"FROM `" + confProject + "." + confDataset + ".v_gen_ai_metrics` m, UNNEST(m.exemplars) AS ex WITH OFFSET AS exemplar_ordinal" +
 			" LEFT JOIN `" + confProject + "." + confDataset + "." + confSpans + "_dedup` s" +
 			" ON s.trace_id = ex.trace_id AND s.span_id = ex.span_id" +
 			" AND s.service_name IS NOT DISTINCT FROM m.service_name" +
 			fmt.Sprintf(" AND s.start_time BETWEEN TIMESTAMP_SUB(m.timestamp, INTERVAL %d HOUR) AND TIMESTAMP_ADD(m.timestamp, INTERVAL %d HOUR)",
 				int(exemplarJoinBefore.Hours()), int(exemplarJoinAfter.Hours())),
 		"WHERE ex.trace_id IS NOT NULL AND ex.span_id IS NOT NULL AND ex.trace_id != '' AND ex.span_id != ''",
+		"QUALIFY ROW_NUMBER() OVER (" +
+			" PARTITION BY m.timestamp, m.start_time, m.receive_time, m.service_name, m.metric_name, m.metric_type," +
+			" TO_JSON_STRING(m.attributes), TO_JSON_STRING(m.resource), TO_JSON_STRING(m.instrumentation_scope), exemplar_ordinal" +
+			" ORDER BY s.end_time DESC, s.start_time DESC, s.receive_time DESC, s.name ASC" +
+			" ) = 1",
 	}
 	for _, c := range exemplarSpanChains {
 		exemplarFragments = append(exemplarFragments, c.sql("s."))
@@ -2797,6 +2820,33 @@ func TestMetricExemplarsViewJoinAndFiltering(t *testing.T) {
 			start: t0.Add(time.Hour + time.Second), end: t0.Add(time.Hour + 2*time.Second),
 			attrs: map[string]any{"gen_ai.operation.name": "chat", "gen_ai.agent.name": "new_bot"},
 		},
+		// Span 8: competing span rows with the same (trace_id, span_id, service_name)
+		// and start_time, but different name and end_time. Both survive otel_spans_dedup
+		// because name is in the span dedup partition key; QUALIFY picks the later end_time.
+		specSpan{
+			trace: traceHex(8), id: spanHex(8), name: "chat draft",
+			start: t0.Add(-2 * time.Minute), end: t0.Add(-2*time.Minute + 100*time.Millisecond),
+			attrs: map[string]any{"gen_ai.operation.name": "chat", "gen_ai.agent.name": "draft_bot"},
+		},
+		specSpan{
+			trace: traceHex(8), id: spanHex(8), name: "chat final",
+			start: t0.Add(-2 * time.Minute), end: t0.Add(-2*time.Minute + 500*time.Millisecond),
+			attrs: map[string]any{"gen_ai.operation.name": "chat", "gen_ai.agent.name": "final_bot"},
+		},
+		// Span 9: competing span rows with the same (trace_id, span_id, service_name)
+		// and name, but different start_time inside the window. Both survive
+		// otel_spans_dedup because start_time is in the span dedup partition key;
+		// QUALIFY picks the later end_time/start_time.
+		specSpan{
+			trace: traceHex(9), id: spanHex(9), name: "chat retry",
+			start: t0.Add(-3 * time.Minute), end: t0.Add(-3*time.Minute + 200*time.Millisecond),
+			attrs: map[string]any{"gen_ai.operation.name": "chat", "gen_ai.agent.name": "early_retry_bot"},
+		},
+		specSpan{
+			trace: traceHex(9), id: spanHex(9), name: "chat retry",
+			start: t0.Add(-1 * time.Minute), end: t0.Add(-1*time.Minute + 600*time.Millisecond),
+			attrs: map[string]any{"gen_ai.operation.name": "chat", "gen_ai.agent.name": "late_retry_bot"},
+		},
 	))
 	// Span 6: different service_name ("other-agent").
 	rig.pushTraces(t, buildTraces(t, "other-agent", specSpan{
@@ -2829,6 +2879,12 @@ func TestMetricExemplarsViewJoinAndFiltering(t *testing.T) {
 				{trace: traceHex(5), span: spanHex(5), at: t0, valDouble: valD(1.0), attrs: map[string]any{"case": "too_new"}},
 				{trace: traceHex(6), span: spanHex(6), at: t0, valDouble: valD(1.0), attrs: map[string]any{"case": "service_mismatch"}},
 				{trace: traceHex(99), span: spanHex(99), at: t0, valDouble: valD(1.0), attrs: map[string]any{"case": "missing_span"}},
+				{trace: traceHex(8), span: spanHex(8), at: t0, valDouble: valD(0.5), attrs: map[string]any{"case": "competing_name"}},
+				{trace: traceHex(9), span: spanHex(9), at: t0, valDouble: valD(0.6), attrs: map[string]any{"case": "competing_start_time"}},
+				// Two identical exemplars in the same metric point's exemplars array
+				// occupy distinct exemplar_ordinal slots, so both survive QUALIFY.
+				{trace: traceHex(1), span: spanHex(1), at: t0, valDouble: valD(0.25), attrs: map[string]any{"case": "duplicate_exemplar_slot"}},
+				{trace: traceHex(1), span: spanHex(1), at: t0, valDouble: valD(0.25), attrs: map[string]any{"case": "duplicate_exemplar_slot"}},
 				// Excluded by WHERE: empty trace_id or empty span_id.
 				{trace: "", span: spanHex(1), at: t0, valDouble: valD(1.0), attrs: map[string]any{"case": "empty_trace"}},
 				{trace: traceHex(1), span: "", at: t0, valDouble: valD(1.0), attrs: map[string]any{"case": "empty_span"}},
@@ -2858,11 +2914,12 @@ func TestMetricExemplarsViewJoinAndFiltering(t *testing.T) {
 	))
 
 	rows := genAIMetricExemplarsView(t, rig.srv.Rows(confMetrics), rig.srv.Rows(confSpans))
-	if len(rows) != 9 {
-		t.Fatalf("v_gen_ai_metric_exemplars has %d rows, want 9 (empty IDs and non-gen_ai metrics excluded)", len(rows))
+	if len(rows) != 13 {
+		t.Fatalf("v_gen_ai_metric_exemplars has %d rows, want 13 (empty IDs, non-gen_ai metrics, and duplicate span join rows excluded)", len(rows))
 	}
 
 	byCase := make(map[string]map[string]any, len(rows))
+	caseCounts := make(map[string]int, len(rows))
 	for _, r := range rows {
 		raw, _ := r["exemplar_filtered_attributes"].(string)
 		var m map[string]string
@@ -2870,6 +2927,16 @@ func TestMetricExemplarsViewJoinAndFiltering(t *testing.T) {
 			t.Fatalf("unmarshal exemplar_filtered_attributes %q: %v", raw, err)
 		}
 		byCase[m["case"]] = r
+		caseCounts[m["case"]]++
+	}
+	for tc, wantCount := range map[string]int{
+		"competing_name":          1,
+		"competing_start_time":    1,
+		"duplicate_exemplar_slot": 2,
+	} {
+		if got := caseCounts[tc]; got != wantCount {
+			t.Errorf("case %q emitted %d rows, want %d", tc, got, wantCount)
+		}
 	}
 
 	requireCols(t, "matched_inside", byCase["matched_inside"], map[string]any{
@@ -2917,6 +2984,16 @@ func TestMetricExemplarsViewJoinAndFiltering(t *testing.T) {
 		"exemplar_value_double":  nil,
 		"span_name":              "chat null_service",
 		"span_gen_ai_agent_name": "null_svc_bot",
+	})
+	requireCols(t, "competing_name", byCase["competing_name"], map[string]any{
+		"span_name":              "chat final",
+		"span_duration_ms":       500.0,
+		"span_gen_ai_agent_name": "final_bot",
+	})
+	requireCols(t, "competing_start_time", byCase["competing_start_time"], map[string]any{
+		"span_start_time":        t0.Add(-1 * time.Minute).UnixMicro(),
+		"span_duration_ms":       600.0,
+		"span_gen_ai_agent_name": "late_retry_bot",
 	})
 
 	for _, unmatched := range []string{"too_old", "too_new", "service_mismatch", "missing_span", "null_vs_named_service"} {

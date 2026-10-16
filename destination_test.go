@@ -1201,6 +1201,291 @@ func TestPrepareDestinationRollupFailureToleranceFollowsPreservedViews(t *testin
 	}
 }
 
+func TestPrepareDestinationSkipsMetricExemplarsViewWhenGenAIMetricsViewPreserved(t *testing.T) {
+	rollupErr := status.Error(codes.InvalidArgument, "column not found in underlying view")
+	view := func(query string) fakeTableMetadataResponse {
+		return fakeTableMetadataResponse{metadata: &bq.TableMetadata{Type: bq.ViewTable, ViewQuery: query, ETag: "etag-1"}}
+	}
+	metricsQuery := fmt.Sprintf(schema.GenAIMetricsViewQuery, "my-project", "otel", defaultMetricsTable)
+	for _, tc := range []struct {
+		name        string
+		metricsView fakeTableMetadataResponse
+		updateErr   error
+		wantErr     error
+		wantSkipped bool
+	}{
+		{
+			name:        "stale metrics view that cannot be updated preserves rollup tolerance",
+			metricsView: view("SELECT 1 AS stale"),
+			updateErr:   forbidden(),
+			wantSkipped: true,
+		},
+		{
+			name:        "replaced metrics view fails startup on exemplars error",
+			metricsView: view("SELECT 1 AS stale"),
+			wantErr:     rollupErr,
+		},
+		{
+			name:        "current metrics view fails startup on exemplars error",
+			metricsView: view(metricsQuery),
+			wantErr:     rollupErr,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := companionViewConfig()
+			core, logs := observer.New(zap.WarnLevel)
+			e := newSignalExporter(
+				component.TelemetrySettings{Logger: zap.New(core)}, cfg, cfg.Metrics.Table, schema.MetricsTableSchema())
+			admin := &fakeDestinationAdmin{
+				datasetMetadata:  &bq.DatasetMetadata{},
+				tableMetadataErr: notFound(),
+				tableMetadataByID: map[string]fakeTableMetadataResponse{
+					schema.GenAIMetricsViewName: tc.metricsView,
+					cfg.Traces.Table + "_dedup": {metadata: &bq.TableMetadata{Type: bq.ViewTable}},
+				},
+				createErrByID: map[string]error{
+					schema.GenAIMetricsViewName:         alreadyExists(),
+					schema.GenAIMetricExemplarsViewName: rollupErr,
+				},
+				updateErrByID: map[string]error{schema.GenAIMetricsViewName: tc.updateErr},
+			}
+
+			err := e.prepareDestination(context.Background(), admin)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tc.wantErr)
+			}
+			skipped := logs.FilterMessage("skipping rollup view creation over preserved companion view").Len()
+			if (skipped == 1) != tc.wantSkipped || skipped > 1 {
+				t.Errorf("%d skipped-rollup warnings, want one: %v", skipped, tc.wantSkipped)
+			}
+		})
+	}
+}
+
+func TestPrepareDestinationRejectsCompanionViewsWhenExistingSpansTableRequiresPartitionFilter(t *testing.T) {
+	restrictiveVariants := []struct {
+		name string
+		md   func(t *testing.T) *bq.TableMetadata
+	}{
+		{
+			name: "top-level RequirePartitionFilter",
+			md: func(t *testing.T) *bq.TableMetadata {
+				return &bq.TableMetadata{
+					Schema:                 mustBigQuerySchema(t, schema.SpansTableSchema()),
+					RequirePartitionFilter: true,
+				}
+			},
+		},
+		{
+			name: "TimePartitioning.RequirePartitionFilter",
+			md: func(t *testing.T) *bq.TableMetadata {
+				return &bq.TableMetadata{
+					Schema:           mustBigQuerySchema(t, schema.SpansTableSchema()),
+					TimePartitioning: &bq.TimePartitioning{Type: bq.HourPartitioningType, Field: "start_time", RequirePartitionFilter: true},
+				}
+			},
+		},
+	}
+
+	for _, variant := range restrictiveVariants {
+		for _, allow := range []bool{false, true} {
+			suffix := "rejected"
+			if allow {
+				suffix = "allowed_with_opt_in"
+			}
+			t.Run("traces/"+variant.name+"/"+suffix, func(t *testing.T) {
+				cfg := companionViewConfig()
+				cfg.AutoCreate.AllowUnprunableViews = allow
+				admin := &fakeDestinationAdmin{
+					datasetMetadata:  &bq.DatasetMetadata{},
+					tableMetadataErr: notFound(),
+					tableMetadataByID: map[string]fakeTableMetadataResponse{
+						cfg.Traces.Table:             {metadata: variant.md(t)},
+						cfg.Logs.Table + "_dedup":    {metadata: &bq.TableMetadata{Type: bq.ViewTable}},
+						cfg.Metrics.Table + "_dedup": {metadata: &bq.TableMetadata{Type: bq.ViewTable}},
+					},
+				}
+				e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+				err := e.prepareDestination(context.Background(), admin)
+				switch {
+				case !allow && (err == nil || !strings.Contains(err.Error(), "auto_create.allow_unprunable_views: true")):
+					t.Fatalf("error = %v, want companion view pruning error", err)
+				case !allow && admin.createdTables[schema.GenAILogsViewName] != nil:
+					t.Error("v_gen_ai_logs must not be created over a restrictive spans table without opt-in")
+				case !allow && admin.createdTables[schema.GenAIMetricExemplarsViewName] != nil:
+					t.Error("v_gen_ai_metric_exemplars must not be created over a restrictive spans table without opt-in")
+				case allow && err != nil:
+					t.Fatalf("prepareDestination with allow_unprunable_views failed: %v", err)
+				case allow && admin.createdTables[schema.GenAILogsViewName] == nil:
+					t.Error("v_gen_ai_logs must be created when allow_unprunable_views is true")
+				case allow && admin.createdTables[schema.GenAIMetricExemplarsViewName] == nil:
+					t.Error("v_gen_ai_metric_exemplars must be created when allow_unprunable_views is true")
+				}
+			})
+
+			t.Run("metrics/"+variant.name+"/"+suffix, func(t *testing.T) {
+				cfg := companionViewConfig()
+				cfg.AutoCreate.AllowUnprunableViews = allow
+				admin := &fakeDestinationAdmin{
+					datasetMetadata:  &bq.DatasetMetadata{},
+					tableMetadataErr: notFound(),
+					tableMetadataByID: map[string]fakeTableMetadataResponse{
+						cfg.Traces.Table:            {metadata: variant.md(t)},
+						cfg.Traces.Table + "_dedup": {metadata: &bq.TableMetadata{Type: bq.ViewTable}},
+					},
+				}
+				e := newTestSignalExporter(cfg, cfg.Metrics.Table, schema.MetricsTableSchema())
+				err := e.prepareDestination(context.Background(), admin)
+				switch {
+				case !allow && (err == nil || !strings.Contains(err.Error(), "auto_create.allow_unprunable_views: true")):
+					t.Fatalf("error = %v, want companion view pruning error", err)
+				case !allow && admin.createdTables[schema.GenAIMetricExemplarsViewName] != nil:
+					t.Error("v_gen_ai_metric_exemplars must not be created over a restrictive spans table without opt-in")
+				case allow && err != nil:
+					t.Fatalf("prepareDestination with allow_unprunable_views failed: %v", err)
+				case allow && admin.createdTables[schema.GenAIMetricExemplarsViewName] == nil:
+					t.Error("v_gen_ai_metric_exemplars must be created when allow_unprunable_views is true")
+				}
+			})
+
+			t.Run("logs/"+variant.name+"/"+suffix, func(t *testing.T) {
+				cfg := companionViewConfig()
+				cfg.AutoCreate.AllowUnprunableViews = allow
+				admin := &fakeDestinationAdmin{
+					datasetMetadata:  &bq.DatasetMetadata{},
+					tableMetadataErr: notFound(),
+					tableMetadataByID: map[string]fakeTableMetadataResponse{
+						cfg.Traces.Table:            {metadata: variant.md(t)},
+						cfg.Traces.Table + "_dedup": {metadata: &bq.TableMetadata{Type: bq.ViewTable}},
+					},
+				}
+				e := newTestSignalExporter(cfg, cfg.Logs.Table, schema.LogsTableSchema())
+				err := e.prepareDestination(context.Background(), admin)
+				switch {
+				case !allow && (err == nil || !strings.Contains(err.Error(), "auto_create.allow_unprunable_views: true")):
+					t.Fatalf("error = %v, want companion view pruning error", err)
+				case !allow && admin.createdTables[schema.GenAILogsViewName] != nil:
+					t.Error("v_gen_ai_logs must not be created over a restrictive spans table without opt-in")
+				case allow && err != nil:
+					t.Fatalf("prepareDestination with allow_unprunable_views failed: %v", err)
+				case allow && admin.createdTables[schema.GenAILogsViewName] == nil:
+					t.Error("v_gen_ai_logs must be created when allow_unprunable_views is true")
+				}
+			})
+		}
+	}
+}
+
+func TestPrepareDestinationRejectsConcurrentlyCreatedRestrictiveSpansTable(t *testing.T) {
+	for _, allow := range []bool{false, true} {
+		name := "rejected_without_opt_in"
+		if allow {
+			name = "allowed_with_opt_in"
+		}
+		t.Run(name, func(t *testing.T) {
+			cfg := companionViewConfig()
+			cfg.AutoCreate.AllowUnprunableViews = allow
+			winnerMD := &bq.TableMetadata{
+				Schema:                 mustBigQuerySchema(t, schema.SpansTableSchema()),
+				RequirePartitionFilter: true,
+			}
+			admin := &fakeDestinationAdmin{
+				datasetMetadata:  &bq.DatasetMetadata{},
+				tableMetadataErr: notFound(),
+				tableSequenceByID: map[string][]fakeTableMetadataResponse{
+					cfg.Traces.Table: {{err: notFound()}, {metadata: winnerMD}},
+				},
+				createErrByID: map[string]error{cfg.Traces.Table: alreadyExists()},
+			}
+			e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+			err := e.prepareDestination(context.Background(), admin)
+			switch {
+			case !allow && (err == nil || !strings.Contains(err.Error(), "auto_create.allow_unprunable_views: true")):
+				t.Fatalf("error = %v, want companion view pruning error", err)
+			case allow && err != nil:
+				t.Fatalf("prepareDestination with allow_unprunable_views failed: %v", err)
+			}
+		})
+	}
+}
+
+func TestPrepareDestinationPeerSpanTablePartitionFilterProbeResults(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		spanResp           fakeTableMetadataResponse
+		tracesReqPart      bool
+		wantErr            error
+		wantPruningErr     bool
+		wantUnreadableWarn bool
+		wantCreated        bool
+	}{
+		{
+			name:        "span_table_absent_and_config_false_creates_view",
+			spanResp:    fakeTableMetadataResponse{err: notFound()},
+			wantCreated: true,
+		},
+		{
+			name:           "span_table_absent_and_config_true_fails",
+			spanResp:       fakeTableMetadataResponse{err: notFound()},
+			tracesReqPart:  true,
+			wantPruningErr: true,
+		},
+		{
+			name:               "span_table_unreadable_warns_and_skips_view",
+			spanResp:           fakeTableMetadataResponse{err: forbidden()},
+			wantUnreadableWarn: true,
+		},
+		{
+			name:     "span_table_deadline_fails_startup",
+			spanResp: fakeTableMetadataResponse{err: context.DeadlineExceeded},
+			wantErr:  context.DeadlineExceeded,
+		},
+	} {
+		for _, signal := range []struct {
+			name        string
+			table       string
+			tableSchema *storagepb.TableSchema
+			viewName    string
+		}{
+			{"metrics", defaultMetricsTable, schema.MetricsTableSchema(), schema.GenAIMetricExemplarsViewName},
+			{"logs", defaultLogsTable, schema.LogsTableSchema(), schema.GenAILogsViewName},
+		} {
+			t.Run(signal.name+"_"+tc.name, func(t *testing.T) {
+				cfg := companionViewConfig()
+				cfg.Traces.RequirePartitionFilter = tc.tracesReqPart
+				core, logs := observer.New(zap.WarnLevel)
+				e := newSignalExporter(
+					component.TelemetrySettings{Logger: zap.New(core)}, cfg, signal.table, signal.tableSchema)
+				admin := &fakeDestinationAdmin{
+					datasetMetadata:  &bq.DatasetMetadata{},
+					tableMetadataErr: notFound(),
+					tableMetadataByID: map[string]fakeTableMetadataResponse{
+						cfg.Traces.Table + "_dedup": {metadata: &bq.TableMetadata{Type: bq.ViewTable}},
+						cfg.Traces.Table:            tc.spanResp,
+					},
+				}
+
+				err := e.prepareDestination(context.Background(), admin)
+				switch {
+				case tc.wantErr != nil && !errors.Is(err, tc.wantErr):
+					t.Fatalf("error = %v, want %v", err, tc.wantErr)
+				case tc.wantPruningErr && (err == nil || !strings.Contains(err.Error(), "auto_create.allow_unprunable_views: true")):
+					t.Fatalf("error = %v, want companion view pruning error", err)
+				case tc.wantErr == nil && !tc.wantPruningErr && err != nil:
+					t.Fatalf("unexpected error = %v", err)
+				}
+				if (admin.createdTables[signal.viewName] != nil) != tc.wantCreated {
+					t.Errorf("%s created = %v, want %v", signal.viewName, admin.createdTables[signal.viewName] != nil, tc.wantCreated)
+				}
+				warns := logs.FilterMessage("span table metadata is unreadable; skipping companion view").Len()
+				if (warns == 1) != tc.wantUnreadableWarn || warns > 1 {
+					t.Errorf("unreadable span table warnings = %d, want one: %v", warns, tc.wantUnreadableWarn)
+				}
+			})
+		}
+	}
+}
+
 func quarantineDestinationConfig() *Config {
 	cfg := validConfig()
 	cfg.Quarantine.Enabled = true

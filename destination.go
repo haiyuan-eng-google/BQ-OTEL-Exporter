@@ -255,10 +255,13 @@ func (e *signalExporter) prepareSignalDestination(ctx context.Context, admin des
 	if err != nil {
 		return fmt.Errorf("deriving destination metadata: %w", err)
 	}
+	effectiveTableMD := tableMD
 	if createTable {
-		if err := e.createDestinationTable(ctx, admin, createMD); err != nil {
+		createdMD, err := e.createDestinationTable(ctx, admin, createMD)
+		if err != nil {
 			return err
 		}
+		effectiveTableMD = createdMD
 	}
 	if err := e.createDedupView(ctx, admin, viewQuery); err != nil {
 		return err
@@ -271,7 +274,7 @@ func (e *signalExporter) prepareSignalDestination(ctx context.Context, admin des
 	if !e.cfg.AutoCreate.CompanionViews {
 		return nil
 	}
-	return e.createCompanionViews(ctx, admin)
+	return e.createCompanionViews(ctx, admin, effectiveTableMD)
 }
 
 func (e *signalExporter) reconcileTableSchema(
@@ -388,19 +391,22 @@ func isContextError(err error) bool {
 
 func (e *signalExporter) createDestinationTable(
 	ctx context.Context, admin destinationAdmin, md *bq.TableMetadata,
-) error {
+) (*bq.TableMetadata, error) {
 	if err := admin.CreateTable(ctx, e.table, md); err != nil {
 		if !isAlreadyExists(err) {
-			return fmt.Errorf("creating destination table %s: %w", e.tableID(), err)
+			return nil, fmt.Errorf("creating destination table %s: %w", e.tableID(), err)
 		}
 		winner, metadataErr := admin.TableMetadata(ctx, e.table)
 		if metadataErr != nil {
-			return fmt.Errorf(
+			return nil, fmt.Errorf(
 				"validating concurrently created destination table %s: %w", e.tableID(), metadataErr)
 		}
-		return e.validateTableMetadata(winner)
+		if err := e.validateTableMetadata(winner); err != nil {
+			return nil, err
+		}
+		return winner, nil
 	}
-	return nil
+	return md, nil
 }
 
 // ensureView creates the view id, or reconciles an existing one to the wanted
@@ -505,7 +511,9 @@ func (e *signalExporter) createDedupView(
 // failing startup, and a later start creates it. An unreadable peer dedup view
 // is skipped with a warning because companion views are a convenience and must
 // not block export.
-func (e *signalExporter) createCompanionViews(ctx context.Context, admin destinationAdmin) error {
+func (e *signalExporter) createCompanionViews(
+	ctx context.Context, admin destinationAdmin, effectiveTableMD *bq.TableMetadata,
+) error {
 	if proto.Equal(e.schema, schema.MetricsTableSchema()) {
 		views := schema.MetricsCompanionViewsMetadata(e.cfg.Project, e.cfg.Dataset, e.table)
 		preserved, err := e.ensureCompanionViews(ctx, admin,
@@ -514,6 +522,10 @@ func (e *signalExporter) createCompanionViews(ctx context.Context, admin destina
 			return err
 		}
 		ok, err := e.probePeerDedupView(ctx, admin, "span", e.cfg.Traces.Table, schema.GenAIMetricExemplarsViewName)
+		if err != nil || !ok {
+			return err
+		}
+		ok, err = e.checkPeerSpanTablePartitionFilter(ctx, admin, e.cfg.Traces.Table, schema.GenAIMetricExemplarsViewName)
 		if err != nil || !ok {
 			return err
 		}
@@ -527,9 +539,16 @@ func (e *signalExporter) createCompanionViews(ctx context.Context, admin destina
 	}
 	isSpans := proto.Equal(e.schema, schema.SpansTableSchema())
 	spansTable, logsTable := e.table, e.cfg.Logs.Table
+	if isSpans && !e.cfg.AutoCreate.AllowUnprunableViews && tableRequiresPartitionFilter(effectiveTableMD) {
+		return e.companionViewPruningError(spansTable)
+	}
 	if !isSpans {
 		spansTable, logsTable = e.cfg.Traces.Table, e.table
 		ok, err := e.probePeerDedupView(ctx, admin, "span", spansTable, schema.GenAILogsViewName)
+		if err != nil || !ok {
+			return err
+		}
+		ok, err = e.checkPeerSpanTablePartitionFilter(ctx, admin, spansTable, schema.GenAILogsViewName)
 		if err != nil || !ok {
 			return err
 		}
@@ -570,6 +589,50 @@ func (e *signalExporter) createCompanionViews(ctx context.Context, admin destina
 		return err
 	}
 	return nil
+}
+
+func tableRequiresPartitionFilter(md *bq.TableMetadata) bool {
+	return md != nil && (md.RequirePartitionFilter ||
+		(md.TimePartitioning != nil && md.TimePartitioning.RequirePartitionFilter))
+}
+
+func (e *signalExporter) companionViewPruningError(spansTable string) error {
+	spanTableID := e.cfg.Project + "." + e.cfg.Dataset + "." + spansTable
+	return fmt.Errorf(
+		"auto_create.companion_views cannot create cross-signal views (%s, %s) over %s while that spans table requires a partition filter: "+
+			"BigQuery rejects queries over those views without a constant start_time partition filter; "+
+			"set auto_create.allow_unprunable_views: true, auto_create.companion_views: false, or ensure %s does not require a partition filter "+
+			"(traces.require_partition_filter: false applies only when creating a new spans table)",
+		schema.GenAILogsViewName, schema.GenAIMetricExemplarsViewName, spanTableID, spanTableID)
+}
+
+func (e *signalExporter) checkPeerSpanTablePartitionFilter(
+	ctx context.Context, admin destinationAdmin, peerSpanTable, dependentView string,
+) (bool, error) {
+	if e.cfg.AutoCreate.AllowUnprunableViews {
+		return true, nil
+	}
+	spanTableID := e.cfg.Project + "." + e.cfg.Dataset + "." + peerSpanTable
+	viewName := e.cfg.Project + "." + e.cfg.Dataset + "." + dependentView
+	spanMD, err := admin.TableMetadata(ctx, peerSpanTable)
+	switch {
+	case err == nil:
+		if tableRequiresPartitionFilter(spanMD) {
+			return false, e.companionViewPruningError(peerSpanTable)
+		}
+		return true, nil
+	case isContextError(err):
+		return false, fmt.Errorf("reading span table metadata for %s: %w", spanTableID, err)
+	case isNotFound(err):
+		if e.cfg.Traces.RequirePartitionFilter {
+			return false, e.companionViewPruningError(peerSpanTable)
+		}
+		return true, nil
+	default:
+		e.logger.Warn("span table metadata is unreadable; skipping companion view",
+			zap.String("view", viewName), zap.String("requires", spanTableID), zap.Error(err))
+		return false, nil
+	}
 }
 
 // ensureCompanionViews creates or reconciles the companion views in order,

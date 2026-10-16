@@ -852,7 +852,9 @@ WHERE metric_name LIKE 'gen_ai.%%'
 // GenAIMetricExemplarsViewDDL creates v_gen_ai_metric_exemplars: one row per
 // exemplar on a GenAI metric point that carries a non-empty trace_id and
 // span_id, left-joined to the span deduplication view within a 25-hour window
-// around the metric point timestamp. An exemplar whose span is absent or
+// around the metric point timestamp. When multiple span deduplication rows
+// match an exemplar in that window, the latest span (by end_time, start_time,
+// receive_time, then name) is selected. An exemplar whose span is absent or
 // outside the window stays in the view with NULL span_* columns.
 const GenAIMetricExemplarsViewDDL = `
 CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAIMetricExemplarsViewName + "`" + ` AS
@@ -904,7 +906,7 @@ SELECT
   ) AS adk_session_id,
   JSON_VALUE(s.attributes, '$."error.type"') AS span_error_type
 FROM ` + "`%[1]s.%[2]s." + GenAIMetricsViewName + "`" + ` m,
-UNNEST(m.exemplars) AS ex
+UNNEST(m.exemplars) AS ex WITH OFFSET AS exemplar_ordinal
 LEFT JOIN ` + "`%[1]s.%[2]s.%[3]s_dedup`" + ` s
   ON s.trace_id = ex.trace_id
   AND s.span_id = ex.span_id
@@ -914,6 +916,10 @@ WHERE ex.trace_id IS NOT NULL
   AND ex.span_id IS NOT NULL
   AND ex.trace_id != ''
   AND ex.span_id != ''
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY m.timestamp, m.start_time, m.receive_time, m.service_name, m.metric_name, m.metric_type, TO_JSON_STRING(m.attributes), TO_JSON_STRING(m.resource), TO_JSON_STRING(m.instrumentation_scope), exemplar_ordinal
+  ORDER BY s.end_time DESC, s.start_time DESC, s.receive_time DESC, s.name ASC
+) = 1
 `
 
 // GenAIModelCostsViewDDL creates v_gen_ai_model_costs: hourly token and

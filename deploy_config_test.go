@@ -550,7 +550,7 @@ func helmEnterpriseValues(maskReplacement string) map[string]any {
 	signal := func(name string) map[string]any {
 		return map[string]any{
 			"partitionExpirationDays": int64(90),
-			"requirePartitionFilter":  name != "traces",
+			"requirePartitionFilter":  true,
 			"kmsKeyName":              key + name,
 			"labels":                  map[string]any{"signal": name},
 			"maxStaleness":            "15m",
@@ -558,15 +558,16 @@ func helmEnterpriseValues(maskReplacement string) map[string]any {
 	}
 	return map[string]any{
 		"bigquery": map[string]any{
-			"autoCreateDataset":        true,
-			"autoCreateTables":         true,
-			"autoCreateCompanionViews": true,
-			"autoCreateSearchIndexes":  true,
-			"kmsKeyName":               key + "default",
-			"labels":                   map[string]any{"env": "prod", "cost-center": int64(1234)},
-			"traces":                   signal("traces"),
-			"logs":                     signal("logs"),
-			"metrics":                  signal("metrics"),
+			"autoCreateDataset":              true,
+			"autoCreateTables":               true,
+			"autoCreateCompanionViews":       true,
+			"autoCreateAllowUnprunableViews": true,
+			"autoCreateSearchIndexes":        true,
+			"kmsKeyName":                     key + "default",
+			"labels":                         map[string]any{"env": "prod", "cost-center": int64(1234)},
+			"traces":                         signal("traces"),
+			"logs":                           signal("logs"),
+			"metrics":                        signal("metrics"),
 		},
 		"offload": map[string]any{
 			"enabled":        true,
@@ -679,8 +680,11 @@ func TestHelmConfigMapDecodesAndValidates(t *testing.T) {
 				t.Errorf("kms_key_name did not reach the exporter: %q, %q, %q",
 					cfg.KMSKeyName, cfg.Logs.KMSKeyName, cfg.Quarantine.KMSKeyName)
 			}
-			if !cfg.AutoCreate.CompanionViews || !cfg.AutoCreate.SearchIndexes {
-				t.Errorf("auto_create = %+v, want companion_views and search_indexes on", cfg.AutoCreate)
+			if !cfg.AutoCreate.CompanionViews || !cfg.AutoCreate.AllowUnprunableViews || !cfg.AutoCreate.SearchIndexes {
+				t.Errorf("auto_create = %+v, want companion_views, allow_unprunable_views, and search_indexes on", cfg.AutoCreate)
+			}
+			if !cfg.Traces.RequirePartitionFilter {
+				t.Errorf("traces.require_partition_filter = %v, want true", cfg.Traces.RequirePartitionFilter)
 			}
 			if !reflect.DeepEqual(cfg.Redaction.BlockedKeys, []string{"x-custom-secret", "*.ssn"}) ||
 				len(cfg.Redaction.BlockedValuePatterns) != 2 {
@@ -783,13 +787,10 @@ var helmUnexposedExporterKeys = map[string]string{
 
 	"logs.log_name_attribute":  "the exporter falls back to well-known attributes, then the service name",
 	"logs.insert_id_attribute": "the exporter falls back to well-known attributes, then the record fingerprint",
-
-	"auto_create.allow_unprunable_views": "cross-signal companion view partition-filter opt-out is set directly on the exporter",
 }
 
 func TestHelmChartExposesExporterOptions(t *testing.T) {
 	overrides := helmEnterpriseValues("[REDACTED]")
-	overrides["bigquery"].(map[string]any)["traces"].(map[string]any)["requirePartitionFilter"] = true
 	conf := confmap.NewFromStringMap(helmCollectorConfig(t, overrides))
 	section := exporterBlock(t, conf, "bigquery")
 	exposed := map[string]bool{}
