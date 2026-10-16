@@ -1,0 +1,64 @@
+{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          {"key": "service.name", "value": {"stringValue": "multi-agent-planner"}},
+          {"key": "service.version", "value": {"stringValue": "1.2.0"}}
+        ]
+      },
+      "scopeLogs": [
+        {
+          "scope": {
+            "name": "synthetic.gen_ai.multi_agent",
+            "version": "1.40.0"
+          },
+          "logRecords": [
+            {
+              "timeUnixNano": "1723420951000000000",
+              "observedTimeUnixNano": "1723420951010000000",
+              "severityNumber": 9,
+              "severityText": "INFO",
+              "eventName": "gen_ai.choice",
+              "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+              "spanId": "00f067aa0ba902b8",
+              "body": {
+                "kvlistValue": {
+                  "values": [
+                    {"key": "role", "value": {"stringValue": "model"}},
+                    {"key": "content", "value": {"stringValue": "Delegating SQL and document lookups to researcher."}}
+                  ]
+                }
+              },
+              "attributes": [
+                {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                {"key": "gen_ai.agent.name", "value": {"stringValue": "planner"}},
+                {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-multi-01"}}
+              ]
+            },
+            {
+              "timeUnixNano": "1723420951450000000",
+              "observedTimeUnixNano": "1723420951460000000",
+              "severityNumber": 17,
+              "severityText": "ERROR",
+              "eventName": "gen_ai.client.inference.operation.details",
+              "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+              "spanId": "00f067aa0ba902bb",
+              "body": {
+                "stringValue": "Model invocation failed with rate_limited: quota exceeded"
+              },
+              "attributes": [
+                {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                {"key": "gen_ai.agent.name", "value": {"stringValue": "researcher"}},
+                {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-multi-01"}},
+                {"key": "error.type", "value": {"stringValue": "rate_limited"}}
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

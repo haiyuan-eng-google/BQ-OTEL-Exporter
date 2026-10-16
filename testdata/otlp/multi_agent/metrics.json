@@ -1,0 +1,376 @@
+{
+  "resourceMetrics": [
+    {
+      "resource": {
+        "attributes": [
+          {"key": "service.name", "value": {"stringValue": "multi-agent-planner"}},
+          {"key": "service.version", "value": {"stringValue": "1.2.0"}}
+        ]
+      },
+      "scopeMetrics": [
+        {
+          "scope": {
+            "name": "synthetic.gen_ai.multi_agent",
+            "version": "1.40.0"
+          },
+          "metrics": [
+            {
+              "name": "gen_ai.client.token.usage",
+              "description": "Legacy GenAI token usage histogram.",
+              "unit": "{token}",
+              "histogram": {
+                "aggregationTemporality": 1,
+                "dataPoints": [
+                  {
+                    "startTimeUnixNano": "1723420950100000000",
+                    "timeUnixNano": "1723420951100000000",
+                    "count": "1",
+                    "sum": 200,
+                    "min": 200,
+                    "max": 200,
+                    "explicitBounds": [1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864],
+                    "bucketCounts": ["0", "0", "0", "0", "1", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0"],
+                    "attributes": [
+                      {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                      {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                      {"key": "gen_ai.token.type", "value": {"stringValue": "input"}},
+                      {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-2.5-pro"}},
+                      {"key": "gen_ai.response.model", "value": {"stringValue": "gemini-2.5-pro-001"}}
+                    ],
+                    "exemplars": [
+                      {
+                        "timeUnixNano": "1723420951100000000",
+                        "asDouble": 200,
+                        "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+                        "spanId": "00f067aa0ba902b8"
+                      }
+                    ]
+                  },
+                  {
+                    "startTimeUnixNano": "1723420950100000000",
+                    "timeUnixNano": "1723420951100000000",
+                    "count": "1",
+                    "sum": 100,
+                    "min": 100,
+                    "max": 100,
+                    "explicitBounds": [1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864],
+                    "bucketCounts": ["0", "0", "0", "0", "1", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0"],
+                    "attributes": [
+                      {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                      {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                      {"key": "gen_ai.token.type", "value": {"stringValue": "output"}},
+                      {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-2.5-pro"}},
+                      {"key": "gen_ai.response.model", "value": {"stringValue": "gemini-2.5-pro-001"}}
+                    ],
+                    "exemplars": [
+                      {
+                        "timeUnixNano": "1723420951100000000",
+                        "asDouble": 100,
+                        "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+                        "spanId": "00f067aa0ba902b8"
+                      }
+                    ]
+                  },
+                  {
+                    "startTimeUnixNano": "1723420951600000000",
+                    "timeUnixNano": "1723420952000000000",
+                    "count": "1",
+                    "sum": 300,
+                    "min": 300,
+                    "max": 300,
+                    "explicitBounds": [1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864],
+                    "bucketCounts": ["0", "0", "0", "0", "0", "1", "0", "0", "0", "0", "0", "0", "0", "0", "0"],
+                    "attributes": [
+                      {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                      {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                      {"key": "gen_ai.token.type", "value": {"stringValue": "input"}},
+                      {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-2.5-flash"}},
+                      {"key": "gen_ai.response.model", "value": {"stringValue": "gemini-2.5-flash-001"}}
+                    ],
+                    "exemplars": [
+                      {
+                        "timeUnixNano": "1723420952000000000",
+                        "asDouble": 300,
+                        "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+                        "spanId": "00f067aa0ba902ba"
+                      }
+                    ]
+                  },
+                  {
+                    "startTimeUnixNano": "1723420951600000000",
+                    "timeUnixNano": "1723420952000000000",
+                    "count": "1",
+                    "sum": 200,
+                    "min": 200,
+                    "max": 200,
+                    "explicitBounds": [1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864],
+                    "bucketCounts": ["0", "0", "0", "0", "1", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0"],
+                    "attributes": [
+                      {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                      {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                      {"key": "gen_ai.token.type", "value": {"stringValue": "output"}},
+                      {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-2.5-flash"}},
+                      {"key": "gen_ai.response.model", "value": {"stringValue": "gemini-2.5-flash-001"}}
+                    ],
+                    "exemplars": [
+                      {
+                        "timeUnixNano": "1723420952000000000",
+                        "asDouble": 200,
+                        "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+                        "spanId": "00f067aa0ba902ba"
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "gen_ai.client.operation.duration",
+              "description": "GenAI operation duration.",
+              "unit": "s",
+              "histogram": {
+                "aggregationTemporality": 1,
+                "dataPoints": [
+                  {
+                    "startTimeUnixNano": "1723420950100000000",
+                    "timeUnixNano": "1723420951100000000",
+                    "count": "1",
+                    "sum": 1.0,
+                    "min": 1.0,
+                    "max": 1.0,
+                    "explicitBounds": [0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96, 81.92],
+                    "bucketCounts": ["0", "0", "0", "0", "0", "0", "0", "1", "0", "0", "0", "0", "0", "0", "0"],
+                    "attributes": [
+                      {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                      {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                      {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-2.5-pro"}},
+                      {"key": "gen_ai.response.model", "value": {"stringValue": "gemini-2.5-pro-001"}}
+                    ],
+                    "exemplars": [
+                      {
+                        "timeUnixNano": "1723420951100000000",
+                        "asDouble": 1.0,
+                        "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+                        "spanId": "00f067aa0ba902b8"
+                      }
+                    ]
+                  },
+                  {
+                    "startTimeUnixNano": "1723420951600000000",
+                    "timeUnixNano": "1723420952000000000",
+                    "count": "1",
+                    "sum": 0.4,
+                    "min": 0.4,
+                    "max": 0.4,
+                    "explicitBounds": [0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96, 81.92],
+                    "bucketCounts": ["0", "0", "0", "0", "0", "0", "1", "0", "0", "0", "0", "0", "0", "0", "0"],
+                    "attributes": [
+                      {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                      {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                      {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-2.5-flash"}},
+                      {"key": "gen_ai.response.model", "value": {"stringValue": "gemini-2.5-flash-001"}}
+                    ],
+                    "exemplars": [
+                      {
+                        "timeUnixNano": "1723420952000000000",
+                        "asDouble": 0.4,
+                        "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+                        "spanId": "00f067aa0ba902ba"
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "gen_ai.client.inference.usage.input_tokens",
+              "description": "Measures input tokens used in an inference operation.",
+              "unit": "{token}",
+              "histogram": {
+                "aggregationTemporality": 1,
+                "dataPoints": [
+                  {
+                    "startTimeUnixNano": "1723420950100000000",
+                    "timeUnixNano": "1723420951100000000",
+                    "count": "1",
+                    "sum": 200,
+                    "min": 200,
+                    "max": 200,
+                    "explicitBounds": [1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864],
+                    "bucketCounts": ["0", "0", "0", "0", "1", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0"],
+                    "attributes": [
+                      {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                      {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                      {"key": "gen_ai.agent.name", "value": {"stringValue": "planner"}},
+                      {"key": "gen_ai.token.modality", "value": {"stringValue": "text"}},
+                      {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-2.5-pro"}},
+                      {"key": "gen_ai.response.model", "value": {"stringValue": "gemini-2.5-pro-001"}}
+                    ],
+                    "exemplars": [
+                      {
+                        "timeUnixNano": "1723420951100000000",
+                        "asDouble": 200,
+                        "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+                        "spanId": "00f067aa0ba902b8"
+                      }
+                    ]
+                  },
+                  {
+                    "startTimeUnixNano": "1723420951600000000",
+                    "timeUnixNano": "1723420952000000000",
+                    "count": "1",
+                    "sum": 300,
+                    "min": 300,
+                    "max": 300,
+                    "explicitBounds": [1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864],
+                    "bucketCounts": ["0", "0", "0", "0", "0", "1", "0", "0", "0", "0", "0", "0", "0", "0", "0"],
+                    "attributes": [
+                      {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                      {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                      {"key": "gen_ai.agent.name", "value": {"stringValue": "researcher"}},
+                      {"key": "gen_ai.token.modality", "value": {"stringValue": "text"}},
+                      {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-2.5-flash"}},
+                      {"key": "gen_ai.response.model", "value": {"stringValue": "gemini-2.5-flash-001"}}
+                    ],
+                    "exemplars": [
+                      {
+                        "timeUnixNano": "1723420952000000000",
+                        "asDouble": 300,
+                        "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+                        "spanId": "00f067aa0ba902ba"
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "gen_ai.client.inference.usage.output_tokens",
+              "description": "Measures output tokens used in an inference operation.",
+              "unit": "{token}",
+              "histogram": {
+                "aggregationTemporality": 1,
+                "dataPoints": [
+                  {
+                    "startTimeUnixNano": "1723420950100000000",
+                    "timeUnixNano": "1723420951100000000",
+                    "count": "1",
+                    "sum": 100,
+                    "min": 100,
+                    "max": 100,
+                    "explicitBounds": [1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864],
+                    "bucketCounts": ["0", "0", "0", "0", "1", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0"],
+                    "attributes": [
+                      {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                      {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                      {"key": "gen_ai.agent.name", "value": {"stringValue": "planner"}},
+                      {"key": "gen_ai.token.modality", "value": {"stringValue": "text"}},
+                      {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-2.5-pro"}},
+                      {"key": "gen_ai.response.model", "value": {"stringValue": "gemini-2.5-pro-001"}}
+                    ],
+                    "exemplars": [
+                      {
+                        "timeUnixNano": "1723420951100000000",
+                        "asDouble": 100,
+                        "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+                        "spanId": "00f067aa0ba902b8"
+                      }
+                    ]
+                  },
+                  {
+                    "startTimeUnixNano": "1723420951600000000",
+                    "timeUnixNano": "1723420952000000000",
+                    "count": "1",
+                    "sum": 200,
+                    "min": 200,
+                    "max": 200,
+                    "explicitBounds": [1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864],
+                    "bucketCounts": ["0", "0", "0", "0", "1", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0"],
+                    "attributes": [
+                      {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                      {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                      {"key": "gen_ai.agent.name", "value": {"stringValue": "researcher"}},
+                      {"key": "gen_ai.token.modality", "value": {"stringValue": "text"}},
+                      {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-2.5-flash"}},
+                      {"key": "gen_ai.response.model", "value": {"stringValue": "gemini-2.5-flash-001"}}
+                    ],
+                    "exemplars": [
+                      {
+                        "timeUnixNano": "1723420952000000000",
+                        "asDouble": 200,
+                        "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+                        "spanId": "00f067aa0ba902ba"
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "gen_ai.client.inference.usage.reasoning.output_tokens",
+              "description": "Measures reasoning output tokens used in an inference operation.",
+              "unit": "{token}",
+              "histogram": {
+                "aggregationTemporality": 1,
+                "dataPoints": [
+                  {
+                    "startTimeUnixNano": "1723420950100000000",
+                    "timeUnixNano": "1723420951100000000",
+                    "count": "1",
+                    "sum": 50,
+                    "min": 50,
+                    "max": 50,
+                    "explicitBounds": [1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864],
+                    "bucketCounts": ["0", "0", "0", "1", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0"],
+                    "attributes": [
+                      {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                      {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                      {"key": "gen_ai.agent.name", "value": {"stringValue": "planner"}},
+                      {"key": "gen_ai.token.modality", "value": {"stringValue": "text"}},
+                      {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-2.5-pro"}},
+                      {"key": "gen_ai.response.model", "value": {"stringValue": "gemini-2.5-pro-001"}}
+                    ],
+                    "exemplars": [
+                      {
+                        "timeUnixNano": "1723420951100000000",
+                        "asDouble": 50,
+                        "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+                        "spanId": "00f067aa0ba902b8"
+                      }
+                    ]
+                  },
+                  {
+                    "startTimeUnixNano": "1723420951600000000",
+                    "timeUnixNano": "1723420952000000000",
+                    "count": "1",
+                    "sum": 70,
+                    "min": 70,
+                    "max": 70,
+                    "explicitBounds": [1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864],
+                    "bucketCounts": ["0", "0", "0", "0", "1", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0"],
+                    "attributes": [
+                      {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                      {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                      {"key": "gen_ai.agent.name", "value": {"stringValue": "researcher"}},
+                      {"key": "gen_ai.token.modality", "value": {"stringValue": "text"}},
+                      {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-2.5-flash"}},
+                      {"key": "gen_ai.response.model", "value": {"stringValue": "gemini-2.5-flash-001"}}
+                    ],
+                    "exemplars": [
+                      {
+                        "timeUnixNano": "1723420952000000000",
+                        "asDouble": 70,
+                        "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+                        "spanId": "00f067aa0ba902ba"
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

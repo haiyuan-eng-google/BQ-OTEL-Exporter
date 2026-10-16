@@ -1,0 +1,207 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {"key": "service.name", "value": {"stringValue": "multi-agent-planner"}},
+          {"key": "service.version", "value": {"stringValue": "1.2.0"}}
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "synthetic.gen_ai.multi_agent",
+            "version": "1.40.0"
+          },
+          "spans": [
+            {
+              "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+              "spanId": "00f067aa0ba902b7",
+              "parentSpanId": "",
+              "name": "invoke_agent planner",
+              "kind": 1,
+              "startTimeUnixNano": "1723420950000000000",
+              "endTimeUnixNano": "1723420954000000000",
+              "attributes": [
+                {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                {"key": "gen_ai.operation.name", "value": {"stringValue": "invoke_agent"}},
+                {"key": "gen_ai.agent.name", "value": {"stringValue": "planner"}},
+                {"key": "gen_ai.agent.id", "value": {"stringValue": "agent-planner-1"}},
+                {"key": "gen_ai.agent.version", "value": {"stringValue": "1.2.0"}},
+                {"key": "gen_ai.main_agent.name", "value": {"stringValue": "planner"}},
+                {"key": "gen_ai.main_agent.id", "value": {"stringValue": "agent-planner-1"}},
+                {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-multi-01"}},
+                {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-2.5-pro"}},
+                {"key": "gen_ai.usage.input_tokens", "value": {"intValue": "500"}},
+                {"key": "gen_ai.usage.output_tokens", "value": {"intValue": "300"}},
+                {"key": "gen_ai.usage.reasoning.output_tokens", "value": {"intValue": "120"}}
+              ],
+              "status": {"code": 1}
+            },
+            {
+              "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+              "spanId": "00f067aa0ba902b8",
+              "parentSpanId": "00f067aa0ba902b7",
+              "name": "chat gemini-2.5-pro",
+              "kind": 3,
+              "startTimeUnixNano": "1723420950100000000",
+              "endTimeUnixNano": "1723420951100000000",
+              "attributes": [
+                {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                {"key": "gen_ai.agent.name", "value": {"stringValue": "planner"}},
+                {"key": "gen_ai.agent.id", "value": {"stringValue": "agent-planner-1"}},
+                {"key": "gen_ai.main_agent.name", "value": {"stringValue": "planner"}},
+                {"key": "gen_ai.main_agent.id", "value": {"stringValue": "agent-planner-1"}},
+                {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-multi-01"}},
+                {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-2.5-pro"}},
+                {"key": "gen_ai.response.model", "value": {"stringValue": "gemini-2.5-pro-001"}},
+                {"key": "gen_ai.response.id", "value": {"stringValue": "resp-chat-01"}},
+                {"key": "gen_ai.usage.input_tokens", "value": {"intValue": "200"}},
+                {"key": "gen_ai.usage.output_tokens", "value": {"intValue": "100"}},
+                {"key": "gen_ai.usage.reasoning.output_tokens", "value": {"intValue": "50"}}
+              ],
+              "status": {"code": 1}
+            },
+            {
+              "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+              "spanId": "00f067aa0ba902b9",
+              "parentSpanId": "00f067aa0ba902b7",
+              "name": "invoke_agent researcher",
+              "kind": 1,
+              "startTimeUnixNano": "1723420951200000000",
+              "endTimeUnixNano": "1723420953800000000",
+              "attributes": [
+                {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                {"key": "gen_ai.operation.name", "value": {"stringValue": "invoke_agent"}},
+                {"key": "gen_ai.agent.name", "value": {"stringValue": "researcher"}},
+                {"key": "gen_ai.agent.id", "value": {"stringValue": "agent-researcher-2"}},
+                {"key": "gen_ai.agent.version", "value": {"stringValue": "1.0.4"}},
+                {"key": "gen_ai.main_agent.name", "value": {"stringValue": "planner"}},
+                {"key": "gen_ai.main_agent.id", "value": {"stringValue": "agent-planner-1"}},
+                {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-multi-01"}},
+                {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-2.5-flash"}},
+                {"key": "gen_ai.usage.input_tokens", "value": {"intValue": "300"}},
+                {"key": "gen_ai.usage.output_tokens", "value": {"intValue": "200"}},
+                {"key": "gen_ai.usage.reasoning_tokens", "value": {"intValue": "70"}}
+              ],
+              "status": {"code": 1}
+            },
+            {
+              "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+              "spanId": "00f067aa0ba902bb",
+              "parentSpanId": "00f067aa0ba902b9",
+              "name": "chat gemini-2.5-flash",
+              "kind": 3,
+              "startTimeUnixNano": "1723420951300000000",
+              "endTimeUnixNano": "1723420951500000000",
+              "attributes": [
+                {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                {"key": "gen_ai.agent.name", "value": {"stringValue": "researcher"}},
+                {"key": "gen_ai.agent.id", "value": {"stringValue": "agent-researcher-2"}},
+                {"key": "gen_ai.main_agent.name", "value": {"stringValue": "planner"}},
+                {"key": "gen_ai.main_agent.id", "value": {"stringValue": "agent-planner-1"}},
+                {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-multi-01"}},
+                {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-2.5-flash"}},
+                {"key": "error.type", "value": {"stringValue": "rate_limited"}}
+              ],
+              "status": {"code": 2, "message": "quota exceeded"}
+            },
+            {
+              "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+              "spanId": "00f067aa0ba902ba",
+              "parentSpanId": "00f067aa0ba902b9",
+              "name": "chat gemini-2.5-flash",
+              "kind": 3,
+              "startTimeUnixNano": "1723420951600000000",
+              "endTimeUnixNano": "1723420952000000000",
+              "attributes": [
+                {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                {"key": "gen_ai.agent.name", "value": {"stringValue": "researcher"}},
+                {"key": "gen_ai.agent.id", "value": {"stringValue": "agent-researcher-2"}},
+                {"key": "gen_ai.main_agent.name", "value": {"stringValue": "planner"}},
+                {"key": "gen_ai.main_agent.id", "value": {"stringValue": "agent-planner-1"}},
+                {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-multi-01"}},
+                {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-2.5-flash"}},
+                {"key": "gen_ai.response.model", "value": {"stringValue": "gemini-2.5-flash-001"}},
+                {"key": "gen_ai.response.id", "value": {"stringValue": "resp-chat-02"}},
+                {"key": "gen_ai.usage.input_tokens", "value": {"intValue": "300"}},
+                {"key": "gen_ai.usage.output_tokens", "value": {"intValue": "200"}},
+                {"key": "gen_ai.usage.reasoning_tokens", "value": {"intValue": "70"}}
+              ],
+              "status": {"code": 1}
+            },
+            {
+              "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+              "spanId": "00f067aa0ba902bc",
+              "parentSpanId": "00f067aa0ba902b9",
+              "name": "execute_tool execute_sql",
+              "kind": 1,
+              "startTimeUnixNano": "1723420952000000000",
+              "endTimeUnixNano": "1723420952600000000",
+              "attributes": [
+                {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                {"key": "gen_ai.operation.name", "value": {"stringValue": "execute_tool"}},
+                {"key": "gen_ai.agent.name", "value": {"stringValue": "researcher"}},
+                {"key": "gen_ai.agent.id", "value": {"stringValue": "agent-researcher-2"}},
+                {"key": "gen_ai.main_agent.name", "value": {"stringValue": "planner"}},
+                {"key": "gen_ai.main_agent.id", "value": {"stringValue": "agent-planner-1"}},
+                {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-multi-01"}},
+                {"key": "gen_ai.tool.name", "value": {"stringValue": "execute_sql"}},
+                {"key": "gen_ai.tool.call.id", "value": {"stringValue": "call-01"}},
+                {"key": "mcp.method.name", "value": {"stringValue": "tools/call"}},
+                {"key": "mcp.session.id", "value": {"stringValue": "mcp-sess-99"}}
+              ],
+              "status": {"code": 1}
+            },
+            {
+              "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+              "spanId": "00f067aa0ba902bd",
+              "parentSpanId": "00f067aa0ba902b9",
+              "name": "execute_tool search_docs",
+              "kind": 1,
+              "startTimeUnixNano": "1723420952100000000",
+              "endTimeUnixNano": "1723420952800000000",
+              "attributes": [
+                {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                {"key": "gen_ai.operation.name", "value": {"stringValue": "execute_tool"}},
+                {"key": "gen_ai.agent.name", "value": {"stringValue": "researcher"}},
+                {"key": "gen_ai.agent.id", "value": {"stringValue": "agent-researcher-2"}},
+                {"key": "gen_ai.main_agent.name", "value": {"stringValue": "planner"}},
+                {"key": "gen_ai.main_agent.id", "value": {"stringValue": "agent-planner-1"}},
+                {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-multi-01"}},
+                {"key": "gen_ai.tool.name", "value": {"stringValue": "search_docs"}},
+                {"key": "gen_ai.tool.call.id", "value": {"stringValue": "call-02"}},
+                {"key": "mcp.method.name", "value": {"stringValue": "tools/call"}},
+                {"key": "mcp.session.id", "value": {"stringValue": "mcp-sess-99"}},
+                {"key": "error.type", "value": {"stringValue": "ToolExecutionTimeout"}}
+              ],
+              "status": {"code": 2, "message": "tool execution timed out"}
+            },
+            {
+              "traceId": "7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d",
+              "spanId": "1122334455667788",
+              "parentSpanId": "deadbeefcafebabe",
+              "name": "invoke_agent late_worker",
+              "kind": 1,
+              "startTimeUnixNano": "1723420960000000000",
+              "endTimeUnixNano": "1723420960500000000",
+              "attributes": [
+                {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                {"key": "gen_ai.operation.name", "value": {"stringValue": "invoke_agent"}},
+                {"key": "gen_ai.agent.name", "value": {"stringValue": "late_worker"}},
+                {"key": "gen_ai.agent.id", "value": {"stringValue": "agent-late-3"}},
+                {"key": "gen_ai.main_agent.name", "value": {"stringValue": "planner"}},
+                {"key": "gen_ai.main_agent.id", "value": {"stringValue": "agent-planner-1"}},
+                {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-multi-02"}}
+              ],
+              "status": {"code": 1}
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

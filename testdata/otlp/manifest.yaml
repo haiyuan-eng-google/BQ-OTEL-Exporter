@@ -79,3 +79,19 @@ frameworks:
     traces_file: microsoft_agent_framework/traces.json
     logs_file: microsoft_agent_framework/logs.json
     metrics_file: microsoft_agent_framework/metrics.json
+scenarios:
+  - id: multi_agent
+    kind: scenario
+    provenance: synthetic
+    semconv_version: "1.40.0"
+    signals: [traces, logs, metrics]
+    gen_ai_system: gcp.vertex.agent
+    traces_file: multi_agent/traces.json
+    logs_file: multi_agent/logs.json
+    metrics_file: multi_agent/metrics.json
+  - id: mcp
+    kind: scenario
+    provenance: synthetic
+    semconv_version: "1.40.0"
+    signals: [traces]
+    traces_file: mcp/traces.json
