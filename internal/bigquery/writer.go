@@ -125,10 +125,9 @@ type Writer struct {
 const maxActiveStreamGenerations = 2
 
 var (
-	errStreamRetired      = errors.New("write stream generation is retired")
-	errWriterClosed       = errors.New("writer is closed")
-	errBackpressureShed   = errors.New("adaptive backpressure window is busy")
-	errBackpressureBudget = errors.New("remaining attempt deadline is below adaptive backpressure ack budget")
+	errStreamRetired              = errors.New("write stream generation is retired")
+	errWriterClosed               = errors.New("writer is closed")
+	errInsufficientDeadlineBudget = errors.New("remaining attempt deadline is below adaptive backpressure reserve")
 )
 
 type streamCreation struct {
@@ -428,6 +427,35 @@ func (w *Writer) tryAcquireDispatchSlot(
 	return true, nil
 }
 
+func (w *Writer) slotWaitReserve() time.Duration {
+	if w.opts.Backpressure == nil {
+		return 0
+	}
+	if w.EffectiveMaxInflightRequests() >= w.opts.MaxInflightRequests {
+		return 0
+	}
+	maxAck := w.opts.Backpressure.MaxAckLatency()
+	if maxAck <= 0 {
+		return 0
+	}
+	return maxAck + maxAck/2
+}
+
+func (w *Writer) deadlineReserve(maxBatchAck time.Duration) time.Duration {
+	if w.opts.Backpressure == nil {
+		return 0
+	}
+	if w.EffectiveMaxInflightRequests() >= w.opts.MaxInflightRequests &&
+		w.EffectiveMaxRequestBytes() >= w.opts.MaxRequestBytes {
+		return 0
+	}
+	ack := max(maxBatchAck, w.opts.Backpressure.MaxAckLatency())
+	if ack <= 0 {
+		return 0
+	}
+	return ack + ack/2
+}
+
 func (w *Writer) waitForDispatchSlot(ctx context.Context, gen *streamGeneration) error {
 	for {
 		if err := ctx.Err(); err != nil {
@@ -439,6 +467,12 @@ func (w *Writer) waitForDispatchSlot(ctx context.Context, gen *streamGeneration)
 			return errStreamRetired
 		}
 		if gen.dispatched < w.EffectiveMaxInflightRequests() {
+			if reserve := w.slotWaitReserve(); reserve > 0 {
+				if deadline, ok := ctx.Deadline(); ok && deadline.Sub(w.now()) <= reserve {
+					w.mu.Unlock()
+					return errInsufficientDeadlineBudget
+				}
+			}
 			gen.dispatched++
 			w.mu.Unlock()
 			return nil
@@ -446,12 +480,38 @@ func (w *Writer) waitForDispatchSlot(ctx context.Context, gen *streamGeneration)
 		sig := w.slotSignalLocked(gen)
 		w.mu.Unlock()
 
+		var (
+			budgetC <-chan time.Time
+			timer   *time.Timer
+		)
+		if reserve := w.slotWaitReserve(); reserve > 0 {
+			if deadline, ok := ctx.Deadline(); ok {
+				wait := deadline.Sub(w.now()) - reserve
+				if wait <= 0 {
+					return errInsufficientDeadlineBudget
+				}
+				timer = time.NewTimer(wait)
+				budgetC = timer.C
+			}
+		}
+
 		select {
 		case <-ctx.Done():
+			if timer != nil {
+				timer.Stop()
+			}
 			return ctx.Err()
 		case <-gen.retiredDone:
+			if timer != nil {
+				timer.Stop()
+			}
 			return errStreamRetired
+		case <-budgetC:
+			return errInsufficientDeadlineBudget
 		case <-sig:
+			if timer != nil {
+				timer.Stop()
+			}
 		}
 	}
 }
@@ -582,6 +642,7 @@ func (w *Writer) recordCleanOrSlowAck(elapsed time.Duration, gen *streamGenerati
 	if bp == nil {
 		return
 	}
+	bp.ObserveAckLatency(elapsed)
 	if bp.LatencyThreshold() > 0 && elapsed > bp.LatencyThreshold() {
 		if bp.OnSlowAck(elapsed) {
 			w.observeBackpressureTransition("latency")
@@ -603,9 +664,9 @@ func (w *Writer) finishResult(gen *streamGeneration, started time.Time) {
 }
 
 func (w *Writer) classifyAndRetire(
-	ctx context.Context, err error, gen *streamGeneration, rowCount int,
+	ctx context.Context, err error, gen *streamGeneration, req requestSlice,
 ) (Verdict, bool, bool) {
-	verdict, attemptEnded := w.classifyAppendFailure(ctx, err, rowCount)
+	verdict, attemptEnded := w.classifyAppendFailure(ctx, err, req)
 	siblingTeardown := false
 	if !attemptEnded && verdict.Label != LabelShutdown && isTeardown(err) && w.isRetired(gen) {
 		// Another attempt retired this generation and closed the connection
@@ -656,6 +717,8 @@ func classifyPreDispatchFailure(err error) Verdict {
 		return Verdict{Retryable, OwnerExporterHelper, LabelCanceled, false}
 	case errors.Is(err, errStreamRetired):
 		return Verdict{Retryable, OwnerExporterHelper, LabelInvalidStream, false}
+	case errors.Is(err, errInsufficientDeadlineBudget):
+		return Verdict{Retryable, OwnerExporterHelper, LabelBackpressure, false}
 	default:
 		return Classify(err)
 	}
@@ -701,11 +764,20 @@ func (o AppendOutcome) IsAcked(rowIndex int) bool {
 	return false
 }
 
+// requestSlice records one split sub-request alongside its wire size and the
+// byte split limit under which it was formed.
+type requestSlice struct {
+	rows            [][]byte
+	bytes           int
+	splitLimitBytes int
+}
+
 // pendingAppend tracks one in-flight AppendRows sub-request and stamps its
 // completion time as soon as Ready() closes so later local dispatch or drain
 // delays do not inflate acknowledgement latency.
 type pendingAppend struct {
 	res               appendResult
+	req               requestSlice
 	start             int
 	count             int
 	dispatched        time.Time
@@ -786,7 +858,7 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 	}
 	defer w.releaseGenerationUser(gen)
 
-	requests := SplitRequests(rows, w.EffectiveMaxRequestBytes())
+	requests := splitRequestSlices(rows, w.EffectiveMaxRequestBytes())
 	deadline, hasDeadline := ctx.Deadline()
 	var maxBatchAck time.Duration
 
@@ -828,7 +900,7 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 				out.RowErrors = append(out.RowErrors, rowErrs...)
 				return
 			}
-			v, attemptEnded, siblingTeardown := w.classifyAndRetire(ctx, rerr, gen, p.count)
+			v, attemptEnded, siblingTeardown := w.classifyAndRetire(ctx, rerr, gen, p.req)
 			if attemptEnded {
 				w.trackResult(gen, p.res, p.dispatched)
 			} else {
@@ -842,6 +914,9 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 		if elapsed > maxBatchAck {
 			maxBatchAck = elapsed
 		}
+		if w.opts.Backpressure != nil {
+			w.opts.Backpressure.ObserveAckLatency(elapsed)
+		}
 		w.finishResult(gen, p.dispatched)
 		w.recordCleanOrSlowAck(elapsed, gen)
 		out.AcknowledgedRows += p.count
@@ -852,17 +927,14 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 dispatch:
 	for _, req := range requests {
 		start := offset
-		offset += len(req)
+		offset += len(req.rows)
 		for {
 			if replayOwed() {
 				break dispatch
 			}
-			if hasDeadline && maxBatchAck > 0 && w.opts.Backpressure != nil &&
-				(w.EffectiveMaxInflightRequests() < w.opts.MaxInflightRequests ||
-					w.EffectiveMaxRequestBytes() < w.opts.MaxRequestBytes) {
-				minBudget := maxBatchAck + maxBatchAck/2
-				if deadline.Sub(w.now()) < minBudget {
-					fail(Verdict{Retryable, OwnerExporterHelper, LabelBackpressure, false}, errBackpressureBudget)
+			if start > 0 && hasDeadline {
+				if reserve := w.deadlineReserve(maxBatchAck); reserve > 0 && deadline.Sub(w.now()) <= reserve {
+					fail(Verdict{Retryable, OwnerExporterHelper, LabelBackpressure, false}, errInsufficientDeadlineBudget)
 					break dispatch
 				}
 			}
@@ -879,11 +951,6 @@ dispatch:
 				inflight = inflight[1:]
 				continue
 			}
-			if hasDeadline && w.opts.Backpressure != nil &&
-				w.EffectiveMaxInflightRequests() < w.opts.MaxInflightRequests {
-				fail(Verdict{Retryable, OwnerExporterHelper, LabelBackpressure, false}, errBackpressureShed)
-				break dispatch
-			}
 			if acquireErr := w.waitForDispatchSlot(ctx, gen); acquireErr != nil {
 				fail(classifyPreDispatchFailure(acquireErr), acquireErr)
 				break dispatch
@@ -892,7 +959,7 @@ dispatch:
 		}
 		pollInflightReady(inflight, w.now)
 		dispatched := w.now()
-		res, aerr := gen.AppendRows(ctx, req)
+		res, aerr := gen.AppendRows(ctx, req.rows)
 		pollInflightReady(inflight, w.now)
 		if aerr == nil {
 			// managedwriter's AppendRows can report success for a request it
@@ -911,7 +978,7 @@ dispatch:
 			// AppendRows can return the attempt-context error after handing a
 			// request to the bidirectional stream. Its acknowledgement is then
 			// ambiguous, and this generation cannot safely be reused.
-			v, attemptEnded, siblingTeardown := w.classifyAndRetire(ctx, aerr, gen, len(req))
+			v, attemptEnded, siblingTeardown := w.classifyAndRetire(ctx, aerr, gen, req)
 			w.recordFailureFeedback(v, attemptEnded, siblingTeardown, w.now().Sub(dispatched))
 			fail(v, aerr)
 			continue
@@ -919,7 +986,7 @@ dispatch:
 		w.registerResult(gen)
 		w.observeInflight(1)
 		p := &pendingAppend{
-			res: res, start: start, count: len(req), dispatched: dispatched,
+			res: res, req: req, start: start, count: len(req.rows), dispatched: dispatched,
 			done: make(chan struct{}),
 		}
 		if !p.pollReady(w.now) {
@@ -948,7 +1015,7 @@ dispatch:
 // applied the rows even though the caller did not observe the acknowledgement.
 // Once the writer's lifecycle has ended, a teardown failure is shutdown however
 // managedwriter reports it.
-func (w *Writer) classifyAppendFailure(ctx context.Context, err error, rowCount int) (Verdict, bool) {
+func (w *Writer) classifyAppendFailure(ctx context.Context, err error, req requestSlice) (Verdict, bool) {
 	ctxErr := ctx.Err()
 	if ctxErr != nil && errors.Is(err, ctxErr) {
 		return Verdict{Uncertain, OwnerExporterHelper, LabelUncertainAck, false}, true
@@ -962,9 +1029,23 @@ func (w *Writer) classifyAppendFailure(ctx context.Context, err error, rowCount 
 	if ownedCtx != nil && ownedCtx.Err() != nil && isTeardown(err) {
 		return Verdict{Retryable, OwnerExporterHelper, LabelShutdown, false}, false
 	}
-	canSplitSmaller := w.opts.Backpressure != nil &&
-		w.opts.Backpressure.EffectiveRequestBytes() > w.opts.Backpressure.MinRequestBytes()
-	return ClassifySubRequest(err, rowCount, canSplitSmaller), false
+	return ClassifySubRequest(err, len(req.rows), w.canSplitSmaller(req)), false
+}
+
+// canSplitSmaller reports whether replaying req at a lower split threshold can
+// split its rows into smaller sub-requests. It checks both the current global
+// threshold and the splitLimitBytes under which req was originally formed so an
+// in-flight request is not permanently rejected when a sibling caller reaches
+// the floor first.
+func (w *Writer) canSplitSmaller(req requestSlice) bool {
+	if len(req.rows) <= 1 || w.opts.Backpressure == nil {
+		return false
+	}
+	floor := w.opts.Backpressure.MinRequestBytes()
+	if w.opts.Backpressure.EffectiveRequestBytes() > floor {
+		return true
+	}
+	return req.splitLimitBytes > floor && req.bytes > floor
 }
 
 // isTeardown reports whether err is how managedwriter fails a request whose
@@ -1015,29 +1096,53 @@ func rowWireBytes(row []byte) int {
 // request: the caller is responsible for rejecting oversized rows before this
 // point, and silently dropping one here would lose data without a count.
 func SplitRequests(rows [][]byte, maxBytes int) [][][]byte {
+	slices := splitRequestSlices(rows, maxBytes)
+	out := make([][][]byte, len(slices))
+	for i, s := range slices {
+		out[i] = s.rows
+	}
+	return out
+}
+
+func splitRequestSlices(rows [][]byte, maxBytes int) []requestSlice {
+	if len(rows) == 0 {
+		return nil
+	}
 	if maxBytes <= 0 {
-		return [][][]byte{rows}
+		size := requestEnvelopeOverheadBytes
+		for _, row := range rows {
+			size += rowWireBytes(row)
+		}
+		return []requestSlice{{rows: rows, bytes: size, splitLimitBytes: maxBytes}}
 	}
 	envelope := requestEnvelopeOverheadBytes
 	if maxBytes <= envelope {
 		envelope = 0
 	}
 	var (
-		out     [][][]byte
+		out     []requestSlice
 		current [][]byte
 		size    = envelope
 	)
 	for _, row := range rows {
 		n := rowWireBytes(row)
 		if len(current) > 0 && size+n > maxBytes {
-			out = append(out, current)
+			out = append(out, requestSlice{
+				rows:            current,
+				bytes:           size,
+				splitLimitBytes: maxBytes,
+			})
 			current, size = nil, envelope
 		}
 		current = append(current, row)
 		size += n
 	}
 	if len(current) > 0 {
-		out = append(out, current)
+		out = append(out, requestSlice{
+			rows:            current,
+			bytes:           size,
+			splitLimitBytes: maxBytes,
+		})
 	}
 	return out
 }

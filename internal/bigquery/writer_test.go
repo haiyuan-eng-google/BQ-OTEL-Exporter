@@ -1421,13 +1421,14 @@ func TestCanceledManagedStreamIsDistinguishedFromShutdown(t *testing.T) {
 	lifetimeCtx, cancelLifetime := context.WithCancel(context.Background())
 	w := &Writer{lifetimeCtx: lifetimeCtx}
 
-	v, ended := w.classifyAppendFailure(context.Background(), context.Canceled, 1)
+	req := requestSlice{rows: [][]byte{{1}}}
+	v, ended := w.classifyAppendFailure(context.Background(), context.Canceled, req)
 	if ended || v.Label != LabelCanceled {
 		t.Fatalf("runtime cancellation = %s ended=%v, want %s/false", v.Label, ended, LabelCanceled)
 	}
 
 	cancelLifetime()
-	v, ended = w.classifyAppendFailure(context.Background(), context.Canceled, 1)
+	v, ended = w.classifyAppendFailure(context.Background(), context.Canceled, req)
 	if ended || v.Label != LabelShutdown {
 		t.Fatalf("shutdown cancellation = %s ended=%v, want %s/false", v.Label, ended, LabelShutdown)
 	}
@@ -2279,8 +2280,6 @@ func TestWriterFloorRecoveryUnderConcurrentLoad(t *testing.T) {
 	}
 
 	t.Run("concurrent callers with deadlines at floor produce zero uncertain verdicts or retirements", func(t *testing.T) {
-		var clockMu sync.Mutex
-		now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
 		bp := NewBackpressureController(BackpressureOptions{
 			MinRequestBytes:     200,
 			MaxRequestBytes:     1600,
@@ -2289,19 +2288,12 @@ func TestWriterFloorRecoveryUnderConcurrentLoad(t *testing.T) {
 			DecreaseFactor:      0.5,
 			RecoveryInterval:    time.Second,
 			LatencyThreshold:    2 * time.Second,
-			Now: func() time.Time {
-				clockMu.Lock()
-				defer clockMu.Unlock()
-				return now
-			},
 		})
-		stepToFloor(bp, func(d time.Duration) {
-			clockMu.Lock()
-			now = now.Add(d)
-			clockMu.Unlock()
-		})
+		bp.effectiveBytes.Store(200)
+		bp.effectiveInflight.Store(1)
+		bp.ObserveAckLatency(20 * time.Millisecond)
 
-		s := &countingLatencyStream{ackLatency: 10 * time.Millisecond}
+		s := &countingLatencyStream{ackLatency: 20 * time.Millisecond}
 		obs := &fakeObserver{}
 		w := &Writer{
 			opts: WriterOptions{
@@ -2324,7 +2316,7 @@ func TestWriterFloorRecoveryUnderConcurrentLoad(t *testing.T) {
 		outcomes := make(chan AppendOutcome, callers)
 		for range callers {
 			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+				ctx, cancel := context.WithTimeout(context.Background(), 55*time.Millisecond)
 				defer cancel()
 				outcomes <- w.Append(ctx, [][]byte{make([]byte, 100)})
 			}()
@@ -2440,7 +2432,6 @@ func TestWriterFloorRecoveryUnderConcurrentLoad(t *testing.T) {
 		defer stop()
 
 		var uncertainCount atomic.Int64
-		var shedCount atomic.Int64
 		var wg sync.WaitGroup
 		for range 8 {
 			wg.Add(1)
@@ -2459,9 +2450,6 @@ func TestWriterFloorRecoveryUnderConcurrentLoad(t *testing.T) {
 					if out.Verdict.Class == Uncertain || out.Verdict.Label == LabelUncertainAck {
 						uncertainCount.Add(1)
 						return
-					}
-					if out.Verdict.Label == LabelBackpressure {
-						shedCount.Add(1)
 					}
 					if out.Err == nil {
 						pending = [][]byte{row, row, row, row}
@@ -2493,9 +2481,6 @@ func TestWriterFloorRecoveryUnderConcurrentLoad(t *testing.T) {
 		if got := uncertainCount.Load(); got != 0 {
 			t.Fatalf("uncertain verdicts during floor recovery = %d, want 0", got)
 		}
-		if got := shedCount.Load(); got == 0 {
-			t.Fatal("expected concurrent callers at floor to experience backpressure shedding during recovery")
-		}
 		if _, _, _, _, retirements := obs.snapshot(); retirements != 0 {
 			t.Fatalf("stream retirements during floor recovery = %d, want 0", retirements)
 		}
@@ -2506,4 +2491,413 @@ func TestWriterFloorRecoveryUnderConcurrentLoad(t *testing.T) {
 			t.Fatalf("final EffectiveRequestBytes() = %d, want 1600 (ceiling)", got)
 		}
 	})
+}
+
+func TestWriterOversizeInflightRemainsRetryableAfterSiblingReachesFloor(t *testing.T) {
+	bp := NewBackpressureController(BackpressureOptions{
+		MinRequestBytes:     256,
+		MaxRequestBytes:     1024,
+		MinInflightRequests: 1,
+		MaxInflightRequests: 8,
+		DecreaseFactor:      0.5,
+		RecoveryInterval:    time.Minute,
+		LatencyThreshold:    time.Minute,
+	})
+
+	req1Sent := make(chan struct{})
+	releaseReq1 := make(chan struct{})
+	oversizeErr := status.Error(codes.ResourceExhausted, "Request payload size exceeds the limit")
+
+	var callNum atomic.Int32
+	s := &funcStream{
+		appendFn: func(_ context.Context, _ [][]byte) (appendResult, error) {
+			if callNum.Add(1) == 1 {
+				close(req1Sent)
+				return &blockingAppendResult{
+					release: releaseReq1,
+					err:     oversizeErr,
+				}, nil
+			}
+			return fakeResult{err: oversizeErr}, nil
+		},
+	}
+
+	w := &Writer{
+		opts: WriterOptions{
+			Project:             "p",
+			Dataset:             "d",
+			Table:               "otel_spans",
+			Signal:              "spans",
+			MaxRequestBytes:     1024,
+			MaxInflightRequests: 8,
+			Backpressure:        bp,
+		},
+		factory: func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+			return s, nil
+		},
+	}
+	defer func() { _ = w.Close() }()
+
+	row := make([]byte, 200)
+	done := make(chan AppendOutcome, 1)
+	go func() {
+		done <- w.Append(context.Background(), [][]byte{row, row, row})
+	}()
+
+	<-req1Sent
+	// Sibling throttles drive the controller down to the 256-byte floor while
+	// Call 1's 600-byte request (split under the old 1024-byte limit) is still
+	// in flight.
+	bp.effectiveBytes.Store(256)
+	bp.effectiveInflight.Store(1)
+	close(releaseReq1)
+
+	out := <-done
+	if out.Verdict.Class != Retryable || out.Verdict.Label != LabelOversizeRequest {
+		t.Fatalf("inflight oversize sub-request verdict = %+v, want Retryable/%s", out.Verdict, LabelOversizeRequest)
+	}
+	if out.Verdict.Owner != OwnerExporterHelper {
+		t.Fatalf("inflight oversize sub-request owner = %v, want %v", out.Verdict.Owner, OwnerExporterHelper)
+	}
+
+	// A multi-row sub-request sent after the floor is reached cannot be split
+	// any smaller (splitLimitBytes == floor == 256), so it remains Permanent.
+	outAtFloor := w.Append(context.Background(), [][]byte{make([]byte, 90), make([]byte, 90)})
+	if outAtFloor.Verdict.Class != Permanent || outAtFloor.Verdict.Label != LabelQuota {
+		t.Fatalf("already-at-floor sub-request verdict = %+v, want Permanent/%s", outAtFloor.Verdict, LabelQuota)
+	}
+}
+
+func TestWriterRecoveryWakesBlockedSlotWaiter(t *testing.T) {
+	var clockMu sync.Mutex
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	bp := NewBackpressureController(BackpressureOptions{
+		MinRequestBytes:     256,
+		MaxRequestBytes:     1024,
+		MinInflightRequests: 1,
+		MaxInflightRequests: 4,
+		DecreaseFactor:      0.5,
+		RecoveryInterval:    50 * time.Millisecond,
+		LatencyThreshold:    time.Second,
+		Now: func() time.Time {
+			clockMu.Lock()
+			defer clockMu.Unlock()
+			return now
+		},
+	})
+	bp.effectiveBytes.Store(1024)
+	bp.effectiveInflight.Store(1)
+
+	req1Sent := make(chan struct{})
+	releaseReq1 := make(chan struct{})
+	req2Dispatched := make(chan struct{})
+	var calls atomic.Int32
+
+	s := &funcStream{
+		appendFn: func(_ context.Context, _ [][]byte) (appendResult, error) {
+			switch calls.Add(1) {
+			case 1:
+				close(req1Sent)
+				return &blockingAppendResult{release: releaseReq1}, nil
+			case 2:
+				close(req2Dispatched)
+				return fakeResult{}, nil
+			default:
+				return fakeResult{}, nil
+			}
+		},
+	}
+
+	w := &Writer{
+		opts: WriterOptions{
+			Project:             "p",
+			Dataset:             "d",
+			Table:               "otel_spans",
+			Signal:              "spans",
+			MaxRequestBytes:     1024,
+			MaxInflightRequests: 4,
+			Backpressure:        bp,
+		},
+		factory: func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+			return s, nil
+		},
+	}
+	defer func() { _ = w.Close() }()
+
+	done1 := make(chan AppendOutcome, 1)
+	go func() {
+		done1 <- w.Append(context.Background(), [][]byte{make([]byte, 64)})
+	}()
+	<-req1Sent
+
+	done2 := make(chan AppendOutcome, 1)
+	go func() {
+		done2 <- w.Append(context.Background(), [][]byte{make([]byte, 64)})
+	}()
+
+	// Wait until Goroutine 2 is registered as a slot waiter while Request 1 holds slot 1/1.
+	waitDeadline := time.Now().Add(time.Second)
+	for {
+		w.mu.Lock()
+		gen := w.ms
+		waiting := gen != nil && gen.slotSignal != nil
+		w.mu.Unlock()
+		if waiting {
+			break
+		}
+		if time.Now().After(waitDeadline) {
+			t.Fatal("timed out waiting for second caller to block on slotSignal")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	clockMu.Lock()
+	now = now.Add(100 * time.Millisecond)
+	clockMu.Unlock()
+
+	w.mu.Lock()
+	gen := w.ms
+	w.mu.Unlock()
+	w.recordCleanOrSlowAck(5*time.Millisecond, gen)
+	if got := bp.EffectiveInflightRequests(); got != 2 {
+		t.Fatalf("EffectiveInflightRequests() after clean ack = %d, want 2", got)
+	}
+
+	// Goroutine 2 must wake up and dispatch Request 2 BEFORE Request 1 finishes.
+	select {
+	case <-req2Dispatched:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("blocked slot waiter was not woken when window stepped up from 1 to 2")
+	}
+
+	close(releaseReq1)
+	if out := <-done1; out.Err != nil {
+		t.Fatalf("Request 1 outcome error = %v, want nil", out.Err)
+	}
+	if out := <-done2; out.Err != nil {
+		t.Fatalf("Request 2 outcome error = %v, want nil", out.Err)
+	}
+}
+
+func TestWriterAsyncReadyWatcherExcludesHeadOfLineDrainDelay(t *testing.T) {
+	bp := NewBackpressureController(BackpressureOptions{
+		MinRequestBytes:     256,
+		MaxRequestBytes:     256,
+		MinInflightRequests: 1,
+		MaxInflightRequests: 4,
+		DecreaseFactor:      0.5,
+		RecoveryInterval:    time.Minute,
+		LatencyThreshold:    100 * time.Millisecond,
+	})
+
+	obs := &fakeObserver{}
+	var calls atomic.Int32
+	s := &funcStream{
+		appendFn: func(_ context.Context, _ [][]byte) (appendResult, error) {
+			switch calls.Add(1) {
+			case 1:
+				// Sub-request 0 takes 220ms and fails with a non-throttle error
+				// (LabelInternal), holding drainOne at the head of the line.
+				return newDelayedAppendResult(220*time.Millisecond, status.Error(codes.Internal, "transient internal failure")), nil
+			default:
+				// Sub-request 1 finishes in 10ms (< 100ms LatencyThreshold) while
+				// drainOne is still blocked on Sub-request 0.
+				return newDelayedAppendResult(10*time.Millisecond, nil), nil
+			}
+		},
+	}
+
+	w := &Writer{
+		opts: WriterOptions{
+			Project:             "p",
+			Dataset:             "d",
+			Table:               "otel_spans",
+			Signal:              "spans",
+			MaxRequestBytes:     256,
+			MaxInflightRequests: 4,
+			Observer:            obs,
+			Backpressure:        bp,
+		},
+		factory: func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+			return s, nil
+		},
+	}
+	defer func() { _ = w.Close() }()
+
+	row := make([]byte, 200)
+	out := w.Append(context.Background(), [][]byte{row, row})
+	if out.AcknowledgedRows != 1 {
+		t.Fatalf("AcknowledgedRows = %d, want 1 (second sub-request acked)", out.AcknowledgedRows)
+	}
+	if got := bp.EffectiveInflightRequests(); got != 4 {
+		t.Fatalf("EffectiveInflightRequests() = %d, want 4 (Sub-request 1 ready at 10ms must not count 220ms head-of-line delay)", got)
+	}
+	obs.mu.Lock()
+	events := append([]string(nil), obs.backpressureEvents...)
+	obs.mu.Unlock()
+	if len(events) != 0 {
+		t.Fatalf("backpressure events = %v, want none", events)
+	}
+}
+
+func TestWriterSiblingTeardownDoesNotThrottleController(t *testing.T) {
+	bp := NewBackpressureController(BackpressureOptions{
+		MinRequestBytes:     256,
+		MaxRequestBytes:     1024,
+		MinInflightRequests: 1,
+		MaxInflightRequests: 4,
+		DecreaseFactor:      0.5,
+		RecoveryInterval:    time.Minute,
+		LatencyThreshold:    time.Minute,
+	})
+
+	obs := &fakeObserver{}
+	bothDispatched := make(chan struct{})
+	streamRetired := make(chan struct{})
+	var calls atomic.Int32
+	var closeOnce sync.Once
+
+	s := &funcStream{
+		appendFn: func(_ context.Context, _ [][]byte) (appendResult, error) {
+			n := calls.Add(1)
+			if n == 2 {
+				close(bothDispatched)
+			}
+			return &callbackAppendResult{
+				getFn: func(context.Context) (int64, error) {
+					<-bothDispatched
+					if n == 1 {
+						// Non-throttle stream failure retires the generation.
+						return 0, status.Error(codes.FailedPrecondition, "stream is closed")
+					}
+					// Sibling waits until Call 1 retires the stream, then sees
+					// local stream teardown (codes.Canceled -> siblingTeardown).
+					<-streamRetired
+					return 0, status.Error(codes.Canceled, "canceled by stream teardown")
+				},
+			}, nil
+		},
+		closeFn: func() error {
+			closeOnce.Do(func() { close(streamRetired) })
+			return nil
+		},
+	}
+
+	w := &Writer{
+		opts: WriterOptions{
+			Project:             "p",
+			Dataset:             "d",
+			Table:               "otel_spans",
+			Signal:              "spans",
+			MaxRequestBytes:     1024,
+			MaxInflightRequests: 4,
+			Observer:            obs,
+			Backpressure:        bp,
+		},
+		factory: func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+			return s, nil
+		},
+	}
+	defer func() { _ = w.Close() }()
+
+	outcomes := make(chan AppendOutcome, 2)
+	for range 2 {
+		go func() {
+			outcomes <- w.Append(context.Background(), [][]byte{make([]byte, 64)})
+		}()
+	}
+
+	var sawUncertain bool
+	for range 2 {
+		out := <-outcomes
+		if out.Verdict.Label == LabelUncertainAck {
+			sawUncertain = true
+		}
+	}
+	if !sawUncertain {
+		t.Fatal("expected sibling teardown call to receive LabelUncertainAck")
+	}
+	if got := bp.EffectiveInflightRequests(); got != 4 {
+		t.Fatalf("EffectiveInflightRequests() = %d, want 4 (sibling teardown must not throttle controller)", got)
+	}
+	if got := bp.EffectiveRequestBytes(); got != 1024 {
+		t.Fatalf("EffectiveRequestBytes() = %d, want 1024", got)
+	}
+	obs.mu.Lock()
+	events := append([]string(nil), obs.backpressureEvents...)
+	obs.mu.Unlock()
+	if len(events) != 0 {
+		t.Fatalf("backpressure events = %v, want none", events)
+	}
+}
+
+type funcStream struct {
+	appendFn func(context.Context, [][]byte) (appendResult, error)
+	closeFn  func() error
+}
+
+func (f *funcStream) AppendRows(ctx context.Context, rows [][]byte, _ ...managedwriter.AppendOption) (appendResult, error) {
+	return f.appendFn(ctx, rows)
+}
+
+func (f *funcStream) Close() error {
+	if f.closeFn != nil {
+		return f.closeFn()
+	}
+	return nil
+}
+
+type blockingAppendResult struct {
+	release <-chan struct{}
+	err     error
+}
+
+func (r *blockingAppendResult) Ready() <-chan struct{} {
+	return r.release
+}
+
+func (r *blockingAppendResult) GetResult(ctx context.Context) (int64, error) {
+	select {
+	case <-r.release:
+		return 0, r.err
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+func (r *blockingAppendResult) FullResponse(ctx context.Context) (*storagepb.AppendRowsResponse, error) {
+	_, err := r.GetResult(ctx)
+	return nil, err
+}
+
+type callbackAppendResult struct {
+	ready <-chan struct{}
+	getFn func(context.Context) (int64, error)
+}
+
+func (r *callbackAppendResult) Ready() <-chan struct{} {
+	if r.ready != nil {
+		return r.ready
+	}
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}
+
+func (r *callbackAppendResult) GetResult(ctx context.Context) (int64, error) {
+	return r.getFn(ctx)
+}
+
+func (r *callbackAppendResult) FullResponse(ctx context.Context) (*storagepb.AppendRowsResponse, error) {
+	_, err := r.GetResult(ctx)
+	return nil, err
+}
+
+func newDelayedAppendResult(delay time.Duration, err error) appendResult {
+	ready := make(chan struct{})
+	go func() {
+		time.Sleep(delay)
+		close(ready)
+	}()
+	return &blockingAppendResult{release: ready, err: err}
 }

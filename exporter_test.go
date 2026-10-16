@@ -25,6 +25,7 @@ import (
 	"go.opentelemetry.io/collector/component/componentstatus"
 	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/consumer/consumererror"
+	"go.opentelemetry.io/collector/exporter/exportertest"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -44,6 +45,7 @@ import (
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/offload"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/protoenc"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/testfakes/bqfake"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
 )
 
@@ -3197,5 +3199,155 @@ func TestOffloadDedupHitsSelfTelemetry(t *testing.T) {
 	}
 	if got := metricInt64SumWithAttr(t, reader, "otelcol_exporter_bigquery_offload_dedup_hits", "signal", "spans"); got != 2 {
 		t.Errorf("offload_dedup_hits{signal=spans} = %d, want 2 (1 intra-batch + 1 cross-batch)", got)
+	}
+}
+
+func TestShutdownFlushWithReducedWindow(t *testing.T) {
+	tests := []struct {
+		name              string
+		backpressure      bool
+		maxInflight       int
+		retriesEnabled    bool
+		stepWindowToFloor bool
+	}{
+		{
+			name:           "backpressure_off",
+			backpressure:   false,
+			maxInflight:    8,
+			retriesEnabled: true,
+		},
+		{
+			name:           "backpressure_off_static_window_1",
+			backpressure:   false,
+			maxInflight:    1,
+			retriesEnabled: true,
+		},
+		{
+			name:              "backpressure_on_window_reduced",
+			backpressure:      true,
+			maxInflight:       8,
+			retriesEnabled:    true,
+			stepWindowToFloor: true,
+		},
+		{
+			name:              "backpressure_on_window_reduced_retries_disabled",
+			backpressure:      true,
+			maxInflight:       8,
+			retriesEnabled:    false,
+			stepWindowToFloor: true,
+		},
+	}
+
+	makeOneSpanBatch := func(seq int) ptrace.Traces {
+		now := time.Date(2026, 8, 12, 16, 0, 0, 0, time.UTC)
+		td := ptrace.NewTraces()
+		rs := td.ResourceSpans().AppendEmpty()
+		rs.Resource().Attributes().PutStr("service.name", "shutdown-flush-test")
+		sp := rs.ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+		sp.SetTraceID(pcommon.TraceID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, byte(seq + 1)})
+		sp.SetSpanID(pcommon.SpanID{1, 2, 3, 4, 5, 6, 7, byte(seq + 1)})
+		sp.SetName(fmt.Sprintf("span-%d", seq))
+		sp.SetKind(ptrace.SpanKindInternal)
+		sp.SetStartTimestamp(pcommon.NewTimestampFromTime(now))
+		sp.SetEndTimestamp(pcommon.NewTimestampFromTime(now.Add(5 * time.Millisecond)))
+		return td
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := bqfake.NewServer(t)
+			ctx := context.Background()
+
+			factory := NewFactory()
+			cfg := factory.CreateDefaultConfig().(*Config)
+			cfg.Project = "my-project"
+			cfg.Dataset = "otel"
+			cfg.Endpoint.URL = srv.Addr()
+			cfg.Endpoint.Insecure = true
+			cfg.Endpoint.WithoutAuthentication = true
+			cfg.TimeoutSettings.Timeout = 5 * time.Second
+			cfg.Write.MaxInflightRequests = tc.maxInflight
+			cfg.QueueSettings.Get().NumConsumers = 8
+			cfg.QueueSettings.Get().QueueSize = 1000
+			cfg.BackOffConfig.Enabled = tc.retriesEnabled
+			cfg.BackOffConfig.InitialInterval = 10 * time.Millisecond
+			cfg.BackOffConfig.MaxInterval = 50 * time.Millisecond
+			cfg.Write.Backpressure.Enabled = tc.backpressure
+			cfg.Write.Backpressure.MinInflightRequests = 1
+			cfg.Write.Backpressure.DecreaseFactor = 0.5
+			cfg.Write.Backpressure.RecoveryInterval = time.Minute
+			cfg.Write.Backpressure.LatencyThreshold = 2 * time.Second
+
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("cfg.Validate: %v", err)
+			}
+
+			exp, err := factory.CreateTraces(ctx, exportertest.NewNopSettings(factory.Type()), cfg)
+			if err != nil {
+				t.Fatalf("CreateTraces: %v", err)
+			}
+			if err := exp.Start(ctx, componenttest.NewNopHost()); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+
+			if tc.stepWindowToFloor {
+				// Step the adaptive window down 8 -> 4 -> 2 -> 1 using three
+				// quota faults spaced past the 250ms throttle debounce.
+				for step := range 3 {
+					_, beforeReqs, _ := srv.Counts()
+					srv.EnqueueFault(bqfake.Fault{
+						Mode:  bqfake.FaultResourceExhausted,
+						Table: "otel_spans",
+					})
+					_ = exp.ConsumeTraces(ctx, makeOneSpanBatch(100+step))
+					waitDeadline := time.Now().Add(2 * time.Second)
+					for {
+						_, reqs, _ := srv.Counts()
+						if reqs > beforeReqs {
+							break
+						}
+						if time.Now().After(waitDeadline) {
+							t.Fatalf("step %d: timed out waiting for quota fault request", step)
+						}
+						time.Sleep(5 * time.Millisecond)
+					}
+					if tc.retriesEnabled {
+						// Wait for the retry of the step-down span to flush before next step.
+						for srv.RowCount("otel_spans") < step+1 && time.Now().Before(waitDeadline) {
+							time.Sleep(5 * time.Millisecond)
+						}
+					}
+					time.Sleep(275 * time.Millisecond)
+				}
+				srv.ResetRows()
+			}
+
+			const totalSpans = 48
+			faults := make([]bqfake.Fault, totalSpans)
+			for i := range faults {
+				faults[i] = bqfake.Fault{
+					Mode:  bqfake.FaultDelayedAck,
+					Table: "otel_spans",
+					Delay: 20 * time.Millisecond,
+				}
+			}
+			srv.EnqueueFault(faults...)
+
+			for i := range totalSpans {
+				if err := exp.ConsumeTraces(ctx, makeOneSpanBatch(i)); err != nil {
+					t.Fatalf("ConsumeTraces(%d): %v", i, err)
+				}
+			}
+
+			shutdownCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			if err := exp.Shutdown(shutdownCtx); err != nil {
+				t.Fatalf("Shutdown: %v", err)
+			}
+
+			if got := srv.RowCount("otel_spans"); got != totalSpans {
+				t.Fatalf("flushed spans at Shutdown = %d, want %d (all queued spans must drain without premature shedding)", got, totalSpans)
+			}
+		})
 	}
 }

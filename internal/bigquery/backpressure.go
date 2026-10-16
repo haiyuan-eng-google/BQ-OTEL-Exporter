@@ -46,6 +46,7 @@ type BackpressureController struct {
 
 	effectiveBytes    atomic.Int64
 	effectiveInflight atomic.Int64
+	ackLatencyNanos   atomic.Int64
 
 	mu           sync.Mutex
 	lastDecrease time.Time
@@ -118,6 +119,34 @@ func (c *BackpressureController) LatencyThreshold() time.Duration {
 	return c.opts.LatencyThreshold
 }
 
+// MaxAckLatency returns the controller's recent acknowledgement latency
+// estimate, or 0 before any server acknowledgement has been observed.
+func (c *BackpressureController) MaxAckLatency() time.Duration {
+	return time.Duration(c.ackLatencyNanos.Load())
+}
+
+// ObserveAckLatency updates the controller's recent server acknowledgement
+// latency estimate. Spikes raise the estimate immediately; faster acks decay
+// it gradually so a single old outlier cannot starve later deadline budgets.
+func (c *BackpressureController) ObserveAckLatency(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	ns := int64(d)
+	for {
+		cur := c.ackLatencyNanos.Load()
+		var next int64
+		if cur <= 0 || ns >= cur {
+			next = ns
+		} else {
+			next = cur - (cur-ns)/4
+		}
+		if c.ackLatencyNanos.CompareAndSwap(cur, next) {
+			return
+		}
+	}
+}
+
 // Level returns the current backpressure level in [0.0, 1.0], where 0 means
 // the controller is at its configured ceiling and 1 means either effective
 // request bytes or effective in-flight requests has reached its configured
@@ -166,6 +195,7 @@ func (c *BackpressureController) OnSlowAck(d time.Duration) bool {
 // congestion or recovery event. It returns true when the effective byte
 // threshold or in-flight limit stepped up.
 func (c *BackpressureController) OnCleanAck(d time.Duration) bool {
+	c.ObserveAckLatency(d)
 	if c.opts.LatencyThreshold > 0 && d > c.opts.LatencyThreshold {
 		return false
 	}
