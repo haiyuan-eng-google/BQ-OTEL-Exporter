@@ -535,6 +535,11 @@ func (w *Writer) observeBackpressureTransition(trigger string) {
 	w.opts.Observer.RecordEffectiveRequestBytes(ctx, w.opts.Signal, w.opts.Table, int64(w.opts.Backpressure.EffectiveRequestBytes()))
 }
 
+// isBackpressureThrottle reports whether a non-permanent server failure should
+// step the adaptive controller down. Client-side attempt expiries
+// (attemptEnded == true) are routed to OnSlowAck in recordFailureFeedback
+// before reaching this switch, so LabelUncertainAck here applies only to
+// server-returned codes.DeadlineExceeded when the caller's context is still live.
 func isBackpressureThrottle(v Verdict) bool {
 	if v.Class == Permanent {
 		return false
