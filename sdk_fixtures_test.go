@@ -703,7 +703,8 @@ func TestAllSevenAgentFrameworkGoldenFixturesEndToEnd(t *testing.T) {
 }
 
 // spanReasoningCount reads reasoning tokens off a span's attributes using the
-// v1.41+ key first and the earlier key second.
+// v1.41.0 key (gen_ai.usage.reasoning.output_tokens) first and the legacy
+// pre-semconv alias (gen_ai.usage.reasoning_tokens) second.
 func spanReasoningCount(attrs map[string]any) (float64, bool) {
 	for _, key := range []string{"gen_ai.usage.reasoning.output_tokens", "gen_ai.usage.reasoning_tokens"} {
 		switch v := attrs[key].(type) {
@@ -1143,19 +1144,20 @@ func TestScenarioGoldenFixturesEndToEnd(t *testing.T) {
 		t.Errorf("parallel tool spans parent_span_id = (%v, %v), want both 00f067aa0ba902b9", tool1.row["parent_span_id"], tool2.row["parent_span_id"])
 	}
 
-	// 2. MCP scenario: protocol lifecycle, SERVER span kind, and failed tools/call
-	//    carrying gen_ai.tool.name + JSON-RPC error code without GenAI operation/provider.
+	// 2. MCP scenario: protocol lifecycle, CLIENT/SERVER span kinds, and failed
+	//    tools/call carrying gen_ai.tool.name + JSON-RPC error code without GenAI operation/provider.
 	for _, wantMCP := range []struct {
 		sid       string
 		parentSID any
+		kind      int64
 		method    string
 		reqID     string
 	}{
-		{sid: "9f8e7d6c5b4a0001", parentSID: nil, method: "initialize", reqID: "req-1"},
-		{sid: "9f8e7d6c5b4a0002", parentSID: "9f8e7d6c5b4a0001", method: "tools/list", reqID: "req-2"},
-		{sid: "9f8e7d6c5b4a0003", parentSID: "9f8e7d6c5b4a0001", method: "tools/call", reqID: "req-3"},
-		{sid: "9f8e7d6c5b4a0004", parentSID: "9f8e7d6c5b4a0001", method: "tools/call", reqID: "req-4"},
-		{sid: "9f8e7d6c5b4a0005", parentSID: "9f8e7d6c5b4a0001", method: "resources/read", reqID: "req-5"},
+		{sid: "9f8e7d6c5b4a0001", parentSID: nil, kind: 3, method: "initialize", reqID: "req-1"},
+		{sid: "9f8e7d6c5b4a0002", parentSID: "9f8e7d6c5b4a0001", kind: 3, method: "tools/list", reqID: "req-2"},
+		{sid: "9f8e7d6c5b4a0003", parentSID: "9f8e7d6c5b4a0001", kind: 3, method: "tools/call", reqID: "req-3"},
+		{sid: "9f8e7d6c5b4a0004", parentSID: "9f8e7d6c5b4a0001", kind: 3, method: "tools/call", reqID: "req-4"},
+		{sid: "9f8e7d6c5b4a0005", parentSID: "9f8e7d6c5b4a0001", kind: 2, method: "resources/read", reqID: "req-5"},
 	} {
 		sf, ok := spansByID[wantMCP.sid]
 		if !ok {
@@ -1163,6 +1165,9 @@ func TestScenarioGoldenFixturesEndToEnd(t *testing.T) {
 		}
 		if sf.row["parent_span_id"] != wantMCP.parentSID {
 			t.Errorf("mcp span %s parent_span_id = %v, want %v", wantMCP.sid, sf.row["parent_span_id"], wantMCP.parentSID)
+		}
+		if sf.row["kind"] != wantMCP.kind {
+			t.Errorf("mcp span %s kind = %v, want %d", wantMCP.sid, sf.row["kind"], wantMCP.kind)
 		}
 		if sf.attrs["mcp.method.name"] != wantMCP.method ||
 			sf.attrs["mcp.protocol.version"] != "2025-06-18" ||
@@ -1199,6 +1204,12 @@ func TestScenarioGoldenFixturesEndToEnd(t *testing.T) {
 			if scope, _ := l["instrumentation_scope"].(map[string]any); scope["version"] != "0.1.0" {
 				t.Errorf("multi_agent log scope.version = %v, want %q", scope["version"], "0.1.0")
 			}
+			resAttrs := decodeResourceAttributes(t, l)
+			if resAttrs["gen_ai.main_agent.id"] != "agent-planner-1" ||
+				resAttrs["gen_ai.main_agent.name"] != "planner" ||
+				resAttrs["gen_ai.main_agent.description"] != "Top-level planner coordinating researcher and tool workers" {
+				t.Errorf("multi_agent log resource.attributes = %v, missing gen_ai.main_agent.{id,name,description}", resAttrs)
+			}
 		}
 		tid, _ := l["trace_id"].(string)
 		sid, _ := l["span_id"].(string)
@@ -1222,6 +1233,12 @@ func TestScenarioGoldenFixturesEndToEnd(t *testing.T) {
 		if svc == "multi-agent-planner" {
 			if scope, _ := r["instrumentation_scope"].(map[string]any); scope["version"] != "0.1.0" {
 				t.Errorf("multi_agent metric scope.version = %v, want %q", scope["version"], "0.1.0")
+			}
+			resAttrs := decodeResourceAttributes(t, r)
+			if resAttrs["gen_ai.main_agent.id"] != "agent-planner-1" ||
+				resAttrs["gen_ai.main_agent.name"] != "planner" ||
+				resAttrs["gen_ai.main_agent.description"] != "Top-level planner coordinating researcher and tool workers" {
+				t.Errorf("multi_agent metric resource.attributes = %v, missing gen_ai.main_agent.{id,name,description}", resAttrs)
 			}
 		}
 		name, _ := r["metric_name"].(string)

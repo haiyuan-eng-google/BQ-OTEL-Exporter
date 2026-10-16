@@ -630,8 +630,8 @@ func normalizeSQL(sql string) string {
 }
 
 // The reasoning token count arrives under gen_ai.usage.reasoning.output_tokens
-// (semantic-conventions-genai@f3c6d0c9) and, from v1.40.0 instrumentation,
-// under gen_ai.usage.reasoning_tokens, and the current key must win.
+// (v1.41.0 and semantic-conventions-genai@f3c6d0c9) and under the legacy
+// pre-semconv alias gen_ai.usage.reasoning_tokens, and the current key must win.
 // error.type and the main-agent (semantic-conventions-genai@f3c6d0c9),
 // agent-version and response-id (v1.40.0), and time-to-first-chunk (v1.41.0)
 // attributes are promoted as additive columns.

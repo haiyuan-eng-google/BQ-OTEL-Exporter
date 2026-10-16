@@ -92,6 +92,6 @@ scenarios:
   - id: mcp
     kind: scenario
     provenance: synthetic
-    semconv_version: "1.40.0+1.41.0+genai-dev"
+    semconv_version: "1.40.0"
     signals: [traces]
     traces_file: mcp/traces.json

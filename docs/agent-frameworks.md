@@ -287,15 +287,18 @@ attribute variants into typed top-level columns over `otel_spans_dedup` and
 `otel_logs_dedup` while keeping the raw transport tables schema-pure.
 `v_gen_ai_metrics` does the same for the `gen_ai.*` metric points over
 `otel_metrics_dedup`. For reasoning tokens, `v_gen_ai_spans` reads
-`gen_ai.usage.reasoning.output_tokens` first and the earlier
-`gen_ai.usage.reasoning_tokens` spelling second. Against OpenTelemetry Semantic Conventions `1.40.0+1.41.0+genai-dev` (`1.40.0`
-GenAI spans, logs, client metrics, `gen_ai.agent.version`, `gen_ai.response.id`,
-`gen_ai.usage.reasoning_tokens`, `gen_ai.usage.cache_read.input_tokens`,
+`gen_ai.usage.reasoning.output_tokens` first and the legacy pre-semconv alias
+`gen_ai.usage.reasoning_tokens` (which no published `semantic-conventions`
+release defines) second for backward compatibility. Against OpenTelemetry
+Semantic Conventions `1.40.0+1.41.0+genai-dev` (`1.40.0` GenAI spans, logs,
+client metrics, `gen_ai.agent.version`, `gen_ai.response.id`,
+`gen_ai.provider.name`, `gen_ai.usage.cache_read.input_tokens`,
 `gen_ai.usage.cache_creation.input_tokens`, and MCP conventions; `1.41.0`
-`gen_ai.response.time_to_first_chunk`; and `semantic-conventions-genai@f3c6d0c9`
+`gen_ai.response.time_to_first_chunk` and `gen_ai.usage.reasoning.output_tokens`;
+and `semantic-conventions-genai@f3c6d0c9`
 (`f3c6d0c9bb66ebd474668a3a0be25c61226f02c2`, labeled `genai-dev` in the manifest
-target) `gen_ai.main_agent.*`, `gen_ai.usage.reasoning.output_tokens`,
-`gen_ai.client.inference.usage.*`, and `gen_ai.token.modality`), `v_gen_ai_spans` also
+target) `gen_ai.main_agent.*`, `gen_ai.token.modality`, and
+`gen_ai.client.inference.usage.*`), `v_gen_ai_spans` also
 promotes `gen_ai.main_agent.{id,name,description}` and `gen_ai.agent.version`
 (coalescing span `attributes` first and `resource.attributes` second),
 `gen_ai.response.id`, and `gen_ai.response.time_to_first_chunk` (and admits
@@ -322,14 +325,17 @@ Beyond the single-framework captures in `testdata/otlp/`, the manifest lists
 synthetic multi-span scenario fixtures (`kind: scenario`, `provenance: synthetic`)
 that exercise delegation hierarchies, parallel tool calls, orphan spans, error
 types, and Model Context Protocol (MCP) telemetry against OpenTelemetry
-Semantic Conventions `1.40.0+1.41.0+genai-dev` (`1.40.0` GenAI baseline,
-`gen_ai.agent.version`, `gen_ai.response.id`, and `mcp.*`; `1.41.0`
-`gen_ai.response.time_to_first_chunk`; and `semantic-conventions-genai@f3c6d0c9`
+Semantic Conventions (`1.40.0` for `mcp` and `1.40.0+1.41.0+genai-dev` for
+`multi_agent`: `1.40.0` GenAI baseline, `gen_ai.agent.version`,
+`gen_ai.response.id`, `gen_ai.provider.name`, and `mcp.*`; `1.41.0`
+`gen_ai.usage.reasoning.output_tokens`, plus the legacy pre-semconv alias
+`gen_ai.usage.reasoning_tokens` in `multi_agent/traces.json`; and
+`semantic-conventions-genai@f3c6d0c9`
 (`f3c6d0c9bb66ebd474668a3a0be25c61226f02c2`, labeled `genai-dev` in the manifest
-target) `gen_ai.main_agent.*`, `gen_ai.usage.reasoning.output_tokens`,
-`gen_ai.client.inference.usage.*`, and `gen_ai.token.modality`).
+target) `gen_ai.main_agent.*`, `gen_ai.token.modality`, and
+`gen_ai.client.inference.usage.*`).
 
 | Scenario ID | Semconv target | Signals | Fixture files | Coverage |
 | --- | --- | --- | --- | --- |
-| `multi_agent` | `1.40.0+1.41.0+genai-dev` | Traces, logs, metrics | `testdata/otlp/multi_agent/{traces,logs,metrics}.json` | Two-level `invoke_agent` delegation in a three-level span tree (`planner` -> `researcher` linked via `parent_span_id`), `gen_ai.main_agent.*` on `resource.attributes`, parallel `execute_tool` spans, failed `chat` and tool spans with `error.type`, orphan child span, both reasoning-token spellings, legacy `gen_ai.client.token.usage` + `gen_ai.client.operation.duration` delta histograms, and `gen_ai.client.inference.usage.*` monotonic delta `Sum` counters with span exemplars. |
-| `mcp` | `1.40.0+1.41.0+genai-dev` | Traces | `testdata/otlp/mcp/traces.json` | MCP session lifecycle (`initialize`, `tools/list`, `tools/call`, `resources/read`), dual-tagged GenAI + MCP tool call vs. pure MCP protocol spans, `SERVER` span kind, and failed `tools/call` carrying `gen_ai.tool.name` + JSON-RPC `error.type = "-32603"`. |
+| `multi_agent` | `1.40.0+1.41.0+genai-dev` | Traces, logs, metrics | `testdata/otlp/multi_agent/{traces,logs,metrics}.json` | Two-level `invoke_agent` delegation in a three-level span tree (`planner` -> `researcher` linked via `parent_span_id`), `gen_ai.main_agent.*` on `resource.attributes`, parallel `execute_tool` spans, failed `chat` and tool spans with `error.type`, orphan child span, both reasoning-token spellings (`1.41.0` `gen_ai.usage.reasoning.output_tokens` and legacy pre-semconv `gen_ai.usage.reasoning_tokens`), legacy `gen_ai.client.token.usage` + `gen_ai.client.operation.duration` delta histograms, and `gen_ai.client.inference.usage.*` monotonic delta `Sum` counters with span exemplars. |
+| `mcp` | `1.40.0` | Traces | `testdata/otlp/mcp/traces.json` | MCP session lifecycle (`initialize`, `tools/list`, `tools/call`, `resources/read`), dual-tagged GenAI + MCP tool call vs. pure MCP protocol spans, `SERVER` span kind, and failed `tools/call` carrying `gen_ai.tool.name` + JSON-RPC `error.type = "-32603"`. |
