@@ -348,6 +348,214 @@ func TestReconcileAdditiveSchema(t *testing.T) {
 	}
 }
 
+const testPolicyTag = "projects/p/locations/us/taxonomies/1/policyTags/2"
+
+// The schema update sends the whole schema back, so the reconciled schema
+// carries every policy tag the live table has, as a copy: on a top-level
+// column, on a field of a RECORD that gains a field, and on a field of a
+// RECORD that gains nothing.
+func TestReconcileAdditiveSchemaKeepsPolicyTags(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		want *storagepb.TableSchema
+		// drop names the fields the live table lacks, so that reconciliation
+		// adds them, and tagged the fields the live table tags.
+		drop, tagged []string
+	}{
+		{
+			name:   "quarantine",
+			want:   QuarantineTableSchema(),
+			drop:   []string{"exporter_instance"},
+			tagged: []string{"raw_payload", "error_message"},
+		},
+		{
+			name:   "spans",
+			want:   SpansTableSchema(),
+			drop:   []string{"scope_schema_url", "payload_refs.object_ref.details"},
+			tagged: []string{"status.message", "payload_refs.object_ref.uri"},
+		},
+		{
+			name:   "logs",
+			want:   LogsTableSchema(),
+			drop:   []string{"record_fingerprint"},
+			tagged: []string{"severity_text", "payload_refs.object_ref.uri"},
+		},
+		{
+			name:   "metrics",
+			want:   MetricsTableSchema(),
+			drop:   []string{"scope_schema_url"},
+			tagged: []string{"metric_description", "exemplars.trace_id"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			live := liveSchema(t, tc.want, tc.drop, tc.tagged)
+			merged, changed, err := ReconcileAdditiveSchema(live, tc.want)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !changed {
+				t.Fatalf("live schema lacks %v, but reconciliation reports no change", tc.drop)
+			}
+			for _, path := range tc.drop {
+				if fieldAt(merged, path) == nil {
+					t.Errorf("reconciled schema lacks %s", path)
+				}
+			}
+			assertPolicyTagsCopied(t, merged, live, tc.tagged)
+		})
+	}
+}
+
+// A RECORD the exporter's schema does not have, such as a column an operator
+// added, is copied with its nested policy tags.
+func TestReconcileAdditiveSchemaKeepsPolicyTagsOfUnknownRecords(t *testing.T) {
+	live := liveSchema(t, QuarantineTableSchema(), []string{"exporter_instance"}, nil)
+	live = append(live, &bq.FieldSchema{Name: "operator_notes", Type: bq.RecordFieldType, Schema: bq.Schema{
+		{Name: "text", Type: bq.StringFieldType, PolicyTags: &bq.PolicyTagList{Names: []string{testPolicyTag}}},
+	}})
+	merged, changed, err := ReconcileAdditiveSchema(live, QuarantineTableSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("live schema lacks exporter_instance, but reconciliation reports no change")
+	}
+	assertPolicyTagsCopied(t, merged, live, []string{"operator_notes.text"})
+}
+
+// A live table whose schema differs from the exporter's only in its policy
+// tags needs no update, and the schema reconciliation returns still carries
+// the tags.
+func TestReconcileAdditiveSchemaIgnoresPolicyTagOnlyDifferences(t *testing.T) {
+	for name, tc := range map[string]struct {
+		want   *storagepb.TableSchema
+		tagged []string
+	}{
+		"quarantine": {QuarantineTableSchema(), []string{"raw_payload", "error_message"}},
+		"spans":      {SpansTableSchema(), []string{"status.message", "payload_refs.object_ref.uri"}},
+		"logs":       {LogsTableSchema(), []string{"severity_text"}},
+		"metrics":    {MetricsTableSchema(), []string{"metric_description"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			live := liveSchema(t, tc.want, nil, tc.tagged)
+			merged, changed, err := ReconcileAdditiveSchema(live, tc.want)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if changed {
+				t.Error("live schema differs only in policy tags, but reconciliation reports a change")
+			}
+			assertPolicyTagsCopied(t, merged, live, tc.tagged)
+		})
+	}
+}
+
+// ReconcileAdditiveSchema relies on the exporter's own schemas carrying no
+// policy tags: reconciliation keeps the live table's tags and never sets any.
+func TestToBigQuerySetsNoPolicyTags(t *testing.T) {
+	for name, in := range map[string]*storagepb.TableSchema{
+		"spans":      SpansTableSchema(),
+		"logs":       LogsTableSchema(),
+		"metrics":    MetricsTableSchema(),
+		"quarantine": QuarantineTableSchema(),
+	} {
+		got, err := ToBigQuery(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tagged := taggedFields(got, ""); len(tagged) != 0 {
+			t.Errorf("%s: ToBigQuery sets policy tags on %v", name, tagged)
+		}
+	}
+}
+
+// liveSchema returns the BigQuery schema of want as a live table might return
+// it: without the fields at the drop paths, and with testPolicyTag on the
+// fields at the tagged paths. Paths are dotted, for example status.message.
+func liveSchema(t *testing.T, want *storagepb.TableSchema, drop, tagged []string) bq.Schema {
+	t.Helper()
+	live, err := ToBigQuery(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range drop {
+		fields := &live
+		name := path
+		if i := strings.LastIndex(path, "."); i >= 0 {
+			parent := fieldAt(live, path[:i])
+			if parent == nil {
+				t.Fatalf("schema has no field %s", path[:i])
+			}
+			fields, name = &parent.Schema, path[i+1:]
+		}
+		before := len(*fields)
+		*fields = slices.DeleteFunc(*fields, func(f *bq.FieldSchema) bool { return f.Name == name })
+		if len(*fields) != before-1 {
+			t.Fatalf("schema has no field %s to drop", path)
+		}
+	}
+	for _, path := range tagged {
+		f := fieldAt(live, path)
+		if f == nil {
+			t.Fatalf("schema has no field %s to tag", path)
+		}
+		f.PolicyTags = &bq.PolicyTagList{Names: []string{testPolicyTag}}
+	}
+	return live
+}
+
+// assertPolicyTagsCopied fails unless exactly the fields at the tagged paths
+// of merged carry testPolicyTag, each in a list that shares no memory with the
+// list the same field has in live.
+func assertPolicyTagsCopied(t *testing.T, merged, live bq.Schema, tagged []string) {
+	t.Helper()
+	if got := taggedFields(merged, ""); !slices.Equal(got, slices.Sorted(slices.Values(tagged))) {
+		t.Errorf("reconciled schema tags %v, want %v", got, slices.Sorted(slices.Values(tagged)))
+	}
+	for _, path := range tagged {
+		got, was := fieldAt(merged, path), fieldAt(live, path)
+		if got == nil || got.PolicyTags == nil || !slices.Equal(got.PolicyTags.Names, []string{testPolicyTag}) {
+			t.Errorf("reconciled %s policy tags = %+v, want [%s]", path, got, testPolicyTag)
+			continue
+		}
+		if got.PolicyTags == was.PolicyTags || &got.PolicyTags.Names[0] == &was.PolicyTags.Names[0] {
+			t.Errorf("reconciled %s shares its policy tags with the live schema", path)
+		}
+	}
+}
+
+// fieldAt returns the field at the dotted path in s, or nil when there is none.
+func fieldAt(s bq.Schema, path string) *bq.FieldSchema {
+	name, rest, nested := strings.Cut(path, ".")
+	for _, f := range s {
+		if f == nil || f.Name != name {
+			continue
+		}
+		if !nested {
+			return f
+		}
+		return fieldAt(f.Schema, rest)
+	}
+	return nil
+}
+
+// taggedFields returns the sorted dotted paths of the fields in s that carry
+// policy tags, each prefixed with prefix.
+func taggedFields(s bq.Schema, prefix string) []string {
+	var paths []string
+	for _, f := range s {
+		if f == nil {
+			continue
+		}
+		if f.PolicyTags != nil {
+			paths = append(paths, prefix+f.Name)
+		}
+		paths = append(paths, taggedFields(f.Schema, prefix+f.Name+".")...)
+	}
+	slices.Sort(paths)
+	return paths
+}
+
 func TestToBigQueryRejectsUnsupportedTypeAndMode(t *testing.T) {
 	for _, tc := range []struct {
 		name  string

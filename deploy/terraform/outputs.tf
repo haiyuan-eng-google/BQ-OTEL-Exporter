@@ -52,3 +52,13 @@ output "kms_key_name" {
   description = "Cloud KMS key used for CMEK encryption, or empty string when CMEK is not configured"
   value       = var.kms_key_name
 }
+
+output "policy_tag_id" {
+  description = "Resource name of the policy tag attached to the sensitive STRING columns, or null unless enable_column_level_security is set"
+  value       = var.enable_column_level_security ? google_data_catalog_policy_tag.sensitive_payload[0].id : null
+}
+
+output "data_policy_id" {
+  description = "Resource name of the data masking policy on the policy tag, or null unless enable_column_level_security is set"
+  value       = var.enable_column_level_security ? google_bigquery_datapolicy_data_policy.sensitive_payload_mask[0].name : null
+}

@@ -103,6 +103,33 @@ jobs:
       - name: Check for known vulnerabilities
         run: govulncheck ./...
 
+  # Checks the Terraform module without credentials or a backend: its
+  # formatting, and every resource block, including those behind opt-in
+  # variables, against the newest provider release versions.tf allows.
+  # Planning and applying stay manual, credentialed steps.
+  terraform:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: deploy/terraform
+    steps:
+      - uses: actions/checkout@v7
+      # The Terraform release is pinned so a new release cannot change the
+      # verdict on an old commit; Dependabot does not track it, so raise it by
+      # hand. The wrapper is off so each step reports Terraform's own output
+      # and exit status.
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: '1.16.6'
+          terraform_wrapper: false
+      - name: Verify formatting
+        run: terraform fmt -check -diff
+      - name: Initialize without a backend
+        run: terraform init -backend=false -input=false
+      - name: Validate
+        run: terraform validate
+
   # Credential-free proof of the image and the Compose journey. Every step
   # prints what it checked, so the job log is the evidence. Writing to
   # BigQuery stays a manual, credentialed check (README "Credentialed smoke").

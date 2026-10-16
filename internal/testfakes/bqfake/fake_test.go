@@ -775,3 +775,119 @@ func TestRESTTableUpdateEnforcesIfMatchETagAndAdditiveSchema(t *testing.T) {
 		t.Fatalf("Table.Update adding new REQUIRED column err = %v, want googleapi.Error with HTTP 400", err)
 	}
 }
+
+func TestRESTTableKeepsPolicyTagsAsSent(t *testing.T) {
+	srv := NewServer(t)
+	ctx := context.Background()
+
+	httpClient, httpBase := srv.NewHTTPClient()
+	t.Cleanup(func() { httpBase.CloseIdleConnections() })
+
+	client, err := bq.NewClient(ctx, "test-project", option.WithHTTPClient(httpClient))
+	if err != nil {
+		t.Fatalf("bq.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	ds := client.Dataset("tags_ds")
+	if err := ds.Create(ctx, &bq.DatasetMetadata{Location: "US"}); err != nil {
+		t.Fatalf("Dataset.Create: %v", err)
+	}
+	const tag = "projects/test-project/locations/us/taxonomies/1/policyTags/2"
+	tbl := ds.Table("tagged")
+	if err := tbl.Create(ctx, &bq.TableMetadata{Schema: bq.Schema{
+		{Name: "ingest_time", Type: bq.TimestampFieldType, Required: true},
+		{Name: "raw_payload", Type: bq.StringFieldType, PolicyTags: &bq.PolicyTagList{Names: []string{tag}}},
+		{Name: "status", Type: bq.RecordFieldType, Schema: bq.Schema{
+			{Name: "code", Type: bq.IntegerFieldType},
+			{Name: "message", Type: bq.StringFieldType, PolicyTags: &bq.PolicyTagList{Names: []string{tag}}},
+		}},
+	}}); err != nil {
+		t.Fatalf("Table.Create: %v", err)
+	}
+	wantTags := map[string][]string{"raw_payload": {tag}, "status.message": {tag}}
+
+	// 1. GET returns the tags the table was created with, nested ones
+	// included, and so does the server-side snapshot.
+	created, err := tbl.Metadata(ctx)
+	if err != nil {
+		t.Fatalf("Table.Metadata after create: %v", err)
+	}
+	if got := policyTagsByPath(created.Schema); !maps.EqualFunc(got, wantTags, slices.Equal) {
+		t.Errorf("policy tags after create = %v, want %v", got, wantTags)
+	}
+	snapshot, ok := srv.Table("test-project", "tags_ds", "tagged")
+	if !ok {
+		t.Fatal("srv.Table did not find the created table")
+	}
+	if got := snapshot.Schema.Fields[1].PolicyTags; got == nil || !slices.Equal(got.Names, []string{tag}) {
+		t.Errorf("snapshot raw_payload policy tags = %#v, want [%s]", got, tag)
+	}
+	if got := snapshot.Schema.Fields[2].Fields[1].PolicyTags; got == nil || !slices.Equal(got.Names, []string{tag}) {
+		t.Errorf("snapshot status.message policy tags = %#v, want [%s]", got, tag)
+	}
+
+	// 2. A PATCH that sends the tags back alongside a new column keeps them.
+	withAdded := append(slices.Clone(created.Schema), &bq.FieldSchema{Name: "error_message", Type: bq.StringFieldType})
+	if _, err := tbl.Update(ctx, bq.TableMetadataToUpdate{Schema: withAdded}, created.ETag); err != nil {
+		t.Fatalf("Table.Update with the tags sent back: %v", err)
+	}
+	patched, err := tbl.Metadata(ctx)
+	if err != nil {
+		t.Fatalf("Table.Metadata after the first update: %v", err)
+	}
+	if len(patched.Schema) != 4 || patched.Schema[3].Name != "error_message" {
+		t.Errorf("schema after the first update = %v, want error_message appended", schemaNames(patched.Schema))
+	}
+	if got := policyTagsByPath(patched.Schema); !maps.EqualFunc(got, wantTags, slices.Equal) {
+		t.Errorf("policy tags after an update that sent them = %v, want %v", got, wantTags)
+	}
+
+	// 3. A PATCH that leaves the tags out stores none, so a test can tell
+	// whether an update carried them.
+	clearPolicyTags(patched.Schema)
+	if _, err := tbl.Update(ctx, bq.TableMetadataToUpdate{Schema: patched.Schema}, patched.ETag); err != nil {
+		t.Fatalf("Table.Update without the tags: %v", err)
+	}
+	untagged, err := tbl.Metadata(ctx)
+	if err != nil {
+		t.Fatalf("Table.Metadata after the second update: %v", err)
+	}
+	if got := policyTagsByPath(untagged.Schema); len(got) != 0 {
+		t.Errorf("policy tags after an update that left them out = %v, want none", got)
+	}
+}
+
+// policyTagsByPath maps the dotted path of every field of s that carries
+// policy tags, nested fields included, to the tag names.
+func policyTagsByPath(s bq.Schema) map[string][]string {
+	out := make(map[string][]string)
+	var walk func(prefix string, s bq.Schema)
+	walk = func(prefix string, s bq.Schema) {
+		for _, f := range s {
+			if f.PolicyTags != nil {
+				out[prefix+f.Name] = f.PolicyTags.Names
+			}
+			walk(prefix+f.Name+".", f.Schema)
+		}
+	}
+	walk("", s)
+	return out
+}
+
+// clearPolicyTags removes the policy tags from every field of s, nested
+// fields included.
+func clearPolicyTags(s bq.Schema) {
+	for _, f := range s {
+		f.PolicyTags = nil
+		clearPolicyTags(f.Schema)
+	}
+}
+
+func schemaNames(s bq.Schema) []string {
+	names := make([]string, 0, len(s))
+	for _, f := range s {
+		names = append(names, f.Name)
+	}
+	return names
+}

@@ -247,3 +247,80 @@ Enable client-side PII and secret redaction by setting `redaction.enabled: true`
 in the collector config. Redaction runs at Step 0, before offload,
 fingerprinting, and quarantine.
 
+### Column-Level Security and Data Masking
+
+Some STRING columns carry text from the telemetry as it was sent, which can
+include prompts, responses, or error details: `otel_spans.status.message`,
+`otel_logs.severity_text`, and `otel_quarantine.raw_payload` and
+`error_message`. Set `enable_column_level_security=true` in the Terraform
+module to put them behind a policy tag and a data masking policy:
+
+| Variable | Default | Purpose |
+|:---|:---|:---|
+| `enable_column_level_security` | `false` | Create the taxonomy, policy tag, data masking policy, reader bindings, and redacted views, and attach the tag to the columns above |
+| `policy_taxonomy_display_name` | `otel_telemetry_sensitivity` | Display name of the taxonomy, which must be unique among the taxonomies of the project and location |
+| `masking_rule` | `SHA256` | What a Masked Reader reads in place of a value: `SHA256` (its SHA-256 hash), `ALWAYS_NULL`, or `DEFAULT_MASKING_VALUE` (an empty string) |
+| `fine_grained_reader_members` | `[]` | Principals granted the Fine-Grained Reader role on the policy tag |
+| `masked_reader_members` | `[]` | Principals granted the Masked Reader role on the data masking policy |
+
+```bash
+terraform apply \
+  -var="project_id=my-project" \
+  -var="enable_column_level_security=true" \
+  -var='fine_grained_reader_members=["group:otel-admins@example.com"]' \
+  -var='masked_reader_members=["group:otel-analysts@example.com"]'
+```
+
+Enable the Data Catalog API (`datacatalog.googleapis.com`) and the BigQuery
+Data Policy API (`bigquerydatapolicy.googleapis.com`) in the project first.
+The identity that runs Terraform also needs to create taxonomies and data
+policies and set their IAM policies, and `bigquery.tables.setCategory` on the
+tables to attach the tag. The `policy_tag_id` and `data_policy_id` outputs
+name the policy tag and the data masking policy, and are `null` while the
+option is off. Try the option on a scratch project before you turn it on for
+an existing deployment.
+
+Three layers keep this text from readers who should not see it:
+
+1. **Collector redaction.** With `redaction.enabled: true` in the collector
+   config, the collector scrubs PII and secrets before it writes a row (see
+   [Redaction](#redaction)).
+2. **Policy tag and data masking.** BigQuery returns a tagged column to a
+   reader as the table below shows.
+3. **Redacted views.** `v_otel_spans_redacted` and `v_otel_logs_redacted` read
+   `otel_spans_dedup` and `otel_logs_dedup` but return `NULL` for every tagged
+   column and every JSON column, including those inside records, and leave out
+   `events`, `links`, and `payload_refs`.
+
+| Reader | Tagged columns |
+|:---|:---|
+| Fine-Grained Reader, with or without Masked Reader | Read as stored |
+| Masked Reader only | Read masked by `masking_rule` |
+| Neither role | A query that reads one fails with an access denied error |
+
+Each binding is authoritative for its role: Terraform removes any other member
+of that role on the policy tag or the data masking policy. The roles decide
+only what a reader gets from the tagged columns; a reader still needs read
+access to the tables, as without this option. Views do not lift these rules:
+the `_dedup` views and the companion views that select `status.message` or
+`severity_text` (`otel_spans_as_allspans`, `v_gen_ai_spans`, and
+`v_gen_ai_logs`) read the tagged columns too. Exporting quarantined rows for
+`cmd/bq-quarantine-replay` reads `raw_payload`, so only a Fine-Grained Reader
+exports the original payloads.
+
+No JSON column is tagged, including `attributes`, `body`, and
+`otel_quarantine.raw_attributes`, so a reader who can read a table reads its
+JSON columns. The redacted views are ordinary views in the same dataset:
+BigQuery checks a query over one against the reader's own access to the
+tables it reads. They keep the JSON columns out of a query's results, but do
+not stop a reader who can read the tables from reading those columns there.
+To keep a reader off the tables, give the reader views like these in a
+separate dataset, authorized on this one.
+
+Terraform grants the collector neither role, because it only appends rows.
+The collector's role does not include `bigquery.tables.setCategory`, which
+changing a column's policy tags takes, and the collector never changes them: a
+collector that runs with `auto_create.tables` (see
+[IAM Permissions](#iam-permissions)) sends each column's policy tags back as
+they are in the schema update that adds missing columns, and a restart against
+a table that already has every column sends no update.
