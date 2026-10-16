@@ -1,0 +1,7 @@
+go test fuzz v1
+string("\xff\xfe")
+string("\xed\xa0\x80")
+int64(0)
+float64(-0)
+bool(false)
+[]byte("\xff\xfe\xfd")

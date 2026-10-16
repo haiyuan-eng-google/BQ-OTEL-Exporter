@@ -1,0 +1,9 @@
+go test fuzz v1
+string("otel_logs")
+string("")
+string("ROW_ERROR")
+string("Which tables hold Q3 revenue?")
+string("1791720000.25")
+string("")
+byte('\x05')
+[]byte("[{\"error_code\":\"ROW_ERROR\",\"ingest_time\":1791720000.25,\"raw_payload\":\"{\\\"resourceLogs\\\":[{\\\"resource\\\":{\\\"attributes\\\":[{\\\"key\\\":\\\"service.name\\\",\\\"value\\\":{\\\"stringValue\\\":\\\"planner\\\"}}]},\\\"scopeLogs\\\":[{\\\"logRecords\\\":[{\\\"timeUnixNano\\\":\\\"1791720000000000000\\\",\\\"eventName\\\":\\\"gen_ai.user.message\\\",\\\"body\\\":{\\\"stringValue\\\":\\\"Which tables hold Q3 revenue?\\\"}}]}]}]}\",\"signal\":\"logs\"},{\"error_code\":\"OVERSIZE_ROW\",\"ingest_time\":\"2026-10-11T12:00:00Z\",\"service_name\":\"planner\",\"signal\":\"spans\",\"trace_id\":\"4bf92f3577b34da6a3ce929d0e0e4736\"},{\"error_code\":\"ROW_ERROR\",\"raw_payload\":\"{\\\"resourceSpans\\\":[{\\\"resource\\\":{\\\"attributes\\\":[{\\\"key\\\":\\\"service.name\\\",\\\"value\\\":{\\\"stringValue\\\":\\\"planner\\\"}}]},\\\"scopeSpans\\\":[{\\\"scope\\\":{\\\"name\\\":\\\"agent.framework\\\"},\\\"spans\\\":[{\\\"traceId\\\":\\\"4bf92f3577b34da6a3ce929d0e0e4736\\\",\\\"spanId\\\":\\\"00f067aa0ba902b7\\\",\\\"name\\\":\\\"invoke_agent planner\\\",\\\"kind\\\":1,\\\"startTimeUnixNano\\\":\\\"1791720000000000000\\\",\\\"endTimeUnixNano\\\":\\\"1791720001000000000\\\",\\\"attributes\\\":[{\\\"key\\\":\\\"gen_ai.operation.name\\\",\\\"value\\\":{\\\"stringValue\\\":\\\"invoke_agent\\\"}},{\\\"key\\\":\\\"gen_ai.agent.name\\\",\\\"value\\\":{\\\"stringValue\\\":\\\"planner\\\"}}]}]}]}]}\",\"signal\":\"profiles\"}]")

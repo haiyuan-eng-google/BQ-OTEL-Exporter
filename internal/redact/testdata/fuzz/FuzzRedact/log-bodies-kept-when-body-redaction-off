@@ -1,0 +1,6 @@
+go test fuzz v1
+[]byte("\x80\n\x15Bearer abc.def-123456\x86\r\xc1\x00")
+string("x-request-id=42")
+string("")
+string("")
+byte('\x80')

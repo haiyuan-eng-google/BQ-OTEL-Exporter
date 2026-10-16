@@ -46,6 +46,7 @@ make fmt vet lint test   # the standard loop
 make vuln                # govulncheck: known vulnerabilities reachable from this code
 make tidy                # go mod tidy; CI fails if go.mod or go.sum would change
 make bench               # every benchmark once, with allocation counts
+make bench-compare       # benchstat: BASE_REF (default HEAD~1) vs the working tree
 make fuzz                # every Fuzz target for FUZZTIME (default 30s) each
 make integration-test    # live BigQuery; needs BQ_PROJECT, BQ_DATASET and ADC
 make mdatagen            # regenerate the files derived from metadata.yaml

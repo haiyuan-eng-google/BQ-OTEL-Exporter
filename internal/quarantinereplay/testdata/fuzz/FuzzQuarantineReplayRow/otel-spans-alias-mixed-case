@@ -1,0 +1,9 @@
+go test fuzz v1
+string("Otel_Spans")
+string("")
+string("OVERSIZE_ROW")
+string("checkout")
+string("")
+string("")
+byte('\x04')
+[]byte("")

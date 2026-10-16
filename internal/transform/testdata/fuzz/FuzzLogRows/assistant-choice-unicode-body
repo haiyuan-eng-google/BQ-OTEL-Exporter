@@ -1,0 +1,7 @@
+go test fuzz v1
+string("gen_ai.choice")
+string("Résumé ✓ 你好 🚀")
+string("sess-8")
+string("inv-8")
+int64(1791720000500000000)
+int64(0)

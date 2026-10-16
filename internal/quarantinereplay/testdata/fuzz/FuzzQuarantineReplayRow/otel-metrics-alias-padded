@@ -1,0 +1,9 @@
+go test fuzz v1
+string(" otel_metrics ")
+string("")
+string("OVERSIZE_ROW")
+string("gen_ai.client.token.usage")
+string("")
+string("")
+byte('\x04')
+[]byte("")

@@ -4,15 +4,24 @@
 package bigqueryexporter
 
 import (
+	"errors"
 	"fmt"
+	"go/ast"
+	"go/build/constraint"
+	"go/parser"
+	"go/token"
+	"io/fs"
 	"maps"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	bq "cloud.google.com/go/bigquery"
 	"gopkg.in/yaml.v3"
@@ -1148,5 +1157,231 @@ func TestDependabotCombinesDockerEntries(t *testing.T) {
 	}
 	if dockerCount != 1 {
 		t.Errorf(".github/dependabot.yml has %d docker entries, want 1 (combined with directories)", dockerCount)
+	}
+}
+
+// TestBenchFuzzWorkflowListsEveryFuzzTarget keeps the bounded fuzzing job in
+// .github/workflows/bench-fuzz.yml in step with the fuzz targets in the code.
+// `go test -fuzz` takes one target per run, so the job lists its targets one by
+// one: a target missing from that list is never fuzzed in CI, and an entry whose
+// target was renamed or removed fuzzes nothing. The job runs `go test` without
+// build tags, so a target in a file with a build constraint would not even be
+// compiled, and its run would pass having fuzzed nothing. Each target also
+// needs a committed seed corpus under <pkg>/testdata/fuzz/<target>/, which
+// plain `go test` replays on every run, and the job has to upload that
+// directory when fuzzing fails, because the failing input it writes there
+// exists only on the runner.
+func TestBenchFuzzWorkflowListsEveryFuzzTarget(t *testing.T) {
+	const path = ".github/workflows/bench-fuzz.yml"
+	var workflow struct {
+		Jobs struct {
+			Fuzz struct {
+				Strategy struct {
+					Matrix struct {
+						Include []struct {
+							Pkg    string `yaml:"pkg"`
+							Target string `yaml:"target"`
+						} `yaml:"include"`
+					} `yaml:"matrix"`
+				} `yaml:"strategy"`
+				Steps []struct {
+					If   string         `yaml:"if"`
+					Uses string         `yaml:"uses"`
+					With map[string]any `yaml:"with"`
+				} `yaml:"steps"`
+			} `yaml:"fuzz"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal([]byte(readRepoText(t, path)), &workflow); err != nil {
+		t.Fatalf("unmarshaling %s: %v", path, err)
+	}
+
+	declared := moduleFuzzTargets(t)
+	if len(declared) == 0 {
+		t.Fatal("found no fuzz targets in the module's test files")
+	}
+
+	listed := map[fuzzTarget]bool{}
+	for _, entry := range workflow.Jobs.Fuzz.Strategy.Matrix.Include {
+		ft := fuzzTarget{pkg: entry.Pkg, name: entry.Target}
+		if listed[ft] {
+			t.Errorf("%s lists fuzz target %s more than once", path, ft)
+		}
+		listed[ft] = true
+		if _, ok := declared[ft]; !ok {
+			t.Errorf("%s lists fuzz target %s, which no test file declares", path, ft)
+		}
+	}
+
+	byName := func(a, b fuzzTarget) int { return strings.Compare(a.String(), b.String()) }
+	for _, ft := range slices.SortedFunc(maps.Keys(declared), byName) {
+		if !listed[ft] {
+			t.Errorf("fuzz target %s (%s) is missing from jobs.fuzz.strategy.matrix.include in %s", ft, declared[ft], path)
+		}
+		if line, err := goBuildConstraint(declared[ft], nil); err != nil {
+			t.Errorf("reading the build constraints of %s: %v", declared[ft], err)
+		} else if line != "" {
+			t.Errorf("fuzz target %s is declared in %s, which has the build constraint %q: the untagged go test -fuzz in %s would compile nothing to fuzz and still pass",
+				ft, declared[ft], line, path)
+		}
+		corpus := filepath.Join(ft.pkg, "testdata", "fuzz", ft.name)
+		entries, err := os.ReadDir(corpus)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("reading the seed corpus of fuzz target %s: %v", ft, err)
+			continue
+		}
+		if !slices.ContainsFunc(entries, func(e fs.DirEntry) bool { return e.Type().IsRegular() }) {
+			t.Errorf("fuzz target %s has no seed corpus file in %s", ft, corpus)
+		}
+	}
+
+	uploads := false
+	for _, step := range workflow.Jobs.Fuzz.Steps {
+		if !strings.HasPrefix(step.Uses, "actions/upload-artifact@") {
+			continue
+		}
+		uploads = true
+		if cond := strings.TrimSpace(step.If); cond != "failure()" && cond != "${{ failure() }}" {
+			t.Errorf("%s uploads the fuzz corpus with if: %q, want failure()", path, step.If)
+		}
+		if upload := fmt.Sprint(step.With["path"]); !strings.Contains(upload, "testdata/fuzz/") {
+			t.Errorf("%s uploads path %q, want the fuzz target's testdata/fuzz directory", path, upload)
+		}
+	}
+	if !uploads {
+		t.Errorf("jobs.fuzz in %s has no actions/upload-artifact step for the failing input", path)
+	}
+}
+
+// fuzzTarget is a fuzz target as the bench-fuzz workflow names it: the package
+// argument `go test` takes and the name of the target function.
+type fuzzTarget struct {
+	pkg, name string
+}
+
+func (ft fuzzTarget) String() string { return ft.pkg + " " + ft.name }
+
+// moduleFuzzTargets returns every fuzz target declared in the module's test
+// files, mapped to the file that declares it. Like the go command matching
+// ./..., it skips testdata and vendor directories, nested modules, and
+// directories and files whose names start with "." or "_".
+func moduleFuzzTargets(t *testing.T) map[fuzzTarget]string {
+	t.Helper()
+	targets := map[fuzzTarget]string{}
+	fset := token.NewFileSet()
+	err := filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == "." {
+			return nil
+		}
+		name := d.Name()
+		ignored := strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_")
+		if d.IsDir() {
+			if ignored || name == "testdata" || name == "vendor" {
+				return filepath.SkipDir
+			}
+			if _, statErr := os.Stat(filepath.Join(path, "go.mod")); statErr == nil {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if ignored || !strings.HasSuffix(name, "_test.go") {
+			return nil
+		}
+		file, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
+		if err != nil {
+			return err
+		}
+		pkg := "."
+		if dir := filepath.Dir(path); dir != "." {
+			pkg = "./" + filepath.ToSlash(dir)
+		}
+		for _, decl := range file.Decls {
+			if fn, ok := decl.(*ast.FuncDecl); ok && isFuzzTarget(fn) {
+				targets[fuzzTarget{pkg: pkg, name: fn.Name.Name}] = path
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("collecting fuzz targets: %v", err)
+	}
+	return targets
+}
+
+// isFuzzTarget reports whether `go test` runs fn as a fuzz target, by the rule
+// the go command applies: fn is named Fuzz, or Fuzz followed by anything but a
+// lower-case letter, has no receiver, type parameters or results, and takes a
+// single *testing.F. Like the go command, it accepts F under any import name.
+func isFuzzTarget(fn *ast.FuncDecl) bool {
+	suffix, ok := strings.CutPrefix(fn.Name.Name, "Fuzz")
+	if !ok || fn.Recv != nil || fn.Type.TypeParams.NumFields() > 0 || fn.Type.Results.NumFields() > 0 {
+		return false
+	}
+	if r, _ := utf8.DecodeRuneInString(suffix); unicode.IsLower(r) {
+		return false
+	}
+	params := fn.Type.Params.List
+	if len(params) != 1 || len(params[0].Names) > 1 {
+		return false
+	}
+	ptr, ok := params[0].Type.(*ast.StarExpr)
+	if !ok {
+		return false
+	}
+	switch x := ptr.X.(type) {
+	case *ast.Ident:
+		return x.Name == "F"
+	case *ast.SelectorExpr:
+		return x.Sel.Name == "F"
+	default:
+		return false
+	}
+}
+
+// goBuildConstraint returns the first //go:build or // +build line among the
+// line comments above the package clause of a Go file, where the go command
+// reads build constraints, or "" if there is none. filename and src are as
+// for parser.ParseFile: a nil src reads filename.
+func goBuildConstraint(filename string, src any) (string, error) {
+	file, err := parser.ParseFile(token.NewFileSet(), filename, src, parser.PackageClauseOnly|parser.ParseComments)
+	if err != nil {
+		return "", err
+	}
+	for _, group := range file.Comments {
+		if group.Pos() > file.Package {
+			break
+		}
+		for _, c := range group.List {
+			if constraint.IsGoBuild(c.Text) || constraint.IsPlusBuild(c.Text) {
+				return c.Text, nil
+			}
+		}
+	}
+	return "", nil
+}
+
+func TestGoBuildConstraint(t *testing.T) {
+	const header = "// Copyright 2026 Google LLC\n// SPDX-License-Identifier: Apache-2.0\n\n"
+	for _, tc := range []struct {
+		name, src, want string
+	}{
+		{name: "no constraint", src: header + "package p\n"},
+		{name: "go:build after the license header", src: header + "//go:build integration\n\npackage p\n", want: "//go:build integration"},
+		{name: "+build line", src: "// +build linux\n\npackage p\n", want: "// +build linux"},
+		{name: "inside a block comment", src: "/*\n//go:build integration\n*/\n\npackage p\n"},
+		{name: "below the package clause", src: "package p\n\n//go:build integration\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := goBuildConstraint("p_test.go", tc.src)
+			if err != nil {
+				t.Fatalf("goBuildConstraint: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("goBuildConstraint = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

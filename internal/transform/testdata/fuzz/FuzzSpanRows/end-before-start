@@ -1,0 +1,9 @@
+go test fuzz v1
+string("chat")
+string("gcp.vertex.agent")
+string("example-chat-model")
+int64(10)
+int64(5)
+byte('\x02')
+int64(1791720001000000000)
+int64(1791720000000000000)

@@ -1,0 +1,7 @@
+go test fuzz v1
+string("4bf92f3577b34da6a3ce929d0e0e4736")
+string("00f067aa0ba902b7")
+string("invoke_agent orchestrator")
+int64(1500000000)
+int64(1791720000000000)
+string("{\"gen_ai.agent.name\":\"orchestrator\",\"gen_ai.usage.input_tokens\":2048,\"tools\":[\"execute_sql\",\"list_tables\"]}")
