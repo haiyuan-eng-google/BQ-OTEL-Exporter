@@ -360,8 +360,9 @@ func TestHelmPersistentQueueCompactsOnTheQueueVolume(t *testing.T) {
 // Terraform provisions every table and view, so by default the collector's
 // service account gets only the data path on the dataset. The auto_create
 // permissions are granted only when grant_auto_create is set, and the only
-// project-scope grant is the jobs.create needed for search indexes. CMEK
-// uses the BigQuery default service account, not data.google_project.number.
+// project-scope grants are the opt-in jobs roles (collector search indexes or
+// Continuous Queries). CMEK uses the BigQuery default service account, not
+// data.google_project.number.
 func TestTerraformGrantsWritePathOnDatasetOnly(t *testing.T) {
 	raw, err := os.ReadFile("deploy/terraform/main.tf")
 	if err != nil {
@@ -372,9 +373,14 @@ func TestTerraformGrantsWritePathOnDatasetOnly(t *testing.T) {
 		t.Error("main.tf must bind the writer role on the dataset")
 	}
 	for _, block := range regexp.MustCompile(`(?s)resource "google_project_iam_member" "[^"]+" \{.*?\n\}`).FindAllString(text, -1) {
-		if !strings.Contains(block, "count   = var.grant_auto_create ? 1 : 0") ||
-			!strings.Contains(block, "otel_collector_jobs") {
-			t.Errorf("project-scope binding must be the opt-in jobs role only:\n%s", block)
+		collectorJobs := strings.Contains(block, "count   = var.grant_auto_create ? 1 : 0") &&
+			strings.Contains(block, "otel_collector_jobs")
+		continuousQueryJobs := strings.Contains(block, "count   = var.enable_continuous_queries ? 1 : 0") &&
+			strings.Contains(block, "continuous_queries_jobs") &&
+			strings.Contains(block, `role    = "roles/bigquery.jobUser"`) &&
+			strings.Contains(block, "google_service_account.continuous_queries[0].email")
+		if !collectorJobs && !continuousQueryJobs {
+			t.Errorf("project-scope binding must be an opt-in jobs role only:\n%s", block)
 		}
 	}
 	roles := regexp.MustCompile(`(?s)resource "google_project_iam_custom_role" "([^"]+)" \{(.*?)\n\}`).FindAllStringSubmatch(text, -1)
@@ -1435,5 +1441,178 @@ func TestGoBuildConstraint(t *testing.T) {
 				t.Errorf("goBuildConstraint = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// BigQuery Continuous Queries cannot read views built on QUALIFY or window
+// functions, so every SQL template in deploy/continuous-queries/ reads the
+// base spans table through APPENDS(TABLE ...) and exports to Cloud Pub/Sub (with
+// a commented INSERT INTO variant for otel_alerts). No template may name a
+// _dedup, v_gen_ai_, or v_mcp_ view, or use QUALIFY, anywhere in the file.
+func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
+	const dir = "deploy/continuous-queries"
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("reading %s: %v", dir, err)
+	}
+	wantTemplates := []string{
+		"agent_latency_p95.sql",
+		"token_budget_burn.sql",
+		"tool_error_rate_alert.sql",
+	}
+	var gotTemplates []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
+			gotTemplates = append(gotTemplates, e.Name())
+		}
+	}
+	slices.Sort(gotTemplates)
+	if !slices.Equal(gotTemplates, wantTemplates) {
+		t.Fatalf("SQL templates in %s = %v, want %v", dir, gotTemplates, wantTemplates)
+	}
+
+	readme := readRepoText(t, filepath.Join(dir, "README.md"))
+	for _, name := range wantTemplates {
+		path := filepath.Join(dir, name)
+		sql := readRepoText(t, path)
+		for _, want := range []string{
+			"APPENDS(",
+			"TABLE `${project_id}.${dataset_id}.${spans_table}`",
+			"EXPORT DATA",
+			"CLOUD_PUBSUB",
+			"https://pubsub.googleapis.com/projects/${project_id}/topics/${pubsub_topic}",
+			"INSERT INTO `${project_id}.${dataset_id}.${alerts_table}`",
+		} {
+			if !strings.Contains(sql, want) {
+				t.Errorf("%s is missing %q", path, want)
+			}
+		}
+		for _, banned := range []string{"_dedup", "v_gen_ai_", "v_mcp_", "duration_ns"} {
+			if strings.Contains(sql, banned) {
+				t.Errorf("%s contains banned view or column reference %q", path, banned)
+			}
+		}
+		if strings.Contains(strings.ToUpper(sql), "QUALIFY") {
+			t.Errorf("%s contains QUALIFY, which Continuous Queries do not support", path)
+		}
+		if !strings.Contains(readme, name) {
+			t.Errorf("%s/README.md does not document %s", dir, name)
+		}
+	}
+	for _, want := range []string{
+		"APPENDS",
+		"CONTINUOUS",
+		"--continuous=true",
+		"--connection_property=",
+		"service_account=",
+	} {
+		if !strings.Contains(readme, want) {
+			t.Errorf("%s/README.md is missing %q", dir, want)
+		}
+	}
+}
+
+// Continuous Queries Terraform resources are opt-in: enable_continuous_queries
+// defaults to false, every Continuous Query resource in main.tf is gated on
+// var.enable_continuous_queries, outputs.tf renders all three SQL templates
+// through templatefile, and deploy/README.md and README.md document the setup.
+func TestTerraformContinuousQueriesAreOptIn(t *testing.T) {
+	const gate = "var.enable_continuous_queries"
+	vars := readRepoText(t, "deploy/terraform/variables.tf")
+	wantVars := []struct{ name, typ, def string }{
+		{"enable_continuous_queries", "bool", "false"},
+		{"continuous_query_slot_capacity", "number", "100"},
+		{"continuous_query_edition", "string", `"ENTERPRISE"`},
+		{"continuous_query_max_turn_input_tokens", "number", "100000"},
+		{"continuous_query_max_turn_output_tokens", "number", "32000"},
+		{"continuous_query_max_turn_duration_ms", "number", "30000"},
+	}
+	for _, v := range wantVars {
+		block := terraformBlock(vars, `variable "`+v.name+`"`)
+		if block == "" {
+			t.Errorf("variables.tf declares no %s", v.name)
+			continue
+		}
+		if got := terraformAttribute(block, "type"); got != v.typ {
+			t.Errorf("variables.tf gives %s the type %q, want %q", v.name, got, v.typ)
+		}
+		if got := terraformAttribute(block, "default"); got != v.def {
+			t.Errorf("variables.tf gives %s the default %q, want %q", v.name, got, v.def)
+		}
+	}
+	editions := firstCapture(`(?m)^\s+condition\s+=\s+contains\(\[([^\]]*)\], var\.continuous_query_edition\)$`,
+		terraformBlock(vars, `variable "continuous_query_edition"`))
+	if !strings.Contains(editions, `"ENTERPRISE"`) || !strings.Contains(editions, `"ENTERPRISE_PLUS"`) {
+		t.Errorf("continuous_query_edition validation = %q, want ENTERPRISE and ENTERPRISE_PLUS", editions)
+	}
+
+	mainTF := readRepoText(t, "deploy/terraform/main.tf")
+	gated := gate + " ? 1 : 0"
+	resources := []string{
+		`resource "google_bigquery_table" "otel_alerts"`,
+		`resource "google_pubsub_topic" "otel_alerts"`,
+		`resource "google_service_account" "continuous_queries"`,
+		`resource "google_bigquery_dataset_iam_member" "continuous_queries_viewer"`,
+		`resource "google_bigquery_table_iam_member" "continuous_queries_alerts_writer"`,
+		`resource "google_pubsub_topic_iam_member" "continuous_queries_publisher"`,
+		`resource "google_pubsub_topic_iam_member" "continuous_queries_pubsub_viewer"`,
+		`resource "google_project_iam_member" "continuous_queries_jobs"`,
+		`resource "google_bigquery_reservation" "continuous_queries"`,
+		`resource "google_bigquery_reservation_assignment" "continuous_queries"`,
+	}
+	for _, header := range resources {
+		body := terraformBlock(mainTF, header)
+		if body == "" {
+			t.Errorf("main.tf is missing %s", header)
+			continue
+		}
+		if got := terraformAttribute(body, "count"); got != gated {
+			t.Errorf("main.tf %s sets count = %q, want %q", header, got, gated)
+		}
+	}
+	assignment := terraformBlock(mainTF, `resource "google_bigquery_reservation_assignment" "continuous_queries"`)
+	if got := terraformAttribute(assignment, "job_type"); got != `"CONTINUOUS"` {
+		t.Errorf("continuous_queries reservation assignment sets job_type = %q, want \"CONTINUOUS\"", got)
+	}
+
+	outputs := readRepoText(t, "deploy/terraform/outputs.tf")
+	for _, outName := range []string{
+		"otel_alerts_table_id",
+		"otel_alerts_pubsub_topic_id",
+		"continuous_queries_service_account_email",
+		"continuous_queries_rendered_sql",
+		"continuous_queries_bq_cli_commands",
+	} {
+		block := terraformBlock(outputs, `output "`+outName+`"`)
+		if block == "" {
+			t.Errorf("outputs.tf is missing %s", outName)
+			continue
+		}
+		if !strings.Contains(block, gate+" ?") || !strings.Contains(block, ": null") {
+			t.Errorf("outputs.tf %s is not gated on %s with null fallback:\n%s", outName, gate, block)
+		}
+	}
+	renderedBlock := terraformBlock(outputs, `output "continuous_queries_rendered_sql"`)
+	for _, name := range []string{"tool_error_rate_alert", "token_budget_burn", "agent_latency_p95"} {
+		if !strings.Contains(renderedBlock, `"`+name+`"`) {
+			t.Errorf("continuous_queries_rendered_sql does not include %s", name)
+		}
+	}
+	if !strings.Contains(renderedBlock, `templatefile("${path.module}/../continuous-queries/${name}.sql"`) {
+		t.Errorf("continuous_queries_rendered_sql does not render templates with templatefile:\n%s", renderedBlock)
+	}
+
+	deploySection := firstCapture(`(?s)\n### Real-Time Alerting \(Continuous Queries\)\n(.*?)(?:\n##+ |\z)`, readRepoText(t, "deploy/README.md"))
+	if deploySection == "" {
+		t.Fatal("deploy/README.md has no Real-Time Alerting (Continuous Queries) section")
+	}
+	for _, v := range wantVars {
+		want := strings.Trim(v.def, `"`)
+		if got := firstCapture("(?m)^\\| `"+v.name+"` \\| `([^`]*)` \\|", deploySection); got != want {
+			t.Errorf("deploy/README.md gives %s the default %q, but variables.tf declares %q", v.name, got, want)
+		}
+	}
+	if !strings.Contains(readRepoText(t, "README.md"), "deploy/continuous-queries/") {
+		t.Error("README.md does not link deploy/continuous-queries/")
 	}
 }

@@ -209,3 +209,70 @@ variable "masked_reader_members" {
   type        = list(string)
   default     = []
 }
+
+# --- Real-time alerting (Continuous Queries) ---
+#
+# Off by default. When enable_continuous_queries is set, main.tf provisions the
+# otel_alerts sink table, Pub/Sub alert topic, dedicated service account,
+# least-privilege IAM bindings, and Enterprise CONTINUOUS reservation.
+
+variable "enable_continuous_queries" {
+  description = "Provision the opt-in Continuous Queries alerting infrastructure: the otel_alerts table, Pub/Sub alert topic, service account, IAM bindings, and Enterprise CONTINUOUS slot reservation."
+  type        = bool
+  default     = false
+}
+
+variable "continuous_query_slot_capacity" {
+  description = "Slot capacity of the BigQuery reservation created for CONTINUOUS jobs when enable_continuous_queries is set. Must be a multiple of 50, at least 50."
+  type        = number
+  default     = 100
+
+  validation {
+    condition     = var.continuous_query_slot_capacity >= 50 && floor(var.continuous_query_slot_capacity) == var.continuous_query_slot_capacity && var.continuous_query_slot_capacity % 50 == 0
+    error_message = "continuous_query_slot_capacity must be a whole multiple of 50, at least 50."
+  }
+}
+
+variable "continuous_query_edition" {
+  description = "BigQuery edition for the CONTINUOUS reservation when enable_continuous_queries is set: ENTERPRISE or ENTERPRISE_PLUS."
+  type        = string
+  default     = "ENTERPRISE"
+
+  validation {
+    condition     = contains(["ENTERPRISE", "ENTERPRISE_PLUS"], var.continuous_query_edition)
+    error_message = "continuous_query_edition must be ENTERPRISE or ENTERPRISE_PLUS."
+  }
+}
+
+variable "continuous_query_max_turn_input_tokens" {
+  description = "Single-turn input token threshold rendered into deploy/continuous-queries/token_budget_burn.sql."
+  type        = number
+  default     = 100000
+
+  validation {
+    condition     = var.continuous_query_max_turn_input_tokens > 0 && floor(var.continuous_query_max_turn_input_tokens) == var.continuous_query_max_turn_input_tokens
+    error_message = "continuous_query_max_turn_input_tokens must be a positive whole number."
+  }
+}
+
+variable "continuous_query_max_turn_output_tokens" {
+  description = "Single-turn output token threshold rendered into deploy/continuous-queries/token_budget_burn.sql."
+  type        = number
+  default     = 32000
+
+  validation {
+    condition     = var.continuous_query_max_turn_output_tokens > 0 && floor(var.continuous_query_max_turn_output_tokens) == var.continuous_query_max_turn_output_tokens
+    error_message = "continuous_query_max_turn_output_tokens must be a positive whole number."
+  }
+}
+
+variable "continuous_query_max_turn_duration_ms" {
+  description = "Single-turn span duration threshold in milliseconds rendered into deploy/continuous-queries/agent_latency_p95.sql."
+  type        = number
+  default     = 30000
+
+  validation {
+    condition     = var.continuous_query_max_turn_duration_ms > 0 && floor(var.continuous_query_max_turn_duration_ms) == var.continuous_query_max_turn_duration_ms
+    error_message = "continuous_query_max_turn_duration_ms must be a positive whole number."
+  }
+}

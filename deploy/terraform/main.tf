@@ -1227,3 +1227,111 @@ resource "google_kms_crypto_key_iam_member" "bq_encryptor" {
   member        = "serviceAccount:${data.google_bigquery_default_service_account.bq_cmek.email}"
 }
 
+# --- Optional Continuous Queries alerting infrastructure ---
+#
+# When enable_continuous_queries is set, this module provisions the alert sink
+# table (otel_alerts), the Pub/Sub alert topic, a dedicated service account for
+# Continuous Query jobs, least-privilege IAM bindings, and an Enterprise or
+# Enterprise Plus reservation assignment with job_type = "CONTINUOUS".
+# otel_alerts inherits the dataset's default encryption when CMEK is enabled.
+
+resource "google_bigquery_table" "otel_alerts" {
+  count = var.enable_continuous_queries ? 1 : 0
+
+  dataset_id          = google_bigquery_dataset.otel.dataset_id
+  table_id            = "otel_alerts"
+  deletion_protection = false
+
+  time_partitioning {
+    type  = "DAY"
+    field = "event_time"
+  }
+
+  clustering = ["alert_kind", "service_name"]
+  labels     = var.labels
+
+  schema = jsonencode([
+    { name = "alert_id", type = "STRING", mode = "REQUIRED" },
+    { name = "alert_kind", type = "STRING", mode = "REQUIRED" },
+    { name = "event_time", type = "TIMESTAMP", mode = "REQUIRED" },
+    { name = "service_name", type = "STRING", mode = "NULLABLE" },
+    { name = "trace_id", type = "STRING", mode = "REQUIRED" },
+    { name = "span_id", type = "STRING", mode = "REQUIRED" },
+    { name = "payload", type = "JSON", mode = "NULLABLE" },
+  ])
+}
+
+resource "google_pubsub_topic" "otel_alerts" {
+  count = var.enable_continuous_queries ? 1 : 0
+
+  name   = "${var.dataset_id}-otel-alerts"
+  labels = var.labels
+}
+
+resource "google_service_account" "continuous_queries" {
+  count = var.enable_continuous_queries ? 1 : 0
+
+  account_id   = "${var.service_account_id}-cq"
+  display_name = "OTel BigQuery Continuous Queries"
+}
+
+resource "google_bigquery_dataset_iam_member" "continuous_queries_viewer" {
+  count = var.enable_continuous_queries ? 1 : 0
+
+  dataset_id = google_bigquery_dataset.otel.dataset_id
+  role       = "roles/bigquery.dataViewer"
+  member     = "serviceAccount:${google_service_account.continuous_queries[0].email}"
+}
+
+resource "google_bigquery_table_iam_member" "continuous_queries_alerts_writer" {
+  count = var.enable_continuous_queries ? 1 : 0
+
+  project    = var.project_id
+  dataset_id = google_bigquery_dataset.otel.dataset_id
+  table_id   = google_bigquery_table.otel_alerts[0].table_id
+  role       = "roles/bigquery.dataEditor"
+  member     = "serviceAccount:${google_service_account.continuous_queries[0].email}"
+}
+
+resource "google_pubsub_topic_iam_member" "continuous_queries_publisher" {
+  count = var.enable_continuous_queries ? 1 : 0
+
+  topic  = google_pubsub_topic.otel_alerts[0].name
+  role   = "roles/pubsub.publisher"
+  member = "serviceAccount:${google_service_account.continuous_queries[0].email}"
+}
+
+resource "google_pubsub_topic_iam_member" "continuous_queries_pubsub_viewer" {
+  count = var.enable_continuous_queries ? 1 : 0
+
+  topic  = google_pubsub_topic.otel_alerts[0].name
+  role   = "roles/pubsub.viewer"
+  member = "serviceAccount:${google_service_account.continuous_queries[0].email}"
+}
+
+resource "google_project_iam_member" "continuous_queries_jobs" {
+  count   = var.enable_continuous_queries ? 1 : 0
+  project = var.project_id
+  role    = "roles/bigquery.jobUser"
+  member  = "serviceAccount:${google_service_account.continuous_queries[0].email}"
+}
+
+resource "google_bigquery_reservation" "continuous_queries" {
+  count = var.enable_continuous_queries ? 1 : 0
+
+  name              = "${replace(var.dataset_id, "_", "-")}-continuous-queries"
+  location          = var.location
+  slot_capacity     = var.continuous_query_slot_capacity
+  edition           = var.continuous_query_edition
+  ignore_idle_slots = false
+}
+
+resource "google_bigquery_reservation_assignment" "continuous_queries" {
+  count = var.enable_continuous_queries ? 1 : 0
+
+  assignee    = "projects/${var.project_id}"
+  job_type    = "CONTINUOUS"
+  reservation = google_bigquery_reservation.continuous_queries[0].id
+  location    = var.location
+}
+
