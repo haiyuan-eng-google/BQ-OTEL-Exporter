@@ -613,12 +613,20 @@ resource "google_bigquery_table" "v_gen_ai_spans" {
           LAX_FLOAT64(attributes['gen_ai.evaluation.score.value']),
           LAX_FLOAT64(attributes['gen_ai.evaluation.score'])
         ) AS gen_ai_evaluation_score,
-        JSON_VALUE(attributes, '$."error.type"') AS error_type
+        JSON_VALUE(attributes, '$."error.type"') AS error_type,
+        JSON_VALUE(attributes, '$."gen_ai.main_agent.id"') AS gen_ai_main_agent_id,
+        JSON_VALUE(attributes, '$."gen_ai.main_agent.name"') AS gen_ai_main_agent_name,
+        JSON_VALUE(attributes, '$."gen_ai.main_agent.description"') AS gen_ai_main_agent_description,
+        JSON_VALUE(attributes, '$."gen_ai.agent.version"') AS gen_ai_agent_version,
+        JSON_VALUE(attributes, '$."gen_ai.response.id"') AS gen_ai_response_id,
+        LAX_FLOAT64(attributes['gen_ai.response.time_to_first_chunk']) AS gen_ai_response_time_to_first_chunk
       FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.otel_spans_dedup.table_id}`
       WHERE JSON_VALUE(attributes, '$."gen_ai.operation.name"') IS NOT NULL
          OR JSON_VALUE(attributes, '$."gen_ai.system"') IS NOT NULL
          OR JSON_VALUE(attributes, '$."gen_ai.provider.name"') IS NOT NULL
          OR JSON_VALUE(attributes, '$."gcp.vertex.agent.invocation_id"') IS NOT NULL
+         OR JSON_VALUE(attributes, '$."gen_ai.main_agent.name"') IS NOT NULL
+         OR JSON_VALUE(attributes, '$."gen_ai.main_agent.id"') IS NOT NULL
     EOT
   }
 }
@@ -672,7 +680,8 @@ resource "google_bigquery_table" "v_gen_ai_logs" {
         l.payload_refs,
         l.attributes,
         l.resource,
-        l.instrumentation_scope
+        l.instrumentation_scope,
+        JSON_VALUE(l.attributes, '$."error.type"') AS error_type
       FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.otel_logs_dedup.table_id}` l
       LEFT JOIN `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.otel_spans_dedup.table_id}` s
         ON l.trace_id = s.trace_id
@@ -715,7 +724,8 @@ resource "google_bigquery_table" "v_gen_ai_model_costs" {
           s.gen_ai_usage_output_tokens,
           s.gen_ai_usage_cache_read_input_tokens,
           s.gen_ai_usage_cache_creation_input_tokens,
-          s.gen_ai_usage_reasoning_tokens
+          s.gen_ai_usage_reasoning_tokens,
+          s.error_type
         FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.v_gen_ai_spans.table_id}` AS s
       ),
       cost_windows AS (
@@ -748,7 +758,9 @@ resource "google_bigquery_table" "v_gen_ai_model_costs" {
         SUM(COALESCE(s.gen_ai_usage_reasoning_tokens, 0)) AS total_reasoning_tokens,
         APPROX_QUANTILES(s.duration_ms, 100)[OFFSET(50)] AS p50_duration_ms,
         APPROX_QUANTILES(s.duration_ms, 100)[OFFSET(95)] AS p95_duration_ms,
-        APPROX_QUANTILES(s.duration_ms, 100)[OFFSET(99)] AS p99_duration_ms
+        APPROX_QUANTILES(s.duration_ms, 100)[OFFSET(99)] AS p99_duration_ms,
+        COUNTIF(s.error_type IS NOT NULL) AS typed_error_count,
+        APPROX_TOP_COUNT(s.error_type, 5) AS top_error_types
       FROM cost_windows AS s
       WHERE NOT EXISTS (
           SELECT 1 FROM UNNEST(s.token_parent_span_ids) AS token_parent_span_id
@@ -798,7 +810,8 @@ resource "google_bigquery_table" "v_gen_ai_sessions" {
           s.gen_ai_usage_output_tokens,
           s.gen_ai_usage_cache_read_input_tokens,
           s.gen_ai_usage_cache_creation_input_tokens,
-          s.gen_ai_usage_reasoning_tokens
+          s.gen_ai_usage_reasoning_tokens,
+          s.error_type
         FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.v_gen_ai_spans.table_id}` AS s
         WHERE COALESCE(s.adk_session_id, s.gen_ai_conversation_id) IS NOT NULL
       ),
@@ -860,7 +873,9 @@ resource "google_bigquery_table" "v_gen_ai_sessions" {
         session_start_date,
         SUM(IF(is_token_leaf, COALESCE(gen_ai_usage_cache_creation_input_tokens, 0), 0)) AS total_cache_creation_input_tokens,
         COUNTIF(is_llm_call) AS llm_call_count,
-        COUNTIF(gen_ai_operation_name = 'invoke_agent') AS agent_invocation_count
+        COUNTIF(gen_ai_operation_name = 'invoke_agent') AS agent_invocation_count,
+        COUNTIF(error_type IS NOT NULL) AS typed_error_count,
+        APPROX_TOP_COUNT(error_type, 5) AS top_error_types
       FROM session_calls
       GROUP BY service_name, session_start_date, session_id
     EOT
@@ -915,7 +930,20 @@ resource "google_bigquery_table" "v_gen_ai_metrics" {
         exemplars,
         attributes,
         resource,
-        instrumentation_scope
+        instrumentation_scope,
+        JSON_VALUE(attributes, '$."gen_ai.token.modality"') AS gen_ai_token_modality,
+        COALESCE(
+          JSON_VALUE(attributes, '$."gen_ai.agent.name"'),
+          JSON_VALUE(attributes, '$."gen_ai.main_agent.name"')
+        ) AS gen_ai_agent_name,
+        CASE
+          WHEN metric_name = 'gen_ai.client.inference.usage.input_tokens' THEN 'input'
+          WHEN metric_name = 'gen_ai.client.inference.usage.output_tokens' THEN 'output'
+          WHEN metric_name = 'gen_ai.client.inference.usage.cache_read.input_tokens' THEN 'cache_read_input'
+          WHEN metric_name = 'gen_ai.client.inference.usage.cache_write.input_tokens' THEN 'cache_write_input'
+          WHEN metric_name = 'gen_ai.client.inference.usage.reasoning.output_tokens' THEN 'reasoning_output'
+          ELSE JSON_VALUE(attributes, '$."gen_ai.token.type"')
+        END AS gen_ai_inference_usage_dimension
       FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.otel_metrics_dedup.table_id}`
       WHERE metric_name LIKE 'gen_ai.%'
     EOT
@@ -941,7 +969,9 @@ resource "google_bigquery_table" "v_gen_ai_tool_usage" {
         COUNTIF(status_code = 2) AS error_count,
         SAFE_DIVIDE(COUNTIF(status_code = 2), COUNT(*)) AS error_rate,
         APPROX_QUANTILES(duration_ms, 100)[OFFSET(50)] AS p50_duration_ms,
-        APPROX_QUANTILES(duration_ms, 100)[OFFSET(95)] AS p95_duration_ms
+        APPROX_QUANTILES(duration_ms, 100)[OFFSET(95)] AS p95_duration_ms,
+        COUNTIF(error_type IS NOT NULL) AS typed_error_count,
+        APPROX_TOP_COUNT(error_type, 5) AS top_error_types
       FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.v_gen_ai_spans.table_id}`
       WHERE gen_ai_tool_name IS NOT NULL OR gen_ai_operation_name = 'execute_tool'
       GROUP BY 1, 2, 3, 4, 5

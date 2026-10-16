@@ -631,16 +631,40 @@ func normalizeSQL(sql string) string {
 
 // The reasoning token count arrives under gen_ai.usage.reasoning.output_tokens
 // and, from earlier instrumentation, under gen_ai.usage.reasoning_tokens, and
-// the current key must win. error.type is promoted for failure breakdowns.
+// the current key must win. error.type and the v1.40+ main-agent,
+// agent-version, and response attributes are promoted as additive columns.
 func TestGenAISpansViewPromotesReasoningTokensAndErrorType(t *testing.T) {
 	exprs := projectionExprs(t, GenAISpansViewQuery, "proj", "ds", "spans")
 	for col, want := range map[string][]string{
-		"gen_ai_usage_reasoning_tokens": {"gen_ai.usage.reasoning.output_tokens", "gen_ai.usage.reasoning_tokens"},
-		"error_type":                    {"error.type"},
+		"gen_ai_usage_reasoning_tokens":       {"gen_ai.usage.reasoning.output_tokens", "gen_ai.usage.reasoning_tokens"},
+		"error_type":                          {"error.type"},
+		"gen_ai_main_agent_id":                {"gen_ai.main_agent.id"},
+		"gen_ai_main_agent_name":              {"gen_ai.main_agent.name"},
+		"gen_ai_main_agent_description":       {"gen_ai.main_agent.description"},
+		"gen_ai_agent_version":                {"gen_ai.agent.version"},
+		"gen_ai_response_id":                  {"gen_ai.response.id"},
+		"gen_ai_response_time_to_first_chunk": {"gen_ai.response.time_to_first_chunk"},
 	} {
 		if got := attributeKeys(exprs[col]); !slices.Equal(got, want) {
 			t.Errorf("v_gen_ai_spans.%s reads %v, want %v", col, got, want)
 		}
+	}
+	if !strings.HasPrefix(exprs["gen_ai_response_time_to_first_chunk"], "LAX_FLOAT64(") {
+		t.Errorf("v_gen_ai_spans.gen_ai_response_time_to_first_chunk = %q, want LAX_FLOAT64(...)", exprs["gen_ai_response_time_to_first_chunk"])
+	}
+	query := normalizeSQL(fmt.Sprintf(GenAISpansViewQuery, "proj", "ds", "spans"))
+	for _, want := range []string{
+		`OR JSON_VALUE(attributes, '$."gen_ai.main_agent.name"') IS NOT NULL`,
+		`OR JSON_VALUE(attributes, '$."gen_ai.main_agent.id"') IS NOT NULL`,
+	} {
+		if !strings.Contains(query, want) {
+			t.Errorf("v_gen_ai_spans WHERE clause must contain %q, got:\n%s", want, query)
+		}
+	}
+
+	logExprs := projectionExprs(t, GenAILogsViewQuery, "proj", "ds", "logs", "spans")
+	if got, want := attributeKeys(logExprs["error_type"]), []string{"l:error.type"}; !slices.Equal(got, want) {
+		t.Errorf("v_gen_ai_logs.error_type reads %v, want %v (log record attributes only)", got, want)
 	}
 }
 
@@ -868,9 +892,24 @@ func TestGenAIMetricsView(t *testing.T) {
 		"gen_ai_response_model": {"gen_ai.response.model"},
 		"gen_ai_token_type":     {"gen_ai.token.type"},
 		"error_type":            {"error.type"},
+		"gen_ai_token_modality": {"gen_ai.token.modality"},
+		"gen_ai_agent_name":     {"gen_ai.agent.name", "gen_ai.main_agent.name"},
 	} {
 		if got := attributeKeys(exprs[col]); !slices.Equal(got, want) {
 			t.Errorf("v_gen_ai_metrics.%s reads %v, want %v", col, got, want)
+		}
+	}
+	dimExpr := normalizeSQL(exprs["gen_ai_inference_usage_dimension"])
+	for _, want := range []string{
+		"WHEN metric_name = 'gen_ai.client.inference.usage.input_tokens' THEN 'input'",
+		"WHEN metric_name = 'gen_ai.client.inference.usage.output_tokens' THEN 'output'",
+		"WHEN metric_name = 'gen_ai.client.inference.usage.cache_read.input_tokens' THEN 'cache_read_input'",
+		"WHEN metric_name = 'gen_ai.client.inference.usage.cache_write.input_tokens' THEN 'cache_write_input'",
+		"WHEN metric_name = 'gen_ai.client.inference.usage.reasoning.output_tokens' THEN 'reasoning_output'",
+		`ELSE JSON_VALUE(attributes, '$."gen_ai.token.type"') END`,
+	} {
+		if !strings.Contains(dimExpr, want) {
+			t.Errorf("gen_ai_inference_usage_dimension = %q, missing %q", dimExpr, want)
 		}
 	}
 }
@@ -911,8 +950,9 @@ func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 			contract: SpansTableSchema(),
 			// 29 identity, timing and promoted columns, the six raw columns
 			// kept for anything not promoted, the 15 OTel GenAI
-			// v1.37+/v1.40+ promoted columns, then error_type, which was
-			// appended last so that no earlier column moved.
+			// v1.37+/v1.40+ promoted columns, error_type, and six v1.40+
+			// main-agent, agent-version, and response columns appended last
+			// so that no earlier column moved.
 			want: []string{
 				"start_time", "end_time", "duration_nano", "duration_ms",
 				"trace_id", "span_id", "parent_span_id", "service_name",
@@ -930,6 +970,8 @@ func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 				"gen_ai_agent_description", "gen_ai_agent_parent_id", "gen_ai_data_source_id",
 				"gen_ai_evaluation_name", "gen_ai_evaluation_score",
 				"error_type",
+				"gen_ai_main_agent_id", "gen_ai_main_agent_name", "gen_ai_main_agent_description",
+				"gen_ai_agent_version", "gen_ai_response_id", "gen_ai_response_time_to_first_chunk",
 			},
 		},
 		{
@@ -938,14 +980,15 @@ func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 			args:      []any{"proj", "ds", "logs", "spans"},
 			contract:  LogsTableSchema(),
 			qualifier: "l",
-			// 20 columns: the passed-through log columns and the promoted
-			// GenAI and agent fields.
+			// 21 columns: the passed-through log columns, the promoted
+			// GenAI and agent fields, and error_type appended last.
 			want: []string{
 				"timestamp", "receive_time", "trace_id", "span_id", "service_name",
 				"event_name", "severity_number", "severity_text",
 				"gen_ai_operation_name", "gen_ai_system", "gen_ai_agent_name",
 				"adk_session_id", "adk_invocation_id", "adk_event_id", "adk_user_id",
 				"body", "payload_refs", "attributes", "resource", "instrumentation_scope",
+				"error_type",
 			},
 		},
 		{
@@ -953,9 +996,10 @@ func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 			query:    GenAIMetricsViewQuery,
 			args:     []any{"proj", "ds", "metrics"},
 			contract: MetricsTableSchema(),
-			// 36 columns: the metric identity, seven promoted GenAI
-			// attributes, every point-value column of the table, and the
-			// raw attribute, resource and scope bags.
+			// 39 columns: the metric identity, seven promoted GenAI
+			// attributes, every point-value column of the table, the raw
+			// attribute, resource and scope bags, and three v1.40+ metric
+			// dimensions appended last.
 			want: []string{
 				"timestamp", "start_time", "receive_time", "service_name",
 				"metric_name", "metric_description", "metric_unit", "metric_type",
@@ -967,6 +1011,7 @@ func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 				"exp_scale", "exp_zero_count", "exp_zero_threshold", "exp_positive", "exp_negative",
 				"summary_quantiles", "exemplars",
 				"attributes", "resource", "instrumentation_scope",
+				"gen_ai_token_modality", "gen_ai_agent_name", "gen_ai_inference_usage_dimension",
 			},
 		},
 		{
@@ -975,13 +1020,15 @@ func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 			args:      []any{"proj", "ds"},
 			qualifier: "s",
 			// The 15 columns the view had before the double-counting fix,
-			// in their original order.
+			// in their original order, plus typed_error_count and
+			// top_error_types appended last.
 			want: []string{
 				"usage_hour", "service_name", "gen_ai_agent_name", "provider", "model",
 				"call_count", "error_count",
 				"total_input_tokens", "total_output_tokens", "total_cache_read_input_tokens",
 				"total_cache_creation_input_tokens", "total_reasoning_tokens",
 				"p50_duration_ms", "p95_duration_ms", "p99_duration_ms",
+				"typed_error_count", "top_error_types",
 			},
 		},
 		{
@@ -989,7 +1036,8 @@ func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 			query: GenAISessionsViewQuery,
 			args:  []any{"proj", "ds"},
 			// The 15 columns the view had before the grain change, in
-			// their original order, then the four it gained.
+			// their original order, then the four it gained, then
+			// typed_error_count and top_error_types appended last.
 			want: []string{
 				"session_id", "user_id", "service_name", "agent_name",
 				"session_start_time", "session_end_time", "session_duration_ms",
@@ -998,6 +1046,21 @@ func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 				"total_reasoning_tokens",
 				"session_start_date", "total_cache_creation_input_tokens",
 				"llm_call_count", "agent_invocation_count",
+				"typed_error_count", "top_error_types",
+			},
+		},
+		{
+			name:  "gen_ai_tool_usage",
+			query: GenAIToolUsageViewQuery,
+			args:  []any{"proj", "ds"},
+			// The 10 columns of v_gen_ai_tool_usage, plus
+			// typed_error_count and top_error_types appended last.
+			want: []string{
+				"usage_hour", "service_name", "gen_ai_agent_name",
+				"gen_ai_tool_name", "gen_ai_tool_type",
+				"call_count", "error_count", "error_rate",
+				"p50_duration_ms", "p95_duration_ms",
+				"typed_error_count", "top_error_types",
 			},
 		},
 	} {
@@ -1027,6 +1090,103 @@ func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 			}
 			if !slices.Equal(got, tc.want) {
 				t.Errorf("projected %d columns:\n%v\nwant %d:\n%v", len(got), got, len(tc.want), tc.want)
+			}
+		})
+	}
+}
+
+// Pre-existing view columns must never shift their 0-based index when new
+// columns are appended. This pins the exact index of the first and last
+// pre-existing column on every companion view modified in PR 1.1.
+func TestCompanionViewPreExistingColumnIndicesUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		query string
+		args  []any
+		pins  map[int]string
+	}{
+		{
+			name:  "gen_ai_spans",
+			query: GenAISpansViewQuery,
+			args:  []any{"proj", "ds", "spans"},
+			pins: map[int]string{
+				0:  "start_time",
+				35: "gen_ai_provider_name",
+				50: "error_type",
+				51: "gen_ai_main_agent_id",
+				56: "gen_ai_response_time_to_first_chunk",
+			},
+		},
+		{
+			name:  "gen_ai_logs",
+			query: GenAILogsViewQuery,
+			args:  []any{"proj", "ds", "logs", "spans"},
+			pins: map[int]string{
+				0:  "timestamp",
+				19: "instrumentation_scope",
+				20: "error_type",
+			},
+		},
+		{
+			name:  "gen_ai_metrics",
+			query: GenAIMetricsViewQuery,
+			args:  []any{"proj", "ds", "metrics"},
+			pins: map[int]string{
+				0:  "timestamp",
+				16: "error_type",
+				35: "instrumentation_scope",
+				36: "gen_ai_token_modality",
+				38: "gen_ai_inference_usage_dimension",
+			},
+		},
+		{
+			name:  "gen_ai_model_costs",
+			query: GenAIModelCostsViewQuery,
+			args:  []any{"proj", "ds"},
+			pins: map[int]string{
+				0:  "usage_hour",
+				14: "p99_duration_ms",
+				15: "typed_error_count",
+				16: "top_error_types",
+			},
+		},
+		{
+			name:  "gen_ai_sessions",
+			query: GenAISessionsViewQuery,
+			args:  []any{"proj", "ds"},
+			pins: map[int]string{
+				0:  "session_id",
+				15: "session_start_date",
+				18: "agent_invocation_count",
+				19: "typed_error_count",
+				20: "top_error_types",
+			},
+		},
+		{
+			name:  "gen_ai_tool_usage",
+			query: GenAIToolUsageViewQuery,
+			args:  []any{"proj", "ds"},
+			pins: map[int]string{
+				0:  "usage_hour",
+				9:  "p95_duration_ms",
+				10: "typed_error_count",
+				11: "top_error_types",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			items, err := selectList(fmt.Sprintf(tc.query, tc.args...))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for idx, want := range tc.pins {
+				if idx >= len(items) {
+					t.Errorf("index %d (%s) out of range; view has %d columns", idx, want, len(items))
+					continue
+				}
+				if got := items[idx].alias; got != want {
+					t.Errorf("column[%d] = %q, want %q", idx, got, want)
+				}
 			}
 		})
 	}

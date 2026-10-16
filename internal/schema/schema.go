@@ -531,8 +531,9 @@ FROM ` + "`%[1]s.%[2]s.%[3]s_dedup`" + `
 `
 
 // GenAISpansViewDDL creates v_gen_ai_spans: the spans that carry
-// gen_ai.operation.name, gen_ai.system, gen_ai.provider.name or
-// gcp.vertex.agent.invocation_id, with the OpenTelemetry GenAI semantic
+// gen_ai.operation.name, gen_ai.system, gen_ai.provider.name,
+// gcp.vertex.agent.invocation_id, gen_ai.main_agent.name or
+// gen_ai.main_agent.id, with the OpenTelemetry GenAI semantic
 // convention attributes (including v1.37+/v1.40+ provider, cache/reasoning
 // token, output, tool, agent, and data source fields) and the Agent
 // Development Kit gcp.vertex.agent.* attributes promoted out of the plain
@@ -541,9 +542,10 @@ FROM ` + "`%[1]s.%[2]s.%[3]s_dedup`" + `
 // gen_ai.provider.name, or the reasoning token count under
 // gen_ai.usage.reasoning.output_tokens and its earlier name
 // gen_ai.usage.reasoning_tokens, the keys are coalesced in a fixed order, the
-// current key first. The error.type attribute is promoted as error_type, the
-// last column, so the position of every earlier column is unchanged. The raw
-// attribute, resource, scope, event and link columns and payload_refs are
+// current key first. The error.type attribute is promoted as error_type,
+// followed by the v1.40+ main-agent, agent-version, and response attributes,
+// appended at the end so the position of every earlier column is unchanged. The
+// raw attribute, resource, scope, event and link columns and payload_refs are
 // kept for anything not promoted.
 const GenAISpansViewDDL = `
 CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAISpansViewName + "`" + ` AS
@@ -637,12 +639,20 @@ SELECT
     LAX_FLOAT64(attributes['gen_ai.evaluation.score.value']),
     LAX_FLOAT64(attributes['gen_ai.evaluation.score'])
   ) AS gen_ai_evaluation_score,
-  JSON_VALUE(attributes, '$."error.type"') AS error_type
+  JSON_VALUE(attributes, '$."error.type"') AS error_type,
+  JSON_VALUE(attributes, '$."gen_ai.main_agent.id"') AS gen_ai_main_agent_id,
+  JSON_VALUE(attributes, '$."gen_ai.main_agent.name"') AS gen_ai_main_agent_name,
+  JSON_VALUE(attributes, '$."gen_ai.main_agent.description"') AS gen_ai_main_agent_description,
+  JSON_VALUE(attributes, '$."gen_ai.agent.version"') AS gen_ai_agent_version,
+  JSON_VALUE(attributes, '$."gen_ai.response.id"') AS gen_ai_response_id,
+  LAX_FLOAT64(attributes['gen_ai.response.time_to_first_chunk']) AS gen_ai_response_time_to_first_chunk
 FROM ` + "`%[1]s.%[2]s.%[3]s_dedup`" + `
 WHERE JSON_VALUE(attributes, '$."gen_ai.operation.name"') IS NOT NULL
    OR JSON_VALUE(attributes, '$."gen_ai.system"') IS NOT NULL
    OR JSON_VALUE(attributes, '$."gen_ai.provider.name"') IS NOT NULL
    OR JSON_VALUE(attributes, '$."gcp.vertex.agent.invocation_id"') IS NOT NULL
+   OR JSON_VALUE(attributes, '$."gen_ai.main_agent.name"') IS NOT NULL
+   OR JSON_VALUE(attributes, '$."gen_ai.main_agent.id"') IS NOT NULL
 `
 
 // GenAILogsViewDDL creates v_gen_ai_logs: the log records whose event name
@@ -724,7 +734,8 @@ SELECT
   l.payload_refs,
   l.attributes,
   l.resource,
-  l.instrumentation_scope
+  l.instrumentation_scope,
+  JSON_VALUE(l.attributes, '$."error.type"') AS error_type
 FROM ` + "`%[1]s.%[2]s.%[3]s_dedup`" + ` l
 LEFT JOIN ` + "`%[1]s.%[2]s.%[4]s_dedup`" + ` s
   ON l.trace_id = s.trace_id
@@ -801,7 +812,20 @@ SELECT
   -- Raw bags
   attributes,
   resource,
-  instrumentation_scope
+  instrumentation_scope,
+  JSON_VALUE(attributes, '$."gen_ai.token.modality"') AS gen_ai_token_modality,
+  COALESCE(
+    JSON_VALUE(attributes, '$."gen_ai.agent.name"'),
+    JSON_VALUE(attributes, '$."gen_ai.main_agent.name"')
+  ) AS gen_ai_agent_name,
+  CASE
+    WHEN metric_name = 'gen_ai.client.inference.usage.input_tokens' THEN 'input'
+    WHEN metric_name = 'gen_ai.client.inference.usage.output_tokens' THEN 'output'
+    WHEN metric_name = 'gen_ai.client.inference.usage.cache_read.input_tokens' THEN 'cache_read_input'
+    WHEN metric_name = 'gen_ai.client.inference.usage.cache_write.input_tokens' THEN 'cache_write_input'
+    WHEN metric_name = 'gen_ai.client.inference.usage.reasoning.output_tokens' THEN 'reasoning_output'
+    ELSE JSON_VALUE(attributes, '$."gen_ai.token.type"')
+  END AS gen_ai_inference_usage_dimension
 FROM ` + "`%[1]s.%[2]s.%[3]s_dedup`" + `
 WHERE metric_name LIKE 'gen_ai.%%'
 `
@@ -912,7 +936,8 @@ WITH cost_spans AS (
     s.gen_ai_usage_output_tokens,
     s.gen_ai_usage_cache_read_input_tokens,
     s.gen_ai_usage_cache_creation_input_tokens,
-    s.gen_ai_usage_reasoning_tokens
+    s.gen_ai_usage_reasoning_tokens,
+    s.error_type
   FROM ` + "`%[1]s.%[2]s." + GenAISpansViewName + "`" + ` AS s
 ),
 cost_windows AS (
@@ -938,7 +963,9 @@ SELECT
   SUM(COALESCE(s.gen_ai_usage_reasoning_tokens, 0)) AS total_reasoning_tokens,
   APPROX_QUANTILES(s.duration_ms, 100)[OFFSET(50)] AS p50_duration_ms,
   APPROX_QUANTILES(s.duration_ms, 100)[OFFSET(95)] AS p95_duration_ms,
-  APPROX_QUANTILES(s.duration_ms, 100)[OFFSET(99)] AS p99_duration_ms
+  APPROX_QUANTILES(s.duration_ms, 100)[OFFSET(99)] AS p99_duration_ms,
+  COUNTIF(s.error_type IS NOT NULL) AS typed_error_count,
+  APPROX_TOP_COUNT(s.error_type, 5) AS top_error_types
 FROM cost_windows AS s
 WHERE ` + genAILLMCallPredicate + `
 GROUP BY 1, 2, 3, 4, 5
@@ -961,8 +988,9 @@ GROUP BY 1, 2, 3, 4, 5
 // llm_call_count counts the LLM calls by the same rule as
 // v_gen_ai_model_costs, and agent_invocation_count counts the invoke_agent
 // spans separately. session_start_date, total_cache_creation_input_tokens,
-// llm_call_count and agent_invocation_count are the last four columns, so the
-// position of every earlier column is unchanged.
+// llm_call_count, agent_invocation_count, typed_error_count and
+// top_error_types are appended at the end, so the position of every earlier
+// column is unchanged.
 const GenAISessionsViewDDL = `
 CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAISessionsViewName + "`" + ` AS
 ` + GenAISessionsViewQuery + `;
@@ -999,7 +1027,8 @@ WITH session_spans AS (
     s.gen_ai_usage_output_tokens,
     s.gen_ai_usage_cache_read_input_tokens,
     s.gen_ai_usage_cache_creation_input_tokens,
-    s.gen_ai_usage_reasoning_tokens
+    s.gen_ai_usage_reasoning_tokens,
+    s.error_type
   FROM ` + "`%[1]s.%[2]s." + GenAISpansViewName + "`" + ` AS s
   WHERE COALESCE(s.adk_session_id, s.gen_ai_conversation_id) IS NOT NULL
 ),
@@ -1037,7 +1066,9 @@ SELECT
   session_start_date,
   SUM(IF(is_token_leaf, COALESCE(gen_ai_usage_cache_creation_input_tokens, 0), 0)) AS total_cache_creation_input_tokens,
   COUNTIF(is_llm_call) AS llm_call_count,
-  COUNTIF(gen_ai_operation_name = 'invoke_agent') AS agent_invocation_count
+  COUNTIF(gen_ai_operation_name = 'invoke_agent') AS agent_invocation_count,
+  COUNTIF(error_type IS NOT NULL) AS typed_error_count,
+  APPROX_TOP_COUNT(error_type, 5) AS top_error_types
 FROM session_calls
 GROUP BY service_name, session_start_date, session_id
 `
@@ -1062,7 +1093,9 @@ SELECT
   COUNTIF(status_code = 2) AS error_count,
   SAFE_DIVIDE(COUNTIF(status_code = 2), COUNT(*)) AS error_rate,
   APPROX_QUANTILES(duration_ms, 100)[OFFSET(50)] AS p50_duration_ms,
-  APPROX_QUANTILES(duration_ms, 100)[OFFSET(95)] AS p95_duration_ms
+  APPROX_QUANTILES(duration_ms, 100)[OFFSET(95)] AS p95_duration_ms,
+  COUNTIF(error_type IS NOT NULL) AS typed_error_count,
+  APPROX_TOP_COUNT(error_type, 5) AS top_error_types
 FROM ` + "`%[1]s.%[2]s." + GenAISpansViewName + "`" + `
 WHERE gen_ai_tool_name IS NOT NULL OR gen_ai_operation_name = 'execute_tool'
 GROUP BY 1, 2, 3, 4, 5

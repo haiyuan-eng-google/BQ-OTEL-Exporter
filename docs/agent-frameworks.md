@@ -288,7 +288,18 @@ attribute variants into typed top-level columns over `otel_spans_dedup` and
 `v_gen_ai_metrics` does the same for the `gen_ai.*` metric points over
 `otel_metrics_dedup`. For reasoning tokens, `v_gen_ai_spans` reads
 `gen_ai.usage.reasoning.output_tokens` first and the earlier
-`gen_ai.usage.reasoning_tokens` spelling second.
+`gen_ai.usage.reasoning_tokens` spelling second. Against OpenTelemetry Semantic
+Conventions `1.40.0`, `v_gen_ai_spans` also promotes `gen_ai.main_agent.{id,name,description}`,
+`gen_ai.agent.version`, `gen_ai.response.id`, and
+`gen_ai.response.time_to_first_chunk` (and admits spans carrying only
+`gen_ai.main_agent.name` or `gen_ai.main_agent.id`); `v_gen_ai_logs` promotes
+`error_type` from the log record's own `error.type` attribute; `v_gen_ai_metrics`
+promotes `gen_ai_token_modality`, `gen_ai_agent_name` (from `gen_ai.agent.name`
+then `gen_ai.main_agent.name`), and `gen_ai_inference_usage_dimension` (`input`,
+`output`, `cache_read_input`, `cache_write_input`, or `reasoning_output` for
+`gen_ai.client.inference.usage.*` metrics, falling back to `gen_ai.token.type`);
+and `v_gen_ai_model_costs`, `v_gen_ai_sessions`, and `v_gen_ai_tool_usage` expose
+`typed_error_count` and `top_error_types` (`APPROX_TOP_COUNT(error_type, 5)`).
 
 Some frameworks report the same tokens on an agent span and again on the model
 call spans beneath it. `v_gen_ai_model_costs` and `v_gen_ai_sessions` leave out
@@ -305,5 +316,5 @@ Semantic Conventions `1.40.0`.
 
 | Scenario ID | Semconv target | Signals | Fixture files | Coverage |
 | --- | --- | --- | --- | --- |
-| `multi_agent` | `1.40.0` | Traces, logs, metrics | `testdata/otlp/multi_agent/{traces,logs,metrics}.json` | Three-level `invoke_agent` delegation (`planner` -> `researcher`), `gen_ai.main_agent.*`, parallel `execute_tool` spans, failed `chat` and tool spans with `error.type`, orphan child span, both reasoning-token spellings, and legacy + v1.40+ GenAI client metric histograms with span exemplars. |
+| `multi_agent` | `1.40.0` | Traces, logs, metrics | `testdata/otlp/multi_agent/{traces,logs,metrics}.json` | Two-level `invoke_agent` delegation in a three-level span tree (`planner` -> `researcher`), `gen_ai.main_agent.*`, parallel `execute_tool` spans, failed `chat` and tool spans with `error.type`, orphan child span, both reasoning-token spellings, and legacy + v1.40+ GenAI client metric histograms with span exemplars. |
 | `mcp` | `1.40.0` | Traces | `testdata/otlp/mcp/traces.json` | MCP session lifecycle (`initialize`, `tools/list`, `tools/call`, `resources/read`), dual-tagged GenAI + MCP tool call vs. pure MCP protocol spans, `SERVER` span kind, and `error.type` on failed MCP calls. |
