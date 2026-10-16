@@ -177,7 +177,9 @@ func oneIntegrationTrace() ptrace.Traces {
 	rs := td.ResourceSpans().AppendEmpty()
 	rs.Resource().Attributes().PutStr("service.name", "it-agent")
 	now := time.Now()
-	s := rs.ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	spans := rs.ScopeSpans().AppendEmpty().Spans()
+
+	s := spans.AppendEmpty()
 	s.SetName("chat gemini-2.5-pro")
 	s.SetTraceID(pcommon.TraceID{1})
 	s.SetSpanID(pcommon.SpanID{1})
@@ -199,6 +201,24 @@ func oneIntegrationTrace() ptrace.Traces {
 	attrs.PutInt("gen_ai.usage.input_tokens", 10)
 	attrs.PutInt("gen_ai.usage.output_tokens", 5)
 	attrs.PutStr("error.type", "rate_limited")
+
+	// A healthy span in the same session, model, and tool group ensures live
+	// BigQuery tests prove top_error_types excludes NULL error_type values.
+	okSpan := spans.AppendEmpty()
+	okSpan.SetName("chat gemini-2.5-pro ok")
+	okSpan.SetTraceID(pcommon.TraceID{2})
+	okSpan.SetSpanID(pcommon.SpanID{2})
+	okSpan.SetStartTimestamp(pcommon.NewTimestampFromTime(now.Add(-500 * time.Millisecond)))
+	okSpan.SetEndTimestamp(pcommon.NewTimestampFromTime(now))
+	okSpan.Status().SetCode(ptrace.StatusCodeOk)
+	okAttrs := okSpan.Attributes()
+	okAttrs.PutStr("gen_ai.operation.name", "chat")
+	okAttrs.PutStr("gen_ai.system", "gcp.vertex.agent")
+	okAttrs.PutStr("gen_ai.request.model", "gemini-2.5-pro")
+	okAttrs.PutStr("gen_ai.conversation.id", "sess-it-1")
+	okAttrs.PutStr("gen_ai.tool.name", "search")
+	okAttrs.PutInt("gen_ai.usage.input_tokens", 8)
+	okAttrs.PutInt("gen_ai.usage.output_tokens", 4)
 	return td
 }
 
@@ -224,8 +244,13 @@ func oneIntegrationMetrics() pmetric.Metrics {
 	m := rm.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
 	m.SetName("gen_ai.client.inference.usage.input_tokens")
 	m.SetUnit("{token}")
-	dp := m.SetEmptyGauge().DataPoints().AppendEmpty()
-	dp.SetTimestamp(pcommon.Timestamp(time.Now().UnixNano()))
+	sum := m.SetEmptySum()
+	sum.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
+	sum.SetIsMonotonic(true)
+	dp := sum.DataPoints().AppendEmpty()
+	now := time.Now()
+	dp.SetStartTimestamp(pcommon.NewTimestampFromTime(now.Add(-time.Second)))
+	dp.SetTimestamp(pcommon.NewTimestampFromTime(now))
 	dp.SetIntValue(10)
 	dp.Attributes().PutStr("gen_ai.system", "gcp.vertex.agent")
 	dp.Attributes().PutStr("gen_ai.token.modality", "text")
@@ -243,7 +268,7 @@ func assertIntegrationViewColumns(ctx context.Context, t *testing.T, client *bq.
 		{
 			name: "v_gen_ai_spans",
 			sql: fmt.Sprintf(
-				"SELECT gen_ai_main_agent_id, gen_ai_main_agent_name, gen_ai_main_agent_description, gen_ai_agent_version, gen_ai_response_id, gen_ai_response_time_to_first_chunk FROM `%s.%s.v_gen_ai_spans` LIMIT 1",
+				"SELECT gen_ai_main_agent_id, gen_ai_main_agent_name, gen_ai_main_agent_description, gen_ai_agent_version, gen_ai_response_id, gen_ai_response_time_to_first_chunk FROM `%s.%s.v_gen_ai_spans` WHERE error_type IS NOT NULL LIMIT 1",
 				project, dataset,
 			),
 			want: []bq.Value{"main-1", "planner", "root planner", "1.0.0", "resp-1", float64(0.25)},
@@ -260,18 +285,18 @@ func assertIntegrationViewColumns(ctx context.Context, t *testing.T, client *bq.
 		},
 		{
 			name: "v_gen_ai_model_costs",
-			sql:  fmt.Sprintf("SELECT typed_error_count, ARRAY_LENGTH(top_error_types) FROM `%s.%s.v_gen_ai_model_costs` LIMIT 1", project, dataset),
-			want: []bq.Value{int64(1), int64(1)},
+			sql:  fmt.Sprintf("SELECT typed_error_count, ARRAY_LENGTH(top_error_types), top_error_types[OFFSET(0)].value FROM `%s.%s.v_gen_ai_model_costs` LIMIT 1", project, dataset),
+			want: []bq.Value{int64(1), int64(1), "rate_limited"},
 		},
 		{
 			name: "v_gen_ai_sessions",
-			sql:  fmt.Sprintf("SELECT typed_error_count, ARRAY_LENGTH(top_error_types) FROM `%s.%s.v_gen_ai_sessions` LIMIT 1", project, dataset),
-			want: []bq.Value{int64(1), int64(1)},
+			sql:  fmt.Sprintf("SELECT typed_error_count, ARRAY_LENGTH(top_error_types), top_error_types[OFFSET(0)].value FROM `%s.%s.v_gen_ai_sessions` LIMIT 1", project, dataset),
+			want: []bq.Value{int64(1), int64(1), "rate_limited"},
 		},
 		{
 			name: "v_gen_ai_tool_usage",
-			sql:  fmt.Sprintf("SELECT typed_error_count, ARRAY_LENGTH(top_error_types) FROM `%s.%s.v_gen_ai_tool_usage` LIMIT 1", project, dataset),
-			want: []bq.Value{int64(1), int64(1)},
+			sql:  fmt.Sprintf("SELECT typed_error_count, ARRAY_LENGTH(top_error_types), top_error_types[OFFSET(0)].value FROM `%s.%s.v_gen_ai_tool_usage` LIMIT 1", project, dataset),
+			want: []bq.Value{int64(1), int64(1), "rate_limited"},
 		},
 	} {
 		rows, err := client.Query(tc.sql).Read(ctx)

@@ -108,7 +108,7 @@ func TestToolUsageViewModelMatchesViewSQL(t *testing.T) {
 		"COUNTIF(status_code = 2) AS error_count,",
 		"SAFE_DIVIDE(COUNTIF(status_code = 2), COUNT(*)) AS error_rate,",
 		"COUNTIF(error_type IS NOT NULL) AS typed_error_count,",
-		"APPROX_TOP_COUNT(error_type, 5) AS top_error_types",
+		"ARRAY( SELECT x FROM UNNEST(APPROX_TOP_COUNT(error_type, 6)) AS x WHERE x.value IS NOT NULL LIMIT 5 ) AS top_error_types",
 		"FROM `"+confProject+"."+confDataset+".v_gen_ai_spans`",
 		"WHERE gen_ai_tool_name IS NOT NULL OR gen_ai_operation_name = 'execute_tool'",
 		"GROUP BY 1, 2, 3, 4, 5",
@@ -537,10 +537,20 @@ func TestGenAIViewNewColumnsAndMainAgentOnlyFilter(t *testing.T) {
 	))
 
 	// Push a second resource whose gen_ai.main_agent.* and gen_ai.agent.version
-	// live on resource.attributes rather than span/point attributes.
+	// live on resource.attributes rather than span/point attributes. Span 4 is a
+	// GenAI chat span and inherits the resource attributes; Span 5 is a plain
+	// HTTP span on the same process and must NOT be admitted to v_gen_ai_spans.
 	resTraces := buildTraces(t, "res-agent-svc",
 		specSpan{
-			trace: traceHex(4), id: spanHex(4), name: "resource main agent",
+			trace: traceHex(4), id: spanHex(4), name: "resource main agent chat",
+			start: at, end: at.Add(time.Second),
+			attrs: map[string]any{
+				"gen_ai.operation.name": "chat",
+				"gen_ai.provider.name":  "gcp.vertex.agent",
+			},
+		},
+		specSpan{
+			trace: traceHex(5), id: spanHex(5), name: "non-genai http span",
 			start: at, end: at.Add(time.Second),
 			attrs: map[string]any{"http.request.method": "POST"},
 		},
@@ -558,7 +568,10 @@ func TestGenAIViewNewColumnsAndMainAgentOnlyFilter(t *testing.T) {
 
 	spans := genAISpansView(t, rig.srv.Rows(confSpans))
 	if len(spans) != 4 {
-		t.Fatalf("v_gen_ai_spans rows = %d, want 4 (span and resource main_agent.* admit spans)", len(spans))
+		t.Fatalf("v_gen_ai_spans rows = %d, want 4 (span main_agent.* admits spans; resource main_agent.* alone does not)", len(spans))
+	}
+	if nonGenAI := rowsWhere(spans, "span_id", spanHex(5)); len(nonGenAI) != 0 {
+		t.Errorf("non-GenAI span on resource with gen_ai.main_agent.name was admitted to v_gen_ai_spans: %v", nonGenAI)
 	}
 	requireCols(t, "span 1 (main_agent.name + ttfc)", onlyRow(t, "span 1", spans, "span_id", spanHex(1)), map[string]any{
 		"gen_ai_main_agent_name":              "orchestrator",
@@ -574,7 +587,8 @@ func TestGenAIViewNewColumnsAndMainAgentOnlyFilter(t *testing.T) {
 		"gen_ai_main_agent_name":        "res-orchestrator",
 		"gen_ai_main_agent_description": "Resource-scoped orchestrator",
 		"gen_ai_agent_version":          "2.0.0",
-		"gen_ai_operation_name":         nil,
+		"gen_ai_operation_name":         "chat",
+		"gen_ai_provider_name":          "gcp.vertex.agent",
 	})
 
 	// v_gen_ai_logs reads error_type from l.attributes only, never s.attributes.

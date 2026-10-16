@@ -405,7 +405,7 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
     Cloud Trace `_AllSpans` layout (`status` narrowed to `STRUCT<code INT64, message STRING>`).
   - `v_gen_ai_spans`: filters `otel_spans_dedup` to GenAI/agent spans (including
     spans carrying only `gen_ai.main_agent.name` or `gen_ai.main_agent.id` on
-    span `attributes` or `resource.attributes`) and
+    span `attributes`) and
     promotes `gen_ai.*`, `error.type`, and `gcp.vertex.agent.*` attributes (`gen_ai_operation_name`,
     `gen_ai_system`, `gen_ai_request_model`, `gen_ai_response_model`,
     `gen_ai_agent_name`, `gen_ai_agent_id`, `gen_ai_conversation_id`,
@@ -427,7 +427,7 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
     second; `error_type` is the `error.type` attribute.
   - `v_gen_ai_model_costs`: hourly token, cache-read/write, reasoning, latency
     (`APPROX_QUANTILES`), and error-count (`error_count`, `typed_error_count`,
-    and `top_error_types` via `APPROX_TOP_COUNT(error_type, 5)`) rollups over
+    and `top_error_types` over non-null `error_type` values) rollups over
     `v_gen_ai_spans` grouped
     by `(usage_hour, service_name, gen_ai_agent_name, provider, model)`. Each
     LLM call is counted once: a span with a direct child span that reports input
@@ -464,7 +464,7 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
     `agent_invocation_count` counts `invoke_agent` spans. `session_start_date`,
     `total_cache_creation_input_tokens`, `llm_call_count`,
     `agent_invocation_count`, `typed_error_count`, and `top_error_types`
-    (`APPROX_TOP_COUNT(error_type, 5)`) are the last six columns, so every
+    (top 5 non-null `error_type` values) are the last six columns, so every
     earlier column keeps its position.
   - `v_gen_ai_tool_usage`: hourly tool invocation count, error rate, typed error
     count (`typed_error_count`, `top_error_types`), and latency

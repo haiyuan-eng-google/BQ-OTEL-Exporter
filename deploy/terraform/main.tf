@@ -639,8 +639,6 @@ resource "google_bigquery_table" "v_gen_ai_spans" {
          OR JSON_VALUE(attributes, '$."gcp.vertex.agent.invocation_id"') IS NOT NULL
          OR JSON_VALUE(attributes, '$."gen_ai.main_agent.name"') IS NOT NULL
          OR JSON_VALUE(attributes, '$."gen_ai.main_agent.id"') IS NOT NULL
-         OR JSON_VALUE(resource.attributes, '$."gen_ai.main_agent.name"') IS NOT NULL
-         OR JSON_VALUE(resource.attributes, '$."gen_ai.main_agent.id"') IS NOT NULL
     EOT
   }
 }
@@ -774,7 +772,11 @@ resource "google_bigquery_table" "v_gen_ai_model_costs" {
         APPROX_QUANTILES(s.duration_ms, 100)[OFFSET(95)] AS p95_duration_ms,
         APPROX_QUANTILES(s.duration_ms, 100)[OFFSET(99)] AS p99_duration_ms,
         COUNTIF(s.error_type IS NOT NULL) AS typed_error_count,
-        APPROX_TOP_COUNT(s.error_type, 5) AS top_error_types
+        ARRAY(
+          SELECT x FROM UNNEST(APPROX_TOP_COUNT(s.error_type, 6)) AS x
+          WHERE x.value IS NOT NULL
+          LIMIT 5
+        ) AS top_error_types
       FROM cost_windows AS s
       WHERE NOT EXISTS (
           SELECT 1 FROM UNNEST(s.token_parent_span_ids) AS token_parent_span_id
@@ -889,7 +891,11 @@ resource "google_bigquery_table" "v_gen_ai_sessions" {
         COUNTIF(is_llm_call) AS llm_call_count,
         COUNTIF(gen_ai_operation_name = 'invoke_agent') AS agent_invocation_count,
         COUNTIF(error_type IS NOT NULL) AS typed_error_count,
-        APPROX_TOP_COUNT(error_type, 5) AS top_error_types
+        ARRAY(
+          SELECT x FROM UNNEST(APPROX_TOP_COUNT(error_type, 6)) AS x
+          WHERE x.value IS NOT NULL
+          LIMIT 5
+        ) AS top_error_types
       FROM session_calls
       GROUP BY service_name, session_start_date, session_id
     EOT
@@ -986,7 +992,11 @@ resource "google_bigquery_table" "v_gen_ai_tool_usage" {
         APPROX_QUANTILES(duration_ms, 100)[OFFSET(50)] AS p50_duration_ms,
         APPROX_QUANTILES(duration_ms, 100)[OFFSET(95)] AS p95_duration_ms,
         COUNTIF(error_type IS NOT NULL) AS typed_error_count,
-        APPROX_TOP_COUNT(error_type, 5) AS top_error_types
+        ARRAY(
+          SELECT x FROM UNNEST(APPROX_TOP_COUNT(error_type, 6)) AS x
+          WHERE x.value IS NOT NULL
+          LIMIT 5
+        ) AS top_error_types
       FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.v_gen_ai_spans.table_id}`
       WHERE gen_ai_tool_name IS NOT NULL OR gen_ai_operation_name = 'execute_tool'
       GROUP BY 1, 2, 3, 4, 5

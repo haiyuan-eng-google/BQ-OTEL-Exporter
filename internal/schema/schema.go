@@ -666,8 +666,6 @@ WHERE JSON_VALUE(attributes, '$."gen_ai.operation.name"') IS NOT NULL
    OR JSON_VALUE(attributes, '$."gcp.vertex.agent.invocation_id"') IS NOT NULL
    OR JSON_VALUE(attributes, '$."gen_ai.main_agent.name"') IS NOT NULL
    OR JSON_VALUE(attributes, '$."gen_ai.main_agent.id"') IS NOT NULL
-   OR JSON_VALUE(resource.attributes, '$."gen_ai.main_agent.name"') IS NOT NULL
-   OR JSON_VALUE(resource.attributes, '$."gen_ai.main_agent.id"') IS NOT NULL
 `
 
 // GenAILogsViewDDL creates v_gen_ai_logs: the log records whose event name
@@ -981,7 +979,11 @@ SELECT
   APPROX_QUANTILES(s.duration_ms, 100)[OFFSET(95)] AS p95_duration_ms,
   APPROX_QUANTILES(s.duration_ms, 100)[OFFSET(99)] AS p99_duration_ms,
   COUNTIF(s.error_type IS NOT NULL) AS typed_error_count,
-  APPROX_TOP_COUNT(s.error_type, 5) AS top_error_types
+  ARRAY(
+    SELECT x FROM UNNEST(APPROX_TOP_COUNT(s.error_type, 6)) AS x
+    WHERE x.value IS NOT NULL
+    LIMIT 5
+  ) AS top_error_types
 FROM cost_windows AS s
 WHERE ` + genAILLMCallPredicate + `
 GROUP BY 1, 2, 3, 4, 5
@@ -1084,7 +1086,11 @@ SELECT
   COUNTIF(is_llm_call) AS llm_call_count,
   COUNTIF(gen_ai_operation_name = 'invoke_agent') AS agent_invocation_count,
   COUNTIF(error_type IS NOT NULL) AS typed_error_count,
-  APPROX_TOP_COUNT(error_type, 5) AS top_error_types
+  ARRAY(
+    SELECT x FROM UNNEST(APPROX_TOP_COUNT(error_type, 6)) AS x
+    WHERE x.value IS NOT NULL
+    LIMIT 5
+  ) AS top_error_types
 FROM session_calls
 GROUP BY service_name, session_start_date, session_id
 `
@@ -1111,7 +1117,11 @@ SELECT
   APPROX_QUANTILES(duration_ms, 100)[OFFSET(50)] AS p50_duration_ms,
   APPROX_QUANTILES(duration_ms, 100)[OFFSET(95)] AS p95_duration_ms,
   COUNTIF(error_type IS NOT NULL) AS typed_error_count,
-  APPROX_TOP_COUNT(error_type, 5) AS top_error_types
+  ARRAY(
+    SELECT x FROM UNNEST(APPROX_TOP_COUNT(error_type, 6)) AS x
+    WHERE x.value IS NOT NULL
+    LIMIT 5
+  ) AS top_error_types
 FROM ` + "`%[1]s.%[2]s." + GenAISpansViewName + "`" + `
 WHERE gen_ai_tool_name IS NOT NULL OR gen_ai_operation_name = 'execute_tool'
 GROUP BY 1, 2, 3, 4, 5

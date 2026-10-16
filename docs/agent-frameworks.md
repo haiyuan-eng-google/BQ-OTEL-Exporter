@@ -295,8 +295,9 @@ GenAI spans, logs, and client metrics, `1.41.0` `gen_ai.agent.version`, and
 promotes `gen_ai.main_agent.{id,name,description}` and `gen_ai.agent.version`
 (coalescing span `attributes` first and `resource.attributes` second),
 `gen_ai.response.id`, and `gen_ai.response.time_to_first_chunk` (and admits
-spans carrying `gen_ai.main_agent.name` or `gen_ai.main_agent.id` on either
-`attributes` or `resource.attributes`); `v_gen_ai_logs` promotes `error_type`
+spans carrying `gen_ai.main_agent.name` or `gen_ai.main_agent.id` on span
+`attributes`, without admitting unrelated spans that only inherit
+`resource.attributes`); `v_gen_ai_logs` promotes `error_type`
 from the log record's own `error.type` attribute; `v_gen_ai_metrics` promotes
 `gen_ai_token_modality`, `gen_ai_agent_name` (from `gen_ai.agent.name` then
 `gen_ai.main_agent.name` on point `attributes`, then `gen_ai.main_agent.name` on
@@ -304,7 +305,7 @@ from the log record's own `error.type` attribute; `v_gen_ai_metrics` promotes
 `output`, `cache_read_input`, `cache_write_input`, or `reasoning_output` for
 `gen_ai.client.inference.usage.*` metrics, falling back to `gen_ai.token.type`);
 and `v_gen_ai_model_costs`, `v_gen_ai_sessions`, and `v_gen_ai_tool_usage` expose
-`typed_error_count` and `top_error_types` (`APPROX_TOP_COUNT(error_type, 5)`).
+`typed_error_count` and `top_error_types` (top 5 non-null `error_type` values via `APPROX_TOP_COUNT(error_type, 6)` filtered to `x.value IS NOT NULL`).
 
 Some frameworks report the same tokens on an agent span and again on the model
 call spans beneath it. `v_gen_ai_model_costs` and `v_gen_ai_sessions` leave out

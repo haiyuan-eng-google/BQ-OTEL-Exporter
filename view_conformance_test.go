@@ -452,8 +452,8 @@ func genAISpansView(t testing.TB, rawSpans []map[string]any) []map[string]any {
 		_, hasOp := row["gen_ai_operation_name"]
 		_, hasSystem := row["gen_ai_system"]
 		_, hasInvocation := row["adk_invocation_id"]
-		_, hasMainAgentName := row["gen_ai_main_agent_name"]
-		_, hasMainAgentID := row["gen_ai_main_agent_id"]
+		_, hasMainAgentName := a.jsonValue("gen_ai.main_agent.name")
+		_, hasMainAgentID := a.jsonValue("gen_ai.main_agent.id")
 		if !hasOp && !hasSystem && !hasInvocation && !hasMainAgentName && !hasMainAgentID {
 			continue
 		}
@@ -592,10 +592,11 @@ func groupKey(vals ...any) string {
 	return b.String()
 }
 
-// topErrorTypes models BigQuery APPROX_TOP_COUNT(error_type, limit): an array
-// of {"value": string, "count": int64} entries for non-NULL error_type values,
-// ordered by count descending and then value ascending. BigQuery returns an
-// empty ARRAY when every input in the group is NULL.
+// topErrorTypes models ARRAY(SELECT x FROM UNNEST(APPROX_TOP_COUNT(error_type, 6)) AS x WHERE x.value IS NOT NULL LIMIT 5):
+// an array of {"value": string, "count": int64} entries for non-NULL error_type
+// values, ordered by count descending and then value ascending. BigQuery's raw
+// APPROX_TOP_COUNT counts NULL as a bucket, so the SQL requests 6 buckets,
+// drops the NULL bucket, and limits to 5.
 func topErrorTypes(counts map[string]int64, limit int) []map[string]any {
 	if len(counts) == 0 {
 		return []map[string]any{}
@@ -1049,9 +1050,7 @@ func TestViewModelMatchesViewSQL(t *testing.T) {
 			" OR JSON_VALUE(attributes, '$.\"gen_ai.provider.name\"') IS NOT NULL" +
 			" OR JSON_VALUE(attributes, '$.\"gcp.vertex.agent.invocation_id\"') IS NOT NULL" +
 			" OR JSON_VALUE(attributes, '$.\"gen_ai.main_agent.name\"') IS NOT NULL" +
-			" OR JSON_VALUE(attributes, '$.\"gen_ai.main_agent.id\"') IS NOT NULL" +
-			" OR JSON_VALUE(resource.attributes, '$.\"gen_ai.main_agent.name\"') IS NOT NULL" +
-			" OR JSON_VALUE(resource.attributes, '$.\"gen_ai.main_agent.id\"') IS NOT NULL",
+			" OR JSON_VALUE(attributes, '$.\"gen_ai.main_agent.id\"') IS NOT NULL",
 	}
 	for _, c := range spanChains {
 		spanFragments = append(spanFragments, c.sql(""))
@@ -1113,7 +1112,7 @@ func TestViewModelMatchesViewSQL(t *testing.T) {
 		"SUM(COALESCE(s.gen_ai_usage_cache_creation_input_tokens, 0)) AS total_cache_creation_input_tokens",
 		"SUM(COALESCE(s.gen_ai_usage_reasoning_tokens, 0)) AS total_reasoning_tokens",
 		"COUNTIF(s.error_type IS NOT NULL) AS typed_error_count",
-		"APPROX_TOP_COUNT(s.error_type, 5) AS top_error_types",
+		"ARRAY( SELECT x FROM UNNEST(APPROX_TOP_COUNT(s.error_type, 6)) AS x WHERE x.value IS NOT NULL LIMIT 5 ) AS top_error_types",
 	)
 
 	requireSQL(t, "v_gen_ai_sessions", render(schema.GenAISessionsViewQuery, confProject, confDataset),
@@ -1142,7 +1141,7 @@ func TestViewModelMatchesViewSQL(t *testing.T) {
 		"COUNTIF(is_llm_call) AS llm_call_count",
 		"COUNTIF(gen_ai_operation_name = 'invoke_agent') AS agent_invocation_count",
 		"COUNTIF(error_type IS NOT NULL) AS typed_error_count",
-		"APPROX_TOP_COUNT(error_type, 5) AS top_error_types",
+		"ARRAY( SELECT x FROM UNNEST(APPROX_TOP_COUNT(error_type, 6)) AS x WHERE x.value IS NOT NULL LIMIT 5 ) AS top_error_types",
 		"GROUP BY service_name, session_start_date, session_id",
 	)
 }

@@ -656,12 +656,17 @@ func TestGenAISpansViewPromotesReasoningTokensAndErrorType(t *testing.T) {
 	for _, want := range []string{
 		`OR JSON_VALUE(attributes, '$."gen_ai.main_agent.name"') IS NOT NULL`,
 		`OR JSON_VALUE(attributes, '$."gen_ai.main_agent.id"') IS NOT NULL`,
-		`OR JSON_VALUE(resource.attributes, '$."gen_ai.main_agent.name"') IS NOT NULL`,
-		`OR JSON_VALUE(resource.attributes, '$."gen_ai.main_agent.id"') IS NOT NULL`,
 	} {
 		if !strings.Contains(query, want) {
 			t.Errorf("v_gen_ai_spans WHERE clause must contain %q, got:\n%s", want, query)
 		}
+	}
+	_, whereClause, hasWhere := strings.Cut(query, " WHERE ")
+	if !hasWhere {
+		t.Fatalf("v_gen_ai_spans query lacks WHERE clause:\n%s", query)
+	}
+	if strings.Contains(whereClause, "resource.attributes") {
+		t.Errorf("v_gen_ai_spans WHERE clause must not match process-wide resource.attributes, got:\n%s", whereClause)
 	}
 
 	logExprs := projectionExprs(t, GenAILogsViewQuery, "proj", "ds", "logs", "spans")
