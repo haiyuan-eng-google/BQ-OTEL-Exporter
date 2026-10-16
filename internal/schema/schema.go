@@ -488,6 +488,8 @@ const (
 	GenAISessionsViewName        = "v_gen_ai_sessions"
 	GenAIToolUsageViewName       = "v_gen_ai_tool_usage"
 	GenAIAgentTrajectoryViewName = "v_gen_ai_agent_trajectory"
+	MCPSpansViewName             = "v_mcp_spans"
+	MCPToolUsageViewName         = "v_mcp_tool_usage"
 )
 
 // SpansAsAllSpansViewDDL creates otel_spans_as_allspans, which presents the
@@ -1652,6 +1654,144 @@ LEFT JOIN token_parent_coverage AS token_leaf_check
   ON t.trace_id = token_leaf_check.trace_id
   AND t.span_id = token_leaf_check.span_id
   AND t.service_name IS NOT DISTINCT FROM token_leaf_check.service_name
+`
+
+// MCPSpansViewDDL creates v_mcp_spans: the spans that carry mcp.method.name,
+// mcp.session.id, or mcp.resource.uri, reading from the span deduplication
+// view so non-GenAI Model Context Protocol operations (such as initialize,
+// tools/list, and resources/read) are visible without changing the
+// v_gen_ai_spans predicate. Spans that also satisfy the v_gen_ai_spans
+// predicate set also_in_gen_ai_view = TRUE so dashboards can deduplicate
+// dual-tagged tools/call spans.
+const MCPSpansViewDDL = `
+CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + MCPSpansViewName + "`" + ` AS
+` + MCPSpansViewQuery + `;
+`
+
+// MCPSpansViewQuery is shared by operator-run DDL and metadata-API view
+// creation. It takes (project, dataset, spans table) and reads the span dedup
+// view, never the raw table.
+const MCPSpansViewQuery = `
+SELECT
+  start_time,
+  end_time,
+  duration_nano,
+  ROUND(duration_nano / 1e6, 3) AS duration_ms,
+  trace_id,
+  span_id,
+  parent_span_id,
+  service_name,
+  name AS span_name,
+  kind AS span_kind,
+  status.code AS status_code,
+  status.message AS status_message,
+  -- Promoted OTel MCP & JSON-RPC semantic convention attributes (v1.40.0)
+  JSON_VALUE(attributes, '$."mcp.method.name"') AS mcp_method_name,
+  JSON_VALUE(attributes, '$."mcp.protocol.version"') AS mcp_protocol_version,
+  JSON_VALUE(attributes, '$."mcp.session.id"') AS mcp_session_id,
+  JSON_VALUE(attributes, '$."mcp.resource.uri"') AS mcp_resource_uri,
+  JSON_VALUE(attributes, '$."jsonrpc.request.id"') AS jsonrpc_request_id,
+  JSON_VALUE(attributes, '$."rpc.response.status_code"') AS rpc_response_status_code,
+  -- Promoted GenAI correlation attributes for dual-tagged MCP spans
+  JSON_VALUE(attributes, '$."gen_ai.operation.name"') AS gen_ai_operation_name,
+  COALESCE(
+    JSON_VALUE(attributes, '$."gen_ai.system"'),
+    JSON_VALUE(attributes, '$."gen_ai.provider.name"')
+  ) AS gen_ai_system,
+  JSON_VALUE(attributes, '$."gen_ai.tool.name"') AS gen_ai_tool_name,
+  JSON_VALUE(attributes, '$."gen_ai.tool.call.id"') AS gen_ai_tool_call_id,
+  JSON_VALUE(attributes, '$."gen_ai.prompt.name"') AS gen_ai_prompt_name,
+  COALESCE(
+    JSON_VALUE(attributes, '$."gen_ai.agent.name"'),
+    JSON_VALUE(attributes, '$."gcp.vertex.agent.name"'),
+    JSON_VALUE(attributes, '$."gen_ai.main_agent.name"')
+  ) AS gen_ai_agent_name,
+  JSON_VALUE(attributes, '$."error.type"') AS error_type,
+  -- Server endpoint correlation
+  JSON_VALUE(attributes, '$."server.address"') AS server_address,
+  LAX_INT64(attributes['server.port']) AS server_port,
+  JSON_VALUE(attributes, '$."network.transport"') AS network_transport,
+  -- MCP classification and v_gen_ai_spans overlap flag
+  COALESCE(JSON_VALUE(attributes, '$."mcp.method.name"') = 'tools/call', FALSE) AS is_tool_call,
+  (
+    JSON_VALUE(attributes, '$."gen_ai.operation.name"') IS NOT NULL
+    OR JSON_VALUE(attributes, '$."gen_ai.system"') IS NOT NULL
+    OR JSON_VALUE(attributes, '$."gen_ai.provider.name"') IS NOT NULL
+    OR JSON_VALUE(attributes, '$."gcp.vertex.agent.invocation_id"') IS NOT NULL
+    OR JSON_VALUE(attributes, '$."gen_ai.main_agent.name"') IS NOT NULL
+    OR JSON_VALUE(attributes, '$."gen_ai.main_agent.id"') IS NOT NULL
+  ) AS also_in_gen_ai_view,
+  -- Multimodal ObjectRef array and raw bags
+  payload_refs,
+  attributes,
+  resource,
+  instrumentation_scope
+FROM ` + "`%[1]s.%[2]s.%[3]s_dedup`" + `
+WHERE JSON_VALUE(attributes, '$."mcp.method.name"') IS NOT NULL
+   OR JSON_VALUE(attributes, '$."mcp.session.id"') IS NOT NULL
+   OR JSON_VALUE(attributes, '$."mcp.resource.uri"') IS NOT NULL
+`
+
+// MCPToolUsageViewDDL creates v_mcp_tool_usage: hourly MCP method, tool,
+// resource, and prompt invocation volume, error rate, typed error breakdown,
+// and latency percentiles over v_mcp_spans.
+const MCPToolUsageViewDDL = `
+CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + MCPToolUsageViewName + "`" + ` AS
+` + MCPToolUsageViewQuery + `;
+`
+
+// MCPToolUsageViewQuery is shared by operator-run DDL and metadata-API view
+// creation. It takes (project, dataset) and reads v_mcp_spans.
+const MCPToolUsageViewQuery = `
+WITH mcp_tool_agg AS (
+  SELECT
+    TIMESTAMP_TRUNC(start_time, HOUR) AS usage_hour,
+    service_name,
+    mcp_method_name,
+    mcp_protocol_version,
+    gen_ai_tool_name,
+    COALESCE(gen_ai_tool_name, mcp_resource_uri, gen_ai_prompt_name) AS mcp_target_name,
+    span_kind,
+    server_address,
+    COUNT(*) AS call_count,
+    COUNTIF(also_in_gen_ai_view) AS gen_ai_tagged_call_count,
+    COUNTIF(status_code = 2 OR error_type IS NOT NULL) AS error_count,
+    COUNTIF(error_type IS NOT NULL) AS typed_error_count,
+    APPROX_TOP_COUNT(error_type, 6) AS raw_top_error_types,
+    SAFE_DIVIDE(COUNTIF(status_code = 2 OR error_type IS NOT NULL), COUNT(*)) AS error_rate,
+    ROUND(AVG(duration_ms), 3) AS avg_duration_ms,
+    APPROX_QUANTILES(duration_ms, 100)[OFFSET(50)] AS p50_duration_ms,
+    APPROX_QUANTILES(duration_ms, 100)[OFFSET(95)] AS p95_duration_ms,
+    APPROX_QUANTILES(duration_ms, 100)[OFFSET(99)] AS p99_duration_ms
+  FROM ` + "`%[1]s.%[2]s." + MCPSpansViewName + "`" + `
+  GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+)
+SELECT
+  usage_hour,
+  service_name,
+  mcp_method_name,
+  mcp_protocol_version,
+  gen_ai_tool_name,
+  mcp_target_name,
+  span_kind,
+  server_address,
+  call_count,
+  gen_ai_tagged_call_count,
+  error_count,
+  typed_error_count,
+  ARRAY(
+    SELECT AS STRUCT x.value, x.count
+    FROM UNNEST(raw_top_error_types) AS x
+    WHERE x.value IS NOT NULL
+    ORDER BY x.count DESC, x.value ASC
+    LIMIT 5
+  ) AS top_error_types,
+  error_rate,
+  avg_duration_ms,
+  p50_duration_ms,
+  p95_duration_ms,
+  p99_duration_ms
+FROM mcp_tool_agg
 `
 
 // FingerprintPrefix is the version tag on record_fingerprint and

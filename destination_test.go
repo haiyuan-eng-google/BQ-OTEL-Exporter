@@ -532,19 +532,25 @@ func TestPrepareDestinationCreatesSpanCompanionViews(t *testing.T) {
 		"v_gen_ai_sessions":         fmt.Sprintf(schema.GenAISessionsViewQuery, "my-project", "otel"),
 		"v_gen_ai_tool_usage":       fmt.Sprintf(schema.GenAIToolUsageViewQuery, "my-project", "otel"),
 		"v_gen_ai_agent_trajectory": fmt.Sprintf(schema.GenAIAgentTrajectoryViewQuery, "my-project", "otel"),
+		"v_mcp_spans":               fmt.Sprintf(schema.MCPSpansViewQuery, "my-project", "otel", cfg.Traces.Table),
+		"v_mcp_tool_usage":          fmt.Sprintf(schema.MCPToolUsageViewQuery, "my-project", "otel"),
 	} {
 		if md := admin.createdTables[id]; md == nil || md.ViewQuery != want {
 			t.Errorf("companion view %s = %#v, want expected view query", id, md)
 		}
 	}
-	if got := len(admin.createdTables); got != 8 {
-		t.Errorf("created %d tables and views, want the table, its dedup view and six span companion views", got)
+	if got := len(admin.createdTables); got != 10 {
+		t.Errorf("created %d tables and views, want the table, its dedup view and eight span companion views", got)
 	}
 	spansIdx := slices.Index(admin.createdTableOrder, "v_gen_ai_spans")
 	for _, rollup := range []string{"v_gen_ai_model_costs", "v_gen_ai_sessions", "v_gen_ai_tool_usage", "v_gen_ai_agent_trajectory"} {
 		if idx := slices.Index(admin.createdTableOrder, rollup); spansIdx < 0 || idx < spansIdx {
 			t.Errorf("createdTableOrder = %v, want v_gen_ai_spans before %s", admin.createdTableOrder, rollup)
 		}
+	}
+	mcpSpansIdx := slices.Index(admin.createdTableOrder, "v_mcp_spans")
+	if idx := slices.Index(admin.createdTableOrder, "v_mcp_tool_usage"); mcpSpansIdx < 0 || idx < mcpSpansIdx {
+		t.Errorf("createdTableOrder = %v, want v_mcp_spans before v_mcp_tool_usage", admin.createdTableOrder)
 	}
 	if !equalStrings(admin.tableReadIDs, []string{cfg.Traces.Table, cfg.Logs.Table + "_dedup", cfg.Metrics.Table + "_dedup"}) {
 		t.Errorf("table reads = %v, want the destination table probe, the log dedup view probe, and the metric dedup view probe", admin.tableReadIDs)
@@ -595,8 +601,8 @@ func TestPrepareDestinationCreatesLogsCompanionViewWhenTracesStartsSecond(t *tes
 	if md := admin.createdTables["v_gen_ai_logs"]; md == nil || md.ViewQuery != want {
 		t.Fatalf("v_gen_ai_logs = %#v, want traces startup to create v_gen_ai_logs when log dedup view already exists", md)
 	}
-	if got := len(admin.createdTables); got != 9 {
-		t.Errorf("created %d tables and views, want the table, its dedup view, six span companion views, and v_gen_ai_logs", got)
+	if got := len(admin.createdTables); got != 11 {
+		t.Errorf("created %d tables and views, want the table, its dedup view, eight span companion views, and v_gen_ai_logs", got)
 	}
 	if !slices.Contains(admin.tableReadIDs, cfg.Logs.Table+"_dedup") {
 		t.Errorf("table reads = %v, want a probe of the log dedup view", admin.tableReadIDs)
@@ -685,6 +691,8 @@ func TestPrepareDestinationCompanionViewCreationResults(t *testing.T) {
 				"v_gen_ai_sessions":         alreadyExists(),
 				"v_gen_ai_tool_usage":       alreadyExists(),
 				"v_gen_ai_agent_trajectory": alreadyExists(),
+				"v_mcp_spans":               alreadyExists(),
+				"v_mcp_tool_usage":          alreadyExists(),
 				"v_gen_ai_logs":             alreadyExists(),
 			},
 		},
@@ -960,6 +968,16 @@ func reconcileTargets() []reconcileTarget {
 			name: "agent trajectory companion view", table: defaultSpansTable, tableSchema: schema.SpansTableSchema(),
 			viewID: schema.GenAIAgentTrajectoryViewName,
 			query:  fmt.Sprintf(schema.GenAIAgentTrajectoryViewQuery, project, dataset),
+		},
+		{
+			name: "mcp spans companion view", table: defaultSpansTable, tableSchema: schema.SpansTableSchema(),
+			viewID: schema.MCPSpansViewName,
+			query:  fmt.Sprintf(schema.MCPSpansViewQuery, project, dataset, defaultSpansTable),
+		},
+		{
+			name: "mcp tool usage companion view", table: defaultSpansTable, tableSchema: schema.SpansTableSchema(),
+			viewID: schema.MCPToolUsageViewName,
+			query:  fmt.Sprintf(schema.MCPToolUsageViewQuery, project, dataset),
 		},
 	}
 }

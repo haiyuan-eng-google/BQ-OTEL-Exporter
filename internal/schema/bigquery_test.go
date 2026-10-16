@@ -259,6 +259,8 @@ func TestCompanionViewsMetadata(t *testing.T) {
 				"v_gen_ai_sessions":         fmt.Sprintf(GenAISessionsViewQuery, "proj", "ds"),
 				"v_gen_ai_tool_usage":       fmt.Sprintf(GenAIToolUsageViewQuery, "proj", "ds"),
 				"v_gen_ai_agent_trajectory": fmt.Sprintf(GenAIAgentTrajectoryViewQuery, "proj", "ds"),
+				"v_mcp_spans":               fmt.Sprintf(MCPSpansViewQuery, "proj", "ds", "spans_tbl"),
+				"v_mcp_tool_usage":          fmt.Sprintf(MCPToolUsageViewQuery, "proj", "ds"),
 			},
 		},
 		{

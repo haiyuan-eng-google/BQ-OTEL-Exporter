@@ -175,6 +175,8 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 		"v_gen_ai_sessions",
 		"v_gen_ai_tool_usage",
 		"v_gen_ai_agent_trajectory",
+		"v_mcp_spans",
+		"v_mcp_tool_usage",
 	} {
 		if _, err := admin.Dataset(dataset).Table(name).Metadata(ctx); err != nil {
 			t.Errorf("resource %s metadata: %v", name, err)
@@ -204,6 +206,7 @@ func oneIntegrationTrace() ptrace.Traces {
 	attrs.PutStr("gen_ai.request.model", "gemini-2.5-pro")
 	attrs.PutStr("gen_ai.conversation.id", "sess-it-1")
 	attrs.PutStr("gen_ai.tool.name", "search")
+	attrs.PutStr("mcp.method.name", "tools/call")
 	attrs.PutStr("gen_ai.main_agent.id", "main-1")
 	attrs.PutStr("gen_ai.main_agent.name", "planner")
 	attrs.PutStr("gen_ai.main_agent.description", "root planner")
@@ -245,6 +248,7 @@ func oneIntegrationTrace() ptrace.Traces {
 	okAttrs.PutStr("gen_ai.request.model", "gemini-2.5-pro")
 	okAttrs.PutStr("gen_ai.conversation.id", "sess-it-1")
 	okAttrs.PutStr("gen_ai.tool.name", "search")
+	okAttrs.PutStr("mcp.method.name", "tools/call")
 	okAttrs.PutInt("gen_ai.usage.input_tokens", 8)
 	okAttrs.PutInt("gen_ai.usage.output_tokens", 4)
 	return td
@@ -350,6 +354,16 @@ func assertIntegrationViewColumns(ctx context.Context, t *testing.T, client *bq.
 			name: "v_gen_ai_agent_trajectory (recursive depth 1 child)",
 			sql:  fmt.Sprintf("SELECT depth, root_span_id, nearest_agent_name, is_orphan, is_leaf, is_token_leaf FROM `%s.%s.v_gen_ai_agent_trajectory` WHERE depth = 1 LIMIT 1", project, dataset),
 			want: []bq.Value{int64(1), "0300000000000000", "planner", false, true, true},
+		},
+		{
+			name: "v_mcp_spans",
+			sql:  fmt.Sprintf("SELECT mcp_method_name, is_tool_call, also_in_gen_ai_view FROM `%s.%s.v_mcp_spans` WHERE error_type IS NOT NULL LIMIT 1", project, dataset),
+			want: []bq.Value{"tools/call", true, true},
+		},
+		{
+			name: "v_mcp_tool_usage",
+			sql:  fmt.Sprintf("SELECT call_count, gen_ai_tagged_call_count, typed_error_count, ARRAY_LENGTH(top_error_types), top_error_types[OFFSET(0)].value FROM `%s.%s.v_mcp_tool_usage` LIMIT 1", project, dataset),
+			want: []bq.Value{int64(2), int64(2), int64(1), int64(1), "rate_limited"},
 		},
 	} {
 		rows, err := client.Query(tc.sql).Read(ctx)

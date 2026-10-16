@@ -569,6 +569,22 @@ func TestCompanionViewTemplates(t *testing.T) {
 			args:    []any{"proj", "ds"},
 			sources: []string{"FROM `proj.ds.v_gen_ai_spans`"},
 		},
+		{
+			name:    "mcp_spans",
+			view:    "v_mcp_spans",
+			query:   MCPSpansViewQuery,
+			ddl:     MCPSpansViewDDL,
+			args:    []any{"proj", "ds", "spans_tbl"},
+			sources: []string{"FROM `proj.ds.spans_tbl_dedup`"},
+		},
+		{
+			name:    "mcp_tool_usage",
+			view:    "v_mcp_tool_usage",
+			query:   MCPToolUsageViewQuery,
+			ddl:     MCPToolUsageViewDDL,
+			args:    []any{"proj", "ds"},
+			sources: []string{"FROM `proj.ds.v_mcp_spans`"},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			query := strings.TrimSpace(fmt.Sprintf(tc.query, tc.args...))
@@ -1238,6 +1254,42 @@ func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 				"agent_path", "is_orphan", "step_index", "is_leaf", "is_token_leaf",
 			},
 		},
+		{
+			name:     "mcp_spans",
+			query:    MCPSpansViewQuery,
+			args:     []any{"proj", "ds", "spans"},
+			contract: SpansTableSchema(),
+			// 34 columns: 12 span identity/status fields, 6 MCP & JSON-RPC
+			// fields, 7 GenAI correlation fields, 3 server endpoint fields,
+			// is_tool_call, also_in_gen_ai_view, and 4 raw bags.
+			want: []string{
+				"start_time", "end_time", "duration_nano", "duration_ms",
+				"trace_id", "span_id", "parent_span_id", "service_name",
+				"span_name", "span_kind", "status_code", "status_message",
+				"mcp_method_name", "mcp_protocol_version", "mcp_session_id",
+				"mcp_resource_uri", "jsonrpc_request_id", "rpc_response_status_code",
+				"gen_ai_operation_name", "gen_ai_system", "gen_ai_tool_name",
+				"gen_ai_tool_call_id", "gen_ai_prompt_name", "gen_ai_agent_name",
+				"error_type",
+				"server_address", "server_port", "network_transport",
+				"is_tool_call", "also_in_gen_ai_view",
+				"payload_refs", "attributes", "resource", "instrumentation_scope",
+			},
+		},
+		{
+			name:  "mcp_tool_usage",
+			query: MCPToolUsageViewQuery,
+			args:  []any{"proj", "ds"},
+			// 18 columns: 8 grouping keys and 10 hourly volume, overlap,
+			// error, and latency rollup columns.
+			want: []string{
+				"usage_hour", "service_name", "mcp_method_name", "mcp_protocol_version",
+				"gen_ai_tool_name", "mcp_target_name", "span_kind", "server_address",
+				"call_count", "gen_ai_tagged_call_count", "error_count", "typed_error_count",
+				"top_error_types", "error_rate", "avg_duration_ms",
+				"p50_duration_ms", "p95_duration_ms", "p99_duration_ms",
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			items, err := selectList(fmt.Sprintf(tc.query, tc.args...))
@@ -1429,6 +1481,44 @@ func TestGenAIAgentTrajectoryView(t *testing.T) {
 	}
 	if n := strings.Count(query, "IS NOT DISTINCT FROM"); n != 7 {
 		t.Errorf("v_gen_ai_agent_trajectory query has %d IS NOT DISTINCT FROM clauses, want 7", n)
+	}
+}
+
+func TestMCPSpansAndToolUsageViews(t *testing.T) {
+	genAIQuery := normalizeSQL(fmt.Sprintf(GenAISpansViewQuery, "proj", "ds", "spans"))
+	_, genAIWhere, ok := strings.Cut(genAIQuery, " WHERE ")
+	if !ok {
+		t.Fatalf("v_gen_ai_spans query lacks WHERE clause:\n%s", genAIQuery)
+	}
+
+	mcpExprs := projectionExprs(t, MCPSpansViewQuery, "proj", "ds", "spans")
+	alsoInGenAI := strings.TrimSuffix(strings.TrimPrefix(mcpExprs["also_in_gen_ai_view"], "( "), " )")
+	if alsoInGenAI != genAIWhere {
+		t.Errorf("v_mcp_spans.also_in_gen_ai_view =\n%s\nwant exact v_gen_ai_spans WHERE predicate:\n%s", alsoInGenAI, genAIWhere)
+	}
+	if got, want := mcpExprs["is_tool_call"], `COALESCE(JSON_VALUE(attributes, '$."mcp.method.name"') = 'tools/call', FALSE)`; got != want {
+		t.Errorf("v_mcp_spans.is_tool_call = %q, want %q", got, want)
+	}
+
+	mcpQuery := normalizeSQL(fmt.Sprintf(MCPSpansViewQuery, "proj", "ds", "spans"))
+	if _, mcpWhere, ok := strings.Cut(mcpQuery, " WHERE "); !ok {
+		t.Fatalf("v_mcp_spans query lacks WHERE clause:\n%s", mcpQuery)
+	} else if want := `JSON_VALUE(attributes, '$."mcp.method.name"') IS NOT NULL OR JSON_VALUE(attributes, '$."mcp.session.id"') IS NOT NULL OR JSON_VALUE(attributes, '$."mcp.resource.uri"') IS NOT NULL`; mcpWhere != want {
+		t.Errorf("v_mcp_spans WHERE = %q, want %q", mcpWhere, want)
+	}
+
+	usageQuery := normalizeSQL(fmt.Sprintf(MCPToolUsageViewQuery, "proj", "ds"))
+	for _, want := range []string{
+		"FROM `proj.ds.v_mcp_spans` GROUP BY 1, 2, 3, 4, 5, 6, 7, 8",
+		"COALESCE(gen_ai_tool_name, mcp_resource_uri, gen_ai_prompt_name) AS mcp_target_name",
+		"COUNTIF(also_in_gen_ai_view) AS gen_ai_tagged_call_count",
+		"COUNTIF(status_code = 2 OR error_type IS NOT NULL) AS error_count",
+		"APPROX_TOP_COUNT(error_type, 6) AS raw_top_error_types",
+		"WHERE x.value IS NOT NULL ORDER BY x.count DESC, x.value ASC LIMIT 5",
+	} {
+		if !strings.Contains(usageQuery, want) {
+			t.Errorf("v_mcp_tool_usage query missing %q:\n%s", want, usageQuery)
+		}
 	}
 }
 

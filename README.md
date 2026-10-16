@@ -536,6 +536,35 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
     window that depends on each row, so it cannot be queried when `otel_spans`
     requires a partition filter, and startup then skips it with a warning
     unless `auto_create.allow_unprunable_views` is set.
+  - `v_mcp_spans`: filters `otel_spans_dedup` to Model Context Protocol spans
+    (any span carrying `mcp.method.name`, `mcp.session.id`, or
+    `mcp.resource.uri`, pinned to OpenTelemetry MCP Semantic Conventions
+    `1.40.0`, Development status) so non-GenAI MCP operations (`initialize`,
+    `tools/list`, `resources/read`, `prompts/get`) are visible without widening
+    the `v_gen_ai_spans` predicate. Promotes `mcp_method_name`,
+    `mcp_protocol_version`, `mcp_session_id`, `mcp_resource_uri`,
+    `jsonrpc_request_id`, `rpc_response_status_code`, GenAI correlation columns
+    (`gen_ai_operation_name`, `gen_ai_system`, `gen_ai_tool_name`,
+    `gen_ai_tool_call_id`, `gen_ai_prompt_name`, `gen_ai_agent_name` from
+    `gen_ai.agent.name`, `gcp.vertex.agent.name`, then `gen_ai.main_agent.name`,
+    and `error_type`), server endpoint columns (`server_address`, `server_port`,
+    `network_transport`), `is_tool_call`, and `also_in_gen_ai_view` (true when
+    the span also satisfies the `v_gen_ai_spans` `WHERE` clause, so dashboards
+    can deduplicate dual-tagged `tools/call` spans across `v_mcp_spans` and
+    `v_gen_ai_spans`).
+  - `v_mcp_tool_usage`: hourly MCP method, tool, resource, and prompt rollup
+    over `v_mcp_spans` grouped by `(usage_hour, service_name, mcp_method_name,
+    mcp_protocol_version, gen_ai_tool_name, mcp_target_name, span_kind,
+    server_address)` where `mcp_target_name` is
+    `COALESCE(gen_ai_tool_name, mcp_resource_uri, gen_ai_prompt_name)` so
+    `resources/read` and `prompts/get` spans group by resource URI or prompt
+    name alongside `gen_ai_tool_name`. Exposes `call_count`,
+    `gen_ai_tagged_call_count` (`COUNTIF(also_in_gen_ai_view)`), `error_count`
+    (`status_code = 2 OR error_type IS NOT NULL`, capturing JSON-RPC or MCP
+    error responses that leave `status_code` unset, whereas
+    `v_gen_ai_tool_usage.error_count` counts `status_code = 2`),
+    `typed_error_count`, `top_error_types` (top 5 non-null `error_type` entries),
+    `error_rate`, `avg_duration_ms`, and `p50`/`p95`/`p99` duration percentiles.
   - `v_gen_ai_logs`: filters `otel_logs_dedup` to GenAI/agent log events and
     left-joins `otel_spans_dedup` on `(trace_id, span_id)` and a null-safe
     `service_name` match, within the window described under *Time-bounded
