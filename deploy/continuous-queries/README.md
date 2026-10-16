@@ -39,12 +39,15 @@ aggregate or rate-limit alerts.
   `v_mcp_spans`—are not eligible as `APPENDS` sources. Each template therefore
   reads `otel_spans` directly and extracts promoted JSON attributes inline.
 - **`require_partition_filter` compatibility**: Every template includes
-  `AND start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)` so
-  partition pruning succeeds when `require_partition_filter = true` is set on
-  `otel_spans`. The 7-day window matches BigQuery's default 7-day time-travel
-  window, which bounds how far back an `APPENDS` start can reach (a dataset can
-  be configured with a shorter one), so long-running spans (>1 hour) and widened
-  `APPENDS` lookback offsets after multi-hour downtime are not dropped.
+  `AND start_time >= TIMESTAMP('1970-01-01 00:00:00+00')` as a top-level
+  conjunct of `WHERE` so partition pruning succeeds when
+  `require_partition_filter = true` is set on `otel_spans` without dropping
+  valid telemetry. BigQuery `APPENDS` bounds commit time (`_CHANGE_TIMESTAMP`),
+  whereas `start_time` is the OTLP event timestamp preserved across late batches
+  and `cmd/bq-quarantine-replay` (`otel_quarantine` defaults to 30-day
+  retention). A relative `CURRENT_TIMESTAMP()` filter on `start_time` would be
+  evaluated once at Continuous Query start and silently omit replayed or
+  late-arriving spans.
 - **Column-level security incompatibility**: BigQuery Continuous Queries do not
   support tables with column-level security policy tags or row-level security.
   `tool_error_rate_alert.sql` omits `status.message`, and `deploy/terraform`
@@ -96,8 +99,10 @@ aggregate or rate-limit alerts.
      - `roles/bigquery.jobUser` on the project.
      - `roles/iam.serviceAccountUser` on the Continuous Query service account.
 4. **Pub/Sub Subscription**: Terraform creates the alert topic
-   (`<dataset>-otel-alerts`) without a subscription. Create a pull or push
-   subscription (or Cloud Run / Dataflow trigger) to receive published alerts.
+   (`otel-alerts-<dataset>`, or a sanitized `otel-alerts-<slug>-<hash>` name for
+   datasets with uppercase characters, leading digits/underscores, or long IDs)
+   without a subscription. Create a pull or push subscription (or Cloud Run /
+   Dataflow trigger) to receive published alerts.
 5. **CLI Tools**: Install the Google Cloud `bq` CLI and `jq` (used to extract
    rendered SQL from `terraform output -json`).
 
@@ -150,7 +155,7 @@ sed \
   -e 's/${project_id}/my-project/g' \
   -e 's/${dataset_id}/otel/g' \
   -e 's/${spans_table}/otel_spans/g' \
-  -e 's/${pubsub_topic}/otel-otel-alerts/g' \
+  -e 's/${pubsub_topic}/otel-alerts-otel/g' \
   -e 's/${max_turn_input_tokens}/100000/g' \
   -e 's/${max_turn_output_tokens}/32000/g' \
   -e 's/${max_turn_duration_ms}/30000/g' \
@@ -186,7 +191,7 @@ WHERE (status.code = 2 OR JSON_VALUE(attributes, '$."error.type"') IS NOT NULL)
     OR JSON_VALUE(attributes, '$."gen_ai.tool.name"') IS NOT NULL
     OR JSON_VALUE(attributes, '$."mcp.method.name"') IS NOT NULL
   )
-  AND start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY);
+  AND start_time >= TIMESTAMP('1970-01-01 00:00:00+00');
 ```
 
 ### Windowed Aggregation (`TUMBLE`, Preview)
@@ -195,14 +200,14 @@ Where BigQuery Continuous Query windowing (Preview) is enabled, you can wrap
 `APPENDS` in a CTE and pass `TABLE <cte_name>` to `TUMBLE` over an aliased
 `_CHANGE_TIMESTAMP` column to emit one row per service, tool, and 5-minute
 window into `otel_alerts`. A window has no single span, so instead of
-`<ALERT_KIND>:<trace_id>:<span_id>` its `alert_id` is built from
-`COALESCE(service_name, '')`, `COALESCE(tool_name, '')`, and `window_start`:
-each `(service_name, tool_name, window_start)` group gets its own
-deduplication key, which is never NULL even when `service_name` or `tool_name`
-is (a NULL name keys as an empty string). Note that `TUMBLE` in Continuous
-Queries is Preview, requires the `TABLE` keyword on its CTE input, and emits a
-window only after a later event with a newer `_CHANGE_TIMESTAMP` advances the
-watermark past `window_end`:
+`<ALERT_KIND>:<trace_id>:<span_id>` its `alert_id` encodes the typed tuple with
+`TO_JSON_STRING(STRUCT(service_name, tool_name, window_start))`: that JSON
+string is never NULL and preserves JSON string escaping plus `null` versus `""`,
+so names containing colons and NULL versus empty tool names stay distinct across
+every `(service_name, tool_name, window_start)` `GROUP BY` group. Note that
+`TUMBLE` in Continuous Queries is Preview, requires the `TABLE` keyword on its
+CTE input, and emits a window only after a later event with a newer
+`_CHANGE_TIMESTAMP` advances the watermark past `window_end`:
 
 ```sql
 INSERT INTO `my-project.otel.otel_alerts` (
@@ -221,10 +226,10 @@ WITH raw_spans AS (
       OR JSON_VALUE(attributes, '$."gen_ai.tool.name"') IS NOT NULL
       OR JSON_VALUE(attributes, '$."mcp.method.name"') IS NOT NULL
     )
-    AND start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+    AND start_time >= TIMESTAMP('1970-01-01 00:00:00+00')
 )
 SELECT
-  CONCAT('TOOL_ERROR_WINDOW:', COALESCE(service_name, ''), ':', COALESCE(tool_name, ''), ':', CAST(window_start AS STRING)) AS alert_id,
+  CONCAT('TOOL_ERROR_WINDOW:', TO_JSON_STRING(STRUCT(service_name, tool_name, window_start))) AS alert_id,
   'TOOL_ERROR_WINDOW' AS alert_kind,
   window_end AS event_time,
   service_name,

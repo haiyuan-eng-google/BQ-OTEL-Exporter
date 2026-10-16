@@ -13,7 +13,10 @@
  *   project_id   : Google Cloud project ID owning the dataset and Pub/Sub topic
  *   dataset_id   : BigQuery dataset ID
  *   spans_table  : Base spans table name (for example otel_spans)
- *   pubsub_topic : Pub/Sub topic name (for example otel-otel-alerts)
+ *   pubsub_topic : Pub/Sub topic name (for example otel-alerts-otel)
+ *
+ * The start_time >= 1970-01-01 predicate satisfies require_partition_filter on
+ * otel_spans without dropping late-arriving or quarantined-replay spans.
  */
 
 EXPORT DATA
@@ -58,5 +61,5 @@ AS (
       OR JSON_VALUE(attributes, '$."gen_ai.tool.name"') IS NOT NULL
       OR JSON_VALUE(attributes, '$."mcp.method.name"') IS NOT NULL
     )
-    AND start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+    AND start_time >= TIMESTAMP('1970-01-01 00:00:00+00')
 );

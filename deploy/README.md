@@ -353,10 +353,12 @@ Preview `TUMBLE` window variants in the directory README). Because BigQuery
 ineligible, the templates read `otel_spans` directly rather than
 `otel_spans_dedup` or `v_gen_ai_*`.
 
-Each template includes an `AND start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)`
-filter so it runs when `require_partition_filter = true` while matching
-BigQuery's default 7-day time-travel window, which bounds the `APPENDS`
-lookback. BigQuery Continuous
+Each template includes an `AND start_time >= TIMESTAMP('1970-01-01 00:00:00+00')`
+filter so partition pruning succeeds when `require_partition_filter = true` is
+set on `otel_spans` without dropping late batches or replayed spans. BigQuery
+`APPENDS` bounds commit time (`_CHANGE_TIMESTAMP`), whereas `start_time` is the
+OTLP event timestamp preserved across late arrivals and `cmd/bq-quarantine-replay`
+(30-day default retention on `otel_quarantine`). BigQuery Continuous
 Queries do not support tables with column-level security policy tags, so
 Terraform enforces a precondition that `enable_column_level_security` is `false`
 when `enable_continuous_queries` is `true`.
@@ -391,8 +393,9 @@ terraform -chdir=deploy/terraform apply \
 Enable `bigquery.googleapis.com`, `bigqueryreservation.googleapis.com`,
 `pubsub.googleapis.com`, and `iam.googleapis.com` first. Provisioning
 `continuous_query_slot_capacity = 100` creates 100 always-on baseline
-Enterprise slots; create a Pub/Sub subscription on `<dataset_id>-otel-alerts`
-to consume published alerts. Terraform renders the SQL templates into
+Enterprise slots; create a Pub/Sub subscription on `otel-alerts-<dataset_id>`
+(or the sanitized topic in `otel_alerts_pubsub_topic_id`) to consume published
+alerts. Terraform renders the SQL templates into
 `continuous_queries_rendered_sql` and prints ready-to-run stdin-piped
 `bq query --continuous=true` commands in `continuous_queries_bq_cli_commands`.
 See [`deploy/continuous-queries/README.md`](continuous-queries/README.md) for

@@ -1235,6 +1235,26 @@ resource "google_kms_crypto_key_iam_member" "bq_encryptor" {
 # Enterprise Plus reservation assignment with job_type = "CONTINUOUS".
 # otel_alerts inherits the dataset's default encryption when CMEK is enabled.
 
+locals {
+  cq_dataset_norm = trim(replace(lower(var.dataset_id), "/[^a-z0-9]+/", "-"), "-")
+  cq_dataset_slug = local.cq_dataset_norm != "" ? local.cq_dataset_norm : "ds"
+  cq_dataset_hash = substr(sha256(var.dataset_id), 0, 8)
+  # Always starts with "otel-cq-" ([a-z]), contains only [a-z0-9-], ends with [a-z0-9],
+  # is at most 8 + 47 + 1 + 8 = 64 chars, and never collides across case/underscore/truncation variants.
+  continuous_query_reservation_name = (
+    can(regex("^[a-z](?:[a-z0-9_]*[a-z0-9])?$", var.dataset_id)) && !can(regex("_[0-9a-f]{8}$", var.dataset_id)) && length("otel-cq-${replace(var.dataset_id, "_", "-")}") <= 55
+    ? "otel-cq-${replace(var.dataset_id, "_", "-")}"
+    : "otel-cq-${trim(substr(local.cq_dataset_slug, 0, min(length(local.cq_dataset_slug), 47)), "-")}-${local.cq_dataset_hash}"
+  )
+  # Always starts with "otel-alerts-" (letter, not "goog"), contains only [a-z0-9_-],
+  # is between 13 and 255 chars, and never collides across case/underscore/truncation variants.
+  otel_alerts_topic_name = (
+    can(regex("^[a-z](?:[a-z0-9_]*[a-z0-9])?$", var.dataset_id)) && !can(regex("_[0-9a-f]{8}$", var.dataset_id)) && length("otel-alerts-${var.dataset_id}") <= 240
+    ? "otel-alerts-${var.dataset_id}"
+    : "otel-alerts-${trim(substr(local.cq_dataset_slug, 0, min(length(local.cq_dataset_slug), 234)), "-")}-${local.cq_dataset_hash}"
+  )
+}
+
 resource "google_bigquery_table" "otel_alerts" {
   count = var.enable_continuous_queries ? 1 : 0
 
@@ -1266,8 +1286,15 @@ resource "google_bigquery_table" "otel_alerts" {
 resource "google_pubsub_topic" "otel_alerts" {
   count = var.enable_continuous_queries ? 1 : 0
 
-  name   = "${var.dataset_id}-otel-alerts"
+  name   = local.otel_alerts_topic_name
   labels = var.labels
+
+  lifecycle {
+    precondition {
+      condition     = can(regex("^[A-Za-z][A-Za-z0-9_~+.%-]{2,254}$", local.otel_alerts_topic_name)) && !can(regex("^(?i)goog", local.otel_alerts_topic_name)) && length(local.otel_alerts_topic_name) <= 255
+      error_message = "Derived Pub/Sub topic name ${local.otel_alerts_topic_name} must start with a letter, not begin with goog, and be 3 to 255 characters."
+    }
+  }
 }
 
 resource "google_service_account" "continuous_queries" {
@@ -1328,7 +1355,7 @@ resource "google_project_iam_member" "continuous_queries_jobs" {
 resource "google_bigquery_reservation" "continuous_queries" {
   count = var.enable_continuous_queries ? 1 : 0
 
-  name              = "${replace(var.dataset_id, "_", "-")}-continuous-queries"
+  name              = local.continuous_query_reservation_name
   location          = var.location
   slot_capacity     = var.continuous_query_slot_capacity
   edition           = var.continuous_query_edition
@@ -1338,6 +1365,10 @@ resource "google_bigquery_reservation" "continuous_queries" {
     precondition {
       condition     = !var.enable_column_level_security
       error_message = "BigQuery Continuous Queries do not support tables with column-level security policy tags (enable_column_level_security must be false when enable_continuous_queries is true)."
+    }
+    precondition {
+      condition     = can(regex("^[a-z][a-z0-9-]{0,62}[a-z0-9]$", local.continuous_query_reservation_name)) && length(local.continuous_query_reservation_name) <= 64
+      error_message = "Derived BigQuery reservation name ${local.continuous_query_reservation_name} must match ^[a-z][a-z0-9-]{0,62}[a-z0-9]$ and be at most 64 characters."
     }
   }
 }

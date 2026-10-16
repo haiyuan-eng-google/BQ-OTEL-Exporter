@@ -4,6 +4,11 @@
 package bigqueryexporter
 
 import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -24,9 +29,13 @@ import (
 	"unicode/utf8"
 
 	bq "cloud.google.com/go/bigquery"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 	"gopkg.in/yaml.v3"
 
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/quarantinereplay"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
 )
 
 func TestGoReleaserConfigUsesValidSchemaAndSignsManifests(t *testing.T) {
@@ -1544,21 +1553,26 @@ func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
 		"token_budget_burn.sql":     "TOKEN_BUDGET_BURN",
 		"agent_latency_p95.sql":     "AGENT_LATENCY_HIGH",
 	}
-	// The 7-day start_time predicate must stay a top-level AND conjunct of
+	// The non-lossy start_time predicate must stay a top-level AND conjunct of
 	// WHERE: moved into the last OR group it keeps the pinned text but binds to
 	// that operand only, which BigQuery rejects on a table that requires a
 	// partition filter. So the lines before it close the OR group or the IN
 	// list above it, and no OR stands outside parentheses.
-	const lookback = "AND start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)"
+	const lookback = "AND start_time >= TIMESTAMP('1970-01-01 00:00:00+00')"
 	lookbackPrecededBy := map[string][]string{
 		"tool_error_rate_alert.sql": {")"},
 		"token_budget_burn.sql":     {")"},
 		"agent_latency_p95.sql":     {"'execute_tool'", ")"},
 	}
 	topLevelOr := regexp.MustCompile(`(?i)\bOR\b`)
+	partitionBoundRE := regexp.MustCompile(`start_time\s*>=\s*TIMESTAMP\('([^']+)'\)`)
 
 	placeholderRE := regexp.MustCompile(`\$\{([a-zA-Z0-9_]+)\}`)
 	readme := readRepoText(t, filepath.Join(dir, "README.md"))
+	if strings.Contains(readme, "INTERVAL 7 DAY") {
+		t.Errorf("%s/README.md still contains the lossy INTERVAL 7 DAY start_time filter", dir)
+	}
+	parsedBounds := map[string]time.Time{}
 	for _, name := range wantTemplates {
 		path := filepath.Join(dir, name)
 		rawSQL := readRepoText(t, path)
@@ -1568,13 +1582,16 @@ func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
 		}
 
 		activeSQL := stripSQLComments(rawSQL)
+		if strings.Contains(activeSQL, "INTERVAL 7 DAY") {
+			t.Errorf("%s active SQL still contains the lossy INTERVAL 7 DAY start_time filter", path)
+		}
 		for _, want := range []string{
 			"EXPORT DATA",
 			"CLOUD_PUBSUB",
 			"https://pubsub.googleapis.com/projects/${project_id}/topics/${pubsub_topic}",
 			"APPENDS(",
 			"TABLE `${project_id}.${dataset_id}.${spans_table}`",
-			"AND start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)",
+			lookback,
 		} {
 			if !strings.Contains(activeSQL, want) {
 				t.Errorf("%s active SQL is missing %q", path, want)
@@ -1598,8 +1615,17 @@ func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
 		if at < len(before) || !slices.Equal(lines[at-len(before):at], before) {
 			t.Errorf("%s: %q is not on its own line right after %q, so it may sit inside an OR group", path, lookback, before)
 		}
-		if top := topLevelWhere(activeSQL); !strings.Contains(top, "AND start_time >= TIMESTAMP_SUB") || topLevelOr.MatchString(top) {
-			t.Errorf("%s: the 7-day start_time predicate is not a top-level AND conjunct of WHERE (top level: %q)", path, top)
+		if top := topLevelWhere(activeSQL); !strings.Contains(top, "AND start_time >= TIMESTAMP") || topLevelOr.MatchString(top) {
+			t.Errorf("%s: the start_time partition predicate is not a top-level AND conjunct of WHERE (top level: %q)", path, top)
+		}
+		if m := partitionBoundRE.FindStringSubmatch(activeSQL); len(m) == 2 {
+			ts, err := time.Parse("2006-01-02 15:04:05-07", m[1])
+			if err != nil {
+				t.Fatalf("%s: parsing partition bound %q: %v", path, m[1], err)
+			}
+			parsedBounds[name] = ts
+		} else {
+			t.Fatalf("%s: could not parse start_time TIMESTAMP bound from active SQL", path)
 		}
 		for _, banned := range []string{"_dedup", "v_gen_ai_", "v_mcp_", "duration_ns", "status.message"} {
 			if strings.Contains(activeSQL, banned) {
@@ -1630,9 +1656,10 @@ func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
 		"| bq query",
 		"INSERT INTO",
 		"TUMBLE",
-		// A window alert has no span, so its alert_id is keyed by service, tool
-		// and window, with NULL names coalesced so the key is never NULL.
-		"CONCAT('TOOL_ERROR_WINDOW:', COALESCE(service_name, ''), ':', COALESCE(tool_name, ''), ':', CAST(window_start AS STRING))",
+		// A window alert has no span, so its alert_id encodes the typed tuple
+		// with TO_JSON_STRING(STRUCT(...)) to preserve JSON string escaping and
+		// NULL vs empty tool names across GROUP BY groups.
+		"CONCAT('TOOL_ERROR_WINDOW:', TO_JSON_STRING(STRUCT(service_name, tool_name, window_start)))",
 		"require_partition_filter",
 		"enable_column_level_security",
 	} {
@@ -1640,6 +1667,233 @@ func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
 			t.Errorf("%s/README.md is missing %q", dir, want)
 		}
 	}
+
+	t.Run("recent_append_old_event_spans", func(t *testing.T) {
+		now := time.Date(2026, 10, 16, 20, 0, 0, 0, time.UTC)
+		makeQualifyingTraces := func(age time.Duration, svcName, toolName string, isAlert bool) ptrace.Traces {
+			td := ptrace.NewTraces()
+			rs := td.ResourceSpans().AppendEmpty()
+			rs.Resource().Attributes().PutStr("service.name", svcName)
+			sp := rs.ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+			sp.SetTraceID(pcommon.TraceID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
+			sp.SetSpanID(pcommon.SpanID{1, 2, 3, 4, 5, 6, 7, 8})
+			sp.SetName("execute_tool")
+			start := now.Add(-age)
+			dur := 5 * time.Millisecond
+			if isAlert {
+				dur = 45 * time.Second
+				sp.Status().SetCode(ptrace.StatusCodeError)
+				sp.Attributes().PutInt("gen_ai.usage.input_tokens", 150000)
+			} else {
+				sp.Status().SetCode(ptrace.StatusCodeOk)
+				sp.Attributes().PutInt("gen_ai.usage.input_tokens", 100)
+			}
+			sp.SetStartTimestamp(pcommon.NewTimestampFromTime(start))
+			sp.SetEndTimestamp(pcommon.NewTimestampFromTime(start.Add(dur)))
+			sp.Attributes().PutStr("gen_ai.operation.name", "execute_tool")
+			sp.Attributes().PutStr("gen_ai.tool.name", toolName)
+			return td
+		}
+
+		// Build a 10-day-old span replayed from otel_quarantine (30-day default retention).
+		var marshaler ptrace.JSONMarshaler
+		rawPayload, err := marshaler.MarshalTraces(makeQualifyingTraces(10*24*time.Hour, "api:worker", "lookup", true))
+		if err != nil {
+			t.Fatalf("MarshalTraces: %v", err)
+		}
+		qLine, err := json.Marshal(quarantinereplay.Record{
+			IngestTime: now.Add(-10 * 24 * time.Hour).Format(time.RFC3339),
+			Signal:     "spans",
+			ErrorCode:  "schema_mismatch",
+			RawPayload: string(rawPayload),
+		})
+		if err != nil {
+			t.Fatalf("Marshal quarantine Record: %v", err)
+		}
+		memSink := quarantinereplay.NewMemorySink()
+		sum, err := quarantinereplay.Replay(context.Background(), bytes.NewReader(append(qLine, '\n')), memSink, quarantinereplay.Options{})
+		if err != nil || sum.ReplayedSpans != 1 || len(memSink.Traces) != 1 {
+			t.Fatalf("quarantinereplay.Replay = (%+v, %v), traces=%d; want 1 replayed span", sum, err, len(memSink.Traces))
+		}
+
+		opts := transform.Options{
+			Limits: transform.DefaultLimits(),
+			Now:    func() time.Time { return now },
+		}
+		eightDayRows, rej := transform.SpanRows(makeQualifyingTraces(8*24*time.Hour, "api", "worker:lookup", true), opts)
+		if len(rej) != 0 || len(eightDayRows) != 1 {
+			t.Fatalf("8-day SpanRows = (%d rows, %d rejects), want (1, 0)", len(eightDayRows), len(rej))
+		}
+		tenDayReplayRows, rej := transform.SpanRows(memSink.Traces[0], opts)
+		if len(rej) != 0 || len(tenDayReplayRows) != 1 {
+			t.Fatalf("10-day replayed SpanRows = (%d rows, %d rejects), want (1, 0)", len(tenDayReplayRows), len(rej))
+		}
+		thirtyDayRows, rej := transform.SpanRows(makeQualifyingTraces(30*24*time.Hour, "agent-svc", "search", true), opts)
+		if len(rej) != 0 || len(thirtyDayRows) != 1 {
+			t.Fatalf("30-day SpanRows = (%d rows, %d rejects), want (1, 0)", len(thirtyDayRows), len(rej))
+		}
+		controlRows, rej := transform.SpanRows(makeQualifyingTraces(1*time.Hour, "agent-svc", "search", false), opts)
+		if len(rej) != 0 || len(controlRows) != 1 {
+			t.Fatalf("control SpanRows = (%d rows, %d rejects), want (1, 0)", len(controlRows), len(rej))
+		}
+
+		matchesTemplate := func(tmpl string, row transform.Row) bool {
+			startMicros, ok := row["start_time"].(int64)
+			if !ok {
+				t.Fatalf("row start_time = %#v, want int64 micros", row["start_time"])
+			}
+			startTime := time.UnixMicro(startMicros).UTC()
+			if startTime.Before(parsedBounds[tmpl]) {
+				return false
+			}
+			var attrs map[string]any
+			if rawAttrs, _ := row["attributes"].(string); rawAttrs != "" {
+				if err := json.Unmarshal([]byte(rawAttrs), &attrs); err != nil {
+					t.Fatalf("unmarshaling row attributes: %v", err)
+				}
+			}
+			statusMap, _ := row["status"].(transform.Row)
+			statusCode, _ := statusMap["code"].(int64)
+			durNano, _ := row["duration_nano"].(int64)
+
+			switch tmpl {
+			case "tool_error_rate_alert.sql":
+				isErr := statusCode == 2 || attrs["error.type"] != nil
+				isToolOrMCP := attrs["gen_ai.operation.name"] == "execute_tool" || attrs["gen_ai.tool.name"] != nil || attrs["mcp.method.name"] != nil
+				return isErr && isToolOrMCP
+			case "token_budget_burn.sql":
+				laxInt64 := func(v any) int64 {
+					switch x := v.(type) {
+					case float64:
+						return int64(x)
+					case string:
+						n, _ := strconv.ParseInt(x, 10, 64)
+						return n
+					default:
+						return 0
+					}
+				}
+				return laxInt64(attrs["gen_ai.usage.input_tokens"]) > 100000 ||
+					laxInt64(attrs["gen_ai.usage.output_tokens"]) > 32000
+			case "agent_latency_p95.sql":
+				op, _ := attrs["gen_ai.operation.name"].(string)
+				validOp := op == "invoke_agent" || op == "chat" || op == "generate_content" || op == "execute_tool"
+				return float64(durNano)/1e6 > 30000 && validOp
+			default:
+				t.Fatalf("unknown template %s", tmpl)
+				return false
+			}
+		}
+
+		for _, tc := range []struct {
+			label string
+			row   transform.Row
+			want  bool
+		}{
+			{"8_day_old_late_batch", eightDayRows[0], true},
+			{"10_day_old_quarantine_replay", tenDayReplayRows[0], true},
+			{"30_day_old_quarantine_replay", thirtyDayRows[0], true},
+			{"healthy_control", controlRows[0], false},
+		} {
+			if gotReceive, _ := tc.row["receive_time"].(int64); gotReceive != now.UnixMicro() {
+				t.Errorf("%s receive_time = %d, want %d (current append time)", tc.label, gotReceive, now.UnixMicro())
+			}
+			for _, tmpl := range wantTemplates {
+				if got := matchesTemplate(tmpl, tc.row); got != tc.want {
+					t.Errorf("%s against %s = %v, want %v", tc.label, tmpl, got, tc.want)
+				}
+			}
+		}
+	})
+
+	t.Run("window_identity_collision_free", func(t *testing.T) {
+		strPtr := func(s string) *string { return &s }
+		windowAlertID := func(serviceName, toolName *string, windowStart string) string {
+			payload, err := json.Marshal(struct {
+				ServiceName *string `json:"service_name"`
+				ToolName    *string `json:"tool_name"`
+				WindowStart string  `json:"window_start"`
+			}{
+				ServiceName: serviceName,
+				ToolName:    toolName,
+				WindowStart: windowStart,
+			})
+			if err != nil {
+				t.Fatalf("json.Marshal window key: %v", err)
+			}
+			return "TOOL_ERROR_WINDOW:" + string(payload)
+		}
+
+		w1 := "2026-10-16 20:00:00+00"
+		w2 := "2026-10-16 20:05:00+00"
+		groups := []struct {
+			label   string
+			service *string
+			tool    *string
+			window  string
+		}{
+			{"colon_in_service", strPtr("api:worker"), strPtr("lookup"), w1},
+			{"colon_in_tool", strPtr("api"), strPtr("worker:lookup"), w1},
+			{"null_tool", strPtr("api"), nil, w1},
+			{"empty_tool", strPtr("api"), strPtr(""), w1},
+			{"unknown_tool", strPtr("api"), strPtr("unknown"), w1},
+			{"null_service", nil, strPtr("lookup"), w1},
+			{"empty_service", strPtr(""), strPtr("lookup"), w1},
+			{"second_tool", strPtr("api"), strPtr("search"), w1},
+			{"next_window", strPtr("api"), strPtr("lookup"), w2},
+		}
+
+		seen := map[string]string{}
+		for _, g := range groups {
+			key := windowAlertID(g.service, g.tool, g.window)
+			if !strings.HasPrefix(key, "TOOL_ERROR_WINDOW:{") {
+				t.Errorf("%s produced malformed alert_id %q", g.label, key)
+			}
+			if prev, exists := seen[key]; exists {
+				t.Errorf("window alert_id collision between %s and %s: %q", prev, g.label, key)
+			}
+			seen[key] = g.label
+		}
+	})
+}
+
+func deriveContinuousQueryNames(datasetID string) (reservation, topic string) {
+	nonAlnum := regexp.MustCompile(`[^a-z0-9]+`)
+	norm := strings.Trim(nonAlnum.ReplaceAllString(strings.ToLower(datasetID), "-"), "-")
+	slug := norm
+	if slug == "" {
+		slug = "ds"
+	}
+	sum := sha256.Sum256([]byte(datasetID))
+	hash := hex.EncodeToString(sum[:])[:8]
+
+	fastValid := regexp.MustCompile(`^[a-z](?:[a-z0-9_]*[a-z0-9])?$`).MatchString(datasetID) &&
+		!regexp.MustCompile(`_[0-9a-f]{8}$`).MatchString(datasetID)
+
+	fastRes := "otel-cq-" + strings.ReplaceAll(datasetID, "_", "-")
+	if fastValid && len(fastRes) <= 55 {
+		reservation = fastRes
+	} else {
+		prefix := slug
+		if len(prefix) > 47 {
+			prefix = prefix[:47]
+		}
+		prefix = strings.Trim(prefix, "-")
+		reservation = "otel-cq-" + prefix + "-" + hash
+	}
+
+	fastTopic := "otel-alerts-" + datasetID
+	if fastValid && len(fastTopic) <= 240 {
+		topic = fastTopic
+	} else {
+		prefix := slug
+		if len(prefix) > 234 {
+			prefix = prefix[:234]
+		}
+		prefix = strings.Trim(prefix, "-")
+		topic = "otel-alerts-" + prefix + "-" + hash
+	}
+	return reservation, topic
 }
 
 // Continuous Queries Terraform resources are opt-in: enable_continuous_queries
@@ -1730,7 +1984,18 @@ func TestTerraformContinuousQueriesAreOptIn(t *testing.T) {
 		t.Errorf("otel_alerts sets require_partition_filter = %q, want var.require_partition_filter", got)
 	}
 
+	alertsTopic := terraformBlock(mainTF, `resource "google_pubsub_topic" "otel_alerts"`)
+	if got := terraformAttribute(alertsTopic, "name"); got != "local.otel_alerts_topic_name" {
+		t.Errorf("google_pubsub_topic.otel_alerts sets name = %q, want local.otel_alerts_topic_name", got)
+	}
+	if !strings.Contains(alertsTopic, `!can(regex("^(?i)goog", local.otel_alerts_topic_name))`) {
+		t.Errorf("google_pubsub_topic.otel_alerts missing Pub/Sub topic name precondition:\n%s", alertsTopic)
+	}
+
 	reservation := terraformBlock(mainTF, `resource "google_bigquery_reservation" "continuous_queries"`)
+	if got := terraformAttribute(reservation, "name"); got != "local.continuous_query_reservation_name" {
+		t.Errorf("continuous_queries reservation sets name = %q, want local.continuous_query_reservation_name", got)
+	}
 	if got := terraformAttribute(reservation, "edition"); got != "var.continuous_query_edition" {
 		t.Errorf("continuous_queries reservation sets edition = %q, want var.continuous_query_edition", got)
 	}
@@ -1739,6 +2004,9 @@ func TestTerraformContinuousQueriesAreOptIn(t *testing.T) {
 	}
 	if !strings.Contains(reservation, "condition     = !var.enable_column_level_security") {
 		t.Errorf("continuous_queries reservation missing !var.enable_column_level_security precondition:\n%s", reservation)
+	}
+	if !strings.Contains(reservation, `can(regex("^[a-z][a-z0-9-]{0,62}[a-z0-9]$", local.continuous_query_reservation_name))`) {
+		t.Errorf("continuous_queries reservation missing reservation name precondition:\n%s", reservation)
 	}
 
 	assignment := terraformBlock(mainTF, `resource "google_bigquery_reservation_assignment" "continuous_queries"`)
@@ -1803,4 +2071,53 @@ func TestTerraformContinuousQueriesAreOptIn(t *testing.T) {
 	if !strings.Contains(readRepoText(t, "README.md"), "deploy/continuous-queries/") {
 		t.Error("README.md does not link deploy/continuous-queries/")
 	}
+
+	t.Run("dataset_id_derived_names", func(t *testing.T) {
+		resRE := regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}[a-z0-9]$`)
+		topicRE := regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_~+.%-]{2,254}$`)
+		googRE := regexp.MustCompile(`(?i)^goog`)
+
+		datasets := []string{
+			"otel",
+			"OTel_Prod",
+			"otel_prod",
+			"2026_otel",
+			"_otel",
+			"otel_",
+			"123otel",
+			"google_otel",
+			"goog_otel",
+			"GOOG_OTEL",
+			"___",
+			"a_b",
+			"a__b",
+			"otel_deadbeef",
+			"otel_telemetry_production_us_central1_agents_v2",
+			strings.Repeat("a", 60),
+			strings.Repeat("B", 1024),
+		}
+
+		seenRes := map[string]string{}
+		seenTopic := map[string]string{}
+		for _, ds := range datasets {
+			res, topic := deriveContinuousQueryNames(ds)
+			if !resRE.MatchString(res) || len(res) > 64 {
+				t.Errorf("dataset_id %q produced invalid reservation name %q (len=%d)", ds, res, len(res))
+			}
+			if !topicRE.MatchString(topic) || googRE.MatchString(topic) || len(topic) > 255 {
+				t.Errorf("dataset_id %q produced invalid topic name %q (len=%d)", ds, topic, len(topic))
+			}
+			if ds == "otel" && (res != "otel-cq-otel" || topic != "otel-alerts-otel") {
+				t.Errorf("dataset_id %q = (%q, %q), want (\"otel-cq-otel\", \"otel-alerts-otel\")", ds, res, topic)
+			}
+			if prev, exists := seenRes[res]; exists {
+				t.Errorf("reservation name collision between %q and %q: %q", prev, ds, res)
+			}
+			seenRes[res] = ds
+			if prev, exists := seenTopic[topic]; exists {
+				t.Errorf("topic name collision between %q and %q: %q", prev, ds, topic)
+			}
+			seenTopic[topic] = ds
+		}
+	})
 }

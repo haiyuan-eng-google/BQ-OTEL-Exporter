@@ -13,9 +13,12 @@
  *   project_id             : Google Cloud project ID owning the dataset and Pub/Sub topic
  *   dataset_id             : BigQuery dataset ID
  *   spans_table            : Base spans table name (for example otel_spans)
- *   pubsub_topic           : Pub/Sub topic name (for example otel-otel-alerts)
+ *   pubsub_topic           : Pub/Sub topic name (for example otel-alerts-otel)
  *   max_turn_input_tokens  : Single-turn input token threshold (for example 100000)
  *   max_turn_output_tokens : Single-turn output token threshold (for example 32000)
+ *
+ * The start_time >= 1970-01-01 predicate satisfies require_partition_filter on
+ * otel_spans without dropping late-arriving or quarantined-replay spans.
  */
 
 EXPORT DATA
@@ -62,5 +65,5 @@ AS (
       COALESCE(LAX_INT64(attributes['gen_ai.usage.input_tokens']), 0) > ${max_turn_input_tokens}
       OR COALESCE(LAX_INT64(attributes['gen_ai.usage.output_tokens']), 0) > ${max_turn_output_tokens}
     )
-    AND start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+    AND start_time >= TIMESTAMP('1970-01-01 00:00:00+00')
 );
