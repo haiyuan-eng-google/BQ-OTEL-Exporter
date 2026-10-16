@@ -530,6 +530,7 @@ func (e *signalExporter) start(ctx context.Context, host component.Host) (err er
 		MaxRequestBytes:     e.cfg.Write.MaxRequestBytes,
 		MaxInflightRequests: e.cfg.Write.MaxInflightRequests,
 		MaxInflightBytes:    e.cfg.Write.MaxInflightBytes,
+		StreamPoolSize:      e.cfg.Write.StreamPoolSize,
 		TraceID:             writeAPITraceID,
 		Observer:            e.tel,
 		Backpressure:        bp,

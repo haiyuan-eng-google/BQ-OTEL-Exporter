@@ -94,6 +94,7 @@ exporters:
       max_row_bytes: 1048576
       max_inflight_requests: 8
       max_inflight_bytes: 67108864
+      stream_pool_size: 4
       compression: gzip
       enable_multiplexing: true
       connection_pool_size: 4

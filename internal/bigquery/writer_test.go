@@ -6,6 +6,7 @@ package bigquery
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -1506,7 +1507,7 @@ func TestAppendRecreatesStreamOnInvalidStream(t *testing.T) {
 	if s.closed == 0 {
 		t.Fatal("the stream should have been closed so the next append rebuilds it")
 	}
-	if w.ms != nil {
+	if w.hasCurrentStream() {
 		t.Fatal("writer should have dropped its stream reference")
 	}
 }
@@ -2871,13 +2872,17 @@ func TestWriterRecoveryWakesBlockedSlotWaiter(t *testing.T) {
 		done2 <- w.Append(context.Background(), [][]byte{make([]byte, 64)})
 	}()
 
+	w.mu.Lock()
+	slot0 := w.slots[0]
+	w.mu.Unlock()
+
 	// Wait until Goroutine 2 is registered as a slot waiter while Request 1 holds slot 1/1.
 	waitDeadline := time.Now().Add(time.Second)
 	for {
-		w.mu.Lock()
-		gen := w.ms
+		slot0.mu.Lock()
+		gen := slot0.ms
 		waiting := gen != nil && gen.slotSignal != nil
-		w.mu.Unlock()
+		slot0.mu.Unlock()
 		if waiting {
 			break
 		}
@@ -2891,9 +2896,9 @@ func TestWriterRecoveryWakesBlockedSlotWaiter(t *testing.T) {
 	now = now.Add(100 * time.Millisecond)
 	clockMu.Unlock()
 
-	w.mu.Lock()
-	gen := w.ms
-	w.mu.Unlock()
+	slot0.mu.Lock()
+	gen := slot0.ms
+	slot0.mu.Unlock()
 	w.recordCleanOrSlowAck(5*time.Millisecond, gen)
 	if got := bp.EffectiveInflightRequests(); got != 2 {
 		t.Fatalf("EffectiveInflightRequests() after clean ack = %d, want 2", got)
@@ -3008,9 +3013,24 @@ func TestWriterRecoveryOnRetiredGenerationWakesCurrentGenerationWaiter(t *testin
 	done1 := appendAsync()
 	waitClosed(req1Sent, "Request 1 to be sent")
 	w.mu.Lock()
-	genA := w.ms
+	slot0 := w.slots[0]
 	w.mu.Unlock()
-	w.retireStream(genA)
+	var genA *streamGeneration
+	waitInflight := time.Now().Add(time.Second)
+	for {
+		slot0.mu.Lock()
+		genA = slot0.ms
+		registered := genA != nil && genA.pending == 1
+		slot0.mu.Unlock()
+		if registered {
+			break
+		}
+		if time.Now().After(waitInflight) {
+			t.Fatal("timed out waiting for Request 1 result registration on generation A")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	w.retireStream(slot0, genA)
 
 	// Request 2 opens generation B and holds its only slot, so Request 3
 	// waits for a slot on B.
@@ -3019,10 +3039,10 @@ func TestWriterRecoveryOnRetiredGenerationWakesCurrentGenerationWaiter(t *testin
 	done3 := appendAsync()
 	waitDeadline := time.Now().Add(5 * time.Second)
 	for {
-		w.mu.Lock()
-		genB := w.ms
+		slot0.mu.Lock()
+		genB := slot0.ms
 		waiting := genB != nil && genB != genA && genB.slotSignal != nil
-		w.mu.Unlock()
+		slot0.mu.Unlock()
 		if waiting {
 			break
 		}
@@ -3283,4 +3303,526 @@ func newDelayedAppendResult(delay time.Duration, err error) appendResult {
 		close(ready)
 	}()
 	return &blockingAppendResult{release: ready, err: err}
+}
+
+type poolCountingStream struct {
+	calls  atomic.Int64
+	closed atomic.Int64
+}
+
+func (s *poolCountingStream) AppendRows(
+	context.Context, [][]byte, ...managedwriter.AppendOption,
+) (appendResult, error) {
+	s.calls.Add(1)
+	return fakeResult{}, nil
+}
+
+func (s *poolCountingStream) Close() error {
+	s.closed.Add(1)
+	return nil
+}
+
+func TestWriterStreamPoolOpensNStreamsAndBalancesLoad(t *testing.T) {
+	const poolSize = 4
+	var (
+		mu      sync.Mutex
+		streams []*poolCountingStream
+	)
+	w := &Writer{
+		opts: WriterOptions{
+			Project:             "p",
+			Dataset:             "d",
+			Table:               "t",
+			MaxRequestBytes:     150,
+			MaxInflightRequests: 4,
+			MaxInflightBytes:    64 * 1024,
+			StreamPoolSize:      poolSize,
+		},
+		lifetimeCtx: context.Background(),
+		factory: func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+			s := &poolCountingStream{}
+			mu.Lock()
+			streams = append(streams, s)
+			mu.Unlock()
+			return s, nil
+		},
+	}
+
+	row := make([]byte, 60)
+	rows := make([][]byte, 16)
+	for i := range rows {
+		rows[i] = row
+	}
+	out := w.Append(context.Background(), rows)
+	if out.Err != nil || out.AcknowledgedRows != 16 {
+		t.Fatalf("Append outcome = %+v, want 16 acknowledged rows and nil error", out)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	mu.Lock()
+	created := append([]*poolCountingStream(nil), streams...)
+	mu.Unlock()
+	if len(created) != poolSize {
+		t.Fatalf("created %d streams, want %d", len(created), poolSize)
+	}
+	var total int64
+	for i, s := range created {
+		calls := s.calls.Load()
+		if calls != 4 {
+			t.Errorf("slot %d AppendRows calls = %d, want 4", i, calls)
+		}
+		if s.closed.Load() != 1 {
+			t.Errorf("slot %d Close calls = %d, want 1", i, s.closed.Load())
+		}
+		total += calls
+	}
+	if total != 16 {
+		t.Fatalf("total AppendRows calls = %d, want 16", total)
+	}
+}
+
+// INV-P2-2: retiring a stream generation on one slot must never close or
+// disturb an in-flight append on another slot in the pool.
+func TestWriterStreamPoolPerSlotRetirementIsolation(t *testing.T) {
+	slot0Pending := newControlledResult()
+	slot0Initial := &scriptedStream{results: []appendResult{slot0Pending}}
+	slot0Replacement := &scriptedStream{results: []appendResult{fakeResult{}}}
+
+	slot1Inflight := newControlledResult()
+	slot1Initial := &scriptedStream{results: []appendResult{slot1Inflight, fakeResult{}}}
+
+	var (
+		mu      sync.Mutex
+		created []stream
+		nextIdx int
+	)
+	script := []stream{slot0Initial, slot1Initial, slot0Replacement}
+	obs := &fakeObserver{}
+	w := &Writer{
+		opts: WriterOptions{
+			Project:             "p",
+			Dataset:             "d",
+			Table:               "t",
+			MaxRequestBytes:     1024,
+			MaxInflightRequests: 2,
+			MaxInflightBytes:    64 * 1024,
+			StreamPoolSize:      2,
+			Observer:            obs,
+		},
+		lifetimeCtx: context.Background(),
+		factory: func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			s := script[nextIdx]
+			nextIdx++
+			created = append(created, s)
+			return s, nil
+		},
+	}
+	defer func() { _ = w.Close() }()
+	// Guard both blocked results with sync.OnceFunc deferred after w.Close so
+	// they run first on early test failure and prevent w.Close from hanging.
+	completeSlot0 := sync.OnceFunc(func() {
+		slot0Pending.complete(status.Error(codes.FailedPrecondition, "stream is finalized"))
+	})
+	defer completeSlot0()
+	completeSlot1 := sync.OnceFunc(func() {
+		slot1Inflight.complete(nil)
+	})
+	defer completeSlot1()
+
+	// Hold slot 0's append in flight until slot 1 also has an in-flight append,
+	// then fail slot 0 with FailedPrecondition so slot 0 retires while slot 1
+	// is mid-append.
+	slot0Done := make(chan AppendOutcome, 1)
+	go func() {
+		slot0Done <- w.Append(context.Background(), [][]byte{{1}})
+	}()
+	select {
+	case <-slot0Pending.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for slot 0 append to start")
+	}
+
+	slot1Done := make(chan AppendOutcome, 1)
+	go func() {
+		slot1Done <- w.Append(context.Background(), [][]byte{{2}})
+	}()
+	select {
+	case <-slot1Inflight.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for slot 1 append to start")
+	}
+
+	// Now fail slot 0 with FailedPrecondition ("stream is finalized").
+	completeSlot0()
+	var out0 AppendOutcome
+	select {
+	case out0 = <-slot0Done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for slot 0 append outcome")
+	}
+	if !out0.Verdict.StreamRecreate || out0.Verdict.Label != LabelInvalidStream {
+		t.Fatalf("slot 0 verdict = %+v, want StreamRecreate=true with label=%s", out0.Verdict, LabelInvalidStream)
+	}
+	if slot0Initial.closeCount() != 1 {
+		t.Fatalf("slot 0 initial stream close count = %d, want 1", slot0Initial.closeCount())
+	}
+	if slot1Initial.closeCount() != 0 {
+		t.Fatalf("slot 1 initial stream close count = %d while slot 0 retired, want 0 (INV-P2-2)", slot1Initial.closeCount())
+	}
+
+	// Complete slot 1's in-flight request cleanly and verify AckedRanges.
+	completeSlot1()
+	var out1 AppendOutcome
+	select {
+	case out1 = <-slot1Done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for slot 1 append outcome")
+	}
+	if out1.Err != nil || out1.AcknowledgedRows != 1 {
+		t.Fatalf("slot 1 outcome = %+v, want 1 acknowledged row and nil error", out1)
+	}
+	if len(out1.AckedRanges) != 1 || out1.AckedRanges[0] != ([2]int{0, 1}) {
+		t.Fatalf("slot 1 AckedRanges = %v, want [[0 1]]", out1.AckedRanges)
+	}
+
+	// Subsequent appends open slot 0's replacement stream and succeed on both slots.
+	for i := range 2 {
+		if out := w.Append(context.Background(), [][]byte{{byte(i + 3)}}); out.Err != nil {
+			t.Fatalf("post-retirement append %d failed: %v", i, out.Err)
+		}
+	}
+	mu.Lock()
+	totalCreated := len(created)
+	mu.Unlock()
+	if totalCreated != 3 {
+		t.Fatalf("created %d streams total, want 3 (slot 0 initial, slot 1 initial, slot 0 replacement)", totalCreated)
+	}
+	if slot1Initial.closeCount() != 0 {
+		t.Fatalf("slot 1 initial stream close count before Writer.Close = %d, want 0", slot1Initial.closeCount())
+	}
+	if _, _, _, _, retirements := obs.snapshot(); retirements != 1 {
+		t.Fatalf("stream retirements = %d, want 1", retirements)
+	}
+}
+
+func TestWriterStreamPoolSelectsSlotWithOpenWindowOverLowerPendingFullSlot(t *testing.T) {
+	bp := NewBackpressureController(BackpressureOptions{
+		MinRequestBytes:     256,
+		MaxRequestBytes:     1024,
+		MinInflightRequests: 1,
+		MaxInflightRequests: 2,
+		DecreaseFactor:      0.5,
+		RecoveryInterval:    time.Minute,
+		LatencyThreshold:    time.Minute,
+	})
+
+	slot0Sent := make(chan struct{})
+	releaseSlot0 := make(chan struct{})
+	slot0Stream := &funcStream{
+		appendFn: func(_ context.Context, _ [][]byte) (appendResult, error) {
+			close(slot0Sent)
+			return &blockingAppendResult{release: releaseSlot0}, nil
+		},
+	}
+
+	slot1Sent1 := make(chan struct{})
+	slot1Sent2 := make(chan struct{})
+	releaseSlot1A := make(chan struct{})
+	var slot1ACalls atomic.Int32
+	slot1GenAStream := &funcStream{
+		appendFn: func(_ context.Context, _ [][]byte) (appendResult, error) {
+			switch slot1ACalls.Add(1) {
+			case 1:
+				close(slot1Sent1)
+			case 2:
+				close(slot1Sent2)
+			}
+			return &blockingAppendResult{release: releaseSlot1A}, nil
+		},
+	}
+
+	var slot1BCalls atomic.Int32
+	slot1GenBStream := &funcStream{
+		appendFn: func(_ context.Context, _ [][]byte) (appendResult, error) {
+			slot1BCalls.Add(1)
+			return fakeResult{}, nil
+		},
+	}
+
+	var (
+		mu      sync.Mutex
+		nextIdx int
+	)
+	script := []stream{slot0Stream, slot1GenAStream, slot1GenBStream}
+	w := &Writer{
+		opts: WriterOptions{
+			Project:             "p",
+			Dataset:             "d",
+			Table:               "t",
+			MaxRequestBytes:     1024,
+			MaxInflightRequests: 2,
+			MaxInflightBytes:    64 * 1024,
+			StreamPoolSize:      2,
+			Backpressure:        bp,
+		},
+		lifetimeCtx: context.Background(),
+		factory: func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			s := script[nextIdx]
+			nextIdx++
+			return s, nil
+		},
+	}
+	defer func() { _ = w.Close() }()
+	release0Once := sync.OnceFunc(func() { close(releaseSlot0) })
+	defer release0Once()
+	release1AOnce := sync.OnceFunc(func() { close(releaseSlot1A) })
+	defer release1AOnce()
+
+	waitSent := func(ch <-chan struct{}, what string) {
+		t.Helper()
+		select {
+		case <-ch:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for %s", what)
+		}
+	}
+	startAppend := func() chan AppendOutcome {
+		done := make(chan AppendOutcome, 1)
+		go func() {
+			done <- w.Append(context.Background(), [][]byte{make([]byte, 32)})
+		}()
+		return done
+	}
+
+	// Caller 1 takes slot 0 (1/2 in flight on slot 0).
+	done1 := startAppend()
+	waitSent(slot0Sent, "slot 0 request")
+
+	// Caller 2 takes slot 1 (1/2 in flight on slot 1 generation A).
+	done2 := startAppend()
+	waitSent(slot1Sent1, "slot 1 generation A request 1")
+
+	// Caller 3 also goes to slot 1 (2/2 in flight on slot 1 generation A).
+	w.nextSlot.Store(1)
+	done3 := startAppend()
+	waitSent(slot1Sent2, "slot 1 generation A request 2")
+
+	// Retire slot 1 generation A while both of its requests remain draining,
+	// then shrink the effective per-slot window to 1. Slot 0 now has lower
+	// pending (1) but its live generation is full (dispatched == 1), whereas
+	// slot 1 has higher pending (2 draining on retired genA) but open window
+	// capacity for a new generation (activeGenerations == 1 < 2).
+	w.mu.Lock()
+	slot0 := w.slots[0]
+	slot1 := w.slots[1]
+	w.mu.Unlock()
+	var genA *streamGeneration
+	waitInflight := time.Now().Add(time.Second)
+	for {
+		slot0.mu.Lock()
+		s0Ready := slot0.ms != nil && slot0.ms.pending == 1
+		slot0.mu.Unlock()
+		slot1.mu.Lock()
+		genA = slot1.ms
+		s1Ready := genA != nil && genA.pending == 2
+		slot1.mu.Unlock()
+		if s0Ready && s1Ready {
+			break
+		}
+		if time.Now().After(waitInflight) {
+			t.Fatal("timed out waiting for slot 0 and slot 1 results to register")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	w.retireStream(slot1, genA)
+
+	bp.effectiveInflight.Store(1)
+	w.nextSlot.Store(0) // Start scan at slot 0 so lower pending alone would pick slot 0.
+
+	if got := slot0.pending.Load(); got != 1 {
+		t.Fatalf("slot 0 pending = %d, want 1", got)
+	}
+	if got := slot1.pending.Load(); got != 2 {
+		t.Fatalf("slot 1 pending = %d, want 2", got)
+	}
+	if slotHasOpenWindow(slot0, 1) {
+		t.Fatal("slot 0 should not have an open window at effectiveInflight=1")
+	}
+	if !slotHasOpenWindow(slot1, 1) {
+		t.Fatal("slot 1 should have an open window for its replacement generation")
+	}
+
+	// Caller 4 must select slot 1 (open window) and finish immediately without
+	// blocking on slot 0's full window.
+	done4 := startAppend()
+	select {
+	case out4 := <-done4:
+		if out4.Err != nil || out4.AcknowledgedRows != 1 {
+			t.Fatalf("caller 4 outcome = %+v, want 1 acknowledged row and nil error", out4)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("caller 4 blocked on full slot 0 instead of selecting slot 1 with an open window")
+	}
+	if got := slot1BCalls.Load(); got != 1 {
+		t.Fatalf("slot 1 generation B AppendRows calls = %d, want 1", got)
+	}
+
+	release0Once()
+	release1AOnce()
+	for i, done := range []chan AppendOutcome{done1, done2, done3} {
+		select {
+		case out := <-done:
+			if out.Err != nil {
+				t.Fatalf("caller %d outcome error = %v, want nil", i+1, out.Err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("caller %d did not finish after release", i+1)
+		}
+	}
+}
+
+type byteTrackingResult struct {
+	ready   chan struct{}
+	release func()
+	once    sync.Once
+}
+
+func (r *byteTrackingResult) Ready() <-chan struct{} { return r.ready }
+
+func (r *byteTrackingResult) GetResult(ctx context.Context) (int64, error) {
+	select {
+	case <-r.ready:
+		r.once.Do(r.release)
+		return 0, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+func (r *byteTrackingResult) FullResponse(context.Context) (*storagepb.AppendRowsResponse, error) {
+	return nil, nil
+}
+
+type byteTrackingStream struct {
+	inflight *atomic.Int64
+	peak     *atomic.Int64
+	hold     time.Duration
+}
+
+func (s *byteTrackingStream) AppendRows(
+	_ context.Context, req [][]byte, _ ...managedwriter.AppendOption,
+) (appendResult, error) {
+	n := int64(requestWireBytes(req))
+	cur := s.inflight.Add(n)
+	for {
+		old := s.peak.Load()
+		if cur <= old || s.peak.CompareAndSwap(old, cur) {
+			break
+		}
+	}
+	ready := make(chan struct{})
+	res := &byteTrackingResult{
+		ready:   ready,
+		release: func() { s.inflight.Add(-n) },
+	}
+	time.AfterFunc(s.hold, func() { close(ready) })
+	return res, nil
+}
+
+func (s *byteTrackingStream) Close() error { return nil }
+
+func TestWriterStreamPoolEnforcesPoolWideMaxInflightBytes(t *testing.T) {
+	// A single 84-byte row has rowWireBytes = 1 + 1 + 84 = 86, plus 64-byte
+	// envelope = 150 wire bytes per sub-request. Setting MaxInflightBytes = 300
+	// allows at most 2 sub-requests in flight across all 4 slots simultaneously.
+	const (
+		poolSize         = 4
+		maxInflightBytes = 300
+		rowSize          = 84
+	)
+	var (
+		inflight atomic.Int64
+		peak     atomic.Int64
+	)
+	w := &Writer{
+		opts: WriterOptions{
+			Project:             "p",
+			Dataset:             "d",
+			Table:               "t",
+			MaxRequestBytes:     200,
+			MaxInflightRequests: 8,
+			MaxInflightBytes:    maxInflightBytes,
+			StreamPoolSize:      poolSize,
+		},
+		lifetimeCtx: context.Background(),
+		factory: func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+			return &byteTrackingStream{
+				inflight: &inflight,
+				peak:     &peak,
+				hold:     5 * time.Millisecond,
+			}, nil
+		},
+	}
+	defer func() { _ = w.Close() }()
+
+	const callers = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, callers)
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			row := make([]byte, rowSize)
+			out := w.Append(context.Background(), [][]byte{row, row})
+			if out.Err != nil || out.AcknowledgedRows != 2 {
+				errs <- fmt.Errorf("Append outcome = %+v, want 2 rows and nil error", out)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	if got := peak.Load(); got > maxInflightBytes {
+		t.Fatalf("peak concurrent wire bytes across pool = %d, exceeded MaxInflightBytes %d", got, maxInflightBytes)
+	}
+	if got := peak.Load(); got < 150 {
+		t.Fatalf("peak concurrent wire bytes = %d, want at least one 150-byte request", got)
+	}
+	if got := inflight.Load(); got != 0 {
+		t.Fatalf("final in-flight wire bytes = %d, want 0", got)
+	}
+}
+
+func TestWriterStreamPoolSizeOneMatchesSingleStream(t *testing.T) {
+	firstFailed := newControlledResult()
+	firstFailed.complete(status.Error(codes.FailedPrecondition, "stream is finalized"))
+	first := &scriptedStream{results: []appendResult{fakeResult{}, firstFailed}}
+	second := &scriptedStream{results: []appendResult{fakeResult{}}}
+	w, createdWith := newScriptedWriter(first, second)
+	w.opts.StreamPoolSize = 1
+	w.opts.MaxRequestBytes = 150
+	w.opts.MaxInflightBytes = 1024
+	defer func() { _ = w.Close() }()
+
+	row := make([]byte, 60)
+	if out := w.Append(context.Background(), [][]byte{row}); out.Err != nil || out.AcknowledgedRows != 1 {
+		t.Fatalf("first append = %+v, want 1 acknowledged row", out)
+	}
+	if out := w.Append(context.Background(), [][]byte{row}); !out.Verdict.StreamRecreate {
+		t.Fatalf("second append verdict = %+v, want StreamRecreate=true", out.Verdict)
+	}
+	if out := w.Append(context.Background(), [][]byte{row}); out.Err != nil || out.AcknowledgedRows != 1 {
+		t.Fatalf("third append = %+v, want recovery on replacement stream", out)
+	}
+	if len(*createdWith) != 2 {
+		t.Fatalf("created %d streams, want 2 (initial + replacement)", len(*createdWith))
+	}
 }

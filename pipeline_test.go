@@ -247,3 +247,82 @@ func TestCollectorPipelineMetricsProvisioningWithBQFake(t *testing.T) {
 		t.Fatalf("%s = %#v, want 1 row with error_code=MISSING_TIMESTAMP", cfg.Quarantine.Table, quarantined)
 	}
 }
+
+func TestCollectorPipelineStreamPoolWithBQFake(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		enableMultiplexing bool
+		wantMinStreams     int
+	}{
+		{name: "multiplexed", enableMultiplexing: true, wantMinStreams: 1},
+		{name: "simplex", enableMultiplexing: false, wantMinStreams: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := bqfake.NewServer(t)
+			ctx := context.Background()
+
+			factory := NewFactory()
+			cfg := factory.CreateDefaultConfig().(*Config)
+			cfg.Project = "my-project"
+			cfg.Dataset = "otel"
+			cfg.Endpoint.URL = srv.Addr()
+			cfg.Endpoint.Insecure = true
+			cfg.Endpoint.WithoutAuthentication = true
+			cfg.Write.StreamPoolSize = 2
+			cfg.Write.EnableMultiplexing = tc.enableMultiplexing
+			cfg.Write.ConnectionPoolSize = 4
+			cfg.Write.MaxRequestBytes = 512
+			cfg.Write.MaxRowBytes = 512
+			cfg.BackOffConfig.InitialInterval = 10 * time.Millisecond
+
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("cfg.Validate: %v", err)
+			}
+
+			exp, err := factory.CreateTraces(ctx, exportertest.NewNopSettings(factory.Type()), cfg)
+			if err != nil {
+				t.Fatalf("CreateTraces: %v", err)
+			}
+			if err := exp.Start(ctx, componenttest.NewNopHost()); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			var once sync.Once
+			shutdown := func() { once.Do(func() { _ = exp.Shutdown(ctx) }) }
+			t.Cleanup(shutdown)
+
+			now := time.Date(2026, 8, 12, 16, 0, 0, 0, time.UTC)
+			const spanCount = 8
+			td := ptrace.NewTraces()
+			rs := td.ResourceSpans().AppendEmpty()
+			rs.Resource().Attributes().PutStr("service.name", "stream-pool-svc")
+			spans := rs.ScopeSpans().AppendEmpty().Spans()
+			for i := range spanCount {
+				sp := spans.AppendEmpty()
+				sp.SetTraceID(pcommon.TraceID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, byte(i + 1)})
+				sp.SetSpanID(pcommon.SpanID{1, 2, 3, 4, 5, 6, 7, byte(i + 1)})
+				sp.SetName(fmt.Sprintf("pool_span_%d", i))
+				sp.SetKind(ptrace.SpanKindServer)
+				sp.SetStartTimestamp(pcommon.NewTimestampFromTime(now.Add(time.Duration(i) * time.Millisecond)))
+				sp.SetEndTimestamp(pcommon.NewTimestampFromTime(now.Add(time.Duration(i+1) * time.Millisecond)))
+				sp.Attributes().PutStr("payload", "padding-bytes-to-split-requests-across-stream-pool-slots-cleanly")
+			}
+
+			if err := exp.ConsumeTraces(ctx, td); err != nil {
+				t.Fatalf("ConsumeTraces: %v", err)
+			}
+			deadline := time.Now().Add(5 * time.Second)
+			for srv.RowCount(cfg.Traces.Table) < spanCount && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+			shutdown()
+
+			if got := srv.RowCount(cfg.Traces.Table); got != spanCount {
+				t.Fatalf("%s row count = %d, want %d", cfg.Traces.Table, got, spanCount)
+			}
+			if streams, requests, _ := srv.Counts(); streams < tc.wantMinStreams || requests < 2 {
+				t.Fatalf("bqfake streams=%d requests=%d, want streams>=%d and requests>=2",
+					streams, requests, tc.wantMinStreams)
+			}
+		})
+	}
+}

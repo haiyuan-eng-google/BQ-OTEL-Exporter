@@ -80,6 +80,10 @@ redaction:
   maskReplacement: ""
   redactLogBody: false
 
+# Storage Write API stream pool tuning.
+write:
+  streamPoolSize: 1
+
 # Collector OTLP receivers.
 receivers:
   grpc:

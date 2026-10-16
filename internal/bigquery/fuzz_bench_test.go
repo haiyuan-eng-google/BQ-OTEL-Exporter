@@ -5,7 +5,12 @@ package bigquery
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	"testing"
+
+	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
+	"cloud.google.com/go/bigquery/storage/managedwriter"
 )
 
 func FuzzSplitRequests(f *testing.F) {
@@ -96,5 +101,66 @@ func BenchmarkAppendSplitWithBackpressure(b *testing.B) {
 		if len(chunks) == 0 {
 			b.Fatal("expected non-empty chunks")
 		}
+	}
+}
+
+var closedBenchReady = func() <-chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}()
+
+type benchAppendResult struct{}
+
+func (benchAppendResult) Ready() <-chan struct{} { return closedBenchReady }
+
+func (benchAppendResult) GetResult(context.Context) (int64, error) { return 0, nil }
+
+func (benchAppendResult) FullResponse(context.Context) (*storagepb.AppendRowsResponse, error) {
+	return nil, nil
+}
+
+type benchStream struct{}
+
+func (benchStream) AppendRows(context.Context, [][]byte, ...managedwriter.AppendOption) (appendResult, error) {
+	return benchAppendResult{}, nil
+}
+
+func (benchStream) Close() error { return nil }
+
+func BenchmarkWriterPool(b *testing.B) {
+	rows := make([][]byte, 16)
+	for i := range rows {
+		rows[i] = bytes.Repeat([]byte("x"), 512)
+	}
+	for _, poolSize := range []int{1, 2, 4} {
+		b.Run(fmt.Sprintf("pool=%d", poolSize), func(b *testing.B) {
+			w := &Writer{
+				opts: WriterOptions{
+					Project:             "p",
+					Dataset:             "d",
+					Table:               "t",
+					MaxRequestBytes:     2048,
+					MaxInflightRequests: 8,
+					MaxInflightBytes:    64 * 1024 * 1024,
+					StreamPoolSize:      poolSize,
+				},
+				lifetimeCtx: context.Background(),
+				factory: func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+					return benchStream{}, nil
+				},
+			}
+			b.Cleanup(func() { _ = w.Close() })
+			b.ReportAllocs()
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					out := w.Append(context.Background(), rows)
+					if out.Err != nil || out.AcknowledgedRows != len(rows) {
+						b.Fatalf("Append outcome = %+v", out)
+					}
+				}
+			})
+		})
 	}
 }

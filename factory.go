@@ -51,6 +51,7 @@ const (
 	// bespoke window. These match its documented defaults.
 	defaultMaxInflightRequests = 8
 	defaultMaxInflightBytes    = 64 * 1024 * 1024
+	defaultStreamPoolSize      = 1
 
 	// Multiplexing shares a pool of gRPC connections across default write
 	// streams instead of opening a dedicated connection per stream.
@@ -106,6 +107,7 @@ func createDefaultConfig() component.Config {
 			MaxRowBytes:         defaultMaxRowBytes,
 			MaxInflightRequests: defaultMaxInflightRequests,
 			MaxInflightBytes:    defaultMaxInflightBytes,
+			StreamPoolSize:      defaultStreamPoolSize,
 			EnableMultiplexing:  defaultEnableMultiplexing,
 			ConnectionPoolSize:  defaultConnectionPoolSize,
 			Backpressure: BackpressureConfig{

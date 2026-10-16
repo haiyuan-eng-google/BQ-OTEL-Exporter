@@ -44,6 +44,7 @@ var (
 
 const (
 	maxBigQueryLabels = 64
+	maxStreamPoolSize = 16
 	minTableStaleness = time.Second
 	maxTableStaleness = 7 * 24 * time.Hour
 )
@@ -235,6 +236,9 @@ type WriteConfig struct {
 	MaxInflightRequests int `mapstructure:"max_inflight_requests"`
 	// MaxInflightBytes bounds the memory held by in-flight appends.
 	MaxInflightBytes int `mapstructure:"max_inflight_bytes"`
+	// StreamPoolSize sets the number of default-stream ManagedStream
+	// instances opened per destination table (1..16).
+	StreamPoolSize int `mapstructure:"stream_pool_size"`
 	// EnableMultiplexing enables BigQuery Storage Write API connection
 	// sharing across default write streams.
 	EnableMultiplexing bool `mapstructure:"enable_multiplexing"`
@@ -457,6 +461,7 @@ func (cfg *Config) Validate() error {
 
 	errs = append(errs, cfg.validateGovernance()...)
 	errs = append(errs, cfg.validateWrite()...)
+	errs = append(errs, cfg.validateStreamPool()...)
 	errs = append(errs, cfg.validateBackpressure()...)
 	errs = append(errs, cfg.validateCredentials()...)
 	errs = append(errs, cfg.validateEndpoint()...)
@@ -642,6 +647,30 @@ func (cfg *Config) validateWrite() []error {
 	}
 	if w.Keepalive.Timeout < 0 {
 		errs = append(errs, errors.New("write.keepalive.timeout must not be negative"))
+	}
+	return errs
+}
+
+func (cfg *Config) validateStreamPool() []error {
+	var errs []error
+	w := cfg.Write
+
+	if w.StreamPoolSize < 1 || w.StreamPoolSize > maxStreamPoolSize {
+		errs = append(errs, fmt.Errorf(
+			"write.stream_pool_size (%d) must be between 1 and %d",
+			w.StreamPoolSize, maxStreamPoolSize))
+		return errs
+	}
+	// When write.enable_multiplexing is false and write.stream_pool_size > 1,
+	// requiring write.connection_pool_size >= write.stream_pool_size (when
+	// connection_pool_size is explicitly set) prevents multiple simplex
+	// AppendRows streams from sharing fewer gRPC channels than configured
+	// stream slots.
+	if !w.EnableMultiplexing && w.StreamPoolSize > 1 &&
+		w.ConnectionPoolSize > 0 && w.ConnectionPoolSize < w.StreamPoolSize {
+		errs = append(errs, fmt.Errorf(
+			"write.connection_pool_size (%d) must be at least write.stream_pool_size (%d) when write.enable_multiplexing is false",
+			w.ConnectionPoolSize, w.StreamPoolSize))
 	}
 	return errs
 }

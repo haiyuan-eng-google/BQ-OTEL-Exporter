@@ -599,6 +599,9 @@ func helmEnterpriseValues(maskReplacement string) map[string]any {
 			"maskReplacement":      maskReplacement,
 			"redactLogBody":        true,
 		},
+		"write": map[string]any{
+			"streamPoolSize": int64(4),
+		},
 	}
 }
 

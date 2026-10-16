@@ -196,6 +196,10 @@ data:
           redact_log_body: {{ .Values.redaction.redactLogBody }}
           {{- end }}
         {{- end }}
+        {{- if .Values.write.streamPoolSize }}
+        write:
+          stream_pool_size: {{ .Values.write.streamPoolSize }}
+        {{- end }}
         retry_on_failure:
           enabled: true
           max_elapsed_time: 900s

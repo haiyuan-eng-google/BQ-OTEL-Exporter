@@ -239,8 +239,9 @@ as log events rather than span attributes.
 | `auto_create.search_indexes`    | `false`               | Execute `CREATE SEARCH INDEX IF NOT EXISTS ... OPTIONS (analyzer = 'NO_OP_ANALYZER')` on `(trace_id, span_id)` for `otel_spans` and `otel_logs` and on `(ALL COLUMNS)` for `otel_metrics`. Requires `auto_create.tables` and `bigquery.jobs.create`. |
 | `write.max_request_bytes`       | `8388608` (8 MiB)     | Our request-size headroom threshold, enforced after protobuf serialization and before `AppendRows`. Distinct from, and below, the API's own per-request limit. |
 | `write.max_row_bytes`           | `1048576` (1 MiB)     | Rejects individual serialized signal rows above this size and bounds quarantine rows by truncating `raw_payload`. |
-| `write.max_inflight_requests`   | `8`                   | Bounds asynchronous in-flight appends. |
-| `write.max_inflight_bytes`      | `67108864` (64 MiB)   | Bounds memory held by in-flight appends. |
+| `write.max_inflight_requests`   | `8`                   | Bounds asynchronous in-flight appends per stream slot. |
+| `write.max_inflight_bytes`      | `67108864` (64 MiB)   | Bounds memory held by in-flight appends across the destination table's stream pool. |
+| `write.stream_pool_size`        | `1`                   | Number of default-stream `ManagedStream` slots opened per destination table (`1..16`). |
 | `write.backpressure.enabled`    | `false`               | Enable adaptive AIMD adjustment of the effective request byte split threshold and in-flight concurrency under Storage Write API congestion. |
 | `write.backpressure.min_request_bytes` | `1048576` (1 MiB) | AIMD floor for the effective per-request byte split threshold (`<= write.max_request_bytes`). |
 | `write.backpressure.min_inflight_requests` | `1`           | AIMD floor for effective concurrent `AppendRows` sub-requests (`>= 1` and `<= write.max_inflight_requests`). |
@@ -778,11 +779,20 @@ Within it a batch waits for the shared write stream, waits for request slots,
 sends every request it splits into at `write.max_request_bytes`, and waits for
 every acknowledgement.
 
-- **Slots.** `write.max_inflight_requests` (default 8) bounds unacknowledged
-  requests per stream, shared by all queue consumers. The queue defaults to the
-  same number of consumers, so each can keep a request in flight without
-  waiting. A batch that needs more requests than there are free slots drains
-  its own earlier acknowledgements before waiting on anyone else's.
+- **Slots.** `write.stream_pool_size` (default `1`, range `1..16`) opens that
+  many default-stream `ManagedStream` slots per destination table, and
+  sub-requests pick a slot whose current stream generation has open in-flight
+  window capacity (breaking ties by fewest pending requests in round-robin
+  order). `write.max_inflight_requests` (default 8) bounds unacknowledged
+  requests per stream slot, while `write.max_inflight_bytes` (default 64 MiB)
+  bounds total in-flight bytes across the entire pool. The queue defaults to the
+  same number of consumers as one slot's request window, so each can keep a
+  request in flight without waiting. A batch that needs more requests than there
+  are free slots drains its own earlier acknowledgements before waiting on
+  anyone else's. When `write.enable_multiplexing` is `false` and
+  `write.stream_pool_size > 1`, an explicit `write.connection_pool_size` must be
+  at least `write.stream_pool_size` so simplex `AppendRows` streams do not share
+  fewer gRPC channels than configured stream slots.
 - **Adaptive backpressure (`write.backpressure.enabled`).** When enabled, AIMD
   congestion control steps the per-request byte split threshold down toward
   `write.backpressure.min_request_bytes` and the concurrent dispatch window down
@@ -803,10 +813,11 @@ every acknowledgement.
   that request was sent, and the stream is kept. If no earlier request of the
   batch was sent either, the batch goes back to exporterhelper as retryable.
 - **Timeout after dispatch:** the rows may already be applied. The batch goes
-  back as `uncertain_ack` (counted in `uncertain_ack_replays`), the stream
-  generation is retired, and the next attempt opens a new one. Requests still
-  in flight on the retired generation are handed back the same way. A replay
-  can duplicate rows; the `_dedup` views collapse them.
+  back as `uncertain_ack` (counted in `uncertain_ack_replays`), that slot's
+  stream generation is retired while other slots in the pool keep serving, and
+  the next attempt on that slot opens a new generation. Requests still in flight
+  on the retired generation are handed back the same way. A replay can duplicate
+  rows; the `_dedup` views collapse them.
 - **Split batches.** A batch sent as several requests takes the verdict of the
   request that still owes the most. An uncertain request outranks a retryable
   one, and a retryable one outranks a permanent rejection. The batch is

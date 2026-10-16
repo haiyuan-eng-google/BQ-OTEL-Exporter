@@ -574,10 +574,7 @@ type guardedStream struct {
 }
 
 func (g *guardedStream) Close() error {
-	g.w.mu.Lock()
-	current := g.w.ms != nil && g.w.ms.stream == stream(g)
-	g.w.mu.Unlock()
-	if current {
+	if g.w.isCurrentStream(g) {
 		g.violations.Add(1)
 	}
 	return g.stream.Close()
