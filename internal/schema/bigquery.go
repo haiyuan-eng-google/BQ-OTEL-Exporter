@@ -6,6 +6,7 @@ package schema
 import (
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
 	"time"
 
@@ -176,6 +177,12 @@ func MetricsCompanionViewsMetadata(project, dataset, metricsTable string) map[st
 // want but missing from existing (both at top level and inside RECORD fields).
 // Required fields missing from existing are not added because BigQuery does
 // not permit adding REQUIRED columns to an existing table.
+//
+// The schema update sends the whole schema back, so every existing field,
+// nested fields included, keeps the policy tags existing gives it, copied
+// rather than shared. want comes from ToBigQuery, which sets no policy tags,
+// so reconciliation never adds, changes or removes a tag, and a field that
+// differs from want only in its tags does not make the schema changed.
 func ReconcileAdditiveSchema(existing bq.Schema, want *storagepb.TableSchema) (bq.Schema, bool, error) {
 	if want == nil {
 		return existing, false, nil
@@ -204,13 +211,18 @@ func reconcileBigQueryFields(existing, want bq.Schema) (bq.Schema, bool) {
 		}
 		existingByName[ef.Name] = true
 		copyField := *ef
-		if wf, ok := wantByName[ef.Name]; ok && ef.Type == bq.RecordFieldType && wf.Type == bq.RecordFieldType &&
-			ef.Required == wf.Required && ef.Repeated == wf.Repeated {
+		copyField.PolicyTags = clonePolicyTags(ef.PolicyTags)
+		wf, ok := wantByName[ef.Name]
+		switch {
+		case ok && ef.Type == bq.RecordFieldType && wf.Type == bq.RecordFieldType &&
+			ef.Required == wf.Required && ef.Repeated == wf.Repeated:
 			nestedMerged, nestedChanged := reconcileBigQueryFields(ef.Schema, wf.Schema)
-			if nestedChanged {
-				copyField.Schema = nestedMerged
-				changed = true
-			}
+			copyField.Schema = nestedMerged
+			changed = changed || nestedChanged
+		case ef.Schema != nil:
+			// A RECORD that want does not reconcile is copied unchanged,
+			// nested policy tags included.
+			copyField.Schema, _ = reconcileBigQueryFields(ef.Schema, nil)
 		}
 		merged[i] = &copyField
 	}
@@ -223,6 +235,16 @@ func reconcileBigQueryFields(existing, want bq.Schema) (bq.Schema, bool) {
 		changed = true
 	}
 	return merged, changed
+}
+
+// clonePolicyTags returns a copy of tags that shares no memory with it. An
+// empty list stays empty and a nil list stays nil, so the update sends back
+// exactly what BigQuery returned for the field.
+func clonePolicyTags(tags *bq.PolicyTagList) *bq.PolicyTagList {
+	if tags == nil {
+		return nil
+	}
+	return &bq.PolicyTagList{Names: slices.Clone(tags.Names)}
 }
 
 var fieldTypePairs = []struct {

@@ -1020,6 +1020,9 @@ func (s *Server) handleREST(w http.ResponseWriter, r *http.Request) {
 						return
 					}
 				}
+				// The schema is stored exactly as sent, policy tags included.
+				// The fake keeps no tag that a request leaves out, so a test
+				// sees exactly which tags an update carried.
 				existing.Schema = cloneJSON(patch.Schema)
 			}
 			if patch.View != nil {

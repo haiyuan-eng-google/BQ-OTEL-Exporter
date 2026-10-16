@@ -29,6 +29,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/testfakes/bqfake"
 )
 
 type fakeDestinationAdmin struct {
@@ -1553,6 +1554,211 @@ func TestPrepareDestinationReconcilesAdditiveSchemaWithETag(t *testing.T) {
 			t.Error("table must not be patched when auto_create.tables is disabled")
 		}
 	})
+}
+
+// TestPrepareDestinationKeepsPolicyTagsThroughSchemaReconcile runs the
+// additive schema update over the REST wire against the fake, which stores
+// an update's schema exactly as sent. A table that lacks a column gets it
+// with every existing policy tag sent back, and a restart against the
+// completed schema writes nothing.
+func TestPrepareDestinationKeepsPolicyTagsThroughSchemaReconcile(t *testing.T) {
+	const tag = "projects/my-project/locations/us/taxonomies/1/policyTags/2"
+	defaults := validConfig()
+	for _, tc := range []struct {
+		name         string
+		table        string
+		tableSchema  *storagepb.TableSchema
+		signalTable  string
+		signalSchema *storagepb.TableSchema
+		quarantine   bool
+		drop         string
+		tagged       []string
+	}{
+		{
+			name:         "otel_spans",
+			table:        defaults.Traces.Table,
+			tableSchema:  schema.SpansTableSchema(),
+			signalTable:  defaults.Traces.Table,
+			signalSchema: schema.SpansTableSchema(),
+			drop:         "payload_refs.object_ref.details",
+			tagged:       []string{"status.message", "payload_refs.object_ref.uri"},
+		},
+		{
+			name:         "otel_logs",
+			table:        defaults.Logs.Table,
+			tableSchema:  schema.LogsTableSchema(),
+			signalTable:  defaults.Logs.Table,
+			signalSchema: schema.LogsTableSchema(),
+			drop:         "record_fingerprint",
+			tagged:       []string{"severity_text"},
+		},
+		{
+			name:         "otel_metrics",
+			table:        defaults.Metrics.Table,
+			tableSchema:  schema.MetricsTableSchema(),
+			signalTable:  defaults.Metrics.Table,
+			signalSchema: schema.MetricsTableSchema(),
+			drop:         "scope_schema_url",
+			tagged:       []string{"metric_description"},
+		},
+		{
+			// Whichever signal starts prepares the quarantine table. Here the
+			// spans exporter does, after creating its own table.
+			name:         "otel_quarantine",
+			table:        defaults.Quarantine.Table,
+			tableSchema:  schema.QuarantineTableSchema(),
+			signalTable:  defaults.Traces.Table,
+			signalSchema: schema.SpansTableSchema(),
+			quarantine:   true,
+			drop:         "exporter_instance",
+			tagged:       []string{"raw_payload", "error_message"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := bqfake.NewServer(t)
+			wireFakeHooks(t, srv)
+			ctx := context.Background()
+			cfg := validConfig()
+			cfg.AutoCreate.Tables = true
+			cfg.Quarantine.Enabled = tc.quarantine
+			admin, err := newDestinationAdmin(ctx, cfg.Project, cfg.Dataset)
+			if err != nil {
+				t.Fatalf("newDestinationAdmin: %v", err)
+			}
+			t.Cleanup(func() { _ = admin.Close() })
+
+			// The table predates one column and has policy tags on some of
+			// the columns it does have.
+			srv.SeedDataset(cfg.Project, cfg.Dataset, "US")
+			seeded := withoutBigQueryField(t, mustBigQuerySchema(t, tc.tableSchema), tc.drop)
+			wantTags := make(map[string][]string, len(tc.tagged))
+			for _, path := range tc.tagged {
+				bigQueryFieldAt(t, seeded, path).PolicyTags = &bq.PolicyTagList{Names: []string{tag}}
+				wantTags[path] = []string{tag}
+			}
+			if err := admin.CreateTable(ctx, tc.table, &bq.TableMetadata{Schema: seeded}); err != nil {
+				t.Fatalf("creating the tagged %s: %v", tc.table, err)
+			}
+			fakeTable := func() *bigqueryapi.Table {
+				t.Helper()
+				tbl, ok := srv.Table(cfg.Project, cfg.Dataset, tc.table)
+				if !ok {
+					t.Fatalf("%s does not exist", tc.table)
+				}
+				return tbl
+			}
+			start := func() {
+				t.Helper()
+				e := newTestSignalExporter(cfg, tc.signalTable, tc.signalSchema)
+				if err := e.prepareDestination(ctx, admin); err != nil {
+					t.Fatalf("prepareDestination: %v", err)
+				}
+			}
+			seededETag := fakeTable().Etag
+
+			// The first start adds the missing column and sends every
+			// existing policy tag back with the rest of the schema.
+			start()
+			updated := fakeTable()
+			if updated.Etag == seededETag {
+				t.Fatalf("%s kept ETag %s, want the missing column %s added", tc.table, seededETag, tc.drop)
+			}
+			if restFieldAt(updated.Schema.Fields, tc.drop) == nil {
+				t.Errorf("%s still lacks %s after the schema update", tc.table, tc.drop)
+			}
+			if got := restPolicyTagsByPath(updated.Schema.Fields); !maps.EqualFunc(got, wantTags, slices.Equal) {
+				t.Errorf("policy tags after the schema update = %v, want %v", got, wantTags)
+			}
+
+			// A restart against the completed schema writes nothing, so
+			// policy tags that want lacks never cause an update.
+			start()
+			restarted := fakeTable()
+			if restarted.Etag != updated.Etag {
+				t.Errorf("restart rewrote %s: ETag %s, want %s", tc.table, restarted.Etag, updated.Etag)
+			}
+			if got := restPolicyTagsByPath(restarted.Schema.Fields); !maps.EqualFunc(got, wantTags, slices.Equal) {
+				t.Errorf("policy tags after a restart = %v, want %v", got, wantTags)
+			}
+		})
+	}
+}
+
+// withoutBigQueryField returns s without the field at the dotted path, which
+// must exist. The records on the way to it are copied, so s is unchanged.
+func withoutBigQueryField(t *testing.T, s bq.Schema, path string) bq.Schema {
+	t.Helper()
+	name, rest, nested := strings.Cut(path, ".")
+	out := make(bq.Schema, 0, len(s))
+	found := false
+	for _, f := range s {
+		switch {
+		case f.Name != name:
+			out = append(out, f)
+		case nested:
+			copied := *f
+			copied.Schema = withoutBigQueryField(t, f.Schema, rest)
+			out = append(out, &copied)
+			found = true
+		default:
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("schema has no field %s", path)
+	}
+	return out
+}
+
+// bigQueryFieldAt returns the field at the dotted path of s, which must
+// exist.
+func bigQueryFieldAt(t *testing.T, s bq.Schema, path string) *bq.FieldSchema {
+	t.Helper()
+	name, rest, nested := strings.Cut(path, ".")
+	for _, f := range s {
+		if f.Name != name {
+			continue
+		}
+		if !nested {
+			return f
+		}
+		return bigQueryFieldAt(t, f.Schema, rest)
+	}
+	t.Fatalf("schema has no field %s", path)
+	return nil
+}
+
+// restFieldAt returns the field at the dotted path of fields, or nil if
+// there is none.
+func restFieldAt(fields []*bigqueryapi.TableFieldSchema, path string) *bigqueryapi.TableFieldSchema {
+	name, rest, nested := strings.Cut(path, ".")
+	for _, f := range fields {
+		if f.Name != name {
+			continue
+		}
+		if !nested {
+			return f
+		}
+		return restFieldAt(f.Fields, rest)
+	}
+	return nil
+}
+
+// restPolicyTagsByPath maps the dotted path of every field that carries
+// policy tags, nested fields included, to the tag names.
+func restPolicyTagsByPath(fields []*bigqueryapi.TableFieldSchema) map[string][]string {
+	out := make(map[string][]string)
+	var walk func(prefix string, fields []*bigqueryapi.TableFieldSchema)
+	walk = func(prefix string, fields []*bigqueryapi.TableFieldSchema) {
+		for _, f := range fields {
+			if f.PolicyTags != nil {
+				out[prefix+f.Name] = f.PolicyTags.Names
+			}
+			walk(prefix+f.Name+".", f.Fields)
+		}
+	}
+	walk("", fields)
+	return out
 }
 
 func TestPrepareDestinationCreatesSearchIndexesWhenEnabled(t *testing.T) {

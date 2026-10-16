@@ -163,3 +163,43 @@ variable "require_partition_filter" {
   type        = bool
   default     = false
 }
+
+# --- Column-level security and data masking ---
+#
+# Off by default. governance.tf creates these resources only when
+# enable_column_level_security is set.
+
+variable "enable_column_level_security" {
+  description = "Create a policy tag taxonomy, a policy tag, and a data masking policy on the tag; attach the tag to the sensitive STRING columns (otel_spans.status.message, otel_logs.severity_text, otel_quarantine.raw_payload and otel_quarantine.error_message); and create the redacted views. Needs the Data Catalog and BigQuery Data Policy APIs enabled in the project."
+  type        = bool
+  default     = false
+}
+
+variable "policy_taxonomy_display_name" {
+  description = "Display name of the policy tag taxonomy. A display name must be unique among the taxonomies of a project and location, so give each deployment that shares them its own."
+  type        = string
+  default     = "otel_telemetry_sensitivity"
+}
+
+variable "masking_rule" {
+  description = "Predefined masking rule of the data masking policy, which decides what a Masked Reader sees in place of a tagged value: SHA256 a SHA-256 hash of the value, ALWAYS_NULL a NULL, and DEFAULT_MASKING_VALUE the default masking value of the column type, an empty string for STRING."
+  type        = string
+  default     = "SHA256"
+
+  validation {
+    condition     = contains(["SHA256", "ALWAYS_NULL", "DEFAULT_MASKING_VALUE"], var.masking_rule)
+    error_message = "masking_rule must be SHA256, ALWAYS_NULL, or DEFAULT_MASKING_VALUE."
+  }
+}
+
+variable "fine_grained_reader_members" {
+  description = "Principals (for example group:otel-admins@example.com) granted the Fine-Grained Reader role on the policy tag, who read the tagged columns unmasked. The binding is authoritative for that role on the tag. Used only when enable_column_level_security is set."
+  type        = list(string)
+  default     = []
+}
+
+variable "masked_reader_members" {
+  description = "Principals granted the Masked Reader role on the data masking policy, who read the tagged columns masked by masking_rule. The binding is authoritative for that role on the policy. Used only when enable_column_level_security is set."
+  type        = list(string)
+  default     = []
+}
