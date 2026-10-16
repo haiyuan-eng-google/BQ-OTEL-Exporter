@@ -101,27 +101,40 @@ var (
 )
 
 // attrChain is one projection of a view out of the plain-JSON attributes
-// column: the first non-NULL of the listed keys, then of the fallback column.
+// column (and, when resourceKeys is non-empty, resource.attributes): the first
+// non-NULL of the listed keys, then of resourceKeys, then of the fallback
+// column.
 type attrChain struct {
-	alias    string
-	keys     []string
-	asInt    bool   // LAX_INT64(attributes['key']) rather than JSON_VALUE(attributes, '$."key"')
-	fallback string // a column of the row that ends the COALESCE
+	alias        string
+	keys         []string
+	resourceKeys []string // keys read from resource.attributes after attributes
+	asInt        bool     // LAX_INT64(attributes['key']) rather than JSON_VALUE(attributes, '$."key"')
+	asFloat      bool     // LAX_FLOAT64(attributes['key']) rather than JSON_VALUE(attributes, '$."key"')
+	fallback     string   // a column of the row that ends the COALESCE
 }
 
 // sql renders the select item the view is expected to hold for the chain over
 // the given attribute sources: a table alias prefix such as "l." and "s.", or
 // "" for a view with one source. Sources are tried in order, and within a
-// source the keys are tried in order.
+// source the keys are tried in order, followed by resourceKeys on
+// resource.attributes.
 func (c attrChain) sql(srcs ...string) string {
 	var els []string
 	for _, src := range srcs {
 		for _, k := range c.keys {
-			if c.asInt {
+			switch {
+			case c.asInt:
 				els = append(els, fmt.Sprintf("LAX_INT64(%sattributes['%s'])", src, k))
-			} else {
+			case c.asFloat:
+				els = append(els, fmt.Sprintf("LAX_FLOAT64(%sattributes['%s'])", src, k))
+			default:
 				els = append(els, fmt.Sprintf("JSON_VALUE(%sattributes, '$.\"%s\"')", src, k))
 			}
+		}
+	}
+	for _, src := range srcs {
+		for _, k := range c.resourceKeys {
+			els = append(els, fmt.Sprintf("JSON_VALUE(%sresource.attributes, '$.\"%s\"')", src, k))
 		}
 	}
 	if c.fallback != "" {
@@ -135,15 +148,30 @@ func (c attrChain) sql(srcs ...string) string {
 }
 
 // eval is the chain's value for a row whose attributes, in source order, are
-// srcs: a string, an int64, or nil for NULL.
+// srcs: a string, an int64, a float64, or nil for NULL.
 func (c attrChain) eval(row map[string]any, srcs ...attrs) any {
 	for _, src := range srcs {
 		for _, k := range c.keys {
-			if c.asInt {
+			switch {
+			case c.asInt:
 				if n, ok := src.laxInt64(k); ok {
 					return n
 				}
-			} else if v, ok := src.jsonValue(k); ok {
+			case c.asFloat:
+				if f, ok := src.laxFloat64(k); ok {
+					return f
+				}
+			default:
+				if v, ok := src.jsonValue(k); ok {
+					return v
+				}
+			}
+		}
+	}
+	if len(c.resourceKeys) > 0 {
+		resAttrs := parseResourceAttrs(row)
+		for _, k := range c.resourceKeys {
+			if v, ok := resAttrs.jsonValue(k); ok {
 				return v
 			}
 		}
@@ -176,6 +204,12 @@ var spanChains = []attrChain{
 	{alias: "gen_ai_usage_cache_creation_input_tokens", keys: []string{"gen_ai.usage.cache_creation.input_tokens", "gen_ai.usage.cache_creation_input_tokens"}, asInt: true},
 	{alias: "gen_ai_usage_reasoning_tokens", keys: []string{"gen_ai.usage.reasoning.output_tokens", "gen_ai.usage.reasoning_tokens"}, asInt: true},
 	{alias: "error_type", keys: []string{"error.type"}},
+	{alias: "gen_ai_main_agent_id", keys: []string{"gen_ai.main_agent.id"}, resourceKeys: []string{"gen_ai.main_agent.id"}},
+	{alias: "gen_ai_main_agent_name", keys: []string{"gen_ai.main_agent.name"}, resourceKeys: []string{"gen_ai.main_agent.name"}},
+	{alias: "gen_ai_main_agent_description", keys: []string{"gen_ai.main_agent.description"}, resourceKeys: []string{"gen_ai.main_agent.description"}},
+	{alias: "gen_ai_agent_version", keys: []string{"gen_ai.agent.version"}, resourceKeys: []string{"gen_ai.agent.version"}},
+	{alias: "gen_ai_response_id", keys: []string{"gen_ai.response.id"}},
+	{alias: "gen_ai_response_time_to_first_chunk", keys: []string{"gen_ai.response.time_to_first_chunk"}, asFloat: true},
 }
 
 // logChains are the columns of v_gen_ai_logs enriched from the record's own
@@ -191,6 +225,10 @@ var logChains = []attrChain{
 	{alias: "adk_user_id", keys: []string{"user.id", "gen_ai.user.id"}},
 }
 
+// logOnlyErrorChain reads error.type from the log record's own attributes
+// without falling back to the joined span's attributes.
+var logOnlyErrorChain = attrChain{alias: "error_type", keys: []string{"error.type"}}
+
 // metricChains are the GenAI attributes v_gen_ai_metrics promotes.
 var metricChains = []attrChain{
 	{alias: "gen_ai_operation_name", keys: []string{"gen_ai.operation.name"}},
@@ -200,6 +238,8 @@ var metricChains = []attrChain{
 	{alias: "gen_ai_response_model", keys: []string{"gen_ai.response.model"}},
 	{alias: "gen_ai_token_type", keys: []string{"gen_ai.token.type"}},
 	{alias: "error_type", keys: []string{"error.type"}},
+	{alias: "gen_ai_token_modality", keys: []string{"gen_ai.token.modality"}},
+	{alias: "gen_ai_agent_name", keys: []string{"gen_ai.agent.name", "gen_ai.main_agent.name"}, resourceKeys: []string{"gen_ai.main_agent.name"}},
 }
 
 // attrs is the parsed plain-JSON attributes column of one row.
@@ -218,6 +258,26 @@ func parseAttrs(t testing.TB, row map[string]any) attrs {
 	var a attrs
 	if err := dec.Decode(&a); err != nil {
 		t.Fatalf("attributes column is not a JSON object (%v): %s", err, raw)
+	}
+	return a
+}
+
+// parseResourceAttrs parses resource.attributes of a decoded row, returning an
+// empty map when the row or its resource struct lacks attributes.
+func parseResourceAttrs(row map[string]any) attrs {
+	res, ok := row["resource"].(map[string]any)
+	if !ok {
+		return attrs{}
+	}
+	raw, ok := res["attributes"].(string)
+	if !ok || raw == "" {
+		return attrs{}
+	}
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+	var a attrs
+	if err := dec.Decode(&a); err != nil {
+		return attrs{}
 	}
 	return a
 }
@@ -256,6 +316,22 @@ func (a attrs) laxInt64(key string) (int64, bool) {
 		return int64(f), true
 	}
 	return 0, false
+}
+
+// laxFloat64 is LAX_FLOAT64(attributes['key']) for numeric or string attributes.
+func (a attrs) laxFloat64(key string) (float64, bool) {
+	switch v := a[key].(type) {
+	case json.Number:
+		f, err := v.Float64()
+		return f, err == nil && !math.IsNaN(f) && !math.IsInf(f, 0)
+	case float64:
+		return v, !math.IsNaN(v) && !math.IsInf(v, 0)
+	case string:
+		f, err := strconv.ParseFloat(v, 64)
+		return f, err == nil && !math.IsNaN(f) && !math.IsInf(f, 0)
+	default:
+		return 0, false
+	}
 }
 
 // colString reads a STRING column of a decoded row; ok is false for NULL.
@@ -376,7 +452,9 @@ func genAISpansView(t testing.TB, rawSpans []map[string]any) []map[string]any {
 		_, hasOp := row["gen_ai_operation_name"]
 		_, hasSystem := row["gen_ai_system"]
 		_, hasInvocation := row["adk_invocation_id"]
-		if !hasOp && !hasSystem && !hasInvocation {
+		_, hasMainAgentName := a.jsonValue("gen_ai.main_agent.name")
+		_, hasMainAgentID := a.jsonValue("gen_ai.main_agent.id")
+		if !hasOp && !hasSystem && !hasInvocation && !hasMainAgentName && !hasMainAgentID {
 			continue
 		}
 		for _, col := range []string{"trace_id", "span_id", "parent_span_id", "service_name", "start_time", "end_time", "duration_nano"} {
@@ -514,11 +592,43 @@ func groupKey(vals ...any) string {
 	return b.String()
 }
 
+// topErrorTypes models the rollup views' outer ARRAY(SELECT AS STRUCT x.value, x.count FROM UNNEST(raw_top_error_types) AS x WHERE x.value IS NOT NULL ORDER BY x.count DESC, x.value ASC LIMIT 5)
+// over raw_top_error_types = APPROX_TOP_COUNT(error_type, 6): an array of
+// {"value": string, "count": int64} entries for non-NULL error_type values,
+// ordered by count descending and then value ascending. BigQuery rejects
+// UNNEST(APPROX_TOP_COUNT(...)) inside the aggregating SELECT and counts NULL
+// as a bucket, so the SQL computes 6 buckets in the aggregating CTE and drops
+// the NULL bucket in the outer SELECT.
+func topErrorTypes(counts map[string]int64, limit int) []map[string]any {
+	if len(counts) == 0 {
+		return []map[string]any{}
+	}
+	keys := make([]string, 0, len(counts))
+	for k := range counts {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if counts[keys[i]] != counts[keys[j]] {
+			return counts[keys[i]] > counts[keys[j]]
+		}
+		return keys[i] < keys[j]
+	})
+	if len(keys) > limit {
+		keys = keys[:limit]
+	}
+	out := make([]map[string]any, len(keys))
+	for i, k := range keys {
+		out[i] = map[string]any{"value": k, "count": counts[k]}
+	}
+	return out
+}
+
 // modelCostsView is v_gen_ai_model_costs over the rows of v_gen_ai_spans,
 // without its percentile columns.
 func modelCostsView(spans []map[string]any) []map[string]any {
 	parents := costsWindow.tokenParents(spans)
 	groups := make(map[string]map[string]any)
+	errCounts := make(map[string]map[string]int64)
 	var order []string
 	for _, s := range spans {
 		if !isLLMCall(s, costsWindow.tokenLeaf(s, parents)) {
@@ -550,15 +660,21 @@ func modelCostsView(spans []map[string]any) []map[string]any {
 				g["model"] = model
 			}
 			for _, col := range []string{"call_count", "error_count", "total_input_tokens", "total_output_tokens",
-				"total_cache_read_input_tokens", "total_cache_creation_input_tokens", "total_reasoning_tokens"} {
+				"total_cache_read_input_tokens", "total_cache_creation_input_tokens", "total_reasoning_tokens",
+				"typed_error_count"} {
 				g[col] = int64(0)
 			}
 			groups[key] = g
+			errCounts[key] = make(map[string]int64)
 			order = append(order, key)
 		}
 		g["call_count"] = g["call_count"].(int64) + 1
 		if code, _ := colInt(s, "status_code"); code == 2 {
 			g["error_count"] = g["error_count"].(int64) + 1
+		}
+		if et, ok := colString(s, "error_type"); ok {
+			g["typed_error_count"] = g["typed_error_count"].(int64) + 1
+			errCounts[key][et]++
 		}
 		for col, src := range map[string]string{
 			"total_input_tokens":                "gen_ai_usage_input_tokens",
@@ -572,7 +688,9 @@ func modelCostsView(spans []map[string]any) []map[string]any {
 	}
 	out := make([]map[string]any, 0, len(order))
 	for _, k := range order {
-		out = append(out, groups[k])
+		g := groups[k]
+		g["top_error_types"] = topErrorTypes(errCounts[k], 5)
+		out = append(out, g)
 	}
 	return out
 }
@@ -602,6 +720,8 @@ func sessionsView(spans []map[string]any) []map[string]any {
 		minStart, maxEnd      int64
 		haveStart, haveEnd    bool
 		toolCalls, errorCount int64
+		typedErrorCount       int64
+		errorTypes            map[string]int64
 	}
 	groups := make(map[string]*acc)
 	var order []string
@@ -621,6 +741,7 @@ func sessionsView(spans []map[string]any) []map[string]any {
 				invocations: make(map[string]bool),
 				users:       make(map[string]bool),
 				agents:      make(map[string]bool),
+				errorTypes:  make(map[string]int64),
 			}
 			if v, ok := s["service_name"]; ok {
 				g.row["service_name"] = v
@@ -658,6 +779,10 @@ func sessionsView(spans []map[string]any) []map[string]any {
 		if code, _ := colInt(s, "status_code"); code == 2 {
 			g.errorCount++
 		}
+		if et, ok := colString(s, "error_type"); ok {
+			g.typedErrorCount++
+			g.errorTypes[et]++
+		}
 		leaf := sessionsWindow.tokenLeaf(s, parents)
 		if leaf { // is_token_leaf
 			for col, src := range map[string]string{
@@ -687,6 +812,8 @@ func sessionsView(spans []map[string]any) []map[string]any {
 		g.row["invocation_count"] = int64(len(g.invocations))
 		g.row["tool_call_count"] = g.toolCalls
 		g.row["error_count"] = g.errorCount
+		g.row["typed_error_count"] = g.typedErrorCount
+		g.row["top_error_types"] = topErrorTypes(g.errorTypes, 5)
 		g.row["user_id_candidates"] = sortedKeys(g.users)
 		g.row["agent_name_candidates"] = sortedKeys(g.agents)
 		out = append(out, g.row)
@@ -746,10 +873,32 @@ func genAILogsView(t testing.TB, rawLogs, rawSpans []map[string]any) []map[strin
 					row[c.alias] = v
 				}
 			}
+			if v := logOnlyErrorChain.eval(l, la); v != nil {
+				row[logOnlyErrorChain.alias] = v
+			}
 			out = append(out, row)
 		}
 	}
 	return out
+}
+
+// inferenceUsageDimension maps a genai-dev gen_ai.client.inference.usage.* metric
+// name to its token dimension label, or falls back to gen_ai.token.type.
+func inferenceUsageDimension(metricName string, a attrs) (string, bool) {
+	switch metricName {
+	case "gen_ai.client.inference.usage.input_tokens":
+		return "input", true
+	case "gen_ai.client.inference.usage.output_tokens":
+		return "output", true
+	case "gen_ai.client.inference.usage.cache_read.input_tokens":
+		return "cache_read_input", true
+	case "gen_ai.client.inference.usage.cache_write.input_tokens":
+		return "cache_write_input", true
+	case "gen_ai.client.inference.usage.reasoning.output_tokens":
+		return "reasoning_output", true
+	default:
+		return a.jsonValue("gen_ai.token.type")
+	}
 }
 
 // genAIMetricsView is v_gen_ai_metrics over the rows of the metrics table. The
@@ -759,7 +908,8 @@ func genAIMetricsView(t testing.TB, rawMetrics []map[string]any) []map[string]an
 	t.Helper()
 	var out []map[string]any
 	for _, m := range metricsDedup.apply(rawMetrics) {
-		if name, _ := colString(m, "metric_name"); !sqlLike(genAIMetricNamePattern, name) {
+		name, _ := colString(m, "metric_name")
+		if !sqlLike(genAIMetricNamePattern, name) {
 			continue
 		}
 		a := parseAttrs(t, m)
@@ -771,6 +921,9 @@ func genAIMetricsView(t testing.TB, rawMetrics []map[string]any) []map[string]an
 			if v := c.eval(m, a); v != nil {
 				row[c.alias] = v
 			}
+		}
+		if dim, ok := inferenceUsageDimension(name, a); ok {
+			row["gen_ai_inference_usage_dimension"] = dim
 		}
 		out = append(out, row)
 	}
@@ -897,7 +1050,9 @@ func TestViewModelMatchesViewSQL(t *testing.T) {
 		"WHERE JSON_VALUE(attributes, '$.\"gen_ai.operation.name\"') IS NOT NULL" +
 			" OR JSON_VALUE(attributes, '$.\"gen_ai.system\"') IS NOT NULL" +
 			" OR JSON_VALUE(attributes, '$.\"gen_ai.provider.name\"') IS NOT NULL" +
-			" OR JSON_VALUE(attributes, '$.\"gcp.vertex.agent.invocation_id\"') IS NOT NULL",
+			" OR JSON_VALUE(attributes, '$.\"gcp.vertex.agent.invocation_id\"') IS NOT NULL" +
+			" OR JSON_VALUE(attributes, '$.\"gen_ai.main_agent.name\"') IS NOT NULL" +
+			" OR JSON_VALUE(attributes, '$.\"gen_ai.main_agent.id\"') IS NOT NULL",
 	}
 	for _, c := range spanChains {
 		spanFragments = append(spanFragments, c.sql(""))
@@ -917,6 +1072,7 @@ func TestViewModelMatchesViewSQL(t *testing.T) {
 			" OR JSON_VALUE(l.attributes, '$.\"gen_ai.system\"') IS NOT NULL" +
 			" OR JSON_VALUE(l.attributes, '$.\"gen_ai.provider.name\"') IS NOT NULL" +
 			" OR JSON_VALUE(l.attributes, '$.\"gcp.vertex.agent.invocation_id\"') IS NOT NULL",
+		logOnlyErrorChain.sql("l."),
 	}
 	for _, c := range logChains {
 		logFragments = append(logFragments, c.sql("l.", "s."))
@@ -926,6 +1082,13 @@ func TestViewModelMatchesViewSQL(t *testing.T) {
 	metricFragments := []string{
 		"FROM `" + confProject + "." + confDataset + "." + confMetrics + "_dedup`",
 		"WHERE metric_name LIKE '" + genAIMetricNamePattern + "'",
+		"CASE" +
+			" WHEN metric_name = 'gen_ai.client.inference.usage.input_tokens' THEN 'input'" +
+			" WHEN metric_name = 'gen_ai.client.inference.usage.output_tokens' THEN 'output'" +
+			" WHEN metric_name = 'gen_ai.client.inference.usage.cache_read.input_tokens' THEN 'cache_read_input'" +
+			" WHEN metric_name = 'gen_ai.client.inference.usage.cache_write.input_tokens' THEN 'cache_write_input'" +
+			" WHEN metric_name = 'gen_ai.client.inference.usage.reasoning.output_tokens' THEN 'reasoning_output'" +
+			" ELSE JSON_VALUE(attributes, '$.\"gen_ai.token.type\"') END AS gen_ai_inference_usage_dimension",
 	}
 	for _, c := range metricChains {
 		metricFragments = append(metricFragments, c.sql(""))
@@ -937,7 +1100,7 @@ func TestViewModelMatchesViewSQL(t *testing.T) {
 	spansRead := "FROM `" + confProject + "." + confDataset + ".v_gen_ai_spans` AS s"
 	requireSQL(t, "v_gen_ai_model_costs", render(schema.GenAIModelCostsViewQuery, confProject, confDataset),
 		"WITH cost_spans AS ( SELECT TIMESTAMP_TRUNC(s.start_time, HOUR) AS usage_hour, s.service_name, s.trace_id, s.span_id, s.parent_span_id,",
-		spansRead+" ), cost_windows AS ( SELECT s.*, "+costsWindow.sql()+" FROM cost_spans AS s )",
+		"s.gen_ai_usage_reasoning_tokens, s.error_type "+spansRead+" ), cost_windows AS ( SELECT s.*, "+costsWindow.sql()+" FROM cost_spans AS s )",
 		"FROM cost_windows AS s WHERE "+llmCallPredicateSQL(),
 		"SELECT s.usage_hour, s.service_name, s.gen_ai_agent_name,"+
 			" COALESCE(s.gen_ai_provider_name, s.gen_ai_system) AS provider,"+
@@ -950,13 +1113,16 @@ func TestViewModelMatchesViewSQL(t *testing.T) {
 		"SUM(COALESCE(s.gen_ai_usage_cache_read_input_tokens, 0)) AS total_cache_read_input_tokens",
 		"SUM(COALESCE(s.gen_ai_usage_cache_creation_input_tokens, 0)) AS total_cache_creation_input_tokens",
 		"SUM(COALESCE(s.gen_ai_usage_reasoning_tokens, 0)) AS total_reasoning_tokens",
+		"COUNTIF(s.error_type IS NOT NULL) AS typed_error_count",
+		"APPROX_TOP_COUNT(s.error_type, 6) AS raw_top_error_types",
+		"SELECT * EXCEPT (raw_top_error_types), ARRAY( SELECT AS STRUCT x.value, x.count FROM UNNEST(raw_top_error_types) AS x WHERE x.value IS NOT NULL ORDER BY x.count DESC, x.value ASC LIMIT 5 ) AS top_error_types FROM cost_agg",
 	)
 
 	requireSQL(t, "v_gen_ai_sessions", render(schema.GenAISessionsViewQuery, confProject, confDataset),
 		"WITH session_spans AS (",
 		"DATE(s.start_time) AS session_start_date",
 		"COALESCE(s.adk_session_id, s.gen_ai_conversation_id) AS session_id",
-		spansRead+" WHERE COALESCE(s.adk_session_id, s.gen_ai_conversation_id) IS NOT NULL ),",
+		"s.gen_ai_usage_reasoning_tokens, s.error_type "+spansRead+" WHERE COALESCE(s.adk_session_id, s.gen_ai_conversation_id) IS NOT NULL ),",
 		"session_windows AS ( SELECT s.*, "+sessionsWindow.sql()+" FROM session_spans AS s ),",
 		"session_calls AS ( SELECT s.*,",
 		tokenLeafSQL()+" AS is_token_leaf",
@@ -977,6 +1143,9 @@ func TestViewModelMatchesViewSQL(t *testing.T) {
 		"SUM(IF(is_token_leaf, COALESCE(gen_ai_usage_cache_creation_input_tokens, 0), 0)) AS total_cache_creation_input_tokens",
 		"COUNTIF(is_llm_call) AS llm_call_count",
 		"COUNTIF(gen_ai_operation_name = 'invoke_agent') AS agent_invocation_count",
+		"COUNTIF(error_type IS NOT NULL) AS typed_error_count",
+		"APPROX_TOP_COUNT(error_type, 6) AS raw_top_error_types",
+		"SELECT * EXCEPT (raw_top_error_types), ARRAY( SELECT AS STRUCT x.value, x.count FROM UNNEST(raw_top_error_types) AS x WHERE x.value IS NOT NULL ORDER BY x.count DESC, x.value ASC LIMIT 5 ) AS top_error_types FROM session_agg",
 		"GROUP BY service_name, session_start_date, session_id",
 	)
 }

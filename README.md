@@ -403,7 +403,9 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
 - **Companion and GenAI rollup views (`auto_create.companion_views`).**
   - `otel_spans_as_allspans`: projects `otel_spans_dedup` into the 25-column
     Cloud Trace `_AllSpans` layout (`status` narrowed to `STRUCT<code INT64, message STRING>`).
-  - `v_gen_ai_spans`: filters `otel_spans_dedup` to GenAI/agent spans and
+  - `v_gen_ai_spans`: filters `otel_spans_dedup` to GenAI/agent spans (including
+    spans carrying only `gen_ai.main_agent.name` or `gen_ai.main_agent.id` on
+    span `attributes`) and
     promotes `gen_ai.*`, `error.type`, and `gcp.vertex.agent.*` attributes (`gen_ai_operation_name`,
     `gen_ai_system`, `gen_ai_request_model`, `gen_ai_response_model`,
     `gen_ai_agent_name`, `gen_ai_agent_id`, `gen_ai_conversation_id`,
@@ -414,13 +416,19 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
     `gen_ai_response_finish_reason`, `gen_ai_tool_name`, `gen_ai_tool_call_id`,
     `gen_ai_tool_type`, `gen_ai_tool_description`, `gen_ai_data_source_id`,
     `gen_ai_output_type`, `error_type`, `adk_event_id`,
-    `adk_session_id`, `adk_invocation_id`, `adk_user_id`) into top-level columns.
+    `adk_session_id`, `adk_invocation_id`, `adk_user_id`,
+    `gen_ai_main_agent_id`, `gen_ai_main_agent_name`, `gen_ai_main_agent_description`,
+    `gen_ai_agent_version`, `gen_ai_response_id`,
+    `gen_ai_response_time_to_first_chunk`) into top-level columns.
     `gen_ai_usage_reasoning_tokens` reads the current
     `gen_ai.usage.reasoning.output_tokens` attribute first and the earlier
-    `gen_ai.usage.reasoning_tokens` spelling second; `error_type` is the
-    `error.type` attribute.
+    `gen_ai.usage.reasoning_tokens` spelling second; `gen_ai_main_agent_*` and
+    `gen_ai_agent_version` read span `attributes` first and `resource.attributes`
+    second; `error_type` is the `error.type` attribute.
   - `v_gen_ai_model_costs`: hourly token, cache-read/write, reasoning, latency
-    (`APPROX_QUANTILES`), and error-count rollups over `v_gen_ai_spans` grouped
+    (`APPROX_QUANTILES`), and error-count (`error_count`, `typed_error_count`,
+    and `top_error_types` over non-null `error_type` values) rollups over
+    `v_gen_ai_spans` grouped
     by `(usage_hour, service_name, gen_ai_agent_name, provider, model)`. Each
     LLM call is counted once: a span with a direct child span that reports input
     or output tokens is taken to report the sum of its children and is left out,
@@ -454,29 +462,38 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
     counted in `llm_call_count` or in `v_gen_ai_model_costs`. `llm_call_count`
     counts LLM calls by the same rule as `v_gen_ai_model_costs`, and
     `agent_invocation_count` counts `invoke_agent` spans. `session_start_date`,
-    `total_cache_creation_input_tokens`, `llm_call_count`, and
-    `agent_invocation_count` are the last four columns, so every earlier column
-    keeps its position.
-  - `v_gen_ai_tool_usage`: hourly tool invocation count, error rate, and latency
+    `total_cache_creation_input_tokens`, `llm_call_count`,
+    `agent_invocation_count`, `typed_error_count`, and `top_error_types`
+    (top 5 non-null `error_type` values) are the last six columns, so every
+    earlier column keeps its position.
+  - `v_gen_ai_tool_usage`: hourly tool invocation count, error rate, typed error
+    count (`typed_error_count`, `top_error_types`), and latency
     rollups over `v_gen_ai_spans` grouped by `(usage_hour, service_name, gen_ai_agent_name, gen_ai_tool_name, gen_ai_tool_type)`.
   - `v_gen_ai_logs`: filters `otel_logs_dedup` to GenAI/agent log events and
     left-joins `otel_spans_dedup` on `(trace_id, span_id)` and a null-safe
     `service_name` match, within the window described under *Time-bounded
     `v_gen_ai_logs` span enrichment* below, to promote `gen_ai.*` and
-    `gcp.vertex.agent.*` correlation columns. A value the log record carries
+    `gcp.vertex.agent.*` correlation columns plus `error_type` (from the log
+    record's own `error.type` attribute). A value the log record carries
     wins over the same attribute on its span, and the agent name, session ID,
     and user ID are coalesced over the same attribute keys, in the same order,
     as the columns of `v_gen_ai_spans`. A filter on `timestamp` can narrow the
     scan of `otel_logs`, but not the span side of the join, and `v_gen_ai_logs`
     cannot be queried when `traces.require_partition_filter` is `true`.
   - `v_gen_ai_metrics`: filters `otel_metrics_dedup` to metric names matching
-    `LIKE 'gen_ai.%'` (for example `gen_ai.client.token.usage` and
-    `gen_ai.client.operation.duration`) and promotes
+    `LIKE 'gen_ai.%'` (for example `gen_ai.client.token.usage`,
+    `gen_ai.client.operation.duration`, and `gen_ai.client.inference.usage.*`)
+    and promotes
     `gen_ai_operation_name`, `gen_ai_system` (from `gen_ai.system`, then
     `gen_ai.provider.name`), `gen_ai_provider_name`, `gen_ai_request_model`,
-    `gen_ai_response_model`, `gen_ai_token_type`, and `error_type` next to every
-    point-value column, including the `exemplars` whose `trace_id` and
-    `span_id` link a point back to a trace.
+    `gen_ai_response_model`, `gen_ai_token_type`, `error_type`,
+    `gen_ai_token_modality`, `gen_ai_agent_name` (from `gen_ai.agent.name` then
+    `gen_ai.main_agent.name` on point `attributes`, then `gen_ai.main_agent.name`
+    on `resource.attributes`), and `gen_ai_inference_usage_dimension` (`input`,
+    `output`, `cache_read_input`, `cache_write_input`, or `reasoning_output` for
+    `gen_ai.client.inference.usage.*` metrics, falling back to `gen_ai.token.type`)
+    next to every point-value column, including the `exemplars` whose `trace_id`
+    and `span_id` link a point back to a trace.
   - The two rollup views, `v_gen_ai_model_costs` and `v_gen_ai_sessions`, read
     `v_gen_ai_spans` once. A window function over that read finds the parents
     that report the sum of their children's tokens, and each view computes one

@@ -4,14 +4,17 @@
       "resource": {
         "attributes": [
           {"key": "service.name", "value": {"stringValue": "multi-agent-planner"}},
-          {"key": "service.version", "value": {"stringValue": "1.2.0"}}
+          {"key": "service.version", "value": {"stringValue": "1.2.0"}},
+          {"key": "gen_ai.main_agent.id", "value": {"stringValue": "agent-planner-1"}},
+          {"key": "gen_ai.main_agent.name", "value": {"stringValue": "planner"}},
+          {"key": "gen_ai.main_agent.description", "value": {"stringValue": "Top-level planner coordinating researcher and tool workers"}}
         ]
       },
       "scopeLogs": [
         {
           "scope": {
             "name": "synthetic.gen_ai.multi_agent",
-            "version": "1.40.0"
+            "version": "0.1.0"
           },
           "logRecords": [
             {
@@ -31,7 +34,7 @@
                 }
               },
               "attributes": [
-                {"key": "gen_ai.system", "value": {"stringValue": "gcp.vertex.agent"}},
+                {"key": "gen_ai.provider.name", "value": {"stringValue": "gcp.vertex.agent"}},
                 {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
                 {"key": "gen_ai.agent.name", "value": {"stringValue": "planner"}},
                 {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv-multi-01"}}

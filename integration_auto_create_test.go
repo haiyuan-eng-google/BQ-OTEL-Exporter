@@ -17,6 +17,8 @@ import (
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/otel/metric/noop"
 	"go.uber.org/zap"
 	bigqueryapi "google.golang.org/api/bigquery/v2"
@@ -98,14 +100,26 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 	}
 	defer func() { _ = logs.shutdown(context.Background()) }()
 
-	if err := traces.pushTraceData(ctx, newTestTraces(1)); err != nil {
+	metrics, err := newMetricsExporter(settings, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := metrics.start(ctx, nil); err != nil {
+		t.Fatalf("first metric startup: %v", err)
+	}
+	defer func() { _ = metrics.shutdown(context.Background()) }()
+
+	if err := traces.pushTraceData(ctx, oneIntegrationTrace()); err != nil {
 		t.Fatalf("write trace: %v", err)
 	}
 	if err := logs.pushLogData(ctx, oneIntegrationLog()); err != nil {
 		t.Fatalf("write log: %v", err)
 	}
+	if err := metrics.pushMetricsData(ctx, oneIntegrationMetrics()); err != nil {
+		t.Fatalf("write metric: %v", err)
+	}
 
-	// A second pair of exporters exercises the dataset and table AlreadyExists
+	// A second set of exporters exercises the dataset and table AlreadyExists
 	// paths and the reconciliation of existing views against the real metadata
 	// API.
 	secondTraces, err := newTracesExporter(settings, cfg)
@@ -130,7 +144,7 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 		t.Fatalf("second log shutdown: %v", err)
 	}
 
-	for _, table := range []string{cfg.Traces.Table, cfg.Logs.Table} {
+	for _, table := range []string{cfg.Traces.Table, cfg.Logs.Table, cfg.Metrics.Table} {
 		if err := waitForRows(ctx, admin, project, dataset, table); err != nil {
 			t.Error(err)
 		}
@@ -141,19 +155,164 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 	if err := waitForRows(ctx, admin, project, dataset, "otel_spans_as_allspans"); err != nil {
 		t.Error(err)
 	}
-	for _, name := range []string{cfg.Quarantine.Table, "v_gen_ai_spans", "v_gen_ai_logs"} {
+	for _, name := range []string{
+		cfg.Quarantine.Table,
+		"v_gen_ai_spans",
+		"v_gen_ai_logs",
+		"v_gen_ai_metrics",
+		"v_gen_ai_model_costs",
+		"v_gen_ai_sessions",
+		"v_gen_ai_tool_usage",
+	} {
 		if _, err := admin.Dataset(dataset).Table(name).Metadata(ctx); err != nil {
 			t.Errorf("resource %s metadata: %v", name, err)
 		}
 	}
+
+	assertIntegrationViewColumns(ctx, t, admin, project, dataset)
+}
+
+func oneIntegrationTrace() ptrace.Traces {
+	td := ptrace.NewTraces()
+	rs := td.ResourceSpans().AppendEmpty()
+	rs.Resource().Attributes().PutStr("service.name", "it-agent")
+	now := time.Now()
+	spans := rs.ScopeSpans().AppendEmpty().Spans()
+
+	s := spans.AppendEmpty()
+	s.SetName("chat gemini-2.5-pro")
+	s.SetTraceID(pcommon.TraceID{1})
+	s.SetSpanID(pcommon.SpanID{1})
+	s.SetStartTimestamp(pcommon.NewTimestampFromTime(now.Add(-time.Second)))
+	s.SetEndTimestamp(pcommon.NewTimestampFromTime(now))
+	s.Status().SetCode(ptrace.StatusCodeError)
+	attrs := s.Attributes()
+	attrs.PutStr("gen_ai.operation.name", "chat")
+	attrs.PutStr("gen_ai.system", "gcp.vertex.agent")
+	attrs.PutStr("gen_ai.request.model", "gemini-2.5-pro")
+	attrs.PutStr("gen_ai.conversation.id", "sess-it-1")
+	attrs.PutStr("gen_ai.tool.name", "search")
+	attrs.PutStr("gen_ai.main_agent.id", "main-1")
+	attrs.PutStr("gen_ai.main_agent.name", "planner")
+	attrs.PutStr("gen_ai.main_agent.description", "root planner")
+	attrs.PutStr("gen_ai.agent.version", "1.0.0")
+	attrs.PutStr("gen_ai.response.id", "resp-1")
+	attrs.PutDouble("gen_ai.response.time_to_first_chunk", 0.25)
+	attrs.PutInt("gen_ai.usage.input_tokens", 10)
+	attrs.PutInt("gen_ai.usage.output_tokens", 5)
+	attrs.PutStr("error.type", "rate_limited")
+
+	// A healthy span in the same session, model, and tool group ensures live
+	// BigQuery tests prove top_error_types excludes NULL error_type values.
+	okSpan := spans.AppendEmpty()
+	okSpan.SetName("chat gemini-2.5-pro ok")
+	okSpan.SetTraceID(pcommon.TraceID{2})
+	okSpan.SetSpanID(pcommon.SpanID{2})
+	okSpan.SetStartTimestamp(pcommon.NewTimestampFromTime(now.Add(-500 * time.Millisecond)))
+	okSpan.SetEndTimestamp(pcommon.NewTimestampFromTime(now))
+	okSpan.Status().SetCode(ptrace.StatusCodeOk)
+	okAttrs := okSpan.Attributes()
+	okAttrs.PutStr("gen_ai.operation.name", "chat")
+	okAttrs.PutStr("gen_ai.system", "gcp.vertex.agent")
+	okAttrs.PutStr("gen_ai.request.model", "gemini-2.5-pro")
+	okAttrs.PutStr("gen_ai.conversation.id", "sess-it-1")
+	okAttrs.PutStr("gen_ai.tool.name", "search")
+	okAttrs.PutInt("gen_ai.usage.input_tokens", 8)
+	okAttrs.PutInt("gen_ai.usage.output_tokens", 4)
+	return td
 }
 
 func oneIntegrationLog() plog.Logs {
 	ld := plog.NewLogs()
-	record := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+	rl := ld.ResourceLogs().AppendEmpty()
+	rl.Resource().Attributes().PutStr("service.name", "it-agent")
+	record := rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
 	record.SetTimestamp(pcommon.Timestamp(time.Now().UnixNano()))
+	record.SetEventName("gen_ai.choice")
+	record.SetTraceID(pcommon.TraceID{1})
+	record.SetSpanID(pcommon.SpanID{1})
+	record.Attributes().PutStr("gen_ai.system", "gcp.vertex.agent")
+	record.Attributes().PutStr("error.type", "rate_limited")
 	record.Body().SetStr("auto-create integration test")
 	return ld
+}
+
+func oneIntegrationMetrics() pmetric.Metrics {
+	md := pmetric.NewMetrics()
+	rm := md.ResourceMetrics().AppendEmpty()
+	rm.Resource().Attributes().PutStr("service.name", "it-agent")
+	m := rm.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	m.SetName("gen_ai.client.inference.usage.input_tokens")
+	m.SetUnit("{token}")
+	sum := m.SetEmptySum()
+	sum.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
+	sum.SetIsMonotonic(true)
+	dp := sum.DataPoints().AppendEmpty()
+	now := time.Now()
+	dp.SetStartTimestamp(pcommon.NewTimestampFromTime(now.Add(-time.Second)))
+	dp.SetTimestamp(pcommon.NewTimestampFromTime(now))
+	dp.SetIntValue(10)
+	dp.Attributes().PutStr("gen_ai.system", "gcp.vertex.agent")
+	dp.Attributes().PutStr("gen_ai.token.modality", "text")
+	dp.Attributes().PutStr("gen_ai.agent.name", "planner")
+	return md
+}
+
+func assertIntegrationViewColumns(ctx context.Context, t *testing.T, client *bq.Client, project, dataset string) {
+	t.Helper()
+	for _, tc := range []struct {
+		name string
+		sql  string
+		want []bq.Value
+	}{
+		{
+			name: "v_gen_ai_spans",
+			sql: fmt.Sprintf(
+				"SELECT gen_ai_main_agent_id, gen_ai_main_agent_name, gen_ai_main_agent_description, gen_ai_agent_version, gen_ai_response_id, gen_ai_response_time_to_first_chunk FROM `%s.%s.v_gen_ai_spans` WHERE error_type IS NOT NULL LIMIT 1",
+				project, dataset,
+			),
+			want: []bq.Value{"main-1", "planner", "root planner", "1.0.0", "resp-1", float64(0.25)},
+		},
+		{
+			name: "v_gen_ai_logs",
+			sql:  fmt.Sprintf("SELECT error_type FROM `%s.%s.v_gen_ai_logs` LIMIT 1", project, dataset),
+			want: []bq.Value{"rate_limited"},
+		},
+		{
+			name: "v_gen_ai_metrics",
+			sql:  fmt.Sprintf("SELECT gen_ai_token_modality, gen_ai_agent_name, gen_ai_inference_usage_dimension FROM `%s.%s.v_gen_ai_metrics` LIMIT 1", project, dataset),
+			want: []bq.Value{"text", "planner", "input"},
+		},
+		{
+			name: "v_gen_ai_model_costs",
+			sql:  fmt.Sprintf("SELECT typed_error_count, ARRAY_LENGTH(top_error_types), top_error_types[OFFSET(0)].value FROM `%s.%s.v_gen_ai_model_costs` LIMIT 1", project, dataset),
+			want: []bq.Value{int64(1), int64(1), "rate_limited"},
+		},
+		{
+			name: "v_gen_ai_sessions",
+			sql:  fmt.Sprintf("SELECT typed_error_count, ARRAY_LENGTH(top_error_types), top_error_types[OFFSET(0)].value FROM `%s.%s.v_gen_ai_sessions` LIMIT 1", project, dataset),
+			want: []bq.Value{int64(1), int64(1), "rate_limited"},
+		},
+		{
+			name: "v_gen_ai_tool_usage",
+			sql:  fmt.Sprintf("SELECT typed_error_count, ARRAY_LENGTH(top_error_types), top_error_types[OFFSET(0)].value FROM `%s.%s.v_gen_ai_tool_usage` LIMIT 1", project, dataset),
+			want: []bq.Value{int64(1), int64(1), "rate_limited"},
+		},
+	} {
+		rows, err := client.Query(tc.sql).Read(ctx)
+		if err != nil {
+			t.Errorf("%s query: %v", tc.name, err)
+			continue
+		}
+		var got []bq.Value
+		if err := rows.Next(&got); err != nil {
+			t.Errorf("%s rows.Next: %v", tc.name, err)
+			continue
+		}
+		if fmt.Sprint(got) != fmt.Sprint(tc.want) {
+			t.Errorf("%s columns = %v, want %v", tc.name, got, tc.want)
+		}
+	}
 }
 
 func waitForRows(ctx context.Context, client *bq.Client, project, dataset, table string) error {

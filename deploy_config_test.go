@@ -927,3 +927,70 @@ func TestTerraformRetentionMatchesExporter(t *testing.T) {
 		}
 	}
 }
+
+var terraformViewHeredocRE = regexp.MustCompile(`(?s)query\s*=\s*<<-?EOT\n(.*?)\n\s*EOT`)
+
+var terraformViewReplacer = strings.NewReplacer(
+	"${var.project_id}", "p",
+	"${google_bigquery_dataset.otel.dataset_id}", "d",
+	"${google_bigquery_table.otel_spans_dedup.table_id}", "otel_spans_dedup",
+	"${google_bigquery_table.otel_logs_dedup.table_id}", "otel_logs_dedup",
+	"${google_bigquery_table.otel_metrics_dedup.table_id}", "otel_metrics_dedup",
+	"${google_bigquery_table.v_gen_ai_spans.table_id}", "v_gen_ai_spans",
+)
+
+func normalizeCompanionViewSQL(sql string) string {
+	var lines []string
+	for _, line := range strings.Split(sql, "\n") {
+		line, _, _ = strings.Cut(line, "--")
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			lines = append(lines, trimmed)
+		}
+	}
+	collapsed := strings.Join(strings.Fields(strings.Join(lines, " ")), " ")
+	collapsed = strings.ReplaceAll(collapsed, "( ", "(")
+	collapsed = strings.ReplaceAll(collapsed, " )", ")")
+	return collapsed
+}
+
+// Each companion view in deploy/terraform/main.tf must match the SQL query the
+// exporter creates via internal/schema, so a view change in one place cannot
+// drift from the other.
+func TestTerraformCompanionViewsMatchExporter(t *testing.T) {
+	mainTF := readRepoText(t, "deploy/terraform/main.tf")
+	for _, tc := range []struct {
+		resource string
+		query    string
+		args     []any
+	}{
+		{schema.SpansAsAllSpansViewName, schema.SpansAsAllSpansViewQuery, []any{"p", "d", "otel_spans"}},
+		{schema.GenAISpansViewName, schema.GenAISpansViewQuery, []any{"p", "d", "otel_spans"}},
+		{schema.GenAILogsViewName, schema.GenAILogsViewQuery, []any{"p", "d", "otel_logs", "otel_spans"}},
+		{schema.GenAIMetricsViewName, schema.GenAIMetricsViewQuery, []any{"p", "d", "otel_metrics"}},
+		{schema.GenAIModelCostsViewName, schema.GenAIModelCostsViewQuery, []any{"p", "d"}},
+		{schema.GenAISessionsViewName, schema.GenAISessionsViewQuery, []any{"p", "d"}},
+		{schema.GenAIToolUsageViewName, schema.GenAIToolUsageViewQuery, []any{"p", "d"}},
+	} {
+		t.Run(tc.resource, func(t *testing.T) {
+			block := terraformBlock(mainTF, `resource "google_bigquery_table" "`+tc.resource+`"`)
+			if block == "" {
+				t.Fatalf("deploy/terraform/main.tf has no google_bigquery_table.%s resource", tc.resource)
+			}
+			m := terraformViewHeredocRE.FindStringSubmatch(block)
+			if m == nil {
+				t.Fatalf("google_bigquery_table.%s has no <<EOT or <<-EOT view query heredoc", tc.resource)
+			}
+			tfQuery := terraformViewReplacer.Replace(m[1])
+			if i := strings.Index(tfQuery, "${"); i >= 0 {
+				t.Fatalf("google_bigquery_table.%s contains an unexpected Terraform interpolation near %q",
+					tc.resource, tfQuery[i:min(len(tfQuery), i+60)])
+			}
+			got := normalizeCompanionViewSQL(tfQuery)
+			want := normalizeCompanionViewSQL(fmt.Sprintf(tc.query, tc.args...))
+			if got != want {
+				t.Errorf("Terraform view %s SQL does not match exporter view SQL:\n--- terraform ---\n%s\n--- exporter ---\n%s",
+					tc.resource, got, want)
+			}
+		})
+	}
+}
