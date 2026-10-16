@@ -201,14 +201,14 @@ to skip partitions. See "Filtering the GenAI views by time" under
 [Operating v0alpha2 tables](../README.md#operating-v0alpha2-tables) for the
 columns the views take. Queries over `v_gen_ai_logs` and `v_gen_ai_metric_exemplars` are rejected even with a
 filter, because no such filter reaches their scan of `otel_spans`, so leave the
-option off for a deployment that queries those views. If a collector starts
-with `auto_create.companion_views: true` against an existing `otel_spans` table
-that requires a partition filter, startup fails unless
-`auto_create.allow_unprunable_views: true` (Helm:
-`bigquery.autoCreateAllowUnprunableViews: true`) is set,
-`auto_create.companion_views` is disabled (`false`), or the partition filter
-requirement on `otel_spans` is removed (`traces.require_partition_filter: false`
-in config applies only when creating a new `otel_spans` table).
+option off for a deployment that queries those views. A collector started
+with `auto_create.companion_views: true` against an `otel_spans` table that
+requires a partition filter skips those two views with a warning, creates the
+other companion views, and starts; set `auto_create.allow_unprunable_views: true`
+(Helm: `bigquery.autoCreateAllowUnprunableViews: true`) to create the two views
+anyway. The collector reads the table's metadata to decide, and its own
+`traces.require_partition_filter` counts only while `otel_spans` does not exist
+yet, because that option applies only when the collector creates the table.
 
 ### Labels
 

@@ -558,16 +558,15 @@ func helmEnterpriseValues(maskReplacement string) map[string]any {
 	}
 	return map[string]any{
 		"bigquery": map[string]any{
-			"autoCreateDataset":              true,
-			"autoCreateTables":               true,
-			"autoCreateCompanionViews":       true,
-			"autoCreateAllowUnprunableViews": true,
-			"autoCreateSearchIndexes":        true,
-			"kmsKeyName":                     key + "default",
-			"labels":                         map[string]any{"env": "prod", "cost-center": int64(1234)},
-			"traces":                         signal("traces"),
-			"logs":                           signal("logs"),
-			"metrics":                        signal("metrics"),
+			"autoCreateDataset":        true,
+			"autoCreateTables":         true,
+			"autoCreateCompanionViews": true,
+			"autoCreateSearchIndexes":  true,
+			"kmsKeyName":               key + "default",
+			"labels":                   map[string]any{"env": "prod", "cost-center": int64(1234)},
+			"traces":                   signal("traces"),
+			"logs":                     signal("logs"),
+			"metrics":                  signal("metrics"),
 		},
 		"offload": map[string]any{
 			"enabled":        true,
@@ -680,8 +679,12 @@ func TestHelmConfigMapDecodesAndValidates(t *testing.T) {
 				t.Errorf("kms_key_name did not reach the exporter: %q, %q, %q",
 					cfg.KMSKeyName, cfg.Logs.KMSKeyName, cfg.Quarantine.KMSKeyName)
 			}
-			if !cfg.AutoCreate.CompanionViews || !cfg.AutoCreate.AllowUnprunableViews || !cfg.AutoCreate.SearchIndexes {
-				t.Errorf("auto_create = %+v, want companion_views, allow_unprunable_views, and search_indexes on", cfg.AutoCreate)
+			// The enterprise values enable companion views with a traces
+			// partition filter and leave autoCreateAllowUnprunableViews unset,
+			// as values written before that key existed do; they must keep
+			// validating.
+			if !cfg.AutoCreate.CompanionViews || !cfg.AutoCreate.SearchIndexes || cfg.AutoCreate.AllowUnprunableViews {
+				t.Errorf("auto_create = %+v, want companion_views and search_indexes on and allow_unprunable_views off", cfg.AutoCreate)
 			}
 			if !cfg.Traces.RequirePartitionFilter {
 				t.Errorf("traces.require_partition_filter = %v, want true", cfg.Traces.RequirePartitionFilter)
@@ -705,6 +708,30 @@ func TestHelmConfigMapDecodesAndValidates(t *testing.T) {
 				cfg.Traces.RequirePartitionFilter, cfg.AutoCreate.CompanionViews)
 		}
 	})
+
+	// The chart renders auto_create.allow_unprunable_views only when
+	// autoCreateAllowUnprunableViews is set, so the default render keeps the
+	// exporter default.
+	for _, allow := range []bool{false, true} {
+		t.Run(fmt.Sprintf("autoCreateAllowUnprunableViews=%v", allow), func(t *testing.T) {
+			overrides := helmEnterpriseValues("[REDACTED]")
+			overrides["bigquery"].(map[string]any)["autoCreateAllowUnprunableViews"] = allow
+			doc := helmCollectorConfig(t, overrides)
+			rendered := yamlPath(doc, "exporters", "bigquery", "auto_create", "allow_unprunable_views")
+			var want any // absent
+			if allow {
+				want = true
+			}
+			if rendered != want {
+				t.Errorf("rendered auto_create.allow_unprunable_views = %#v, want %#v", rendered, want)
+			}
+			cfg := decodeExporterConfig(t, "autoCreateAllowUnprunableViews", exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
+			if cfg.AutoCreate.AllowUnprunableViews != allow || !cfg.AutoCreate.CompanionViews || !cfg.Traces.RequirePartitionFilter {
+				t.Errorf("auto_create = %+v, traces.require_partition_filter = %v; want allow_unprunable_views %v with companion_views and a traces partition filter",
+					cfg.AutoCreate, cfg.Traces.RequirePartitionFilter, allow)
+			}
+		})
+	}
 }
 
 // An offload.cacheSize of 0 disables the cross-batch cache, whose exporter
@@ -791,6 +818,9 @@ var helmUnexposedExporterKeys = map[string]string{
 
 func TestHelmChartExposesExporterOptions(t *testing.T) {
 	overrides := helmEnterpriseValues("[REDACTED]")
+	// Off by default and rendered only when set; the enterprise values leave
+	// it unset, as values written before it existed do.
+	overrides["bigquery"].(map[string]any)["autoCreateAllowUnprunableViews"] = true
 	conf := confmap.NewFromStringMap(helmCollectorConfig(t, overrides))
 	section := exporterBlock(t, conf, "bigquery")
 	exposed := map[string]bool{}

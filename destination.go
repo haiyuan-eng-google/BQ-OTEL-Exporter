@@ -511,6 +511,17 @@ func (e *signalExporter) createDedupView(
 // failing startup, and a later start creates it. An unreadable peer dedup view
 // is skipped with a warning because companion views are a convenience and must
 // not block export.
+//
+// The cross-signal views join spans on a window that depends on each row, so
+// BigQuery cannot use it to skip span partitions and rejects every query over
+// them when the spans table requires a partition filter. Unless
+// auto_create.allow_unprunable_views is set, the two cross-signal views are
+// therefore skipped with a warning when the spans table in effect requires
+// one: for the traces exporter the existing table, the table it created, or
+// the winner of a concurrent creation; for the logs and metrics exporters the
+// table's metadata, or traces.require_partition_filter while the table does
+// not exist yet. The single-signal views are created either way, and this
+// never fails startup.
 func (e *signalExporter) createCompanionViews(
 	ctx context.Context, admin destinationAdmin, effectiveTableMD *bq.TableMetadata,
 ) error {
@@ -525,7 +536,7 @@ func (e *signalExporter) createCompanionViews(
 		if err != nil || !ok {
 			return err
 		}
-		ok, err = e.checkPeerSpanTablePartitionFilter(ctx, admin, e.cfg.Traces.Table, schema.GenAIMetricExemplarsViewName)
+		ok, err = e.peerSpanTableAllowsCrossSignalView(ctx, admin, e.cfg.Traces.Table, schema.GenAIMetricExemplarsViewName)
 		if err != nil || !ok {
 			return err
 		}
@@ -539,16 +550,13 @@ func (e *signalExporter) createCompanionViews(
 	}
 	isSpans := proto.Equal(e.schema, schema.SpansTableSchema())
 	spansTable, logsTable := e.table, e.cfg.Logs.Table
-	if isSpans && !e.cfg.AutoCreate.AllowUnprunableViews && tableRequiresPartitionFilter(effectiveTableMD) {
-		return e.companionViewPruningError(spansTable)
-	}
 	if !isSpans {
 		spansTable, logsTable = e.cfg.Traces.Table, e.table
 		ok, err := e.probePeerDedupView(ctx, admin, "span", spansTable, schema.GenAILogsViewName)
 		if err != nil || !ok {
 			return err
 		}
-		ok, err = e.checkPeerSpanTablePartitionFilter(ctx, admin, spansTable, schema.GenAILogsViewName)
+		ok, err = e.peerSpanTableAllowsCrossSignalView(ctx, admin, spansTable, schema.GenAILogsViewName)
 		if err != nil || !ok {
 			return err
 		}
@@ -564,11 +572,12 @@ func (e *signalExporter) createCompanionViews(
 	}
 
 	if isSpans {
+		spansRequireFilter := tableRequiresPartitionFilter(effectiveTableMD)
 		ok, err := e.probePeerDedupView(ctx, admin, "log", logsTable, schema.GenAILogsViewName)
 		if err != nil {
 			return err
 		}
-		if ok {
+		if ok && !e.skipCrossSignalView(spansTable, schema.GenAILogsViewName, spansRequireFilter) {
 			logViews := schema.CompanionViewsMetadata(e.cfg.Project, e.cfg.Dataset, spansTable, logsTable, false)
 			if _, err := e.ensureCompanionViews(ctx, admin,
 				slices.Sorted(maps.Keys(logViews)), logViews, e.effectiveLabels(e.cfg.Logs.Labels), false); err != nil {
@@ -579,6 +588,9 @@ func (e *signalExporter) createCompanionViews(
 		ok, err = e.probePeerDedupView(ctx, admin, "metric", e.cfg.Metrics.Table, schema.GenAIMetricExemplarsViewName)
 		if err != nil || !ok {
 			return err
+		}
+		if e.skipCrossSignalView(spansTable, schema.GenAIMetricExemplarsViewName, spansRequireFilter) {
+			return nil
 		}
 		metricViews := schema.MetricsCompanionViewsMetadata(e.cfg.Project, e.cfg.Dataset, e.cfg.Metrics.Table)
 		metricViews[schema.GenAIMetricExemplarsViewName] = schema.MetricExemplarsCompanionViewMetadata(
@@ -591,22 +603,41 @@ func (e *signalExporter) createCompanionViews(
 	return nil
 }
 
+// tableRequiresPartitionFilter reports whether a table's metadata, in either of
+// the two places BigQuery reports it, requires a partition filter on queries.
 func tableRequiresPartitionFilter(md *bq.TableMetadata) bool {
 	return md != nil && (md.RequirePartitionFilter ||
 		(md.TimePartitioning != nil && md.TimePartitioning.RequirePartitionFilter))
 }
 
-func (e *signalExporter) companionViewPruningError(spansTable string) error {
-	spanTableID := e.cfg.Project + "." + e.cfg.Dataset + "." + spansTable
-	return fmt.Errorf(
-		"auto_create.companion_views cannot create cross-signal views (%s, %s) over %s while that spans table requires a partition filter: "+
-			"BigQuery rejects queries over those views without a constant start_time partition filter; "+
-			"set auto_create.allow_unprunable_views: true, auto_create.companion_views: false, or ensure %s does not require a partition filter "+
-			"(traces.require_partition_filter: false applies only when creating a new spans table)",
-		schema.GenAILogsViewName, schema.GenAIMetricExemplarsViewName, spanTableID, spanTableID)
+// skipCrossSignalView reports whether the cross-signal companion view over
+// spansTable is skipped: when that table requires a partition filter and
+// auto_create.allow_unprunable_views is off, BigQuery would reject every query
+// over the view, so it is left out with a warning instead of failing startup.
+func (e *signalExporter) skipCrossSignalView(spansTable, view string, spansRequireFilter bool) bool {
+	if !spansRequireFilter || e.cfg.AutoCreate.AllowUnprunableViews {
+		return false
+	}
+	e.logger.Warn(crossSignalViewSkippedMessage,
+		zap.String("view", e.cfg.Project+"."+e.cfg.Dataset+"."+view),
+		zap.String("spans_table", e.cfg.Project+"."+e.cfg.Dataset+"."+spansTable))
+	return true
 }
 
-func (e *signalExporter) checkPeerSpanTablePartitionFilter(
+// crossSignalViewSkippedMessage is the warning logged when a cross-signal
+// companion view is skipped because the spans table requires a partition filter.
+const crossSignalViewSkippedMessage = "skipping cross-signal companion view because the spans table requires a partition filter; " +
+	"set auto_create.allow_unprunable_views: true to create it anyway"
+
+// peerSpanTableAllowsCrossSignalView reads the spans table that a cross-signal
+// view of the logs or metrics exporter joins, and reports whether to create the
+// view. The table's metadata decides whether it requires a partition filter;
+// traces.require_partition_filter decides only while the table does not exist
+// yet, because it applies only when the table is created. A view over a table
+// that requires one is skipped with a warning (see skipCrossSignalView), and so
+// is a view over a table whose metadata cannot be read, which is never taken to
+// require no filter. Only a context error fails startup.
+func (e *signalExporter) peerSpanTableAllowsCrossSignalView(
 	ctx context.Context, admin destinationAdmin, peerSpanTable, dependentView string,
 ) (bool, error) {
 	if e.cfg.AutoCreate.AllowUnprunableViews {
@@ -617,17 +648,11 @@ func (e *signalExporter) checkPeerSpanTablePartitionFilter(
 	spanMD, err := admin.TableMetadata(ctx, peerSpanTable)
 	switch {
 	case err == nil:
-		if tableRequiresPartitionFilter(spanMD) {
-			return false, e.companionViewPruningError(peerSpanTable)
-		}
-		return true, nil
+		return !e.skipCrossSignalView(peerSpanTable, dependentView, tableRequiresPartitionFilter(spanMD)), nil
 	case isContextError(err):
 		return false, fmt.Errorf("reading span table metadata for %s: %w", spanTableID, err)
 	case isNotFound(err):
-		if e.cfg.Traces.RequirePartitionFilter {
-			return false, e.companionViewPruningError(peerSpanTable)
-		}
-		return true, nil
+		return !e.skipCrossSignalView(peerSpanTable, dependentView, e.cfg.Traces.RequirePartitionFilter), nil
 	default:
 		e.logger.Warn("span table metadata is unreadable; skipping companion view",
 			zap.String("view", viewName), zap.String("requires", spanTableID), zap.Error(err))

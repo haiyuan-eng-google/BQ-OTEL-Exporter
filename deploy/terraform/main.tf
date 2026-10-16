@@ -980,7 +980,9 @@ resource "google_bigquery_table" "v_gen_ai_metrics" {
           WHEN metric_name = 'gen_ai.client.inference.usage.cache_write.input_tokens' THEN 'cache_write_input'
           WHEN metric_name = 'gen_ai.client.inference.usage.reasoning.output_tokens' THEN 'reasoning_output'
           ELSE JSON_VALUE(attributes, '$."gen_ai.token.type"')
-        END AS gen_ai_inference_usage_dimension
+        END AS gen_ai_inference_usage_dimension,
+        time_unix_nano,
+        point_fingerprint
       FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.otel_metrics_dedup.table_id}`
       WHERE metric_name LIKE 'gen_ai.%'
     EOT
@@ -1048,7 +1050,7 @@ resource "google_bigquery_table" "v_gen_ai_metric_exemplars" {
         AND ex.trace_id != ''
         AND ex.span_id != ''
       QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY m.timestamp, m.start_time, m.receive_time, m.service_name, m.metric_name, m.metric_type, TO_JSON_STRING(m.attributes), TO_JSON_STRING(m.resource), TO_JSON_STRING(m.instrumentation_scope), exemplar_ordinal
+        PARTITION BY m.timestamp, m.time_unix_nano, m.service_name, m.metric_name, m.metric_type, m.point_fingerprint, exemplar_ordinal
         ORDER BY s.end_time DESC, s.start_time DESC, s.receive_time DESC, s.name ASC
       ) = 1
     EOT

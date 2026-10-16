@@ -777,7 +777,11 @@ WHERE COALESCE(NULLIF(l.event_name, ''), JSON_VALUE(l.attributes, '$."event.name
 // raw attribute, resource and scope columns are kept for anything not promoted,
 // followed by gen_ai_token_modality, gen_ai_agent_name, and
 // gen_ai_inference_usage_dimension (semantic-conventions-genai@f3c6d0c9)
-// appended at the end.
+// appended at the end, and then by time_unix_nano and point_fingerprint, which
+// with timestamp, service_name, metric_name and metric_type make up the
+// identity of a point in the metric deduplication view (see
+// MetricsDedupViewDDL), so two points that share a microsecond timestamp stay
+// distinguishable.
 const GenAIMetricsViewDDL = `
 CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAIMetricsViewName + "`" + ` AS
 ` + GenAIMetricsViewQuery + `;
@@ -844,7 +848,9 @@ SELECT
     WHEN metric_name = 'gen_ai.client.inference.usage.cache_write.input_tokens' THEN 'cache_write_input'
     WHEN metric_name = 'gen_ai.client.inference.usage.reasoning.output_tokens' THEN 'reasoning_output'
     ELSE JSON_VALUE(attributes, '$."gen_ai.token.type"')
-  END AS gen_ai_inference_usage_dimension
+  END AS gen_ai_inference_usage_dimension,
+  time_unix_nano,
+  point_fingerprint
 FROM ` + "`%[1]s.%[2]s.%[3]s_dedup`" + `
 WHERE metric_name LIKE 'gen_ai.%%'
 `
@@ -856,6 +862,16 @@ WHERE metric_name LIKE 'gen_ai.%%'
 // match an exemplar in that window, the latest span (by end_time, start_time,
 // receive_time, then name) is selected. An exemplar whose span is absent or
 // outside the window stays in the view with NULL span_* columns.
+//
+// That selection ranks the rows of one exemplar slot: one point of the metric
+// deduplication view, identified by the same columns as there (timestamp,
+// time_unix_nano, service_name, metric_name, metric_type, point_fingerprint),
+// and the exemplar's offset in its exemplars array. Distinct points that share
+// a microsecond timestamp, and repeated exemplars of one point, therefore each
+// keep their row. m.timestamp stays among the PARTITION BY columns because
+// BigQuery pushes a filter below a window function only when the filter refers
+// to PARTITION BY columns (see MetricsDedupViewDDL); this keeps that path open
+// for a filter on metric_timestamp.
 const GenAIMetricExemplarsViewDDL = `
 CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAIMetricExemplarsViewName + "`" + ` AS
 ` + GenAIMetricExemplarsViewQuery + `;
@@ -917,7 +933,7 @@ WHERE ex.trace_id IS NOT NULL
   AND ex.trace_id != ''
   AND ex.span_id != ''
 QUALIFY ROW_NUMBER() OVER (
-  PARTITION BY m.timestamp, m.start_time, m.receive_time, m.service_name, m.metric_name, m.metric_type, TO_JSON_STRING(m.attributes), TO_JSON_STRING(m.resource), TO_JSON_STRING(m.instrumentation_scope), exemplar_ordinal
+  PARTITION BY m.timestamp, m.time_unix_nano, m.service_name, m.metric_name, m.metric_type, m.point_fingerprint, exemplar_ordinal
   ORDER BY s.end_time DESC, s.start_time DESC, s.receive_time DESC, s.name ASC
 ) = 1
 `

@@ -950,7 +950,7 @@ func TestGenAIMetricExemplarsView(t *testing.T) {
 		"LEFT JOIN `proj.ds.spans_tbl_dedup` s ON s.trace_id = ex.trace_id AND s.span_id = ex.span_id AND s.service_name IS NOT DISTINCT FROM m.service_name",
 		"AND s.start_time BETWEEN TIMESTAMP_SUB(m.timestamp, INTERVAL 24 HOUR) AND TIMESTAMP_ADD(m.timestamp, INTERVAL 1 HOUR)",
 		"WHERE ex.trace_id IS NOT NULL AND ex.span_id IS NOT NULL AND ex.trace_id != '' AND ex.span_id != ''",
-		"QUALIFY ROW_NUMBER() OVER ( PARTITION BY m.timestamp, m.start_time, m.receive_time, m.service_name, m.metric_name, m.metric_type, TO_JSON_STRING(m.attributes), TO_JSON_STRING(m.resource), TO_JSON_STRING(m.instrumentation_scope), exemplar_ordinal ORDER BY s.end_time DESC, s.start_time DESC, s.receive_time DESC, s.name ASC ) = 1",
+		"QUALIFY ROW_NUMBER() OVER ( PARTITION BY m.timestamp, m.time_unix_nano, m.service_name, m.metric_name, m.metric_type, m.point_fingerprint, exemplar_ordinal ORDER BY s.end_time DESC, s.start_time DESC, s.receive_time DESC, s.name ASC ) = 1",
 	} {
 		if !strings.Contains(normalized, want) {
 			t.Errorf("v_gen_ai_metric_exemplars must contain %q, got:\n%s", want, normalized)
@@ -989,6 +989,51 @@ func TestGenAIMetricExemplarsView(t *testing.T) {
 	} {
 		if got := attributeKeys(exprs[col]); !slices.Equal(got, want) {
 			t.Errorf("v_gen_ai_metric_exemplars.%s reads %v, want %v", col, got, want)
+		}
+	}
+}
+
+// The exemplar window ranks the span rows of one exemplar slot, so it
+// partitions by the identity of a point in the metric dedup view, which
+// v_gen_ai_metrics passes through unchanged, and then by the exemplar's array
+// offset. Leaving an identity column out would merge distinct points that
+// share a microsecond timestamp and keep only one of their exemplars.
+func TestGenAIMetricExemplarsViewPartitionsByMetricDedupIdentity(t *testing.T) {
+	partitionBy := func(view, query string) []string {
+		t.Helper()
+		_, rest, ok := strings.Cut(normalizeSQL(query), "PARTITION BY ")
+		if !ok {
+			t.Fatalf("%s has no PARTITION BY:\n%s", view, query)
+		}
+		list, _, ok := strings.Cut(rest, " ORDER BY ")
+		if !ok {
+			t.Fatalf("%s has no ORDER BY after its PARTITION BY:\n%s", view, query)
+		}
+		cols := strings.Split(list, ",")
+		for i, col := range cols {
+			cols[i] = strings.TrimSpace(col)
+		}
+		return cols
+	}
+	identity := partitionBy("otel_metrics_dedup", fmt.Sprintf(MetricsDedupViewQuery, "proj", "ds", "metrics"))
+	for _, col := range []string{"timestamp", "time_unix_nano", "point_fingerprint"} {
+		if !slices.Contains(identity, col) {
+			t.Fatalf("otel_metrics_dedup partitions by %v, which has no %s", identity, col)
+		}
+	}
+	want := make([]string, 0, len(identity)+1)
+	for _, col := range identity {
+		want = append(want, "m."+col)
+	}
+	want = append(want, "exemplar_ordinal")
+	got := partitionBy("v_gen_ai_metric_exemplars", fmt.Sprintf(GenAIMetricExemplarsViewQuery, "proj", "ds", "spans"))
+	if !slices.Equal(got, want) {
+		t.Errorf("v_gen_ai_metric_exemplars partitions by %v, want %v", got, want)
+	}
+	exprs := projectionExprs(t, GenAIMetricsViewQuery, "proj", "ds", "metrics")
+	for _, col := range identity {
+		if exprs[col] != col {
+			t.Errorf("v_gen_ai_metrics.%s = %q, want the dedup view's column passed through", col, exprs[col])
 		}
 	}
 }
@@ -1076,11 +1121,12 @@ func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 			query:    GenAIMetricsViewQuery,
 			args:     []any{"proj", "ds", "metrics"},
 			contract: MetricsTableSchema(),
-			// 39 columns: the metric identity, seven promoted GenAI
+			// 41 columns: the metric identity, seven promoted GenAI
 			// attributes, every point-value column of the table, the raw
-			// attribute, resource and scope bags, and three
-			// semantic-conventions-genai@f3c6d0c9 metric dimensions appended
-			// last.
+			// attribute, resource and scope bags, three
+			// semantic-conventions-genai@f3c6d0c9 metric dimensions, and
+			// the two columns that complete the metric dedup identity,
+			// appended last.
 			want: []string{
 				"timestamp", "start_time", "receive_time", "service_name",
 				"metric_name", "metric_description", "metric_unit", "metric_type",
@@ -1093,6 +1139,7 @@ func TestCompanionViewsProjectPublishedColumns(t *testing.T) {
 				"summary_quantiles", "exemplars",
 				"attributes", "resource", "instrumentation_scope",
 				"gen_ai_token_modality", "gen_ai_agent_name", "gen_ai_inference_usage_dimension",
+				"time_unix_nano", "point_fingerprint",
 			},
 		},
 		{
@@ -1234,6 +1281,8 @@ func TestCompanionViewPreExistingColumnIndicesUnchanged(t *testing.T) {
 				35: "instrumentation_scope",
 				36: "gen_ai_token_modality",
 				38: "gen_ai_inference_usage_dimension",
+				39: "time_unix_nano",
+				40: "point_fingerprint",
 			},
 		},
 		{

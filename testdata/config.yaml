@@ -78,7 +78,11 @@ exporters:
       dataset: true
       tables: true
       companion_views: true
-      allow_unprunable_views: true
+      # The default. With traces.require_partition_filter on as well, this is
+      # the combination that must keep validating: startup skips only the
+      # cross-signal views, with a warning, when the spans table in effect
+      # requires a partition filter.
+      allow_unprunable_views: false
       search_indexes: true
     # Enterprise governance.
     kms_key_name: projects/my-project/locations/us-central1/keyRings/otel/cryptoKeys/bq
