@@ -507,8 +507,8 @@ func TestPrepareDestinationCreatesSpanCompanionViews(t *testing.T) {
 			t.Errorf("createdTableOrder = %v, want v_gen_ai_spans before %s", admin.createdTableOrder, rollup)
 		}
 	}
-	if !equalStrings(admin.tableReadIDs, []string{cfg.Traces.Table, cfg.Logs.Table + "_dedup"}) {
-		t.Errorf("table reads = %v, want the destination table probe and the log dedup view probe", admin.tableReadIDs)
+	if !equalStrings(admin.tableReadIDs, []string{cfg.Traces.Table, cfg.Logs.Table + "_dedup", cfg.Metrics.Table + "_dedup"}) {
+		t.Errorf("table reads = %v, want the destination table probe, the log dedup view probe, and the metric dedup view probe", admin.tableReadIDs)
 	}
 }
 
@@ -722,8 +722,139 @@ func TestPrepareDestinationCreatesMetricsCompanionView(t *testing.T) {
 	if wantLabels := map[string]string{"env": "prod", "signal": "metrics"}; !maps.Equal(md.Labels, wantLabels) {
 		t.Errorf("v_gen_ai_metrics labels = %v, want %v", md.Labels, wantLabels)
 	}
-	if !equalStrings(admin.tableReadIDs, []string{cfg.Metrics.Table}) {
-		t.Errorf("table reads = %v, want only the destination table probe", admin.tableReadIDs)
+	if !equalStrings(admin.tableReadIDs, []string{cfg.Metrics.Table, cfg.Traces.Table + "_dedup"}) {
+		t.Errorf("table reads = %v, want the destination table probe and the span dedup view probe", admin.tableReadIDs)
+	}
+}
+
+func TestPrepareDestinationCreatesMetricExemplarsCompanionViewOverSpanDedupView(t *testing.T) {
+	cfg := companionViewConfig()
+	cfg.Labels = map[string]string{"env": "prod"}
+	cfg.Metrics.Labels = map[string]string{"signal": "metrics"}
+	admin := &fakeDestinationAdmin{
+		datasetMetadata:  &bq.DatasetMetadata{},
+		tableMetadataErr: notFound(),
+		tableMetadataByID: map[string]fakeTableMetadataResponse{
+			cfg.Traces.Table + "_dedup": {metadata: &bq.TableMetadata{Type: bq.ViewTable}},
+		},
+	}
+	e := newTestSignalExporter(cfg, cfg.Metrics.Table, schema.MetricsTableSchema())
+
+	if err := e.prepareDestination(context.Background(), admin); err != nil {
+		t.Fatal(err)
+	}
+	wantOrder := []string{
+		cfg.Metrics.Table,
+		cfg.Metrics.Table + "_dedup",
+		schema.GenAIMetricsViewName,
+		schema.GenAIMetricExemplarsViewName,
+	}
+	if !equalStrings(admin.createdTableOrder, wantOrder) {
+		t.Errorf("created %v, want %v", admin.createdTableOrder, wantOrder)
+	}
+	want := fmt.Sprintf(schema.GenAIMetricExemplarsViewQuery, "my-project", "otel", cfg.Traces.Table)
+	md := admin.createdTables[schema.GenAIMetricExemplarsViewName]
+	if md == nil || md.ViewQuery != want || md.UseLegacySQL {
+		t.Fatalf("v_gen_ai_metric_exemplars = %#v, want the join of v_gen_ai_metrics and the span dedup view", md)
+	}
+	if wantLabels := map[string]string{"env": "prod", "signal": "metrics"}; !maps.Equal(md.Labels, wantLabels) {
+		t.Errorf("v_gen_ai_metric_exemplars labels = %v, want %v", md.Labels, wantLabels)
+	}
+}
+
+func TestPrepareDestinationCreatesMetricExemplarsCompanionViewWhenTracesStartsSecond(t *testing.T) {
+	cfg := companionViewConfig()
+	cfg.Labels = map[string]string{"env": "prod"}
+	cfg.Metrics.Labels = map[string]string{"signal": "metrics"}
+	admin := &fakeDestinationAdmin{
+		datasetMetadata:  &bq.DatasetMetadata{},
+		tableMetadataErr: notFound(),
+		tableMetadataByID: map[string]fakeTableMetadataResponse{
+			cfg.Metrics.Table + "_dedup": {metadata: &bq.TableMetadata{Type: bq.ViewTable}},
+		},
+	}
+	e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+
+	if err := e.prepareDestination(context.Background(), admin); err != nil {
+		t.Fatal(err)
+	}
+	wantMetrics := fmt.Sprintf(schema.GenAIMetricsViewQuery, "my-project", "otel", cfg.Metrics.Table)
+	if md := admin.createdTables[schema.GenAIMetricsViewName]; md == nil || md.ViewQuery != wantMetrics {
+		t.Fatalf("v_gen_ai_metrics = %#v, want traces startup to ensure v_gen_ai_metrics before v_gen_ai_metric_exemplars", md)
+	}
+	wantExemplars := fmt.Sprintf(schema.GenAIMetricExemplarsViewQuery, "my-project", "otel", cfg.Traces.Table)
+	md := admin.createdTables[schema.GenAIMetricExemplarsViewName]
+	if md == nil || md.ViewQuery != wantExemplars {
+		t.Fatalf("v_gen_ai_metric_exemplars = %#v, want traces startup to create v_gen_ai_metric_exemplars when metric dedup view already exists", md)
+	}
+	metricsIdx := slices.Index(admin.createdTableOrder, schema.GenAIMetricsViewName)
+	exemplarsIdx := slices.Index(admin.createdTableOrder, schema.GenAIMetricExemplarsViewName)
+	if metricsIdx < 0 || exemplarsIdx < 0 || exemplarsIdx < metricsIdx {
+		t.Errorf("createdTableOrder = %v, want %s before %s",
+			admin.createdTableOrder, schema.GenAIMetricsViewName, schema.GenAIMetricExemplarsViewName)
+	}
+	if wantLabels := map[string]string{"env": "prod", "signal": "metrics"}; !maps.Equal(md.Labels, wantLabels) {
+		t.Errorf("v_gen_ai_metric_exemplars labels = %v, want %v", md.Labels, wantLabels)
+	}
+	if _, ok := admin.createdTables[schema.GenAILogsViewName]; ok {
+		t.Error("v_gen_ai_logs must not be created when the log dedup view does not exist")
+	}
+}
+
+func TestPrepareDestinationMetricExemplarsCompanionViewNeedsPeerDedupView(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		probeErr error
+		wantErr  error
+	}{
+		{name: "absent", probeErr: notFound()},
+		{name: "unreadable", probeErr: forbidden()},
+		{name: "deadline", probeErr: context.DeadlineExceeded, wantErr: context.DeadlineExceeded},
+	} {
+		t.Run("metrics_"+tc.name, func(t *testing.T) {
+			cfg := companionViewConfig()
+			admin := &fakeDestinationAdmin{
+				datasetMetadata:  &bq.DatasetMetadata{},
+				tableMetadataErr: notFound(),
+				tableMetadataByID: map[string]fakeTableMetadataResponse{
+					cfg.Traces.Table + "_dedup": {err: tc.probeErr},
+				},
+			}
+			e := newTestSignalExporter(cfg, cfg.Metrics.Table, schema.MetricsTableSchema())
+
+			err := e.prepareDestination(context.Background(), admin)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tc.wantErr)
+			}
+			if _, ok := admin.createdTables[schema.GenAIMetricExemplarsViewName]; ok {
+				t.Error("v_gen_ai_metric_exemplars must not be created without a readable span dedup view")
+			}
+			if admin.createdTables[schema.GenAIMetricsViewName] == nil {
+				t.Error("v_gen_ai_metrics must still be created")
+			}
+		})
+		t.Run("traces_"+tc.name, func(t *testing.T) {
+			cfg := companionViewConfig()
+			admin := &fakeDestinationAdmin{
+				datasetMetadata:  &bq.DatasetMetadata{},
+				tableMetadataErr: notFound(),
+				tableMetadataByID: map[string]fakeTableMetadataResponse{
+					cfg.Metrics.Table + "_dedup": {err: tc.probeErr},
+				},
+			}
+			e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+
+			err := e.prepareDestination(context.Background(), admin)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tc.wantErr)
+			}
+			if _, ok := admin.createdTables[schema.GenAIMetricExemplarsViewName]; ok {
+				t.Error("v_gen_ai_metric_exemplars must not be created without a readable metric dedup view")
+			}
+			if admin.createdTables[schema.GenAISpansViewName] == nil {
+				t.Error("span companion views must still be created")
+			}
+		})
 	}
 }
 
@@ -776,6 +907,14 @@ func reconcileTargets() []reconcileTarget {
 			name: "metric companion view", table: defaultMetricsTable, tableSchema: schema.MetricsTableSchema(),
 			viewID: schema.GenAIMetricsViewName,
 			query:  fmt.Sprintf(schema.GenAIMetricsViewQuery, project, dataset, defaultMetricsTable),
+		},
+		{
+			name: "metric exemplars companion view", table: defaultMetricsTable, tableSchema: schema.MetricsTableSchema(),
+			viewID: schema.GenAIMetricExemplarsViewName,
+			query:  fmt.Sprintf(schema.GenAIMetricExemplarsViewQuery, project, dataset, defaultSpansTable),
+			peers: map[string]fakeTableMetadataResponse{
+				defaultSpansTable + "_dedup": {metadata: &bq.TableMetadata{Type: bq.ViewTable}},
+			},
 		},
 	}
 }
@@ -1059,6 +1198,526 @@ func TestPrepareDestinationRollupFailureToleranceFollowsPreservedViews(t *testin
 				t.Error("the rollup views after the skipped one must still be created")
 			}
 		})
+	}
+}
+
+func TestPrepareDestinationSkipsMetricExemplarsViewWhenGenAIMetricsViewPreserved(t *testing.T) {
+	rollupErr := status.Error(codes.InvalidArgument, "column not found in underlying view")
+	view := func(query string) fakeTableMetadataResponse {
+		return fakeTableMetadataResponse{metadata: &bq.TableMetadata{Type: bq.ViewTable, ViewQuery: query, ETag: "etag-1"}}
+	}
+	metricsQuery := fmt.Sprintf(schema.GenAIMetricsViewQuery, "my-project", "otel", defaultMetricsTable)
+	for _, tc := range []struct {
+		name        string
+		metricsView fakeTableMetadataResponse
+		updateErr   error
+		wantErr     error
+		wantSkipped bool
+	}{
+		{
+			name:        "stale metrics view that cannot be updated preserves rollup tolerance",
+			metricsView: view("SELECT 1 AS stale"),
+			updateErr:   forbidden(),
+			wantSkipped: true,
+		},
+		{
+			name:        "replaced metrics view fails startup on exemplars error",
+			metricsView: view("SELECT 1 AS stale"),
+			wantErr:     rollupErr,
+		},
+		{
+			name:        "current metrics view fails startup on exemplars error",
+			metricsView: view(metricsQuery),
+			wantErr:     rollupErr,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := companionViewConfig()
+			core, logs := observer.New(zap.WarnLevel)
+			e := newSignalExporter(
+				component.TelemetrySettings{Logger: zap.New(core)}, cfg, cfg.Metrics.Table, schema.MetricsTableSchema())
+			admin := &fakeDestinationAdmin{
+				datasetMetadata:  &bq.DatasetMetadata{},
+				tableMetadataErr: notFound(),
+				tableMetadataByID: map[string]fakeTableMetadataResponse{
+					schema.GenAIMetricsViewName: tc.metricsView,
+					cfg.Traces.Table + "_dedup": {metadata: &bq.TableMetadata{Type: bq.ViewTable}},
+				},
+				createErrByID: map[string]error{
+					schema.GenAIMetricsViewName:         alreadyExists(),
+					schema.GenAIMetricExemplarsViewName: rollupErr,
+				},
+				updateErrByID: map[string]error{schema.GenAIMetricsViewName: tc.updateErr},
+			}
+
+			err := e.prepareDestination(context.Background(), admin)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tc.wantErr)
+			}
+			skipped := logs.FilterMessage("skipping rollup view creation over preserved companion view").Len()
+			if (skipped == 1) != tc.wantSkipped || skipped > 1 {
+				t.Errorf("%d skipped-rollup warnings, want one: %v", skipped, tc.wantSkipped)
+			}
+		})
+	}
+}
+
+// restrictiveSpansTableVariants are the two places BigQuery reports that a
+// spans table requires a partition filter.
+var restrictiveSpansTableVariants = []struct {
+	name string
+	md   func(t *testing.T) *bq.TableMetadata
+}{
+	{
+		name: "top-level RequirePartitionFilter",
+		md: func(t *testing.T) *bq.TableMetadata {
+			return &bq.TableMetadata{
+				Schema:                 mustBigQuerySchema(t, schema.SpansTableSchema()),
+				RequirePartitionFilter: true,
+			}
+		},
+	},
+	{
+		name: "TimePartitioning.RequirePartitionFilter",
+		md: func(t *testing.T) *bq.TableMetadata {
+			return &bq.TableMetadata{
+				Schema:           mustBigQuerySchema(t, schema.SpansTableSchema()),
+				TimePartitioning: &bq.TimePartitioning{Type: bq.HourPartitioningType, Field: "start_time", RequirePartitionFilter: true},
+			}
+		},
+	},
+}
+
+// requireCrossSignalViewSkips checks that startup skipped exactly the given
+// cross-signal views with the partition-filter warning, in order, each warning
+// naming the view and the spans table, and that it created none of them.
+func requireCrossSignalViewSkips(
+	t *testing.T, logs *observer.ObservedLogs, admin *fakeDestinationAdmin, views ...string,
+) {
+	t.Helper()
+	if !strings.Contains(crossSignalViewSkippedMessage, "auto_create.allow_unprunable_views: true") {
+		t.Errorf("skip warning %q does not name the option that creates the views anyway", crossSignalViewSkippedMessage)
+	}
+	var skipped []string
+	for _, entry := range logs.FilterMessage(crossSignalViewSkippedMessage).All() {
+		fields := entry.ContextMap()
+		view, _ := fields["view"].(string)
+		skipped = append(skipped, view)
+		if got, want := fields["spans_table"], "my-project.otel."+defaultSpansTable; got != want {
+			t.Errorf("skip warning for %s names spans table %v, want %s", view, got, want)
+		}
+	}
+	var want []string
+	for _, view := range views {
+		want = append(want, "my-project.otel."+view)
+	}
+	if !slices.Equal(skipped, want) {
+		t.Errorf("partition-filter skip warnings name %v, want %v", skipped, want)
+	}
+	for _, view := range views {
+		if admin.createdTables[view] != nil {
+			t.Errorf("%s must not be created over a spans table that requires a partition filter", view)
+		}
+	}
+}
+
+// crossSignalViewSignals describes, for each signal exporter, the peer dedup
+// views its cross-signal views need, the single-signal companion views it
+// creates once those exist, which never depend on the spans table's partition
+// filter (the traces exporter also ensures v_gen_ai_metrics once the metric
+// dedup view exists), and the cross-signal views it creates.
+var crossSignalViewSignals = []struct {
+	name              string
+	table             string
+	tableSchema       *storagepb.TableSchema
+	peerDedup         []string
+	singleSignalViews []string
+	crossViews        []string
+}{
+	{
+		name: "traces", table: defaultSpansTable, tableSchema: schema.SpansTableSchema(),
+		peerDedup:         []string{defaultLogsTable + "_dedup", defaultMetricsTable + "_dedup"},
+		singleSignalViews: slices.Concat(schema.SpanCompanionViewOrder, []string{schema.GenAIMetricsViewName}),
+		crossViews:        []string{schema.GenAILogsViewName, schema.GenAIMetricExemplarsViewName},
+	},
+	{
+		name: "metrics", table: defaultMetricsTable, tableSchema: schema.MetricsTableSchema(),
+		peerDedup:         []string{defaultSpansTable + "_dedup"},
+		singleSignalViews: []string{schema.GenAIMetricsViewName},
+		crossViews:        []string{schema.GenAIMetricExemplarsViewName},
+	},
+	{
+		name: "logs", table: defaultLogsTable, tableSchema: schema.LogsTableSchema(),
+		peerDedup:  []string{defaultSpansTable + "_dedup"},
+		crossViews: []string{schema.GenAILogsViewName},
+	},
+}
+
+// The cross-signal views join spans on a row-dependent window, which BigQuery
+// cannot use to skip span partitions, so it rejects every query over them when
+// the spans table requires a partition filter. Startup then skips only those
+// views, with a warning, and still creates every single-signal view and
+// starts; auto_create.allow_unprunable_views creates them anyway. The existing
+// table's metadata decides, and traces.require_partition_filter is left at
+// false here, since it applies only when the table is created.
+func TestPrepareDestinationSkipsCrossSignalViewsWhenExistingSpansTableRequiresPartitionFilter(t *testing.T) {
+	for _, variant := range restrictiveSpansTableVariants {
+		for _, allow := range []bool{false, true} {
+			suffix := "skipped_with_warning"
+			if allow {
+				suffix = "created_with_opt_in"
+			}
+			for _, signal := range crossSignalViewSignals {
+				t.Run(signal.name+"/"+variant.name+"/"+suffix, func(t *testing.T) {
+					cfg := companionViewConfig()
+					cfg.AutoCreate.AllowUnprunableViews = allow
+					if err := cfg.Validate(); err != nil {
+						t.Fatalf("Validate() = %v, want the configuration accepted", err)
+					}
+					byID := map[string]fakeTableMetadataResponse{defaultSpansTable: {metadata: variant.md(t)}}
+					for _, id := range signal.peerDedup {
+						byID[id] = fakeTableMetadataResponse{metadata: &bq.TableMetadata{Type: bq.ViewTable}}
+					}
+					admin := &fakeDestinationAdmin{
+						datasetMetadata:   &bq.DatasetMetadata{},
+						tableMetadataErr:  notFound(),
+						tableMetadataByID: byID,
+					}
+					core, logs := observer.New(zap.WarnLevel)
+					e := newSignalExporter(
+						component.TelemetrySettings{Logger: zap.New(core)}, cfg, signal.table, signal.tableSchema)
+
+					if err := e.prepareDestination(context.Background(), admin); err != nil {
+						t.Fatalf("prepareDestination = %v, want startup to succeed", err)
+					}
+					for _, id := range append([]string{signal.table + "_dedup"}, signal.singleSignalViews...) {
+						if admin.createdTables[id] == nil {
+							t.Errorf("%s was not created; it does not depend on the spans table's partition filter", id)
+						}
+					}
+					if !allow {
+						requireCrossSignalViewSkips(t, logs, admin, signal.crossViews...)
+						return
+					}
+					requireCrossSignalViewSkips(t, logs, admin)
+					for _, id := range signal.crossViews {
+						if admin.createdTables[id] == nil {
+							t.Errorf("%s must be created when allow_unprunable_views is true", id)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+// The spans table in effect may also be one the traces exporter has just
+// created, which requires a partition filter when
+// traces.require_partition_filter is set, or one another collector created
+// first, which may require one whatever this collector's configuration says.
+// Either way the table in effect decides, as for an existing table.
+func TestPrepareDestinationSkipsCrossSignalViewsOverCreatedRestrictiveSpansTable(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, cfg *Config, admin *fakeDestinationAdmin)
+		// Whether the table this exporter asked to create requires a
+		// partition filter.
+		wantRequestedRestrictive bool
+	}{
+		{
+			name: "created by this exporter",
+			setup: func(_ *testing.T, cfg *Config, _ *fakeDestinationAdmin) {
+				cfg.Traces.RequirePartitionFilter = true
+			},
+			wantRequestedRestrictive: true,
+		},
+		{
+			name: "created concurrently by another collector",
+			setup: func(t *testing.T, _ *Config, admin *fakeDestinationAdmin) {
+				admin.tableSequenceByID = map[string][]fakeTableMetadataResponse{
+					defaultSpansTable: {{err: notFound()}, {metadata: restrictiveSpansTableVariants[0].md(t)}},
+				}
+				admin.createErrByID = map[string]error{defaultSpansTable: alreadyExists()}
+			},
+		},
+	} {
+		for _, allow := range []bool{false, true} {
+			suffix := "skipped_with_warning"
+			if allow {
+				suffix = "created_with_opt_in"
+			}
+			t.Run(tc.name+"/"+suffix, func(t *testing.T) {
+				cfg := companionViewConfig()
+				cfg.AutoCreate.AllowUnprunableViews = allow
+				admin := &fakeDestinationAdmin{
+					datasetMetadata:  &bq.DatasetMetadata{},
+					tableMetadataErr: notFound(),
+					tableMetadataByID: map[string]fakeTableMetadataResponse{
+						defaultLogsTable + "_dedup":    {metadata: &bq.TableMetadata{Type: bq.ViewTable}},
+						defaultMetricsTable + "_dedup": {metadata: &bq.TableMetadata{Type: bq.ViewTable}},
+					},
+				}
+				tc.setup(t, cfg, admin)
+				if err := cfg.Validate(); err != nil {
+					t.Fatalf("Validate() = %v, want the configuration accepted", err)
+				}
+				core, logs := observer.New(zap.WarnLevel)
+				e := newSignalExporter(
+					component.TelemetrySettings{Logger: zap.New(core)}, cfg, defaultSpansTable, schema.SpansTableSchema())
+
+				if err := e.prepareDestination(context.Background(), admin); err != nil {
+					t.Fatalf("prepareDestination = %v, want startup to succeed", err)
+				}
+				requested, attempted := admin.createdTables[defaultSpansTable]
+				if !attempted {
+					t.Fatal("the traces exporter did not try to create the spans table")
+				}
+				if got := tableRequiresPartitionFilter(requested); got != tc.wantRequestedRestrictive {
+					t.Fatalf("requested spans table requires a partition filter = %v, want %v", got, tc.wantRequestedRestrictive)
+				}
+				for _, id := range slices.Concat([]string{defaultSpansTable + "_dedup"}, schema.SpanCompanionViewOrder, []string{schema.GenAIMetricsViewName}) {
+					if admin.createdTables[id] == nil {
+						t.Errorf("%s was not created; it does not depend on the spans table's partition filter", id)
+					}
+				}
+				if !allow {
+					requireCrossSignalViewSkips(t, logs, admin, schema.GenAILogsViewName, schema.GenAIMetricExemplarsViewName)
+					return
+				}
+				requireCrossSignalViewSkips(t, logs, admin)
+				for _, id := range []string{schema.GenAILogsViewName, schema.GenAIMetricExemplarsViewName} {
+					if admin.createdTables[id] == nil {
+						t.Errorf("%s must be created when allow_unprunable_views is true", id)
+					}
+				}
+			})
+		}
+	}
+}
+
+// A traces-only deployment has no log or metric dedup view, so no
+// cross-signal view could be created and a spans table that requires a
+// partition filter changes nothing: the span companion views are created
+// without a partition-filter warning, and startup succeeds, as it did before
+// the spans table's partition filter was checked.
+func TestPrepareDestinationTracesOnlyRestrictiveSpansTableKeepsSpanViews(t *testing.T) {
+	for _, requirePartitionFilter := range []bool{false, true} {
+		t.Run(fmt.Sprintf("traces.require_partition_filter=%v", requirePartitionFilter), func(t *testing.T) {
+			cfg := companionViewConfig()
+			cfg.Traces.RequirePartitionFilter = requirePartitionFilter
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate() = %v, want the configuration accepted", err)
+			}
+			admin := &fakeDestinationAdmin{
+				datasetMetadata:  &bq.DatasetMetadata{},
+				tableMetadataErr: notFound(),
+				tableMetadataByID: map[string]fakeTableMetadataResponse{
+					defaultSpansTable: {metadata: restrictiveSpansTableVariants[0].md(t)},
+				},
+			}
+			core, logs := observer.New(zap.WarnLevel)
+			e := newSignalExporter(
+				component.TelemetrySettings{Logger: zap.New(core)}, cfg, defaultSpansTable, schema.SpansTableSchema())
+
+			if err := e.prepareDestination(context.Background(), admin); err != nil {
+				t.Fatalf("prepareDestination = %v, want startup to succeed", err)
+			}
+			if want := append([]string{defaultSpansTable + "_dedup"}, schema.SpanCompanionViewOrder...); !equalStrings(admin.createdTableOrder, want) {
+				t.Errorf("created %v, want %v", admin.createdTableOrder, want)
+			}
+			if want := []string{defaultSpansTable, defaultLogsTable + "_dedup", defaultMetricsTable + "_dedup"}; !equalStrings(admin.tableReadIDs, want) {
+				t.Errorf("table reads = %v, want %v: the existing table, then both peer dedup view probes", admin.tableReadIDs, want)
+			}
+			requireCrossSignalViewSkips(t, logs, admin)
+		})
+	}
+}
+
+// v_gen_ai_metrics reads only the metric dedup view, so the traces exporter
+// ensures it whenever that view exists, whatever the spans table requires. A
+// traces-only collector pointed at a dataset whose metric dedup view another
+// collector created, and whose v_gen_ai_metrics is missing, gets it even when
+// the spans table requires a partition filter; only the two cross-signal views
+// are skipped.
+func TestPrepareDestinationTracesOnlyRestrictiveSpansTableCreatesSingleSignalMetricsView(t *testing.T) {
+	for _, variant := range restrictiveSpansTableVariants {
+		t.Run(variant.name, func(t *testing.T) {
+			cfg := companionViewConfig()
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate() = %v, want the configuration accepted", err)
+			}
+			admin := &fakeDestinationAdmin{
+				datasetMetadata:  &bq.DatasetMetadata{},
+				tableMetadataErr: notFound(),
+				tableMetadataByID: map[string]fakeTableMetadataResponse{
+					defaultSpansTable:              {metadata: variant.md(t)},
+					defaultLogsTable + "_dedup":    {metadata: &bq.TableMetadata{Type: bq.ViewTable}},
+					defaultMetricsTable + "_dedup": {metadata: &bq.TableMetadata{Type: bq.ViewTable}},
+				},
+			}
+			core, logs := observer.New(zap.WarnLevel)
+			e := newSignalExporter(
+				component.TelemetrySettings{Logger: zap.New(core)}, cfg, defaultSpansTable, schema.SpansTableSchema())
+
+			if err := e.prepareDestination(context.Background(), admin); err != nil {
+				t.Fatalf("prepareDestination = %v, want startup to succeed", err)
+			}
+			want := slices.Concat([]string{defaultSpansTable + "_dedup"}, schema.SpanCompanionViewOrder, []string{schema.GenAIMetricsViewName})
+			if !equalStrings(admin.createdTableOrder, want) {
+				t.Errorf("created %v, want %v", admin.createdTableOrder, want)
+			}
+			wantQuery := fmt.Sprintf(schema.GenAIMetricsViewQuery, "my-project", "otel", defaultMetricsTable)
+			if md := admin.createdTables[schema.GenAIMetricsViewName]; md == nil || md.ViewQuery != wantQuery {
+				t.Errorf("v_gen_ai_metrics = %#v, want the view over the metric dedup view", md)
+			}
+			requireCrossSignalViewSkips(t, logs, admin, schema.GenAILogsViewName, schema.GenAIMetricExemplarsViewName)
+		})
+	}
+}
+
+// traces.require_partition_filter applies only when the spans table is
+// created. Against an existing table that requires no partition filter, the
+// cross-signal views can be queried, so every exporter creates the ones it
+// owns, without a warning.
+func TestPrepareDestinationCreationPreferenceDoesNotOverrideExistingSpansTable(t *testing.T) {
+	for _, signal := range crossSignalViewSignals {
+		t.Run(signal.name, func(t *testing.T) {
+			cfg := companionViewConfig()
+			cfg.Traces.RequirePartitionFilter = true
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate() = %v, want the configuration accepted", err)
+			}
+			byID := map[string]fakeTableMetadataResponse{
+				defaultSpansTable: {metadata: &bq.TableMetadata{Schema: mustBigQuerySchema(t, schema.SpansTableSchema())}},
+			}
+			for _, id := range signal.peerDedup {
+				byID[id] = fakeTableMetadataResponse{metadata: &bq.TableMetadata{Type: bq.ViewTable}}
+			}
+			admin := &fakeDestinationAdmin{
+				datasetMetadata:   &bq.DatasetMetadata{},
+				tableMetadataErr:  notFound(),
+				tableMetadataByID: byID,
+			}
+			core, logs := observer.New(zap.WarnLevel)
+			e := newSignalExporter(
+				component.TelemetrySettings{Logger: zap.New(core)}, cfg, signal.table, signal.tableSchema)
+
+			if err := e.prepareDestination(context.Background(), admin); err != nil {
+				t.Fatalf("prepareDestination = %v, want startup to succeed", err)
+			}
+			for _, id := range append(slices.Clone(signal.singleSignalViews), signal.crossViews...) {
+				if admin.createdTables[id] == nil {
+					t.Errorf("%s was not created over a spans table that requires no partition filter", id)
+				}
+			}
+			requireCrossSignalViewSkips(t, logs, admin)
+		})
+	}
+}
+
+// The logs and metrics exporters read the spans table their cross-signal view
+// joins. Its metadata decides, and traces.require_partition_filter stands in
+// for it only while the table does not exist, because the option applies only
+// when the table is created. A view over a table that requires a partition
+// filter, or whose metadata cannot be read, is skipped with a warning; only a
+// context error fails startup.
+func TestPrepareDestinationPeerSpanTablePartitionFilterProbeResults(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		spanResp           fakeTableMetadataResponse
+		tracesReqPart      bool
+		allow              bool
+		wantErr            error
+		wantSkipWarn       bool
+		wantUnreadableWarn bool
+		wantCreated        bool
+	}{
+		{
+			name:        "span_table_absent_and_config_false_creates_view",
+			spanResp:    fakeTableMetadataResponse{err: notFound()},
+			wantCreated: true,
+		},
+		{
+			name:          "span_table_absent_and_config_true_skips_view_with_warning",
+			spanResp:      fakeTableMetadataResponse{err: notFound()},
+			tracesReqPart: true,
+			wantSkipWarn:  true,
+		},
+		{
+			name:          "span_table_absent_and_config_true_with_opt_in_creates_view",
+			spanResp:      fakeTableMetadataResponse{err: notFound()},
+			tracesReqPart: true,
+			allow:         true,
+			wantCreated:   true,
+		},
+		{
+			name:          "span_table_without_filter_creates_view_despite_config_true",
+			spanResp:      fakeTableMetadataResponse{metadata: &bq.TableMetadata{}},
+			tracesReqPart: true,
+			wantCreated:   true,
+		},
+		{
+			name:         "span_table_with_filter_skips_view_with_warning_despite_config_false",
+			spanResp:     fakeTableMetadataResponse{metadata: &bq.TableMetadata{RequirePartitionFilter: true}},
+			wantSkipWarn: true,
+		},
+		{
+			name:               "span_table_unreadable_warns_and_skips_view",
+			spanResp:           fakeTableMetadataResponse{err: forbidden()},
+			wantUnreadableWarn: true,
+		},
+		{
+			name:     "span_table_deadline_fails_startup",
+			spanResp: fakeTableMetadataResponse{err: context.DeadlineExceeded},
+			wantErr:  context.DeadlineExceeded,
+		},
+	} {
+		for _, signal := range []struct {
+			name        string
+			table       string
+			tableSchema *storagepb.TableSchema
+			viewName    string
+		}{
+			{"metrics", defaultMetricsTable, schema.MetricsTableSchema(), schema.GenAIMetricExemplarsViewName},
+			{"logs", defaultLogsTable, schema.LogsTableSchema(), schema.GenAILogsViewName},
+		} {
+			t.Run(signal.name+"_"+tc.name, func(t *testing.T) {
+				cfg := companionViewConfig()
+				cfg.Traces.RequirePartitionFilter = tc.tracesReqPart
+				cfg.AutoCreate.AllowUnprunableViews = tc.allow
+				if err := cfg.Validate(); err != nil {
+					t.Fatalf("Validate() = %v, want the configuration accepted", err)
+				}
+				core, logs := observer.New(zap.WarnLevel)
+				e := newSignalExporter(
+					component.TelemetrySettings{Logger: zap.New(core)}, cfg, signal.table, signal.tableSchema)
+				admin := &fakeDestinationAdmin{
+					datasetMetadata:  &bq.DatasetMetadata{},
+					tableMetadataErr: notFound(),
+					tableMetadataByID: map[string]fakeTableMetadataResponse{
+						cfg.Traces.Table + "_dedup": {metadata: &bq.TableMetadata{Type: bq.ViewTable}},
+						cfg.Traces.Table:            tc.spanResp,
+					},
+				}
+
+				err := e.prepareDestination(context.Background(), admin)
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("error = %v, want %v", err, tc.wantErr)
+				}
+				if (admin.createdTables[signal.viewName] != nil) != tc.wantCreated {
+					t.Errorf("%s created = %v, want %v", signal.viewName, admin.createdTables[signal.viewName] != nil, tc.wantCreated)
+				}
+				if tc.wantSkipWarn {
+					requireCrossSignalViewSkips(t, logs, admin, signal.viewName)
+				} else {
+					requireCrossSignalViewSkips(t, logs, admin)
+				}
+				warns := logs.FilterMessage("span table metadata is unreadable; skipping companion view").Len()
+				if (warns == 1) != tc.wantUnreadableWarn || warns > 1 {
+					t.Errorf("unreadable span table warnings = %d, want one: %v", warns, tc.wantUnreadableWarn)
+				}
+			})
+		}
 	}
 }
 

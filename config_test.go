@@ -185,6 +185,113 @@ func TestValidateAcceptsCompanionViewsWithTableCreation(t *testing.T) {
 	}
 }
 
+// Whether the cross-signal companion views (v_gen_ai_logs,
+// v_gen_ai_metric_exemplars) can be queried depends on whether the spans table
+// in effect requires a partition filter, which only startup can read, because
+// traces.require_partition_filter applies only when that table is created.
+// No combination of companion_views, require_partition_filter, and
+// allow_unprunable_views is therefore a configuration error: startup skips the
+// cross-signal views with a warning when they could not be queried.
+func TestValidateAcceptsCompanionViewsWithPartitionFilters(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{
+			name: "traces require_partition_filter with companion_views",
+			mutate: func(c *Config) {
+				c.AutoCreate.Tables = true
+				c.AutoCreate.CompanionViews = true
+				c.Traces.RequirePartitionFilter = true
+			},
+		},
+		{
+			name: "traces require_partition_filter with companion_views and allow_unprunable_views",
+			mutate: func(c *Config) {
+				c.AutoCreate.Tables = true
+				c.AutoCreate.CompanionViews = true
+				c.Traces.RequirePartitionFilter = true
+				c.AutoCreate.AllowUnprunableViews = true
+			},
+		},
+		{
+			name: "traces require_partition_filter without companion_views",
+			mutate: func(c *Config) {
+				c.AutoCreate.Tables = true
+				c.Traces.RequirePartitionFilter = true
+			},
+		},
+		{
+			name: "allow_unprunable_views without companion_views",
+			mutate: func(c *Config) {
+				c.AutoCreate.AllowUnprunableViews = true
+			},
+		},
+		{
+			name: "logs and metrics require_partition_filter with companion_views",
+			mutate: func(c *Config) {
+				c.AutoCreate.Tables = true
+				c.AutoCreate.CompanionViews = true
+				c.Logs.RequirePartitionFilter = true
+				c.Metrics.RequirePartitionFilter = true
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validConfig()
+			tc.mutate(cfg)
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate() = %v, want nil", err)
+			}
+		})
+	}
+}
+
+// auto_create.allow_unprunable_views is the key operators write. The full
+// section of the testdata fixture enables companion views with a spans
+// partition filter, and validates without that key, as it did before the key
+// existed, so a configuration written before it keeps starting.
+func TestAllowUnprunableViewsConfigKey(t *testing.T) {
+	for _, want := range []bool{false, true} {
+		t.Run(fmt.Sprintf("decodes %v", want), func(t *testing.T) {
+			cfg := decodeExporterConfig(t, "allow_unprunable_views", map[string]any{
+				"project": "my-project",
+				"dataset": "otel",
+				"traces":  map[string]any{"require_partition_filter": true},
+				"auto_create": map[string]any{
+					"tables":                 true,
+					"companion_views":        true,
+					"allow_unprunable_views": want,
+				},
+			})
+			if cfg.AutoCreate.AllowUnprunableViews != want {
+				t.Fatalf("auto_create.allow_unprunable_views decoded as %v, want %v",
+					cfg.AutoCreate.AllowUnprunableViews, want)
+			}
+		})
+	}
+
+	t.Run("testdata full section without the key", func(t *testing.T) {
+		doc := parseYAMLMap(t, "testdata/config.yaml", readRepoText(t, "testdata/config.yaml"))
+		autoCreate, ok := yamlPath(doc, "exporters", "bigquery/full", "auto_create").(map[string]any)
+		if !ok {
+			t.Fatal("testdata/config.yaml has no exporters::bigquery/full::auto_create section")
+		}
+		if _, ok := autoCreate["allow_unprunable_views"]; !ok {
+			t.Fatal("exporters::bigquery/full::auto_create does not set allow_unprunable_views; this check removes it")
+		}
+		delete(autoCreate, "allow_unprunable_views")
+		section := yamlPath(doc, "exporters", "bigquery/full").(map[string]any)
+		cfg := decodeExporterConfig(t, "bigquery/full without allow_unprunable_views", section)
+		if !cfg.AutoCreate.Tables || !cfg.AutoCreate.CompanionViews || !cfg.Traces.RequirePartitionFilter ||
+			cfg.AutoCreate.AllowUnprunableViews {
+			t.Fatalf("auto_create = %+v, traces.require_partition_filter = %v; want tables and companion_views "+
+				"on, allow_unprunable_views off, and a traces partition filter",
+				cfg.AutoCreate, cfg.Traces.RequirePartitionFilter)
+		}
+	})
+}
+
 func TestValidateAcceptsEnterpriseAndLifecycleSettings(t *testing.T) {
 	cfg := validConfig()
 	cfg.Traces.PartitionExpirationDays = 365

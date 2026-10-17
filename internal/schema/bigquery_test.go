@@ -313,6 +313,33 @@ func TestMetricsCompanionViewsMetadata(t *testing.T) {
 	}
 }
 
+// v_gen_ai_metric_exemplars joins v_gen_ai_metrics with the span dedup view, so
+// its metadata helper takes the spans table name and stays separate from the
+// single-signal companion view maps.
+func TestMetricExemplarsCompanionViewMetadata(t *testing.T) {
+	md := MetricExemplarsCompanionViewMetadata("proj", "ds", "spans_tbl")
+	if want := fmt.Sprintf(GenAIMetricExemplarsViewQuery, "proj", "ds", "spans_tbl"); md.ViewQuery != want {
+		t.Errorf("v_gen_ai_metric_exemplars query = %q, want %q", md.ViewQuery, want)
+	}
+	if !strings.Contains(md.ViewQuery, "FROM `proj.ds.v_gen_ai_metrics` m,\nUNNEST(m.exemplars) AS ex") {
+		t.Errorf("v_gen_ai_metric_exemplars must unnest v_gen_ai_metrics.exemplars, got %q", md.ViewQuery)
+	}
+	if !strings.Contains(md.ViewQuery, "LEFT JOIN `proj.ds.spans_tbl_dedup` s") {
+		t.Errorf("v_gen_ai_metric_exemplars must left join the span dedup view, got %q", md.ViewQuery)
+	}
+	if md.UseLegacySQL || md.Schema != nil || md.TimePartitioning != nil || md.Clustering != nil {
+		t.Errorf("v_gen_ai_metric_exemplars must be a plain standard SQL view, got %+v", md)
+	}
+	for _, isSpans := range []bool{true, false} {
+		if _, ok := CompanionViewsMetadata("proj", "ds", "spans_tbl", "logs_tbl", isSpans)[GenAIMetricExemplarsViewName]; ok {
+			t.Errorf("CompanionViewsMetadata(isSpans=%v) must not include v_gen_ai_metric_exemplars", isSpans)
+		}
+	}
+	if _, ok := MetricsCompanionViewsMetadata("proj", "ds", "metrics_tbl")[GenAIMetricExemplarsViewName]; ok {
+		t.Errorf("MetricsCompanionViewsMetadata must not include v_gen_ai_metric_exemplars")
+	}
+}
+
 func TestReconcileAdditiveSchema(t *testing.T) {
 	want := SpansTableSchema()
 	fullBQ, err := ToBigQuery(want)

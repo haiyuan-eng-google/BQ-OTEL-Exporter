@@ -36,6 +36,9 @@ data:
           {{- if .Values.bigquery.autoCreateCompanionViews }}
           companion_views: {{ .Values.bigquery.autoCreateCompanionViews }}
           {{- end }}
+          {{- if .Values.bigquery.autoCreateAllowUnprunableViews }}
+          allow_unprunable_views: {{ .Values.bigquery.autoCreateAllowUnprunableViews }}
+          {{- end }}
           {{- if .Values.bigquery.autoCreateSearchIndexes }}
           search_indexes: {{ .Values.bigquery.autoCreateSearchIndexes }}
           {{- end }}

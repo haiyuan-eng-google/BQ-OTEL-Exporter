@@ -202,9 +202,22 @@ type AutoCreateConfig struct {
 	// only, best effort): otel_spans_as_allspans, v_gen_ai_spans,
 	// v_gen_ai_model_costs, v_gen_ai_sessions, and v_gen_ai_tool_usage with the
 	// traces table, v_gen_ai_logs with the logs table once the traces dedup
-	// view exists, and v_gen_ai_metrics with the metrics table.
+	// view exists, and v_gen_ai_metrics and v_gen_ai_metric_exemplars with the
+	// metrics table (the latter once the traces dedup view exists).
 	// Requires tables.
 	CompanionViews bool `mapstructure:"companion_views"`
+	// AllowUnprunableViews creates the cross-signal companion views
+	// (v_gen_ai_logs, v_gen_ai_metric_exemplars) even when the spans table
+	// requires a partition filter. Those views join the span deduplication
+	// view on a row-dependent timestamp window rather than a constant
+	// start_time filter, so BigQuery rejects queries over them when the spans
+	// table requires a partition filter. By default they are therefore skipped
+	// with a warning at startup in that case; the single-signal companion
+	// views are created either way. Whether the spans table requires a
+	// partition filter is read from its metadata at startup, and
+	// traces.require_partition_filter is consulted only while the table does
+	// not exist yet.
+	AllowUnprunableViews bool `mapstructure:"allow_unprunable_views"`
 	// SearchIndexes runs CREATE SEARCH INDEX IF NOT EXISTS on signal tables
 	// at startup. Requires tables and bigquery.jobs.create.
 	SearchIndexes bool `mapstructure:"search_indexes"`

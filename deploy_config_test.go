@@ -679,12 +679,56 @@ func TestHelmConfigMapDecodesAndValidates(t *testing.T) {
 				t.Errorf("kms_key_name did not reach the exporter: %q, %q, %q",
 					cfg.KMSKeyName, cfg.Logs.KMSKeyName, cfg.Quarantine.KMSKeyName)
 			}
-			if !cfg.AutoCreate.CompanionViews || !cfg.AutoCreate.SearchIndexes {
-				t.Errorf("auto_create = %+v, want companion_views and search_indexes on", cfg.AutoCreate)
+			// The enterprise values enable companion views with a traces
+			// partition filter and leave autoCreateAllowUnprunableViews unset,
+			// as values written before that key existed do; they must keep
+			// validating.
+			if !cfg.AutoCreate.CompanionViews || !cfg.AutoCreate.SearchIndexes || cfg.AutoCreate.AllowUnprunableViews {
+				t.Errorf("auto_create = %+v, want companion_views and search_indexes on and allow_unprunable_views off", cfg.AutoCreate)
+			}
+			if !cfg.Traces.RequirePartitionFilter {
+				t.Errorf("traces.require_partition_filter = %v, want true", cfg.Traces.RequirePartitionFilter)
 			}
 			if !reflect.DeepEqual(cfg.Redaction.BlockedKeys, []string{"x-custom-secret", "*.ssn"}) ||
 				len(cfg.Redaction.BlockedValuePatterns) != 2 {
 				t.Errorf("redaction lists = %v and %v", cfg.Redaction.BlockedKeys, cfg.Redaction.BlockedValuePatterns)
+			}
+		})
+	}
+
+	t.Run("traces requirePartitionFilter without companionViews", func(t *testing.T) {
+		overrides := helmEnterpriseValues("[REDACTED]")
+		bq := overrides["bigquery"].(map[string]any)
+		bq["autoCreateCompanionViews"] = false
+		bq["traces"].(map[string]any)["requirePartitionFilter"] = true
+		conf := confmap.NewFromStringMap(helmCollectorConfig(t, overrides))
+		cfg := decodeExporterConfig(t, "traces requirePartitionFilter", exporterBlock(t, conf, "bigquery"))
+		if !cfg.Traces.RequirePartitionFilter || cfg.AutoCreate.CompanionViews {
+			t.Errorf("decoded traces.require_partition_filter = %v, auto_create.companion_views = %v, want true and false",
+				cfg.Traces.RequirePartitionFilter, cfg.AutoCreate.CompanionViews)
+		}
+	})
+
+	// The chart renders auto_create.allow_unprunable_views only when
+	// autoCreateAllowUnprunableViews is set, so the default render keeps the
+	// exporter default.
+	for _, allow := range []bool{false, true} {
+		t.Run(fmt.Sprintf("autoCreateAllowUnprunableViews=%v", allow), func(t *testing.T) {
+			overrides := helmEnterpriseValues("[REDACTED]")
+			overrides["bigquery"].(map[string]any)["autoCreateAllowUnprunableViews"] = allow
+			doc := helmCollectorConfig(t, overrides)
+			rendered := yamlPath(doc, "exporters", "bigquery", "auto_create", "allow_unprunable_views")
+			var want any // absent
+			if allow {
+				want = true
+			}
+			if rendered != want {
+				t.Errorf("rendered auto_create.allow_unprunable_views = %#v, want %#v", rendered, want)
+			}
+			cfg := decodeExporterConfig(t, "autoCreateAllowUnprunableViews", exporterBlock(t, confmap.NewFromStringMap(doc), "bigquery"))
+			if cfg.AutoCreate.AllowUnprunableViews != allow || !cfg.AutoCreate.CompanionViews || !cfg.Traces.RequirePartitionFilter {
+				t.Errorf("auto_create = %+v, traces.require_partition_filter = %v; want allow_unprunable_views %v with companion_views and a traces partition filter",
+					cfg.AutoCreate, cfg.Traces.RequirePartitionFilter, allow)
 			}
 		})
 	}
@@ -779,7 +823,11 @@ var helmUnexposedExporterKeys = map[string]string{
 }
 
 func TestHelmChartExposesExporterOptions(t *testing.T) {
-	conf := confmap.NewFromStringMap(helmCollectorConfig(t, helmEnterpriseValues("[REDACTED]")))
+	overrides := helmEnterpriseValues("[REDACTED]")
+	// Off by default and rendered only when set; the enterprise values leave
+	// it unset, as values written before it existed do.
+	overrides["bigquery"].(map[string]any)["autoCreateAllowUnprunableViews"] = true
+	conf := confmap.NewFromStringMap(helmCollectorConfig(t, overrides))
 	section := exporterBlock(t, conf, "bigquery")
 	exposed := map[string]bool{}
 	for _, key := range presentExporterKeys(section, exporterKeySet(), "") {
@@ -943,6 +991,7 @@ var terraformViewReplacer = strings.NewReplacer(
 	"${google_bigquery_table.otel_logs_dedup.table_id}", "otel_logs_dedup",
 	"${google_bigquery_table.otel_metrics_dedup.table_id}", "otel_metrics_dedup",
 	"${google_bigquery_table.v_gen_ai_spans.table_id}", "v_gen_ai_spans",
+	"${google_bigquery_table.v_gen_ai_metrics.table_id}", "v_gen_ai_metrics",
 )
 
 func normalizeCompanionViewSQL(sql string) string {
@@ -973,6 +1022,7 @@ func TestTerraformCompanionViewsMatchExporter(t *testing.T) {
 		{schema.GenAISpansViewName, schema.GenAISpansViewQuery, []any{"p", "d", "otel_spans"}},
 		{schema.GenAILogsViewName, schema.GenAILogsViewQuery, []any{"p", "d", "otel_logs", "otel_spans"}},
 		{schema.GenAIMetricsViewName, schema.GenAIMetricsViewQuery, []any{"p", "d", "otel_metrics"}},
+		{schema.GenAIMetricExemplarsViewName, schema.GenAIMetricExemplarsViewQuery, []any{"p", "d", "otel_spans"}},
 		{schema.GenAIModelCostsViewName, schema.GenAIModelCostsViewQuery, []any{"p", "d"}},
 		{schema.GenAISessionsViewName, schema.GenAISessionsViewQuery, []any{"p", "d"}},
 		{schema.GenAIToolUsageViewName, schema.GenAIToolUsageViewQuery, []any{"p", "d"}},

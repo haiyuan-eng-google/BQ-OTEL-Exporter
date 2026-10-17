@@ -479,13 +479,14 @@ ON ` + "`%[1]s.%[2]s.%[3]s`" + ` (ALL COLUMNS) OPTIONS (analyzer = 'NO_OP_ANALYZ
 // Their names are fixed rather than derived from the table names, so one
 // dataset holds one set of them.
 const (
-	SpansAsAllSpansViewName = "otel_spans_as_allspans"
-	GenAISpansViewName      = "v_gen_ai_spans"
-	GenAILogsViewName       = "v_gen_ai_logs"
-	GenAIMetricsViewName    = "v_gen_ai_metrics"
-	GenAIModelCostsViewName = "v_gen_ai_model_costs"
-	GenAISessionsViewName   = "v_gen_ai_sessions"
-	GenAIToolUsageViewName  = "v_gen_ai_tool_usage"
+	SpansAsAllSpansViewName      = "otel_spans_as_allspans"
+	GenAISpansViewName           = "v_gen_ai_spans"
+	GenAILogsViewName            = "v_gen_ai_logs"
+	GenAIMetricsViewName         = "v_gen_ai_metrics"
+	GenAIMetricExemplarsViewName = "v_gen_ai_metric_exemplars"
+	GenAIModelCostsViewName      = "v_gen_ai_model_costs"
+	GenAISessionsViewName        = "v_gen_ai_sessions"
+	GenAIToolUsageViewName       = "v_gen_ai_tool_usage"
 )
 
 // SpansAsAllSpansViewDDL creates otel_spans_as_allspans, which presents the
@@ -776,7 +777,11 @@ WHERE COALESCE(NULLIF(l.event_name, ''), JSON_VALUE(l.attributes, '$."event.name
 // raw attribute, resource and scope columns are kept for anything not promoted,
 // followed by gen_ai_token_modality, gen_ai_agent_name, and
 // gen_ai_inference_usage_dimension (semantic-conventions-genai@f3c6d0c9)
-// appended at the end.
+// appended at the end, and then by time_unix_nano and point_fingerprint, which
+// with timestamp, service_name, metric_name and metric_type make up the
+// identity of a point in the metric deduplication view (see
+// MetricsDedupViewDDL), so two points that share a microsecond timestamp stay
+// distinguishable.
 const GenAIMetricsViewDDL = `
 CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAIMetricsViewName + "`" + ` AS
 ` + GenAIMetricsViewQuery + `;
@@ -843,9 +848,94 @@ SELECT
     WHEN metric_name = 'gen_ai.client.inference.usage.cache_write.input_tokens' THEN 'cache_write_input'
     WHEN metric_name = 'gen_ai.client.inference.usage.reasoning.output_tokens' THEN 'reasoning_output'
     ELSE JSON_VALUE(attributes, '$."gen_ai.token.type"')
-  END AS gen_ai_inference_usage_dimension
+  END AS gen_ai_inference_usage_dimension,
+  time_unix_nano,
+  point_fingerprint
 FROM ` + "`%[1]s.%[2]s.%[3]s_dedup`" + `
 WHERE metric_name LIKE 'gen_ai.%%'
+`
+
+// GenAIMetricExemplarsViewDDL creates v_gen_ai_metric_exemplars: one row per
+// exemplar on a GenAI metric point that carries a non-empty trace_id and
+// span_id, left-joined to the span deduplication view within a 25-hour window
+// around the metric point timestamp. When multiple span deduplication rows
+// match an exemplar in that window, the latest span (by end_time, start_time,
+// receive_time, then name) is selected. An exemplar whose span is absent or
+// outside the window stays in the view with NULL span_* columns.
+//
+// That selection ranks the rows of one exemplar slot: one point of the metric
+// deduplication view, identified by the same columns as there (timestamp,
+// time_unix_nano, service_name, metric_name, metric_type, point_fingerprint),
+// and the exemplar's offset in its exemplars array. Distinct points that share
+// a microsecond timestamp, and repeated exemplars of one point, therefore each
+// keep their row. m.timestamp stays among the PARTITION BY columns because
+// BigQuery pushes a filter below a window function only when the filter refers
+// to PARTITION BY columns (see MetricsDedupViewDDL); this keeps that path open
+// for a filter on metric_timestamp.
+const GenAIMetricExemplarsViewDDL = `
+CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAIMetricExemplarsViewName + "`" + ` AS
+` + GenAIMetricExemplarsViewQuery + `;
+`
+
+// GenAIMetricExemplarsViewQuery is shared by operator-run DDL and metadata-API
+// view creation. It takes (project, dataset, spans table), reads
+// v_gen_ai_metrics, unnests exemplars, and left-joins the span dedup view.
+const GenAIMetricExemplarsViewQuery = `
+SELECT
+  m.timestamp AS metric_timestamp,
+  m.service_name,
+  m.metric_name,
+  m.metric_unit,
+  m.metric_type,
+  m.gen_ai_operation_name,
+  m.gen_ai_system,
+  m.gen_ai_request_model,
+  m.gen_ai_response_model,
+  m.gen_ai_agent_name,
+  m.gen_ai_token_type,
+  m.gen_ai_token_modality,
+  m.error_type AS metric_error_type,
+  ex.time AS exemplar_timestamp,
+  ex.value_double AS exemplar_value_double,
+  ex.value_int64 AS exemplar_value_int64,
+  ex.trace_id AS trace_id,
+  ex.span_id AS span_id,
+  ex.filtered_attributes AS exemplar_filtered_attributes,
+  s.start_time AS span_start_time,
+  s.end_time AS span_end_time,
+  s.duration_nano AS span_duration_nano,
+  ROUND(s.duration_nano / 1e6, 3) AS span_duration_ms,
+  s.name AS span_name,
+  s.status.code AS span_status_code,
+  s.status.message AS span_status_message,
+  COALESCE(
+    JSON_VALUE(s.attributes, '$."gen_ai.agent.name"'),
+    JSON_VALUE(s.attributes, '$."gcp.vertex.agent.name"'),
+    JSON_VALUE(s.resource.attributes, '$."gen_ai.agent.name"'),
+    JSON_VALUE(s.attributes, '$."gen_ai.main_agent.name"'),
+    JSON_VALUE(s.resource.attributes, '$."gen_ai.main_agent.name"')
+  ) AS span_gen_ai_agent_name,
+  JSON_VALUE(s.attributes, '$."gen_ai.tool.name"') AS span_gen_ai_tool_name,
+  COALESCE(
+    JSON_VALUE(s.attributes, '$."gcp.vertex.agent.session_id"'),
+    JSON_VALUE(s.attributes, '$."gen_ai.conversation.id"')
+  ) AS adk_session_id,
+  JSON_VALUE(s.attributes, '$."error.type"') AS span_error_type
+FROM ` + "`%[1]s.%[2]s." + GenAIMetricsViewName + "`" + ` m,
+UNNEST(m.exemplars) AS ex WITH OFFSET AS exemplar_ordinal
+LEFT JOIN ` + "`%[1]s.%[2]s.%[3]s_dedup`" + ` s
+  ON s.trace_id = ex.trace_id
+  AND s.span_id = ex.span_id
+  AND s.service_name IS NOT DISTINCT FROM m.service_name
+  AND s.start_time BETWEEN TIMESTAMP_SUB(m.timestamp, INTERVAL 24 HOUR) AND TIMESTAMP_ADD(m.timestamp, INTERVAL 1 HOUR)
+WHERE ex.trace_id IS NOT NULL
+  AND ex.span_id IS NOT NULL
+  AND ex.trace_id != ''
+  AND ex.span_id != ''
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY m.timestamp, m.time_unix_nano, m.service_name, m.metric_name, m.metric_type, m.point_fingerprint, exemplar_ordinal
+  ORDER BY s.end_time DESC, s.start_time DESC, s.receive_time DESC, s.name ASC
+) = 1
 `
 
 // GenAIModelCostsViewDDL creates v_gen_ai_model_costs: hourly token and
