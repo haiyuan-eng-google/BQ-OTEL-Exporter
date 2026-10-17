@@ -643,7 +643,18 @@ resource "google_bigquery_table" "v_gen_ai_spans" {
   }
 }
 
+# Earlier releases created v_gen_ai_logs without count; keep that view as
+# instance 0 rather than replacing it.
+moved {
+  from = google_bigquery_table.v_gen_ai_logs
+  to   = google_bigquery_table.v_gen_ai_logs[0]
+}
+
 resource "google_bigquery_table" "v_gen_ai_logs" {
+  # BigQuery rejects every query over this view while otel_spans requires a
+  # partition filter, so it is left out then unless allow_unprunable_views.
+  count = (!var.require_partition_filter || var.allow_unprunable_views) ? 1 : 0
+
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "v_gen_ai_logs"
 
@@ -990,6 +1001,10 @@ resource "google_bigquery_table" "v_gen_ai_metrics" {
 }
 
 resource "google_bigquery_table" "v_gen_ai_metric_exemplars" {
+  # Like v_gen_ai_logs, left out while otel_spans requires a partition filter
+  # unless allow_unprunable_views.
+  count = (!var.require_partition_filter || var.allow_unprunable_views) ? 1 : 0
+
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "v_gen_ai_metric_exemplars"
 

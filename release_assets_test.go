@@ -715,6 +715,58 @@ func TestTerraformTablesTakeRetentionAndPartitionFilterVariables(t *testing.T) {
 	}
 }
 
+// require_partition_filter applies to otel_spans too, and BigQuery rejects
+// every query over v_gen_ai_logs and v_gen_ai_metric_exemplars while otel_spans
+// requires a partition filter. As the collector does, the module creates those
+// two views only while require_partition_filter is off or
+// allow_unprunable_views (default false) is set, and gates no other view. The
+// outputs stay valid without the views, and the v_gen_ai_logs of an earlier
+// release moves to instance 0 instead of being replaced.
+func TestTerraformCrossSignalViewsFollowAllowUnprunableViews(t *testing.T) {
+	variable := terraformBlock(readRepoText(t, "deploy/terraform/variables.tf"), `variable "allow_unprunable_views"`)
+	for _, want := range []string{"type        = bool", "default     = false"} {
+		if !strings.Contains(variable, want) {
+			t.Errorf("variables.tf allow_unprunable_views does not contain %s:\n%s", want, variable)
+		}
+	}
+
+	mainTF := readRepoText(t, "deploy/terraform/main.tf")
+	const gate = "\n  count = (!var.require_partition_filter || var.allow_unprunable_views) ? 1 : 0\n"
+	for _, view := range []string{schema.GenAILogsViewName, schema.GenAIMetricExemplarsViewName} {
+		if body := terraformBlock(mainTF, `resource "google_bigquery_table" "`+view+`"`); !strings.Contains("\n"+body, gate) {
+			t.Errorf("main.tf %s is not gated by%s", view, gate)
+		}
+	}
+	countArgument := regexp.MustCompile(`(?m)^  count\s+=`)
+	for _, view := range append(slices.Clone(schema.SpanCompanionViewOrder), schema.GenAIMetricsViewName) {
+		body := terraformBlock(mainTF, `resource "google_bigquery_table" "`+view+`"`)
+		if body == "" {
+			t.Fatalf("main.tf has no %s view", view)
+		}
+		if countArgument.MatchString(body) || strings.Contains(body, "allow_unprunable_views") {
+			t.Errorf("main.tf gates the single-signal view %s, which does not join otel_spans across signals", view)
+		}
+	}
+	if n := strings.Count(mainTF, "var.allow_unprunable_views"); n != 2 {
+		t.Errorf("main.tf reads var.allow_unprunable_views %d times, want 2, in the gates of the two cross-signal views", n)
+	}
+	if moved := "\nmoved {\n  from = google_bigquery_table.v_gen_ai_logs\n  to   = google_bigquery_table.v_gen_ai_logs[0]\n}\n"; !strings.Contains(mainTF, moved) {
+		t.Errorf("main.tf does not move the earlier google_bigquery_table.v_gen_ai_logs to instance 0:%s", moved)
+	}
+
+	outputs := readRepoText(t, "deploy/terraform/outputs.tf")
+	if got, want := terraformAttribute(terraformBlock(outputs, `output "v_gen_ai_metric_exemplars_table_id"`), "value"),
+		"one(google_bigquery_table.v_gen_ai_metric_exemplars[*].id)"; got != want {
+		t.Errorf("outputs.tf v_gen_ai_metric_exemplars_table_id has the value %q, want %q", got, want)
+	}
+	unindexed := regexp.MustCompile(`google_bigquery_table\.(v_gen_ai_logs|v_gen_ai_metric_exemplars)\.`)
+	for _, file := range []string{"main.tf", "outputs.tf", "governance.tf"} {
+		if m := unindexed.FindString(readRepoText(t, "deploy/terraform/"+file)); m != "" {
+			t.Errorf("deploy/terraform/%s reads %s without an instance key, which is invalid once the view has count", file, m)
+		}
+	}
+}
+
 // The prose gives the column count of the tables, and each count is taken
 // here from the exporter's schema, so a column cannot be added without the
 // prose following it.
@@ -863,14 +915,14 @@ func TestDeployReadmeDocumentsMaxStalenessValues(t *testing.T) {
 	}
 }
 
-// deploy/README.md lists every retention and partition filter variable with
-// the default variables.tf declares, and says that the collector's own
-// options for a table apply only to tables the collector creates, naming
-// every per-signal option other than the table name.
+// deploy/README.md lists every retention and partition filter variable, and
+// allow_unprunable_views, with the default variables.tf declares, and says
+// that the collector's own options for a table apply only to tables the
+// collector creates, naming every per-signal option other than the table name.
 func TestDeployReadmeDocumentsTerraformGovernance(t *testing.T) {
 	readme := readRepoText(t, "deploy/README.md")
 	vars := readRepoText(t, "deploy/terraform/variables.tf")
-	for _, variable := range append(slices.Sorted(maps.Values(terraformExpirationVariables)), "require_partition_filter") {
+	for _, variable := range append(slices.Sorted(maps.Values(terraformExpirationVariables)), "require_partition_filter", "allow_unprunable_views") {
 		want := firstCapture(`(?m)^  default\s+=\s+(.+)$`, terraformBlock(vars, `variable "`+variable+`"`))
 		got := firstCapture("(?m)^\\| `"+variable+"` \\| `([^`]*)` \\|", readme)
 		if want == "" || got != want {

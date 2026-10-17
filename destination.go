@@ -589,15 +589,16 @@ func (e *signalExporter) createCompanionViews(
 		if err != nil || !ok {
 			return err
 		}
-		if e.skipCrossSignalView(spansTable, schema.GenAIMetricExemplarsViewName, spansRequireFilter) {
-			return nil
-		}
+		// v_gen_ai_metrics reads only the metric dedup view, so it is ensured
+		// whatever the spans table requires; only the exemplar view joins spans.
 		metricViews := schema.MetricsCompanionViewsMetadata(e.cfg.Project, e.cfg.Dataset, e.cfg.Metrics.Table)
-		metricViews[schema.GenAIMetricExemplarsViewName] = schema.MetricExemplarsCompanionViewMetadata(
-			e.cfg.Project, e.cfg.Dataset, spansTable)
-		_, err = e.ensureCompanionViews(ctx, admin,
-			[]string{schema.GenAIMetricsViewName, schema.GenAIMetricExemplarsViewName},
-			metricViews, e.effectiveLabels(e.cfg.Metrics.Labels), false)
+		order := []string{schema.GenAIMetricsViewName}
+		if !e.skipCrossSignalView(spansTable, schema.GenAIMetricExemplarsViewName, spansRequireFilter) {
+			metricViews[schema.GenAIMetricExemplarsViewName] = schema.MetricExemplarsCompanionViewMetadata(
+				e.cfg.Project, e.cfg.Dataset, spansTable)
+			order = append(order, schema.GenAIMetricExemplarsViewName)
+		}
+		_, err = e.ensureCompanionViews(ctx, admin, order, metricViews, e.effectiveLabels(e.cfg.Metrics.Labels), false)
 		return err
 	}
 	return nil

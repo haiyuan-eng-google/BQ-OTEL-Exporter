@@ -29,8 +29,8 @@ output "v_gen_ai_metrics_table_id" {
 }
 
 output "v_gen_ai_metric_exemplars_table_id" {
-  description = "Fully-qualified v_gen_ai_metric_exemplars view ID"
-  value       = google_bigquery_table.v_gen_ai_metric_exemplars.id
+  description = "Fully-qualified v_gen_ai_metric_exemplars view ID, or null when require_partition_filter is set without allow_unprunable_views"
+  value       = one(google_bigquery_table.v_gen_ai_metric_exemplars[*].id)
 }
 
 output "service_account_email" {

@@ -1322,27 +1322,29 @@ func requireCrossSignalViewSkips(
 }
 
 // crossSignalViewSignals describes, for each signal exporter, the peer dedup
-// views its cross-signal views need, the companion views it creates over its
-// own signal only, and the cross-signal views it creates.
+// views its cross-signal views need, the single-signal companion views it
+// creates once those exist, which never depend on the spans table's partition
+// filter (the traces exporter also ensures v_gen_ai_metrics once the metric
+// dedup view exists), and the cross-signal views it creates.
 var crossSignalViewSignals = []struct {
-	name        string
-	table       string
-	tableSchema *storagepb.TableSchema
-	peerDedup   []string
-	ownViews    []string
-	crossViews  []string
+	name              string
+	table             string
+	tableSchema       *storagepb.TableSchema
+	peerDedup         []string
+	singleSignalViews []string
+	crossViews        []string
 }{
 	{
 		name: "traces", table: defaultSpansTable, tableSchema: schema.SpansTableSchema(),
-		peerDedup:  []string{defaultLogsTable + "_dedup", defaultMetricsTable + "_dedup"},
-		ownViews:   schema.SpanCompanionViewOrder,
-		crossViews: []string{schema.GenAILogsViewName, schema.GenAIMetricExemplarsViewName},
+		peerDedup:         []string{defaultLogsTable + "_dedup", defaultMetricsTable + "_dedup"},
+		singleSignalViews: slices.Concat(schema.SpanCompanionViewOrder, []string{schema.GenAIMetricsViewName}),
+		crossViews:        []string{schema.GenAILogsViewName, schema.GenAIMetricExemplarsViewName},
 	},
 	{
 		name: "metrics", table: defaultMetricsTable, tableSchema: schema.MetricsTableSchema(),
-		peerDedup:  []string{defaultSpansTable + "_dedup"},
-		ownViews:   []string{schema.GenAIMetricsViewName},
-		crossViews: []string{schema.GenAIMetricExemplarsViewName},
+		peerDedup:         []string{defaultSpansTable + "_dedup"},
+		singleSignalViews: []string{schema.GenAIMetricsViewName},
+		crossViews:        []string{schema.GenAIMetricExemplarsViewName},
 	},
 	{
 		name: "logs", table: defaultLogsTable, tableSchema: schema.LogsTableSchema(),
@@ -1388,7 +1390,7 @@ func TestPrepareDestinationSkipsCrossSignalViewsWhenExistingSpansTableRequiresPa
 					if err := e.prepareDestination(context.Background(), admin); err != nil {
 						t.Fatalf("prepareDestination = %v, want startup to succeed", err)
 					}
-					for _, id := range append([]string{signal.table + "_dedup"}, signal.ownViews...) {
+					for _, id := range append([]string{signal.table + "_dedup"}, signal.singleSignalViews...) {
 						if admin.createdTables[id] == nil {
 							t.Errorf("%s was not created; it does not depend on the spans table's partition filter", id)
 						}
@@ -1473,7 +1475,7 @@ func TestPrepareDestinationSkipsCrossSignalViewsOverCreatedRestrictiveSpansTable
 				if got := tableRequiresPartitionFilter(requested); got != tc.wantRequestedRestrictive {
 					t.Fatalf("requested spans table requires a partition filter = %v, want %v", got, tc.wantRequestedRestrictive)
 				}
-				for _, id := range append([]string{defaultSpansTable + "_dedup"}, schema.SpanCompanionViewOrder...) {
+				for _, id := range slices.Concat([]string{defaultSpansTable + "_dedup"}, schema.SpanCompanionViewOrder, []string{schema.GenAIMetricsViewName}) {
 					if admin.createdTables[id] == nil {
 						t.Errorf("%s was not created; it does not depend on the spans table's partition filter", id)
 					}
@@ -1483,7 +1485,7 @@ func TestPrepareDestinationSkipsCrossSignalViewsOverCreatedRestrictiveSpansTable
 					return
 				}
 				requireCrossSignalViewSkips(t, logs, admin)
-				for _, id := range []string{schema.GenAILogsViewName, schema.GenAIMetricsViewName, schema.GenAIMetricExemplarsViewName} {
+				for _, id := range []string{schema.GenAILogsViewName, schema.GenAIMetricExemplarsViewName} {
 					if admin.createdTables[id] == nil {
 						t.Errorf("%s must be created when allow_unprunable_views is true", id)
 					}
@@ -1531,6 +1533,48 @@ func TestPrepareDestinationTracesOnlyRestrictiveSpansTableKeepsSpanViews(t *test
 	}
 }
 
+// v_gen_ai_metrics reads only the metric dedup view, so the traces exporter
+// ensures it whenever that view exists, whatever the spans table requires. A
+// traces-only collector pointed at a dataset whose metric dedup view another
+// collector created, and whose v_gen_ai_metrics is missing, gets it even when
+// the spans table requires a partition filter; only the two cross-signal views
+// are skipped.
+func TestPrepareDestinationTracesOnlyRestrictiveSpansTableCreatesSingleSignalMetricsView(t *testing.T) {
+	for _, variant := range restrictiveSpansTableVariants {
+		t.Run(variant.name, func(t *testing.T) {
+			cfg := companionViewConfig()
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate() = %v, want the configuration accepted", err)
+			}
+			admin := &fakeDestinationAdmin{
+				datasetMetadata:  &bq.DatasetMetadata{},
+				tableMetadataErr: notFound(),
+				tableMetadataByID: map[string]fakeTableMetadataResponse{
+					defaultSpansTable:              {metadata: variant.md(t)},
+					defaultLogsTable + "_dedup":    {metadata: &bq.TableMetadata{Type: bq.ViewTable}},
+					defaultMetricsTable + "_dedup": {metadata: &bq.TableMetadata{Type: bq.ViewTable}},
+				},
+			}
+			core, logs := observer.New(zap.WarnLevel)
+			e := newSignalExporter(
+				component.TelemetrySettings{Logger: zap.New(core)}, cfg, defaultSpansTable, schema.SpansTableSchema())
+
+			if err := e.prepareDestination(context.Background(), admin); err != nil {
+				t.Fatalf("prepareDestination = %v, want startup to succeed", err)
+			}
+			want := slices.Concat([]string{defaultSpansTable + "_dedup"}, schema.SpanCompanionViewOrder, []string{schema.GenAIMetricsViewName})
+			if !equalStrings(admin.createdTableOrder, want) {
+				t.Errorf("created %v, want %v", admin.createdTableOrder, want)
+			}
+			wantQuery := fmt.Sprintf(schema.GenAIMetricsViewQuery, "my-project", "otel", defaultMetricsTable)
+			if md := admin.createdTables[schema.GenAIMetricsViewName]; md == nil || md.ViewQuery != wantQuery {
+				t.Errorf("v_gen_ai_metrics = %#v, want the view over the metric dedup view", md)
+			}
+			requireCrossSignalViewSkips(t, logs, admin, schema.GenAILogsViewName, schema.GenAIMetricExemplarsViewName)
+		})
+	}
+}
+
 // traces.require_partition_filter applies only when the spans table is
 // created. Against an existing table that requires no partition filter, the
 // cross-signal views can be queried, so every exporter creates the ones it
@@ -1561,7 +1605,7 @@ func TestPrepareDestinationCreationPreferenceDoesNotOverrideExistingSpansTable(t
 			if err := e.prepareDestination(context.Background(), admin); err != nil {
 				t.Fatalf("prepareDestination = %v, want startup to succeed", err)
 			}
-			for _, id := range append(slices.Clone(signal.ownViews), signal.crossViews...) {
+			for _, id := range append(slices.Clone(signal.singleSignalViews), signal.crossViews...) {
 				if admin.createdTables[id] == nil {
 					t.Errorf("%s was not created over a spans table that requires no partition filter", id)
 				}
