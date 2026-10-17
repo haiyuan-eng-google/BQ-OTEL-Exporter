@@ -354,14 +354,16 @@ ineligible, the templates read `otel_spans` directly rather than
 `otel_spans_dedup` or `v_gen_ai_*`.
 
 Each template includes an `AND start_time >= TIMESTAMP('1970-01-01 00:00:00+00')`
-filter so partition pruning succeeds when `require_partition_filter = true` is
-set on `otel_spans` without dropping late batches or replayed spans. BigQuery
-`APPENDS` bounds commit time (`_CHANGE_TIMESTAMP`), whereas `start_time` is the
-OTLP event timestamp preserved across late arrivals and `cmd/bq-quarantine-replay`
-(30-day default retention on `otel_quarantine`). BigQuery Continuous
-Queries do not support tables with column-level security policy tags, so
-Terraform enforces a precondition that `enable_column_level_security` is `false`
-when `enable_continuous_queries` is `true`.
+filter so queries satisfy BigQuery's `require_partition_filter = true`
+requirement without dropping late-arriving, backfilled, or quarantine-replayed
+spans (this constant epoch bound satisfies the static filter requirement rather
+than pruning historical partitions; `APPENDS` itself bounds scan volume by
+commit timestamp `_CHANGE_TIMESTAMP`, whereas `start_time` is the OTLP event
+timestamp preserved across late arrivals and `cmd/bq-quarantine-replay`, with a
+30-day default retention on `otel_quarantine`). BigQuery Continuous Queries do
+not support tables with column-level security policy tags, so Terraform enforces
+a precondition that `enable_column_level_security` is `false` when
+`enable_continuous_queries` is `true`.
 
 Set `enable_continuous_queries=true` in the Terraform module (with
 `service_account_id` at most 27 characters so `<service_account_id>-cq` fits

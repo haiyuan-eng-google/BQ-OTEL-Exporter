@@ -43,6 +43,7 @@ AS (
         ) AS session_id,
         COALESCE(
           JSON_VALUE(attributes, '$."gen_ai.agent.name"'),
+          JSON_VALUE(attributes, '$."gcp.vertex.agent.name"'),
           JSON_VALUE(attributes, '$."gen_ai.main_agent.name"')
         ) AS agent_name,
         JSON_VALUE(attributes, '$."gen_ai.request.model"') AS request_model,

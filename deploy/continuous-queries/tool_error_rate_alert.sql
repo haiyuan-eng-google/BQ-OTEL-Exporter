@@ -38,6 +38,7 @@ AS (
         JSON_VALUE(attributes, '$."gen_ai.operation.name"') AS operation_name,
         COALESCE(
           JSON_VALUE(attributes, '$."gen_ai.agent.name"'),
+          JSON_VALUE(attributes, '$."gcp.vertex.agent.name"'),
           JSON_VALUE(attributes, '$."gen_ai.main_agent.name"')
         ) AS agent_name,
         JSON_VALUE(attributes, '$."gen_ai.tool.name"') AS tool_name,

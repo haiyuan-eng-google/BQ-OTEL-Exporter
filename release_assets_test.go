@@ -18,6 +18,7 @@ import (
 	"io/fs"
 	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -1460,31 +1461,106 @@ func stripSQLComments(sql string) string {
 	return regexp.MustCompile(`(?m)--.*$`).ReplaceAllString(noBlocks, "")
 }
 
-// topLevelWhere returns the last WHERE clause of a template's active SQL with
-// the contents of every parenthesized group left out, up to the parenthesis
-// that encloses the clause, so the text left holds only its top-level
-// conjuncts and operators.
-func topLevelWhere(activeSQL string) string {
-	i := strings.LastIndex(activeSQL, "WHERE")
-	if i < 0 {
-		return ""
-	}
-	var b strings.Builder
+// hasBalancedParens reports whether every '(' and ')' outside SQL single-quoted
+// and backtick-quoted literals in sql is balanced and never dips below depth 0.
+func hasBalancedParens(sql string) bool {
 	depth := 0
-	for _, r := range activeSQL[i:] {
+	inSingle, inBacktick := false, false
+	for _, r := range sql {
 		switch {
+		case r == '\'' && !inBacktick:
+			inSingle = !inSingle
+		case r == '`' && !inSingle:
+			inBacktick = !inBacktick
+		case inSingle || inBacktick:
 		case r == '(':
 			depth++
 		case r == ')':
 			depth--
 			if depth < 0 {
-				return b.String()
+				return false
 			}
-		case depth == 0:
-			b.WriteRune(r)
 		}
 	}
-	return b.String()
+	return !inSingle && !inBacktick && depth == 0
+}
+
+// extractWhereClause returns the full text of the last WHERE clause in
+// activeSQL (up to the closing ')' that encloses the SELECT query or a
+// top-level ';') together with its depth-0 projection (with the contents of
+// every parenthesized group omitted).
+func extractWhereClause(activeSQL string) (whereClause, topLevel string) {
+	i := strings.LastIndex(activeSQL, "WHERE")
+	if i < 0 {
+		return "", ""
+	}
+	var full, top strings.Builder
+	depth := 0
+	inSingle, inBacktick := false, false
+	for _, r := range activeSQL[i:] {
+		switch {
+		case r == '\'' && !inBacktick:
+			inSingle = !inSingle
+			full.WriteRune(r)
+			if depth == 0 {
+				top.WriteRune(r)
+			}
+		case r == '`' && !inSingle:
+			inBacktick = !inBacktick
+			full.WriteRune(r)
+			if depth == 0 {
+				top.WriteRune(r)
+			}
+		case inSingle || inBacktick:
+			full.WriteRune(r)
+			if depth == 0 {
+				top.WriteRune(r)
+			}
+		case r == '(':
+			depth++
+			full.WriteRune(r)
+		case r == ')':
+			depth--
+			if depth < 0 {
+				return full.String(), top.String()
+			}
+			full.WriteRune(r)
+		case r == ';' && depth == 0:
+			return full.String(), top.String()
+		default:
+			full.WriteRune(r)
+			if depth == 0 {
+				top.WriteRune(r)
+			}
+		}
+	}
+	return full.String(), top.String()
+}
+
+// parenDepthAtSubstring returns the parenthesis nesting depth at the start of
+// the first occurrence of sub in sql (ignoring parentheses inside single-quoted
+// or backtick-quoted SQL literals), or (-1, false) if sub is not present.
+func parenDepthAtSubstring(sql, sub string) (int, bool) {
+	idx := strings.Index(sql, sub)
+	if idx < 0 {
+		return -1, false
+	}
+	depth := 0
+	inSingle, inBacktick := false, false
+	for _, r := range sql[:idx] {
+		switch {
+		case r == '\'' && !inBacktick:
+			inSingle = !inSingle
+		case r == '`' && !inSingle:
+			inBacktick = !inBacktick
+		case inSingle || inBacktick:
+		case r == '(':
+			depth++
+		case r == ')':
+			depth--
+		}
+	}
+	return depth, true
 }
 
 // BigQuery Continuous Queries cannot read views built on QUALIFY or window
@@ -1554,24 +1630,56 @@ func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
 		"agent_latency_p95.sql":     "AGENT_LATENCY_HIGH",
 	}
 	// The non-lossy start_time predicate must stay a top-level AND conjunct of
-	// WHERE: moved into the last OR group it keeps the pinned text but binds to
-	// that operand only, which BigQuery rejects on a table that requires a
-	// partition filter. So the lines before it close the OR group or the IN
-	// list above it, and no OR stands outside parentheses.
+	// WHERE (parenthesis depth 0) with no relative time filters or extra
+	// start_time comparisons.
 	const lookback = "AND start_time >= TIMESTAMP('1970-01-01 00:00:00+00')"
-	lookbackPrecededBy := map[string][]string{
-		"tool_error_rate_alert.sql": {")"},
-		"token_budget_burn.sql":     {")"},
-		"agent_latency_p95.sql":     {"'execute_tool'", ")"},
-	}
 	topLevelOr := regexp.MustCompile(`(?i)\bOR\b`)
 	partitionBoundRE := regexp.MustCompile(`start_time\s*>=\s*TIMESTAMP\('([^']+)'\)`)
+	checkNonLossyWhere := func(label, sqlText string) {
+		t.Helper()
+		if !hasBalancedParens(sqlText) {
+			t.Errorf("%s has unbalanced parentheses", label)
+		}
+		whereClause, top := extractWhereClause(sqlText)
+		if whereClause == "" {
+			t.Fatalf("%s has no WHERE clause", label)
+		}
+		if depth, ok := parenDepthAtSubstring(whereClause, lookback); !ok || depth != 0 {
+			t.Errorf("%s: %q must appear in WHERE at parenthesis depth 0, got ok=%v depth=%d (WHERE: %q)", label, lookback, ok, depth, whereClause)
+		}
+		if !strings.Contains(top, "AND start_time >= TIMESTAMP") || topLevelOr.MatchString(top) {
+			t.Errorf("%s: the start_time partition predicate is not a top-level AND conjunct of WHERE (top level: %q)", label, top)
+		}
+		if gotCount := strings.Count(whereClause, "start_time"); gotCount != 1 {
+			t.Errorf("%s WHERE clause references start_time %d times, want 1 (WHERE: %q)", label, gotCount, whereClause)
+		}
+		upperWhere := strings.ToUpper(whereClause)
+		for _, bannedWhere := range []string{"CURRENT_TIMESTAMP", "TIMESTAMP_SUB", "TIMESTAMP_DIFF", "INTERVAL"} {
+			if strings.Contains(upperWhere, bannedWhere) {
+				t.Errorf("%s WHERE clause contains relative time filter keyword %q (WHERE: %q)", label, bannedWhere, whereClause)
+			}
+		}
+	}
 
 	placeholderRE := regexp.MustCompile(`\$\{([a-zA-Z0-9_]+)\}`)
 	readme := readRepoText(t, filepath.Join(dir, "README.md"))
-	if strings.Contains(readme, "INTERVAL 7 DAY") {
-		t.Errorf("%s/README.md still contains the lossy INTERVAL 7 DAY start_time filter", dir)
+	for _, docPath := range []string{filepath.Join(dir, "README.md"), "deploy/README.md", "README.md"} {
+		docText := readRepoText(t, docPath)
+		if strings.Contains(strings.ToLower(docText), "partition pruning succeeds") {
+			t.Errorf("%s still claims the epoch start_time bound makes partition pruning succeed", docPath)
+		}
 	}
+	appendsBlocks := 0
+	for _, m := range regexp.MustCompile("(?s)```sql\\n(.*?)```").FindAllStringSubmatch(readme, -1) {
+		if strings.Contains(m[1], "APPENDS(") {
+			appendsBlocks++
+			checkNonLossyWhere(dir+"/README.md SQL block", stripSQLComments(m[1]))
+		}
+	}
+	if appendsBlocks < 2 {
+		t.Errorf("%s/README.md has %d APPENDS SQL blocks, want at least 2 (INSERT INTO and TUMBLE)", dir, appendsBlocks)
+	}
+
 	parsedBounds := map[string]time.Time{}
 	for _, name := range wantTemplates {
 		path := filepath.Join(dir, name)
@@ -1582,9 +1690,7 @@ func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
 		}
 
 		activeSQL := stripSQLComments(rawSQL)
-		if strings.Contains(activeSQL, "INTERVAL 7 DAY") {
-			t.Errorf("%s active SQL still contains the lossy INTERVAL 7 DAY start_time filter", path)
-		}
+		checkNonLossyWhere(path, activeSQL)
 		for _, want := range []string{
 			"EXPORT DATA",
 			"CLOUD_PUBSUB",
@@ -1592,6 +1698,9 @@ func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
 			"APPENDS(",
 			"TABLE `${project_id}.${dataset_id}.${spans_table}`",
 			lookback,
+			`JSON_VALUE(attributes, '$."gen_ai.agent.name"')`,
+			`JSON_VALUE(attributes, '$."gcp.vertex.agent.name"')`,
+			`JSON_VALUE(attributes, '$."gen_ai.main_agent.name"')`,
 		} {
 			if !strings.Contains(activeSQL, want) {
 				t.Errorf("%s active SQL is missing %q", path, want)
@@ -1605,27 +1714,15 @@ func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
 		if want := "CONCAT('" + alertKinds[name] + ":', trace_id, ':', span_id) AS alert_id"; !strings.Contains(activeSQL, want) {
 			t.Errorf("%s active SQL does not build the documented alert_id %q", path, want)
 		}
-		var lines []string
-		for _, line := range strings.Split(activeSQL, "\n") {
-			if line = strings.TrimSpace(line); line != "" {
-				lines = append(lines, line)
-			}
-		}
-		at, before := slices.Index(lines, lookback), lookbackPrecededBy[name]
-		if at < len(before) || !slices.Equal(lines[at-len(before):at], before) {
-			t.Errorf("%s: %q is not on its own line right after %q, so it may sit inside an OR group", path, lookback, before)
-		}
-		if top := topLevelWhere(activeSQL); !strings.Contains(top, "AND start_time >= TIMESTAMP") || topLevelOr.MatchString(top) {
-			t.Errorf("%s: the start_time partition predicate is not a top-level AND conjunct of WHERE (top level: %q)", path, top)
-		}
 		if m := partitionBoundRE.FindStringSubmatch(activeSQL); len(m) == 2 {
 			ts, err := time.Parse("2006-01-02 15:04:05-07", m[1])
 			if err != nil {
-				t.Fatalf("%s: parsing partition bound %q: %v", path, m[1], err)
+				t.Errorf("%s: parsing partition bound %q: %v", path, m[1], err)
+			} else {
+				parsedBounds[name] = ts
 			}
-			parsedBounds[name] = ts
 		} else {
-			t.Fatalf("%s: could not parse start_time TIMESTAMP bound from active SQL", path)
+			t.Errorf("%s: could not parse start_time TIMESTAMP bound from active SQL", path)
 		}
 		for _, banned := range []string{"_dedup", "v_gen_ai_", "v_mcp_", "duration_ns", "status.message"} {
 			if strings.Contains(activeSQL, banned) {
@@ -1738,12 +1835,16 @@ func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
 		}
 
 		matchesTemplate := func(tmpl string, row transform.Row) bool {
+			bound, hasBound := parsedBounds[tmpl]
+			if !hasBound {
+				t.Fatalf("no parsed start_time TIMESTAMP bound for %s", tmpl)
+			}
 			startMicros, ok := row["start_time"].(int64)
 			if !ok {
 				t.Fatalf("row start_time = %#v, want int64 micros", row["start_time"])
 			}
 			startTime := time.UnixMicro(startMicros).UTC()
-			if startTime.Before(parsedBounds[tmpl]) {
+			if startTime.Before(bound) {
 				return false
 			}
 			var attrs map[string]any
@@ -1807,21 +1908,85 @@ func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
 	})
 
 	t.Run("window_identity_collision_free", func(t *testing.T) {
+		var tumbleSQL string
+		for _, m := range regexp.MustCompile("(?s)```sql\n(.*?)```").FindAllStringSubmatch(readme, -1) {
+			if strings.Contains(m[1], "FROM TUMBLE(") {
+				tumbleSQL = m[1]
+				break
+			}
+		}
+		if tumbleSQL == "" {
+			t.Fatal("deploy/continuous-queries/README.md has no TUMBLE SQL block")
+		}
+		if !regexp.MustCompile(`(?i)\bFROM\s+TUMBLE\(\s*TABLE\s+\w+`).MatchString(tumbleSQL) {
+			t.Errorf("TUMBLE SQL block must pass TABLE <cte> to TUMBLE:\n%s", tumbleSQL)
+		}
+		alertIDMatch := regexp.MustCompile(`CONCAT\('([^']+)',\s*TO_JSON_STRING\(STRUCT\(([^)]+)\)\)\)\s+AS\s+alert_id`).FindStringSubmatch(tumbleSQL)
+		if len(alertIDMatch) != 3 {
+			t.Fatalf("could not parse CONCAT('<prefix>', TO_JSON_STRING(STRUCT(...))) AS alert_id from TUMBLE SQL:\n%s", tumbleSQL)
+		}
+		prefix := alertIDMatch[1]
+		if prefix != "TOOL_ERROR_WINDOW:" {
+			t.Errorf("TUMBLE alert_id prefix = %q, want %q", prefix, "TOOL_ERROR_WINDOW:")
+		}
+		var structFields []string
+		for _, f := range strings.Split(alertIDMatch[2], ",") {
+			if col := strings.TrimSpace(f); col != "" {
+				structFields = append(structFields, col)
+			}
+		}
+		groupByClause := firstCapture(`(?i)\bGROUP\s+BY\s+([^\n;]+)`, tumbleSQL)
+		if groupByClause == "" {
+			t.Fatalf("could not parse GROUP BY clause from TUMBLE SQL:\n%s", tumbleSQL)
+		}
+		groupCols := map[string]bool{}
+		for _, g := range strings.Split(groupByClause, ",") {
+			if col := strings.TrimSpace(g); col != "" {
+				groupCols[col] = true
+			}
+		}
+		for _, wantCol := range []string{"service_name", "tool_name", "window_start"} {
+			if !slices.Contains(structFields, wantCol) {
+				t.Errorf("TUMBLE alert_id STRUCT fields %v missing required group column %q", structFields, wantCol)
+			}
+		}
+		for _, col := range structFields {
+			if !groupCols[col] {
+				t.Errorf("TUMBLE alert_id STRUCT field %q is not in GROUP BY (%s)", col, groupByClause)
+			}
+		}
+
 		strPtr := func(s string) *string { return &s }
 		windowAlertID := func(serviceName, toolName *string, windowStart string) string {
-			payload, err := json.Marshal(struct {
-				ServiceName *string `json:"service_name"`
-				ToolName    *string `json:"tool_name"`
-				WindowStart string  `json:"window_start"`
-			}{
-				ServiceName: serviceName,
-				ToolName:    toolName,
-				WindowStart: windowStart,
-			})
-			if err != nil {
-				t.Fatalf("json.Marshal window key: %v", err)
+			colValues := map[string]any{
+				"service_name": serviceName,
+				"tool_name":    toolName,
+				"window_start": windowStart,
 			}
-			return "TOOL_ERROR_WINDOW:" + string(payload)
+			var buf bytes.Buffer
+			buf.WriteByte('{')
+			for i, col := range structFields {
+				val, ok := colValues[col]
+				if !ok {
+					t.Fatalf("unknown column %q in TUMBLE alert_id STRUCT", col)
+				}
+				if i > 0 {
+					buf.WriteByte(',')
+				}
+				keyBytes, err := json.Marshal(col)
+				if err != nil {
+					t.Fatalf("json.Marshal key %q: %v", col, err)
+				}
+				valBytes, err := json.Marshal(val)
+				if err != nil {
+					t.Fatalf("json.Marshal val for %q: %v", col, err)
+				}
+				buf.Write(keyBytes)
+				buf.WriteByte(':')
+				buf.Write(valBytes)
+			}
+			buf.WriteByte('}')
+			return prefix + buf.String()
 		}
 
 		w1 := "2026-10-16 20:00:00+00"
@@ -1857,41 +2022,135 @@ func TestContinuousQueryTemplatesReadBaseTablesViaAppends(t *testing.T) {
 	})
 }
 
-func deriveContinuousQueryNames(datasetID string) (reservation, topic string) {
-	nonAlnum := regexp.MustCompile(`[^a-z0-9]+`)
-	norm := strings.Trim(nonAlnum.ReplaceAllString(strings.ToLower(datasetID), "-"), "-")
+type cqNameSpec struct {
+	rawLocals       string
+	nonAlnumRE      *regexp.Regexp
+	normReplace     string
+	normTrim        string
+	fallbackSlug    string
+	hashStart       int
+	hashLen         int
+	resCleanRE      *regexp.Regexp
+	resSuffixRE     *regexp.Regexp
+	resPrefix       string
+	resFastMaxLen   int
+	resSlowSlugCap  int
+	topicCleanRE    *regexp.Regexp
+	topicSuffixRE   *regexp.Regexp
+	topicPrefix     string
+	topicFastMaxLen int
+	topicSlowCap    int
+}
+
+func parseContinuousQueryNameSpec(t *testing.T, mainTF string) cqNameSpec {
+	t.Helper()
+	var cqLocals string
+	for _, m := range regexp.MustCompile(`(?s)(?:^|\n)locals \{\n(.*?)\n\}`).FindAllStringSubmatch(mainTF, -1) {
+		if strings.Contains(m[1], "continuous_query_reservation_name") || strings.Contains(m[1], "otel_alerts_topic_name") {
+			cqLocals = m[1]
+			break
+		}
+	}
+	if cqLocals == "" {
+		t.Fatal("main.tf has no locals block defining continuous_query_reservation_name and otel_alerts_topic_name")
+	}
+
+	normMatch := regexp.MustCompile(`cq_dataset_norm\s*=\s*trim\(replace\(lower\(var\.dataset_id\),\s*"/([^"]+)/",\s*"([^"]+)"\),\s*"([^"]+)"\)`).FindStringSubmatch(cqLocals)
+	if len(normMatch) != 4 {
+		t.Fatalf("could not parse cq_dataset_norm from main.tf locals:\n%s", cqLocals)
+	}
+	slugFallback := firstCapture(`cq_dataset_slug\s*=\s*local\.cq_dataset_norm\s*!=\s*""\s*\?\s*local\.cq_dataset_norm\s*:\s*"([^"]+)"`, cqLocals)
+	if slugFallback == "" {
+		t.Fatalf("could not parse cq_dataset_slug from main.tf locals:\n%s", cqLocals)
+	}
+	hashMatch := regexp.MustCompile(`cq_dataset_hash\s*=\s*substr\(sha256\(var\.dataset_id\),\s*([0-9]+),\s*([0-9]+)\)`).FindStringSubmatch(cqLocals)
+	if len(hashMatch) != 3 {
+		t.Fatalf("could not parse cq_dataset_hash from main.tf locals:\n%s", cqLocals)
+	}
+	hashStart, _ := strconv.Atoi(hashMatch[1])
+	hashLen, _ := strconv.Atoi(hashMatch[2])
+
+	resMatch := regexp.MustCompile(`(?s)continuous_query_reservation_name\s*=\s*\(\s*` +
+		`can\(regex\("([^"]+)",\s*var\.dataset_id\)\)\s*&&\s*!can\(regex\("([^"]+)",\s*var\.dataset_id\)\)\s*&&\s*` +
+		`length\("([a-z0-9-]+)\$\{replace\(var\.dataset_id,\s*"_",\s*"-"\)\}"\)\s*<=\s*([0-9]+)\s*` +
+		`\?\s*"([a-z0-9-]+)\$\{replace\(var\.dataset_id,\s*"_",\s*"-"\)\}"\s*` +
+		`:\s*"([a-z0-9-]+)\$\{trim\(substr\(local\.cq_dataset_slug,\s*0,\s*min\(length\(local\.cq_dataset_slug\),\s*([0-9]+)\)\),\s*"-"\)\}-\$\{local\.cq_dataset_hash\}"\s*\)`).FindStringSubmatch(cqLocals)
+	if len(resMatch) != 8 {
+		t.Fatalf("could not parse continuous_query_reservation_name from main.tf locals:\n%s", cqLocals)
+	}
+	if resMatch[3] != resMatch[5] || resMatch[3] != resMatch[6] {
+		t.Fatalf("continuous_query_reservation_name prefixes disagree: %q vs %q vs %q", resMatch[3], resMatch[5], resMatch[6])
+	}
+	resFastMaxLen, _ := strconv.Atoi(resMatch[4])
+	resSlowSlugCap, _ := strconv.Atoi(resMatch[7])
+
+	topicMatch := regexp.MustCompile(`(?s)otel_alerts_topic_name\s*=\s*\(\s*` +
+		`can\(regex\("([^"]+)",\s*var\.dataset_id\)\)\s*&&\s*!can\(regex\("([^"]+)",\s*var\.dataset_id\)\)\s*&&\s*` +
+		`length\("([a-z0-9-]+)\$\{var\.dataset_id\}"\)\s*<=\s*([0-9]+)\s*` +
+		`\?\s*"([a-z0-9-]+)\$\{var\.dataset_id\}"\s*` +
+		`:\s*"([a-z0-9-]+)\$\{trim\(substr\(local\.cq_dataset_slug,\s*0,\s*min\(length\(local\.cq_dataset_slug\),\s*([0-9]+)\)\),\s*"-"\)\}-\$\{local\.cq_dataset_hash\}"\s*\)`).FindStringSubmatch(cqLocals)
+	if len(topicMatch) != 8 {
+		t.Fatalf("could not parse otel_alerts_topic_name from main.tf locals:\n%s", cqLocals)
+	}
+	if topicMatch[3] != topicMatch[5] || topicMatch[3] != topicMatch[6] {
+		t.Fatalf("otel_alerts_topic_name prefixes disagree: %q vs %q vs %q", topicMatch[3], topicMatch[5], topicMatch[6])
+	}
+	topicFastMaxLen, _ := strconv.Atoi(topicMatch[4])
+	topicSlowCap, _ := strconv.Atoi(topicMatch[7])
+
+	return cqNameSpec{
+		rawLocals:       cqLocals,
+		nonAlnumRE:      regexp.MustCompile(normMatch[1]),
+		normReplace:     normMatch[2],
+		normTrim:        normMatch[3],
+		fallbackSlug:    slugFallback,
+		hashStart:       hashStart,
+		hashLen:         hashLen,
+		resCleanRE:      regexp.MustCompile(resMatch[1]),
+		resSuffixRE:     regexp.MustCompile(resMatch[2]),
+		resPrefix:       resMatch[3],
+		resFastMaxLen:   resFastMaxLen,
+		resSlowSlugCap:  resSlowSlugCap,
+		topicCleanRE:    regexp.MustCompile(topicMatch[1]),
+		topicSuffixRE:   regexp.MustCompile(topicMatch[2]),
+		topicPrefix:     topicMatch[3],
+		topicFastMaxLen: topicFastMaxLen,
+		topicSlowCap:    topicSlowCap,
+	}
+}
+
+func (s cqNameSpec) derive(datasetID string) (reservation, topic string) {
+	norm := strings.Trim(s.nonAlnumRE.ReplaceAllString(strings.ToLower(datasetID), s.normReplace), s.normTrim)
 	slug := norm
 	if slug == "" {
-		slug = "ds"
+		slug = s.fallbackSlug
 	}
 	sum := sha256.Sum256([]byte(datasetID))
-	hash := hex.EncodeToString(sum[:])[:8]
+	fullHash := hex.EncodeToString(sum[:])
+	hash := fullHash[s.hashStart : s.hashStart+s.hashLen]
 
-	fastValid := regexp.MustCompile(`^[a-z](?:[a-z0-9_]*[a-z0-9])?$`).MatchString(datasetID) &&
-		!regexp.MustCompile(`_[0-9a-f]{8}$`).MatchString(datasetID)
-
-	fastRes := "otel-cq-" + strings.ReplaceAll(datasetID, "_", "-")
-	if fastValid && len(fastRes) <= 55 {
+	fastRes := s.resPrefix + strings.ReplaceAll(datasetID, "_", "-")
+	if s.resCleanRE.MatchString(datasetID) && !s.resSuffixRE.MatchString(datasetID) && len(fastRes) <= s.resFastMaxLen {
 		reservation = fastRes
 	} else {
 		prefix := slug
-		if len(prefix) > 47 {
-			prefix = prefix[:47]
+		if len(prefix) > s.resSlowSlugCap {
+			prefix = prefix[:s.resSlowSlugCap]
 		}
 		prefix = strings.Trim(prefix, "-")
-		reservation = "otel-cq-" + prefix + "-" + hash
+		reservation = s.resPrefix + prefix + "-" + hash
 	}
 
-	fastTopic := "otel-alerts-" + datasetID
-	if fastValid && len(fastTopic) <= 240 {
+	fastTopic := s.topicPrefix + datasetID
+	if s.topicCleanRE.MatchString(datasetID) && !s.topicSuffixRE.MatchString(datasetID) && len(fastTopic) <= s.topicFastMaxLen {
 		topic = fastTopic
 	} else {
 		prefix := slug
-		if len(prefix) > 234 {
-			prefix = prefix[:234]
+		if len(prefix) > s.topicSlowCap {
+			prefix = prefix[:s.topicSlowCap]
 		}
 		prefix = strings.Trim(prefix, "-")
-		topic = "otel-alerts-" + prefix + "-" + hash
+		topic = s.topicPrefix + prefix + "-" + hash
 	}
 	return reservation, topic
 }
@@ -2073,9 +2332,17 @@ func TestTerraformContinuousQueriesAreOptIn(t *testing.T) {
 	}
 
 	t.Run("dataset_id_derived_names", func(t *testing.T) {
-		resRE := regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}[a-z0-9]$`)
-		topicRE := regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_~+.%-]{2,254}$`)
-		googRE := regexp.MustCompile(`(?i)^goog`)
+		spec := parseContinuousQueryNameSpec(t, mainTF)
+
+		resPrecondRE := firstCapture(`can\(regex\("([^"]+)",\s*local\.continuous_query_reservation_name\)\)`, reservation)
+		topicPrecondRE := firstCapture(`can\(regex\("([^"]+)",\s*local\.otel_alerts_topic_name\)\)`, alertsTopic)
+		topicNoGoogRE := firstCapture(`!can\(regex\("([^"]+)",\s*local\.otel_alerts_topic_name\)\)`, alertsTopic)
+		if resPrecondRE == "" || topicPrecondRE == "" || topicNoGoogRE == "" {
+			t.Fatalf("missing precondition regexes in main.tf (res=%q, topic=%q, nogoog=%q)", resPrecondRE, topicPrecondRE, topicNoGoogRE)
+		}
+		resRE := regexp.MustCompile(resPrecondRE)
+		topicRE := regexp.MustCompile(topicPrecondRE)
+		googRE := regexp.MustCompile(topicNoGoogRE)
 
 		datasets := []string{
 			"otel",
@@ -2097,10 +2364,20 @@ func TestTerraformContinuousQueriesAreOptIn(t *testing.T) {
 			strings.Repeat("B", 1024),
 		}
 
+		tfBin, tfErr := exec.LookPath("terraform")
+		var tfDir string
+		if tfErr == nil {
+			tfDir = t.TempDir()
+			hclFile := "variable \"dataset_id\" {\n  type = string\n}\n\nlocals {\n" + spec.rawLocals + "\n}\n"
+			if err := os.WriteFile(filepath.Join(tfDir, "main.tf"), []byte(hclFile), 0o600); err != nil {
+				t.Fatalf("writing temp main.tf for terraform console: %v", err)
+			}
+		}
+
 		seenRes := map[string]string{}
 		seenTopic := map[string]string{}
 		for _, ds := range datasets {
-			res, topic := deriveContinuousQueryNames(ds)
+			res, topic := spec.derive(ds)
 			if !resRE.MatchString(res) || len(res) > 64 {
 				t.Errorf("dataset_id %q produced invalid reservation name %q (len=%d)", ds, res, len(res))
 			}
@@ -2109,6 +2386,26 @@ func TestTerraformContinuousQueriesAreOptIn(t *testing.T) {
 			}
 			if ds == "otel" && (res != "otel-cq-otel" || topic != "otel-alerts-otel") {
 				t.Errorf("dataset_id %q = (%q, %q), want (\"otel-cq-otel\", \"otel-alerts-otel\")", ds, res, topic)
+			}
+			if tfDir != "" {
+				cmd := exec.Command(tfBin, "-chdir="+tfDir, "console", "-var=dataset_id="+ds)
+				cmd.Env = append(os.Environ(), "CHECKPOINT_DISABLE=1")
+				cmd.Stdin = strings.NewReader("jsonencode([local.continuous_query_reservation_name, local.otel_alerts_topic_name])\n")
+				out, err := cmd.CombinedOutput()
+				if err != nil {
+					t.Fatalf("terraform console for dataset_id %q failed: %v\n%s", ds, err, out)
+				}
+				var encoded string
+				if err := json.Unmarshal(bytes.TrimSpace(out), &encoded); err != nil {
+					t.Fatalf("unquoting terraform console output %q: %v", out, err)
+				}
+				var hclPair [2]string
+				if err := json.Unmarshal([]byte(encoded), &hclPair); err != nil {
+					t.Fatalf("unmarshaling terraform console JSON %q: %v", encoded, err)
+				}
+				if hclPair[0] != res || hclPair[1] != topic {
+					t.Errorf("terraform console for %q = (%q, %q), parsed spec derived (%q, %q)", ds, hclPair[0], hclPair[1], res, topic)
+				}
 			}
 			if prev, exists := seenRes[res]; exists {
 				t.Errorf("reservation name collision between %q and %q: %q", prev, ds, res)

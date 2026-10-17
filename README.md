@@ -683,7 +683,10 @@ ON `my-project.otel.otel_metrics` (ALL COLUMNS) OPTIONS (analyzer = 'NO_OP_ANALY
   `QUALIFY` views, and Continuous Queries do not support column-level security
   policy tags. Because exporter retries, `APPENDS` lookback replay, and
   BigQuery automatic reprocessing deliver alerts at-least-once, downstream
-  consumers deduplicate on `alert_id` (`<ALERT_KIND>:<trace_id>:<span_id>`).
+  consumers deduplicate on `alert_id` (`<ALERT_KIND>:<trace_id>:<span_id>` for
+  per-span alerts, or `TOOL_ERROR_WINDOW:<json_struct_key>` via
+  `TO_JSON_STRING(STRUCT(service_name, tool_name, window_start))` in the
+  windowed Preview example).
   Optional Terraform wiring in
   [`deploy/terraform`](deploy/README.md#real-time-alerting-continuous-queries)
   (`enable_continuous_queries=true`) provisions the `otel_alerts` table, Pub/Sub

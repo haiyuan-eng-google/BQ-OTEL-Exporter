@@ -40,11 +40,13 @@ aggregate or rate-limit alerts.
   reads `otel_spans` directly and extracts promoted JSON attributes inline.
 - **`require_partition_filter` compatibility**: Every template includes
   `AND start_time >= TIMESTAMP('1970-01-01 00:00:00+00')` as a top-level
-  conjunct of `WHERE` so partition pruning succeeds when
-  `require_partition_filter = true` is set on `otel_spans` without dropping
-  valid telemetry. BigQuery `APPENDS` bounds commit time (`_CHANGE_TIMESTAMP`),
+  conjunct of `WHERE` so queries satisfy BigQuery's
+  `require_partition_filter = true` requirement without dropping late-arriving,
+  backfilled, or quarantine-replayed spans (this constant epoch bound satisfies
+  the static filter requirement rather than pruning historical partitions;
+  `APPENDS` itself bounds scan volume by commit timestamp `_CHANGE_TIMESTAMP`,
   whereas `start_time` is the OTLP event timestamp preserved across late batches
-  and `cmd/bq-quarantine-replay` (`otel_quarantine` defaults to 30-day
+  and `cmd/bq-quarantine-replay`, where `otel_quarantine` defaults to 30-day
   retention). A relative `CURRENT_TIMESTAMP()` filter on `start_time` would be
   evaluated once at Continuous Query start and silently omit replayed or
   late-arriving spans.
