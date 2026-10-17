@@ -231,6 +231,15 @@ that request were appended. A row error is therefore not just "that row
 failed": every other row that shared the request must be sent again, minus the
 invalid ones.
 
+**Adaptive AIMD backpressure.** When `write.backpressure.enabled` is set, the
+writer adjusts its effective per-request byte split threshold and in-flight
+request limit using additive-increase / multiplicative-decrease (AIMD) control.
+Congestion verdicts (`quota_exhausted`, multi-row `oversize_request`,
+`unavailable`, `uncertain_ack`) and slow acknowledgements step down the split
+threshold and concurrency window; clean acknowledgements after
+`recovery_interval` step them back up toward the configured ceiling. The writer
+never retries internally: `exporterhelper` remains the single retry owner.
+
 ## What was rejected and why
 
 - **Typed wrappers around every attribute value.** An earlier pre-alpha revision

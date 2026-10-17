@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
@@ -28,6 +29,7 @@ type WriterOptions struct {
 	Project string
 	Dataset string
 	Table   string
+	Signal  string
 
 	// Descriptor describes the row message, derived from the destination
 	// table's schema.
@@ -51,6 +53,10 @@ type WriterOptions struct {
 
 	// Observer receives bounded, content-free stream lifecycle telemetry.
 	Observer Observer
+
+	// Backpressure optionally adjusts the effective per-request byte split
+	// threshold and in-flight dispatch concurrency using AIMD control.
+	Backpressure *BackpressureController
 }
 
 // Observer is the delivery-critical stream telemetry surface. The exporter
@@ -62,6 +68,9 @@ type Observer interface {
 	RecordAppendResultWait(context.Context, time.Duration)
 	RecordTimeoutAfterDispatch(context.Context)
 	RecordStreamRetirement(context.Context)
+	RecordBackpressureLevel(ctx context.Context, signal, table string, level float64)
+	RecordEffectiveRequestBytes(ctx context.Context, signal, table string, bytes int64)
+	RecordBackpressureEvent(ctx context.Context, signal, table, trigger string)
 }
 
 // TableRef renders the fully qualified destination table path.
@@ -86,6 +95,7 @@ type stream interface {
 
 // appendResult is the slice of AppendResult the writer depends on.
 type appendResult interface {
+	Ready() <-chan struct{}
 	GetResult(ctx context.Context) (int64, error)
 	FullResponse(ctx context.Context) (*storagepb.AppendRowsResponse, error)
 }
@@ -129,12 +139,13 @@ type streamCreation struct {
 // generation only while it is still the writer's current stream.
 type streamGeneration struct {
 	stream
-	users         int
-	pending       int
-	retired       bool
-	slotHeld      bool
-	dispatchSlots chan struct{}
-	retiredDone   chan struct{}
+	users       int
+	pending     int
+	dispatched  int
+	slotSignal  chan struct{}
+	retired     bool
+	slotHeld    bool
+	retiredDone chan struct{}
 }
 
 // NewWriter builds a writer whose managed streams retain lifetimeCtx for their
@@ -250,15 +261,10 @@ func (w *Writer) startStreamCreationLocked() {
 			}
 			w.activeGenerations--
 		default:
-			window := w.opts.MaxInflightRequests
-			if window <= 0 {
-				window = 1
-			}
 			w.ms = &streamGeneration{
-				stream:        ms,
-				slotHeld:      true,
-				dispatchSlots: make(chan struct{}, window),
-				retiredDone:   make(chan struct{}),
+				stream:      ms,
+				slotHeld:    true,
+				retiredDone: make(chan struct{}),
 			}
 		}
 		if w.creation == creation {
@@ -363,61 +369,96 @@ func (w *Writer) markGenerationRetiredLocked(gen *streamGeneration) {
 	close(gen.retiredDone)
 }
 
+// EffectiveMaxRequestBytes returns the current request split threshold,
+// reading from the adaptive BackpressureController when configured.
+func (w *Writer) EffectiveMaxRequestBytes() int {
+	if w.opts.Backpressure != nil {
+		if n := w.opts.Backpressure.EffectiveRequestBytes(); n > 0 {
+			return n
+		}
+	}
+	return w.opts.MaxRequestBytes
+}
+
+// EffectiveMaxInflightRequests returns the current concurrent dispatch limit,
+// reading from the adaptive BackpressureController when configured.
+func (w *Writer) EffectiveMaxInflightRequests() int {
+	if w.opts.Backpressure != nil {
+		if n := w.opts.Backpressure.EffectiveInflightRequests(); n >= 1 {
+			return n
+		}
+	}
+	if w.opts.MaxInflightRequests >= 1 {
+		return w.opts.MaxInflightRequests
+	}
+	return 1
+}
+
+func (w *Writer) slotSignalLocked(gen *streamGeneration) <-chan struct{} {
+	if gen.slotSignal == nil {
+		gen.slotSignal = make(chan struct{})
+	}
+	return gen.slotSignal
+}
+
+func (w *Writer) notifySlotChangeLocked(gen *streamGeneration) {
+	if gen.slotSignal != nil {
+		close(gen.slotSignal)
+		gen.slotSignal = nil
+	}
+}
+
 func (w *Writer) tryAcquireDispatchSlot(
 	ctx context.Context, gen *streamGeneration,
 ) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	select {
-	case <-gen.retiredDone:
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if gen.retired {
 		return false, errStreamRetired
-	default:
 	}
-	select {
-	case gen.dispatchSlots <- struct{}{}:
-		if err := ctx.Err(); err != nil {
-			w.releaseDispatchSlot(gen)
-			return false, err
-		}
-		select {
-		case <-gen.retiredDone:
-			w.releaseDispatchSlot(gen)
-			return false, errStreamRetired
-		default:
-			return true, nil
-		}
-	default:
+	if gen.dispatched >= w.EffectiveMaxInflightRequests() {
 		return false, nil
 	}
+	gen.dispatched++
+	return true, nil
 }
 
 func (w *Writer) waitForDispatchSlot(ctx context.Context, gen *streamGeneration) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	select {
-	case gen.dispatchSlots <- struct{}{}:
+	for {
 		if err := ctx.Err(); err != nil {
-			w.releaseDispatchSlot(gen)
 			return err
 		}
-		select {
-		case <-gen.retiredDone:
-			w.releaseDispatchSlot(gen)
+		w.mu.Lock()
+		if gen.retired {
+			w.mu.Unlock()
 			return errStreamRetired
-		default:
+		}
+		if gen.dispatched < w.EffectiveMaxInflightRequests() {
+			gen.dispatched++
+			w.mu.Unlock()
 			return nil
 		}
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-gen.retiredDone:
-		return errStreamRetired
+		sig := w.slotSignalLocked(gen)
+		w.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-gen.retiredDone:
+			return errStreamRetired
+		case <-sig:
+		}
 	}
 }
 
 func (w *Writer) releaseDispatchSlot(gen *streamGeneration) {
-	<-gen.dispatchSlots
+	w.mu.Lock()
+	gen.dispatched--
+	w.notifySlotChangeLocked(gen)
+	w.mu.Unlock()
 }
 
 func (w *Writer) registerResult(gen *streamGeneration) {
@@ -429,9 +470,10 @@ func (w *Writer) registerResult(gen *streamGeneration) {
 func (w *Writer) releaseResult(gen *streamGeneration) {
 	w.mu.Lock()
 	gen.pending--
+	gen.dispatched--
+	w.notifySlotChangeLocked(gen)
 	w.releaseGenerationSlotLocked(gen)
 	w.mu.Unlock()
-	w.releaseDispatchSlot(gen)
 }
 
 func (w *Writer) releaseGenerationUser(gen *streamGeneration) {
@@ -462,15 +504,102 @@ func (w *Writer) observeUnresolved(delta int64) {
 	}
 }
 
+func (w *Writer) now() time.Time {
+	if w.opts.Backpressure != nil && w.opts.Backpressure.now != nil {
+		return w.opts.Backpressure.now()
+	}
+	return time.Now()
+}
+
 func (w *Writer) observeResultWait(started time.Time) {
 	if w.opts.Observer != nil {
-		w.opts.Observer.RecordAppendResultWait(context.Background(), time.Since(started))
+		w.opts.Observer.RecordAppendResultWait(context.Background(), w.now().Sub(started))
 	}
 }
 
 func (w *Writer) observeTimeoutAfterDispatch() {
 	if w.opts.Observer != nil {
 		w.opts.Observer.RecordTimeoutAfterDispatch(context.Background())
+	}
+}
+
+func (w *Writer) observeBackpressureTransition(trigger string) {
+	if w.opts.Observer == nil || w.opts.Backpressure == nil {
+		return
+	}
+	ctx := context.Background()
+	w.opts.Observer.RecordBackpressureEvent(ctx, w.opts.Signal, w.opts.Table, trigger)
+	w.opts.Observer.RecordBackpressureLevel(ctx, w.opts.Signal, w.opts.Table, w.opts.Backpressure.Level())
+	w.opts.Observer.RecordEffectiveRequestBytes(ctx, w.opts.Signal, w.opts.Table, int64(w.opts.Backpressure.EffectiveRequestBytes()))
+}
+
+// isBackpressureThrottle reports whether a non-permanent server failure should
+// step the adaptive controller down. Client-side attempt expiries
+// (attemptEnded == true) are routed to OnSlowAck in recordFailureFeedback
+// before reaching this switch, so LabelUncertainAck here applies only to
+// server-returned codes.DeadlineExceeded when the caller's context is still live.
+func isBackpressureThrottle(v Verdict) bool {
+	if v.Class == Permanent {
+		return false
+	}
+	switch v.Label {
+	case LabelQuota, LabelOversizeRequest, LabelUnavailable, LabelUncertainAck:
+		return true
+	default:
+		return false
+	}
+}
+
+// recordFailureFeedback updates the adaptive backpressure controller after a
+// sub-request failure. Client-side attempt expiry (attemptEnded) is measured
+// only by elapsed latency so callers with nearly-spent deadlines do not pin
+// the controller at its floor, and sibling stream teardown is ignored.
+func (w *Writer) recordFailureFeedback(
+	v Verdict, attemptEnded, siblingTeardown bool, elapsed time.Duration,
+) {
+	bp := w.opts.Backpressure
+	if bp == nil || siblingTeardown {
+		return
+	}
+	if attemptEnded {
+		if bp.OnSlowAck(elapsed) {
+			w.observeBackpressureTransition("latency")
+		}
+		return
+	}
+	if !isBackpressureThrottle(v) {
+		return
+	}
+	if bp.OnThrottle() {
+		w.observeBackpressureTransition("throttle")
+	}
+}
+
+func (w *Writer) recordCleanOrSlowAck(elapsed time.Duration, gen *streamGeneration) {
+	bp := w.opts.Backpressure
+	if bp == nil {
+		return
+	}
+	if bp.LatencyThreshold() > 0 && elapsed > bp.LatencyThreshold() {
+		if bp.OnSlowAck(elapsed) {
+			w.observeBackpressureTransition("latency")
+		}
+		return
+	}
+	if bp.OnCleanAck(elapsed) {
+		w.mu.Lock()
+		// The larger window applies to every generation. gen may already be
+		// retired and draining while callers wait for a slot on the current
+		// generation, so wake those waiters too rather than leaving them until
+		// the current generation's next slot release. Only the current
+		// generation can be live; waiters on a retired one have already left
+		// through retiredDone.
+		w.notifySlotChangeLocked(gen)
+		if cur := w.ms; cur != nil && cur != gen {
+			w.notifySlotChangeLocked(cur)
+		}
+		w.mu.Unlock()
+		w.observeBackpressureTransition("recovery")
 	}
 }
 
@@ -481,15 +610,17 @@ func (w *Writer) finishResult(gen *streamGeneration, started time.Time) {
 }
 
 func (w *Writer) classifyAndRetire(
-	ctx context.Context, err error, gen *streamGeneration,
-) (Verdict, bool) {
-	verdict, attemptEnded := w.classifyAppendFailure(ctx, err)
+	ctx context.Context, err error, gen *streamGeneration, req requestSlice,
+) (Verdict, bool, bool) {
+	verdict, attemptEnded := w.classifyAppendFailure(ctx, err, req)
+	siblingTeardown := false
 	if !attemptEnded && verdict.Label != LabelShutdown && isTeardown(err) && w.isRetired(gen) {
 		// Another attempt retired this generation and closed the connection
 		// under this request. It may already have reached the service, so the
 		// outcome is as ambiguous as an expired attempt's and its replay can
 		// duplicate.
 		verdict = Verdict{Uncertain, OwnerExporterHelper, LabelUncertainAck, false}
+		siblingTeardown = true
 	}
 	if verdict.StreamRecreate || attemptEnded || verdict.Class == Uncertain {
 		w.retireStream(gen)
@@ -497,7 +628,7 @@ func (w *Writer) classifyAndRetire(
 	if attemptEnded {
 		w.observeTimeoutAfterDispatch()
 	}
-	return verdict, attemptEnded
+	return verdict, attemptEnded, siblingTeardown
 }
 
 // deliveryRank orders verdicts by what a batch still owes its rows:
@@ -577,6 +708,79 @@ func (o AppendOutcome) IsAcked(rowIndex int) bool {
 	return false
 }
 
+// requestSlice records one split sub-request alongside its wire size and the
+// byte split limit under which it was formed.
+type requestSlice struct {
+	rows            [][]byte
+	bytes           int
+	splitLimitBytes int
+}
+
+// pendingAppend tracks one in-flight AppendRows sub-request and stamps its
+// completion time as soon as Ready() closes so later local dispatch or drain
+// delays do not inflate acknowledgement latency.
+type pendingAppend struct {
+	res               appendResult
+	req               requestSlice
+	start             int
+	count             int
+	dispatched        time.Time
+	completedUnixNano atomic.Int64
+	done              chan struct{}
+	stopOnce          sync.Once
+}
+
+func stampNano(t time.Time) int64 {
+	if ns := t.UnixNano(); ns != 0 {
+		return ns
+	}
+	return 1
+}
+
+func (p *pendingAppend) pollReady(nowFn func() time.Time) bool {
+	if p.completedUnixNano.Load() != 0 {
+		return true
+	}
+	ready := p.res.Ready()
+	if ready == nil {
+		return false
+	}
+	select {
+	case <-ready:
+		p.completedUnixNano.CompareAndSwap(0, stampNano(nowFn()))
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *pendingAppend) stopWatcher() {
+	if p.done == nil {
+		return
+	}
+	p.stopOnce.Do(func() { close(p.done) })
+}
+
+func (p *pendingAppend) ackDuration(nowFn func() time.Time) time.Duration {
+	p.pollReady(nowFn)
+	if completed := p.completedUnixNano.Load(); completed != 0 {
+		if d := time.Duration(completed - p.dispatched.UnixNano()); d >= 0 {
+			return d
+		}
+		return 0
+	}
+	if d := nowFn().Sub(p.dispatched); d >= 0 {
+		return d
+	}
+	return 0
+}
+
+func pollInflightReady(inflight []*pendingAppend, nowFn func() time.Time) {
+	for _, p := range inflight {
+		p.pollReady(nowFn)
+	}
+}
+
 // Append splits rows into requests under the size threshold and sends them,
 // then waits for every acknowledgement.
 //
@@ -598,15 +802,9 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 	}
 	defer w.releaseGenerationUser(gen)
 
-	requests := SplitRequests(rows, w.opts.MaxRequestBytes)
+	requests := splitRequestSlices(rows, w.EffectiveMaxRequestBytes())
 
-	type pending struct {
-		res        appendResult
-		start      int
-		count      int
-		dispatched time.Time
-	}
-	inflight := make([]pending, 0, len(requests))
+	inflight := make([]*pendingAppend, 0, len(requests))
 	out := AppendOutcome{}
 	// fail folds one request's failure into the batch. Err keeps the first
 	// failure for diagnosis, but the verdict follows delivery precedence
@@ -629,8 +827,13 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 	replayOwed := func() bool {
 		return out.Err != nil && (out.Verdict.Class != Permanent || out.Verdict.StreamRecreate)
 	}
-	drainOne := func(p pending) {
-		if _, rerr := p.res.GetResult(ctx); rerr != nil {
+	drainOne := func(p *pendingAppend) {
+		defer p.stopWatcher()
+		pollInflightReady(inflight, w.now)
+		_, rerr := p.res.GetResult(ctx)
+		pollInflightReady(inflight, w.now)
+		elapsed := p.ackDuration(w.now)
+		if rerr != nil {
 			// Row errors arrive alongside the error; the whole request is not
 			// appended when any row in it fails.
 			rowErrs := extractRowErrors(ctx, p.res, p.start)
@@ -639,17 +842,19 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 				out.RowErrors = append(out.RowErrors, rowErrs...)
 				return
 			}
-			v, attemptEnded := w.classifyAndRetire(ctx, rerr, gen)
+			v, attemptEnded, siblingTeardown := w.classifyAndRetire(ctx, rerr, gen, p.req)
 			if attemptEnded {
 				w.trackResult(gen, p.res, p.dispatched)
 			} else {
 				w.finishResult(gen, p.dispatched)
 			}
+			w.recordFailureFeedback(v, attemptEnded, siblingTeardown, elapsed)
 			// Keep draining all other results already dispatched by this call.
 			fail(v, rerr)
 			return
 		}
 		w.finishResult(gen, p.dispatched)
+		w.recordCleanOrSlowAck(elapsed, gen)
 		out.AcknowledgedRows += p.count
 		out.AckedRanges = append(out.AckedRanges, [2]int{p.start, p.start + p.count})
 	}
@@ -658,7 +863,7 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 dispatch:
 	for _, req := range requests {
 		start := offset
-		offset += len(req)
+		offset += len(req.rows)
 		for {
 			if replayOwed() {
 				break dispatch
@@ -682,8 +887,10 @@ dispatch:
 			}
 			break
 		}
-		dispatched := time.Now()
-		res, aerr := gen.AppendRows(ctx, req)
+		pollInflightReady(inflight, w.now)
+		dispatched := w.now()
+		res, aerr := gen.AppendRows(ctx, req.rows)
+		pollInflightReady(inflight, w.now)
 		if aerr == nil {
 			// managedwriter's AppendRows can report success for a request it
 			// never sent when the call races the end of the attempt or the
@@ -701,15 +908,29 @@ dispatch:
 			// AppendRows can return the attempt-context error after handing a
 			// request to the bidirectional stream. Its acknowledgement is then
 			// ambiguous, and this generation cannot safely be reused.
-			v, _ := w.classifyAndRetire(ctx, aerr, gen)
+			v, attemptEnded, siblingTeardown := w.classifyAndRetire(ctx, aerr, gen, req)
+			w.recordFailureFeedback(v, attemptEnded, siblingTeardown, w.now().Sub(dispatched))
 			fail(v, aerr)
 			continue
 		}
 		w.registerResult(gen)
 		w.observeInflight(1)
-		inflight = append(inflight, pending{
-			res: res, start: start, count: len(req), dispatched: dispatched,
-		})
+		p := &pendingAppend{
+			res: res, req: req, start: start, count: len(req.rows), dispatched: dispatched,
+			done: make(chan struct{}),
+		}
+		if !p.pollReady(w.now) {
+			if ready := res.Ready(); ready != nil {
+				go func() {
+					select {
+					case <-ready:
+						p.completedUnixNano.CompareAndSwap(0, stampNano(w.now()))
+					case <-p.done:
+					}
+				}()
+			}
+		}
+		inflight = append(inflight, p)
 	}
 
 	for _, p := range inflight {
@@ -724,7 +945,7 @@ dispatch:
 // applied the rows even though the caller did not observe the acknowledgement.
 // Once the writer's lifecycle has ended, a teardown failure is shutdown however
 // managedwriter reports it.
-func (w *Writer) classifyAppendFailure(ctx context.Context, err error) (Verdict, bool) {
+func (w *Writer) classifyAppendFailure(ctx context.Context, err error, req requestSlice) (Verdict, bool) {
 	ctxErr := ctx.Err()
 	if ctxErr != nil && errors.Is(err, ctxErr) {
 		return Verdict{Uncertain, OwnerExporterHelper, LabelUncertainAck, false}, true
@@ -738,7 +959,23 @@ func (w *Writer) classifyAppendFailure(ctx context.Context, err error) (Verdict,
 	if ownedCtx != nil && ownedCtx.Err() != nil && isTeardown(err) {
 		return Verdict{Retryable, OwnerExporterHelper, LabelShutdown, false}, false
 	}
-	return Classify(err), false
+	return ClassifySubRequest(err, len(req.rows), w.canSplitSmaller(req)), false
+}
+
+// canSplitSmaller reports whether replaying req at a lower split threshold can
+// split its rows into smaller sub-requests. It checks both the current global
+// threshold and the splitLimitBytes under which req was originally formed so an
+// in-flight request is not permanently rejected when a sibling caller reaches
+// the floor first.
+func (w *Writer) canSplitSmaller(req requestSlice) bool {
+	if len(req.rows) <= 1 || w.opts.Backpressure == nil {
+		return false
+	}
+	floor := w.opts.Backpressure.MinRequestBytes()
+	if w.opts.Backpressure.EffectiveRequestBytes() > floor {
+		return true
+	}
+	return req.splitLimitBytes > floor && req.bytes > floor
 }
 
 // isTeardown reports whether err is how managedwriter fails a request whose
@@ -789,29 +1026,53 @@ func rowWireBytes(row []byte) int {
 // request: the caller is responsible for rejecting oversized rows before this
 // point, and silently dropping one here would lose data without a count.
 func SplitRequests(rows [][]byte, maxBytes int) [][][]byte {
+	slices := splitRequestSlices(rows, maxBytes)
+	out := make([][][]byte, len(slices))
+	for i, s := range slices {
+		out[i] = s.rows
+	}
+	return out
+}
+
+func splitRequestSlices(rows [][]byte, maxBytes int) []requestSlice {
+	if len(rows) == 0 {
+		return nil
+	}
 	if maxBytes <= 0 {
-		return [][][]byte{rows}
+		size := requestEnvelopeOverheadBytes
+		for _, row := range rows {
+			size += rowWireBytes(row)
+		}
+		return []requestSlice{{rows: rows, bytes: size, splitLimitBytes: maxBytes}}
 	}
 	envelope := requestEnvelopeOverheadBytes
 	if maxBytes <= envelope {
 		envelope = 0
 	}
 	var (
-		out     [][][]byte
+		out     []requestSlice
 		current [][]byte
 		size    = envelope
 	)
 	for _, row := range rows {
 		n := rowWireBytes(row)
 		if len(current) > 0 && size+n > maxBytes {
-			out = append(out, current)
+			out = append(out, requestSlice{
+				rows:            current,
+				bytes:           size,
+				splitLimitBytes: maxBytes,
+			})
 			current, size = nil, envelope
 		}
 		current = append(current, row)
 		size += n
 	}
 	if len(current) > 0 {
-		out = append(out, current)
+		out = append(out, requestSlice{
+			rows:            current,
+			bytes:           size,
+			splitLimitBytes: maxBytes,
+		})
 	}
 	return out
 }

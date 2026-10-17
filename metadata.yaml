@@ -68,6 +68,41 @@ telemetry:
         value_type: double
         bucket_boundaries: [0.001, 0.01, 0.1, 1, 5, 30, 70, 120]
 
+    otelcol_exporter_bigquery_backpressure_events:
+      enabled: true
+      stability: development
+      description: >-
+        Count of adaptive AIMD backpressure step-down and recovery transitions,
+        by signal, destination table, and trigger.
+      unit: "{event}"
+      sum:
+        value_type: int
+        monotonic: true
+      attributes: [signal, table, trigger]
+
+    otelcol_exporter_bigquery_backpressure_level:
+      enabled: true
+      stability: development
+      description: >-
+        Current adaptive AIMD backpressure level in [0.0, 1.0], where 0 means
+        the writer is at its configured ceiling and 1 means effective request
+        bytes or in-flight concurrency is at its configured floor.
+      unit: "1"
+      gauge:
+        value_type: double
+      attributes: [signal, table]
+
+    otelcol_exporter_bigquery_effective_request_bytes:
+      enabled: true
+      stability: development
+      description: >-
+        Current effective per-request byte split threshold controlled by
+        adaptive AIMD backpressure.
+      unit: By
+      gauge:
+        value_type: int
+      attributes: [signal, table]
+
     otelcol_exporter_bigquery_inflight_requests:
       enabled: true
       stability: development
@@ -235,6 +270,7 @@ attributes:
     type: string
     enum:
       - quota_exhausted
+      - oversize_request
       - unavailable
       - internal
       - permission_denied
@@ -298,3 +334,19 @@ attributes:
       - logs
       - metrics
       - spans
+
+  table:
+    description: >-
+      The configured destination BigQuery table ID for the signal writer.
+      Bounded by configuration (one table per signal exporter).
+    type: string
+
+  trigger:
+    description: >-
+      What caused an adaptive AIMD backpressure transition. Bounded by
+      construction; this enumeration is the whole domain.
+    type: string
+    enum:
+      - latency
+      - recovery
+      - throttle

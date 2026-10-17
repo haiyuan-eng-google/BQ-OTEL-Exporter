@@ -76,3 +76,25 @@ func BenchmarkSplitRequests(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkAppendSplitWithBackpressure(b *testing.B) {
+	rows := make([][]byte, 100)
+	for i := range rows {
+		rows[i] = bytes.Repeat([]byte("x"), 32*1024)
+	}
+	ctrl := NewBackpressureController(BackpressureOptions{
+		MinRequestBytes:     256 * 1024,
+		MaxRequestBytes:     900 * 1024,
+		MinInflightRequests: 1,
+		MaxInflightRequests: 8,
+	})
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		chunks := SplitRequests(rows, ctrl.EffectiveRequestBytes())
+		if len(chunks) == 0 {
+			b.Fatal("expected non-empty chunks")
+		}
+	}
+}

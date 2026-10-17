@@ -27,6 +27,8 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/otel/metric/noop"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.uber.org/zap"
 	"google.golang.org/api/option"
 
@@ -1297,5 +1299,169 @@ func TestVerticalSliceViewsReconcileOnRestart(t *testing.T) {
 		if state != reconciled[id] {
 			t.Errorf("%s was written although it was current: %+v, want %+v", id, state, reconciled[id])
 		}
+	}
+}
+
+func TestVerticalSliceAdaptiveBackpressureThrottleAndRecovery(t *testing.T) {
+	srv := bqfake.NewServer(t)
+	wireFakeHooks(t, srv)
+
+	cfg := validConfig()
+	cfg.Project = "my-project"
+	cfg.Dataset = "otel"
+	cfg.Location = "US"
+	cfg.AutoCreate.Dataset = true
+	cfg.AutoCreate.Tables = true
+	cfg.Write.MaxRequestBytes = 8000
+	cfg.Write.MaxRowBytes = 4000
+	cfg.Write.MaxInflightRequests = 4
+	cfg.Write.Backpressure = BackpressureConfig{
+		Enabled:             true,
+		MinRequestBytes:     2000,
+		MinInflightRequests: 1,
+		DecreaseFactor:      0.5,
+		RecoveryInterval:    5 * time.Millisecond,
+		LatencyThreshold:    0,
+	}
+
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+
+	res := pcommon.NewResource()
+	res.Attributes().PutStr("service.instance.id", "collector-pod-bp")
+	settings := component.TelemetrySettings{
+		Logger:        zap.NewNop(),
+		MeterProvider: mp,
+		Resource:      res,
+	}
+
+	ctx := context.Background()
+	tracesExp, err := newTracesExporter(settings, cfg)
+	if err != nil {
+		t.Fatalf("newTracesExporter: %v", err)
+	}
+	if err := tracesExp.start(ctx, nil); err != nil {
+		t.Fatalf("tracesExporter.start: %v", err)
+	}
+	t.Cleanup(func() { _ = tracesExp.shutdown(context.Background()) })
+
+	td := ptrace.NewTraces()
+	rs := td.ResourceSpans().AppendEmpty()
+	rs.Resource().Attributes().PutStr("service.name", "bp-service")
+	ss := rs.ScopeSpans().AppendEmpty()
+	payload := strings.Repeat("x", 600)
+	for i := range 6 {
+		sp := ss.Spans().AppendEmpty()
+		sp.SetTraceID([16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, byte(i + 1)})
+		sp.SetSpanID([8]byte{1, 2, 3, 4, 5, 6, 7, byte(i + 1)})
+		sp.SetName("bp-span")
+		sp.SetStartTimestamp(pcommon.Timestamp(1_700_000_000_000_000_000))
+		sp.SetEndTimestamp(pcommon.Timestamp(1_700_000_001_000_000_000))
+		sp.Attributes().PutStr("payload", payload)
+	}
+
+	srv.EnqueueFault(bqfake.Fault{
+		Mode:    bqfake.FaultResourceExhausted,
+		Table:   "otel_spans",
+		Message: "Exceeds 'AppendRows throughput' quota for project my-project",
+	})
+
+	err = tracesExp.pushTraceData(ctx, td)
+	if err == nil {
+		t.Fatal("first pushTraceData under ResourceExhausted succeeded, want retryable error")
+	}
+	if consumererror.IsPermanent(err) {
+		t.Fatalf("first pushTraceData returned permanent error: %v", err)
+	}
+	if got := len(srv.Rows("otel_spans")); got != 0 {
+		t.Fatalf("otel_spans rows after throttled attempt = %d, want 0", got)
+	}
+
+	var rmThrottled metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &rmThrottled); err != nil {
+		t.Fatalf("reader.Collect after throttle: %v", err)
+	}
+	var throttledLevel float64
+	var throttledBytes int64
+	for _, sm := range rmThrottled.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			switch m.Name {
+			case "otelcol_exporter_bigquery_backpressure_level":
+				if g, ok := m.Data.(metricdata.Gauge[float64]); ok && len(g.DataPoints) > 0 {
+					throttledLevel = g.DataPoints[0].Value
+				}
+			case "otelcol_exporter_bigquery_effective_request_bytes":
+				if g, ok := m.Data.(metricdata.Gauge[int64]); ok && len(g.DataPoints) > 0 {
+					throttledBytes = g.DataPoints[0].Value
+				}
+			}
+		}
+	}
+	if throttledLevel <= 0 {
+		t.Fatalf("backpressure_level gauge after throttle = %v, want > 0", throttledLevel)
+	}
+	if throttledBytes != 4000 {
+		t.Fatalf("effective_request_bytes gauge after throttle = %d, want 4000", throttledBytes)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+
+	if err := tracesExp.pushTraceData(ctx, td); err != nil {
+		t.Fatalf("second pushTraceData (exporterhelper retry) failed: %v", err)
+	}
+	if got := len(srv.Rows("otel_spans")); got != 6 {
+		t.Fatalf("otel_spans rows after retry = %d, want 6", got)
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &rm); err != nil {
+		t.Fatalf("reader.Collect: %v", err)
+	}
+	seenMetrics := map[string]bool{}
+	var throttleEvents, recoveryEvents int64
+	var recoveredBytes int64
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			seenMetrics[m.Name] = true
+			switch m.Name {
+			case "otelcol_exporter_bigquery_effective_request_bytes":
+				if g, ok := m.Data.(metricdata.Gauge[int64]); ok && len(g.DataPoints) > 0 {
+					recoveredBytes = g.DataPoints[0].Value
+				}
+			case "otelcol_exporter_bigquery_backpressure_events":
+				sum, ok := m.Data.(metricdata.Sum[int64])
+				if !ok {
+					t.Fatalf("backpressure_events data = %T, want Sum[int64]", m.Data)
+				}
+				for _, dp := range sum.DataPoints {
+					trig, _ := dp.Attributes.Value("trigger")
+					switch trig.AsString() {
+					case "throttle":
+						throttleEvents += dp.Value
+					case "recovery":
+						recoveryEvents += dp.Value
+					}
+				}
+			}
+		}
+	}
+	for _, want := range []string{
+		"otelcol_exporter_bigquery_backpressure_level",
+		"otelcol_exporter_bigquery_effective_request_bytes",
+		"otelcol_exporter_bigquery_backpressure_events",
+	} {
+		if !seenMetrics[want] {
+			t.Errorf("expected metric %s to be emitted, got %v", want, seenMetrics)
+		}
+	}
+	if throttleEvents < 1 {
+		t.Errorf("throttle backpressure events = %d, want >= 1", throttleEvents)
+	}
+	if recoveryEvents < 1 {
+		t.Errorf("recovery backpressure events = %d, want >= 1", recoveryEvents)
+	}
+	if recoveredBytes <= throttledBytes {
+		t.Errorf("effective_request_bytes after recovery = %d, want > %d", recoveredBytes, throttledBytes)
 	}
 }

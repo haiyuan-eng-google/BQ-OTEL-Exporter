@@ -210,6 +210,39 @@ func TestPermissionHintNamesThePermission(t *testing.T) {
 	}
 }
 
+func TestClassifySubRequestOversizeWithBackpressure(t *testing.T) {
+	oversizeErr := status.Error(codes.ResourceExhausted, "Request payload size exceeds the limit: 10485760 bytes.")
+
+	t.Run("multi-row oversize when split can still shrink is retryable", func(t *testing.T) {
+		v := ClassifySubRequest(oversizeErr, 4, true)
+		if v.Class != Retryable || v.Owner != OwnerExporterHelper || v.Label != LabelOversizeRequest {
+			t.Fatalf("ClassifySubRequest(multi-row, canSplitSmaller=true) = %+v, want {Retryable, OwnerExporterHelper, oversize_request}", v)
+		}
+	})
+
+	t.Run("single-row oversize when split can still shrink stays permanent", func(t *testing.T) {
+		v := ClassifySubRequest(oversizeErr, 1, true)
+		if v.Class != Permanent || v.Owner != OwnerExporter || v.Label != LabelQuota {
+			t.Fatalf("ClassifySubRequest(single-row, canSplitSmaller=true) = %+v, want {Permanent, OwnerExporter, quota_exhausted}", v)
+		}
+	})
+
+	t.Run("multi-row oversize at floor or with backpressure disabled stays permanent", func(t *testing.T) {
+		v := ClassifySubRequest(oversizeErr, 4, false)
+		if v.Class != Permanent || v.Owner != OwnerExporter || v.Label != LabelQuota {
+			t.Fatalf("ClassifySubRequest(multi-row, canSplitSmaller=false) = %+v, want {Permanent, OwnerExporter, quota_exhausted}", v)
+		}
+	})
+
+	t.Run("throughput quota exhaustion with backpressure enabled stays quota_exhausted", func(t *testing.T) {
+		quotaErr := status.Error(codes.ResourceExhausted, throughputQuotaPrefix+" for project x")
+		v := ClassifySubRequest(quotaErr, 4, true)
+		if v.Class != Retryable || v.Owner != OwnerExporterHelper || v.Label != LabelQuota {
+			t.Fatalf("ClassifySubRequest(throughput quota, enabled) = %+v, want {Retryable, OwnerExporterHelper, quota_exhausted}", v)
+		}
+	})
+}
+
 func contains(s, sub string) bool {
 	return len(s) >= len(sub) && (func() bool {
 		for i := 0; i+len(sub) <= len(s); i++ {

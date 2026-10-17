@@ -96,6 +96,13 @@ exporters:
         permit_without_stream: true
         time: 30s
         timeout: 10s
+      backpressure:
+        enabled: true
+        min_request_bytes: 1048576
+        min_inflight_requests: 1
+        decrease_factor: 0.5
+        recovery_interval: 10s
+        latency_threshold: 2s
     limits:
       max_attribute_count: 1024
       max_event_count: 1024
