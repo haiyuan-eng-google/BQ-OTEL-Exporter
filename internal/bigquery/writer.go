@@ -580,7 +580,6 @@ func (w *Writer) recordCleanOrSlowAck(elapsed time.Duration, gen *streamGenerati
 	if bp == nil {
 		return
 	}
-	bp.ObserveAckLatency(elapsed)
 	if bp.LatencyThreshold() > 0 && elapsed > bp.LatencyThreshold() {
 		if bp.OnSlowAck(elapsed) {
 			w.observeBackpressureTransition("latency")
@@ -589,7 +588,16 @@ func (w *Writer) recordCleanOrSlowAck(elapsed time.Duration, gen *streamGenerati
 	}
 	if bp.OnCleanAck(elapsed) {
 		w.mu.Lock()
+		// The larger window applies to every generation. gen may already be
+		// retired and draining while callers wait for a slot on the current
+		// generation, so wake those waiters too rather than leaving them until
+		// the current generation's next slot release. Only the current
+		// generation can be live; waiters on a retired one have already left
+		// through retiredDone.
 		w.notifySlotChangeLocked(gen)
+		if cur := w.ms; cur != nil && cur != gen {
+			w.notifySlotChangeLocked(cur)
+		}
 		w.mu.Unlock()
 		w.observeBackpressureTransition("recovery")
 	}
@@ -844,9 +852,6 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 			// Keep draining all other results already dispatched by this call.
 			fail(v, rerr)
 			return
-		}
-		if w.opts.Backpressure != nil {
-			w.opts.Backpressure.ObserveAckLatency(elapsed)
 		}
 		w.finishResult(gen, p.dispatched)
 		w.recordCleanOrSlowAck(elapsed, gen)

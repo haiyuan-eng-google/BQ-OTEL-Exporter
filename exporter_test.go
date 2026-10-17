@@ -2422,6 +2422,32 @@ func metricInt64ByAttr(t *testing.T, reader *sdkmetric.ManualReader, name, attrK
 	return out
 }
 
+// metricFloat64Gauge returns the single data point of a float64 gauge.
+func metricFloat64Gauge(t *testing.T, reader *sdkmetric.ManualReader, name string) float64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != name {
+				continue
+			}
+			gauge, ok := m.Data.(metricdata.Gauge[float64])
+			if !ok {
+				t.Fatalf("metric %s data = %T, want float64 gauge", name, m.Data)
+			}
+			if len(gauge.DataPoints) != 1 {
+				t.Fatalf("metric %s has %d data points, want 1", name, len(gauge.DataPoints))
+			}
+			return gauge.DataPoints[0].Value
+		}
+	}
+	t.Fatalf("metric %s was not recorded", name)
+	return 0
+}
+
 // slowQuarantineStore is a payload store whose every upload outlasts a 10 ms
 // quarantine budget, and that counts the uploads it was asked for.
 func slowQuarantineStore(calls *atomic.Int32) funcBlobStore {
@@ -3277,12 +3303,22 @@ func TestShutdownFlushWithReducedWindow(t *testing.T) {
 			cfg.Write.Backpressure.DecreaseFactor = 0.5
 			cfg.Write.Backpressure.RecoveryInterval = time.Minute
 			cfg.Write.Backpressure.LatencyThreshold = 2 * time.Second
+			// backpressure_level reports the larger of the byte and in-flight
+			// pressures. A byte floor below the 1 MiB threshold that three
+			// step-downs reach keeps the byte pressure under 1, so the gauge
+			// reads 1 exactly when EffectiveInflightRequests() is at its floor
+			// of 1. The byte threshold itself is the same 1 MiB as with the
+			// default floor.
+			cfg.Write.Backpressure.MinRequestBytes = 256 * 1024
 
 			if err := cfg.Validate(); err != nil {
 				t.Fatalf("cfg.Validate: %v", err)
 			}
 
-			exp, err := factory.CreateTraces(ctx, exportertest.NewNopSettings(factory.Type()), cfg)
+			reader := sdkmetric.NewManualReader()
+			set := exportertest.NewNopSettings(factory.Type())
+			set.MeterProvider = sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+			exp, err := factory.CreateTraces(ctx, set, cfg)
 			if err != nil {
 				t.Fatalf("CreateTraces: %v", err)
 			}
@@ -3339,7 +3375,18 @@ func TestShutdownFlushWithReducedWindow(t *testing.T) {
 				}
 			}
 
-			shutdownCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			if tc.stepWindowToFloor {
+				// Recovery needs a clean acknowledgement a minute after the
+				// last step-down, so the window is still at its floor while
+				// the queue drains.
+				if got := metricFloat64Gauge(t, reader, "otelcol_exporter_bigquery_backpressure_level"); got != 1 {
+					t.Fatalf("backpressure_level before Shutdown = %v, want 1 (EffectiveInflightRequests() at its floor of 1)", got)
+				}
+			}
+
+			// A generous budget: under CPU starvation 48 delayed acks through a
+			// window of 1 take several times their nominal second.
+			shutdownCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			defer cancel()
 			if err := exp.Shutdown(shutdownCtx); err != nil {
 				t.Fatalf("Shutdown: %v", err)
@@ -3390,20 +3437,24 @@ func TestSlowAckThenFastServiceRowConservation(t *testing.T) {
 		}
 	}
 
+	// Tripwire for the removed early shed, which failed batches with
+	// error_code=backpressure before their timeout expired. No code produces
+	// that label any more, so it is matched as a literal.
+	const removedShedLabel = "backpressure"
 	assertZeroBackpressureLogs := func(t *testing.T, logs *observer.ObservedLogs) {
 		t.Helper()
 		var bpErrors int
 		for _, entry := range logs.FilterMessage("append failed").All() {
-			if entry.ContextMap()["error_code"] == bqi.LabelBackpressure {
+			if entry.ContextMap()["error_code"] == removedShedLabel {
 				bpErrors++
 			}
 		}
 		if bpErrors != 0 {
-			t.Fatalf("captured %d append failed log entries with error_code=%s, want 0", bpErrors, bqi.LabelBackpressure)
+			t.Fatalf("captured %d append failed log entries with error_code=%s, want 0", bpErrors, removedShedLabel)
 		}
 	}
 
-	t.Run("slow_ack_warmup_exceeding_reserve_48_spans_20ms", func(t *testing.T) {
+	t.Run("slow_ack_warmup_48_spans_20ms", func(t *testing.T) {
 		for _, retriesEnabled := range []bool{true, false} {
 			name := "retries_enabled_shutdown"
 			if !retriesEnabled {
@@ -3456,8 +3507,9 @@ func TestSlowAckThenFastServiceRowConservation(t *testing.T) {
 					_ = exp.Shutdown(cCtx)
 				})
 
-				// Warmup ack takes 2.2s (> 500ms threshold) on a 3s timeout, so
-				// 1.5x the slow-ack estimate (3.3s) exceeds the 3s attempt timeout.
+				// The 2.2s warmup ack exceeds the 500ms latency threshold and
+				// steps the window down. The 48 spans that follow, acknowledged
+				// in 20ms, must all be stored within the 3s attempt timeout.
 				srv.EnqueueFault(bqfake.Fault{
 					Mode:  bqfake.FaultDelayedAck,
 					Table: "otel_spans",
@@ -3506,7 +3558,7 @@ func TestSlowAckThenFastServiceRowConservation(t *testing.T) {
 		}
 	})
 
-	t.Run("probe_e_3400ms_warmup_100_span_split_batch", func(t *testing.T) {
+	t.Run("slow_ack_3400ms_warmup_100_span_split_batch", func(t *testing.T) {
 		for _, retriesEnabled := range []bool{false, true} {
 			name := "retries_disabled"
 			if retriesEnabled {
@@ -3585,7 +3637,7 @@ func TestSlowAckThenFastServiceRowConservation(t *testing.T) {
 		}
 	})
 
-	t.Run("probe_e_slot_3400ms_warmup_eight_1_span_batches", func(t *testing.T) {
+	t.Run("slow_ack_3400ms_warmup_eight_1_span_batches", func(t *testing.T) {
 		for _, retriesEnabled := range []bool{false, true} {
 			name := "retries_disabled"
 			if retriesEnabled {

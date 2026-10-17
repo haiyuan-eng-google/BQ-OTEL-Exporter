@@ -86,7 +86,6 @@ type Verdict struct {
 const (
 	LabelQuota           = "quota_exhausted"
 	LabelOversizeRequest = "oversize_request"
-	LabelBackpressure    = "backpressure"
 	LabelUnavailable     = "unavailable"
 	LabelInternal        = "internal"
 	LabelPermission      = "permission_denied"

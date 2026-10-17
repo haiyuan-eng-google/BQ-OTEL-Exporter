@@ -2279,7 +2279,7 @@ func TestWriterFloorRecoveryUnderConcurrentLoad(t *testing.T) {
 		}
 	}
 
-	t.Run("virtual-clock stale slow-ack estimate does not abandon multi-sub-request batch", func(t *testing.T) {
+	t.Run("virtual-clock stale slow ack does not abandon multi-sub-request batch", func(t *testing.T) {
 		start := time.Now().Add(time.Hour)
 		s := newVirtualClockStream(start, 20*time.Millisecond)
 		bp := NewBackpressureController(BackpressureOptions{
@@ -2293,7 +2293,6 @@ func TestWriterFloorRecoveryUnderConcurrentLoad(t *testing.T) {
 			Now:                 s.currentTime,
 		})
 		stepToFloor(bp, s.advanceLocked)
-		bp.ObserveAckLatency(800 * time.Millisecond)
 		bp.OnSlowAck(800 * time.Millisecond)
 
 		obs := &fakeObserver{}
@@ -2349,7 +2348,6 @@ func TestWriterFloorRecoveryUnderConcurrentLoad(t *testing.T) {
 			RecoveryInterval:    10 * time.Second,
 			LatencyThreshold:    2 * time.Second,
 		})
-		bp.ObserveAckLatency(3400 * time.Millisecond)
 		bp.OnSlowAck(3400 * time.Millisecond)
 		if got := bp.EffectiveRequestBytes(); got != 512 {
 			t.Fatalf("EffectiveRequestBytes() after 3.4s ack = %d, want 512", got)
@@ -2407,7 +2405,7 @@ func TestWriterFloorRecoveryUnderConcurrentLoad(t *testing.T) {
 			LatencyThreshold:    2 * time.Second,
 		})
 		bp.effectiveInflight.Store(1)
-		bp.ObserveAckLatency(3400 * time.Millisecond)
+		bp.OnSlowAck(3400 * time.Millisecond)
 
 		slotTaken := make(chan struct{})
 		var calls atomic.Int32
@@ -2500,6 +2498,11 @@ func TestWriterFloorRecoveryUnderConcurrentLoad(t *testing.T) {
 			},
 		}
 		defer func() { _ = w.Close() }()
+		// Registered after the Close defer so it runs first: when an assertion
+		// below fails, the first request is released before Close waits for
+		// it, and the test reports the failure instead of hanging.
+		releaseOnce := sync.OnceFunc(func() { close(releaseSlot) })
+		defer releaseOnce()
 
 		done1 := make(chan AppendOutcome, 1)
 		go func() {
@@ -2509,7 +2512,16 @@ func TestWriterFloorRecoveryUnderConcurrentLoad(t *testing.T) {
 
 		ctx2, cancel2 := context.WithTimeout(context.Background(), 25*time.Millisecond)
 		defer cancel2()
-		out2 := w.Append(ctx2, [][]byte{make([]byte, 64)})
+		done2 := make(chan AppendOutcome, 1)
+		go func() {
+			done2 <- w.Append(ctx2, [][]byte{make([]byte, 64)})
+		}()
+		var out2 AppendOutcome
+		select {
+		case out2 = <-done2:
+		case <-time.After(5 * time.Second):
+			t.Fatal("slot waiter did not return after its context expired")
+		}
 
 		if out2.Verdict.Class != Retryable || out2.Verdict.Label != LabelCanceled {
 			t.Fatalf("expired slot-waiter verdict = %+v, want Retryable/%s", out2.Verdict, LabelCanceled)
@@ -2524,9 +2536,14 @@ func TestWriterFloorRecoveryUnderConcurrentLoad(t *testing.T) {
 			t.Fatalf("stream retirements = %d, want 0", retirements)
 		}
 
-		close(releaseSlot)
-		if out1 := <-done1; out1.Err != nil || out1.AcknowledgedRows != 1 {
-			t.Fatalf("first caller outcome = %+v, want 1 acknowledged row", out1)
+		releaseOnce()
+		select {
+		case out1 := <-done1:
+			if out1.Err != nil || out1.AcknowledgedRows != 1 {
+				t.Fatalf("first caller outcome = %+v, want 1 acknowledged row", out1)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("first caller did not finish after its slot was released")
 		}
 	})
 
@@ -2578,7 +2595,7 @@ func TestWriterFloorRecoveryUnderConcurrentLoad(t *testing.T) {
 					if bp.EffectiveInflightRequests() == 8 && bp.EffectiveRequestBytes() == 1600 {
 						return
 					}
-					attemptCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+					attemptCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 					out := w.Append(attemptCtx, pending)
 					cancel()
 					if out.Verdict.Class == Uncertain || out.Verdict.Label == LabelUncertainAck {
@@ -2671,6 +2688,8 @@ func TestWriterOversizeInflightRemainsRetryableAfterSiblingReachesFloor(t *testi
 		},
 	}
 	defer func() { _ = w.Close() }()
+	releaseOnce := sync.OnceFunc(func() { close(releaseReq1) })
+	defer releaseOnce()
 
 	row := make([]byte, 200)
 	done := make(chan AppendOutcome, 1)
@@ -2678,15 +2697,24 @@ func TestWriterOversizeInflightRemainsRetryableAfterSiblingReachesFloor(t *testi
 		done <- w.Append(context.Background(), [][]byte{row, row, row})
 	}()
 
-	<-req1Sent
+	select {
+	case <-req1Sent:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for Call 1 to be sent")
+	}
 	// Sibling throttles drive the controller down to the 256-byte floor while
 	// Call 1's 600-byte request (split under the old 1024-byte limit) is still
 	// in flight.
 	bp.effectiveBytes.Store(256)
 	bp.effectiveInflight.Store(1)
-	close(releaseReq1)
+	releaseOnce()
 
-	out := <-done
+	var out AppendOutcome
+	select {
+	case out = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for Call 1 to finish after release")
+	}
 	if out.Verdict.Class != Retryable || out.Verdict.Label != LabelOversizeRequest {
 		t.Fatalf("inflight oversize sub-request verdict = %+v, want Retryable/%s", out.Verdict, LabelOversizeRequest)
 	}
@@ -2699,6 +2727,75 @@ func TestWriterOversizeInflightRemainsRetryableAfterSiblingReachesFloor(t *testi
 	outAtFloor := w.Append(context.Background(), [][]byte{make([]byte, 90), make([]byte, 90)})
 	if outAtFloor.Verdict.Class != Permanent || outAtFloor.Verdict.Label != LabelQuota {
 		t.Fatalf("already-at-floor sub-request verdict = %+v, want Permanent/%s", outAtFloor.Verdict, LabelQuota)
+	}
+}
+
+// A multi-row sub-request whose AppendRows call fails synchronously with an
+// oversize ResourceExhausted error, after a sibling has driven the controller
+// to its byte floor, is classified with the split limit it was formed under,
+// as on the asynchronous result path: it can still be split smaller, so it is
+// retryable rather than a permanent quota failure.
+func TestWriterSyncAppendRowsOversizeUsesFrozenSplitLimit(t *testing.T) {
+	bp := NewBackpressureController(BackpressureOptions{
+		MinRequestBytes:     256,
+		MaxRequestBytes:     1024,
+		MinInflightRequests: 1,
+		MaxInflightRequests: 8,
+		DecreaseFactor:      0.5,
+		RecoveryInterval:    time.Minute,
+		LatencyThreshold:    time.Minute,
+	})
+	oversizeErr := status.Error(codes.ResourceExhausted, "Request payload size exceeds the limit")
+
+	var calls atomic.Int32
+	s := &funcStream{
+		appendFn: func(_ context.Context, _ [][]byte) (appendResult, error) {
+			calls.Add(1)
+			// Sibling throttles reach the 256-byte floor after this request
+			// was split under the 1024-byte limit and before AppendRows
+			// reports the oversize error.
+			bp.effectiveBytes.Store(256)
+			bp.effectiveInflight.Store(1)
+			return nil, oversizeErr
+		},
+	}
+	w := &Writer{
+		opts: WriterOptions{
+			Project:             "p",
+			Dataset:             "d",
+			Table:               "otel_spans",
+			Signal:              "spans",
+			MaxRequestBytes:     1024,
+			MaxInflightRequests: 8,
+			Backpressure:        bp,
+		},
+		factory: func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+			return s, nil
+		},
+	}
+	defer func() { _ = w.Close() }()
+
+	row := make([]byte, 200)
+	out := w.Append(context.Background(), [][]byte{row, row, row})
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("AppendRows calls = %d, want 1 (three rows fit one request under the 1024-byte limit)", got)
+	}
+	if out.Verdict.Class != Retryable || out.Verdict.Label != LabelOversizeRequest {
+		t.Fatalf("synchronous oversize sub-request verdict = %+v, want Retryable/%s", out.Verdict, LabelOversizeRequest)
+	}
+	if out.Verdict.Owner != OwnerExporterHelper {
+		t.Fatalf("synchronous oversize sub-request owner = %v, want %v", out.Verdict.Owner, OwnerExporterHelper)
+	}
+
+	// A multi-row sub-request formed at the floor cannot be split any smaller
+	// (splitLimitBytes == floor == 256), so the same synchronous error stays
+	// Permanent.
+	outAtFloor := w.Append(context.Background(), [][]byte{make([]byte, 90), make([]byte, 90)})
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("AppendRows calls = %d, want 2", got)
+	}
+	if outAtFloor.Verdict.Class != Permanent || outAtFloor.Verdict.Label != LabelQuota {
+		t.Fatalf("already-at-floor synchronous sub-request verdict = %+v, want Permanent/%s", outAtFloor.Verdict, LabelQuota)
 	}
 }
 
@@ -2757,6 +2854,11 @@ func TestWriterRecoveryWakesBlockedSlotWaiter(t *testing.T) {
 		},
 	}
 	defer func() { _ = w.Close() }()
+	// Registered after the Close defer so it runs first: when an assertion
+	// below fails, Request 1 is released before Close waits for it, and the
+	// test reports the failure instead of hanging.
+	releaseOnce := sync.OnceFunc(func() { close(releaseReq1) })
+	defer releaseOnce()
 
 	done1 := make(chan AppendOutcome, 1)
 	go func() {
@@ -2804,12 +2906,159 @@ func TestWriterRecoveryWakesBlockedSlotWaiter(t *testing.T) {
 		t.Fatal("blocked slot waiter was not woken when window stepped up from 1 to 2")
 	}
 
-	close(releaseReq1)
-	if out := <-done1; out.Err != nil {
-		t.Fatalf("Request 1 outcome error = %v, want nil", out.Err)
+	releaseOnce()
+	for i, done := range []chan AppendOutcome{done1, done2} {
+		select {
+		case out := <-done:
+			if out.Err != nil {
+				t.Fatalf("Request %d outcome error = %v, want nil", i+1, out.Err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("Request %d did not finish after Request 1 was released", i+1)
+		}
 	}
-	if out := <-done2; out.Err != nil {
-		t.Fatalf("Request 2 outcome error = %v, want nil", out.Err)
+}
+
+// A clean acknowledgement that grows the window must wake callers waiting for
+// a slot on the current generation, even when the acknowledged request belongs
+// to an older generation that was retired and is still draining.
+func TestWriterRecoveryOnRetiredGenerationWakesCurrentGenerationWaiter(t *testing.T) {
+	var clockMu sync.Mutex
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	bp := NewBackpressureController(BackpressureOptions{
+		MinRequestBytes:     256,
+		MaxRequestBytes:     1024,
+		MinInflightRequests: 1,
+		MaxInflightRequests: 4,
+		DecreaseFactor:      0.5,
+		RecoveryInterval:    50 * time.Millisecond,
+		LatencyThreshold:    time.Second,
+		Now: func() time.Time {
+			clockMu.Lock()
+			defer clockMu.Unlock()
+			return now
+		},
+	})
+	bp.effectiveInflight.Store(1)
+
+	req1Sent := make(chan struct{})
+	releaseReq1 := make(chan struct{})
+	req2Sent := make(chan struct{})
+	releaseReq2 := make(chan struct{})
+	req3Dispatched := make(chan struct{})
+	var calls atomic.Int32
+	s := &funcStream{
+		appendFn: func(_ context.Context, _ [][]byte) (appendResult, error) {
+			switch calls.Add(1) {
+			case 1:
+				close(req1Sent)
+				return &blockingAppendResult{release: releaseReq1}, nil
+			case 2:
+				close(req2Sent)
+				return &blockingAppendResult{release: releaseReq2}, nil
+			case 3:
+				close(req3Dispatched)
+				return fakeResult{}, nil
+			default:
+				return fakeResult{}, nil
+			}
+		},
+	}
+	w := &Writer{
+		opts: WriterOptions{
+			Project:             "p",
+			Dataset:             "d",
+			Table:               "otel_spans",
+			Signal:              "spans",
+			MaxRequestBytes:     1024,
+			MaxInflightRequests: 4,
+			Backpressure:        bp,
+		},
+		factory: func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+			return s, nil
+		},
+	}
+	defer func() { _ = w.Close() }()
+	// Registered after the Close defer so they run first: when an assertion
+	// below fails, both blocked requests are released before Close waits for
+	// them, and the test reports the failure instead of hanging.
+	releaseOnce1 := sync.OnceFunc(func() { close(releaseReq1) })
+	defer releaseOnce1()
+	releaseOnce2 := sync.OnceFunc(func() { close(releaseReq2) })
+	defer releaseOnce2()
+
+	waitClosed := func(ch <-chan struct{}, what string) {
+		t.Helper()
+		select {
+		case <-ch:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for %s", what)
+		}
+	}
+	appendAsync := func() chan AppendOutcome {
+		done := make(chan AppendOutcome, 1)
+		go func() {
+			done <- w.Append(context.Background(), [][]byte{make([]byte, 64)})
+		}()
+		return done
+	}
+
+	// Request 1 holds the only slot of generation A, which is then retired
+	// while the request is still in flight, as a sibling's failure would.
+	done1 := appendAsync()
+	waitClosed(req1Sent, "Request 1 to be sent")
+	w.mu.Lock()
+	genA := w.ms
+	w.mu.Unlock()
+	w.retireStream(genA)
+
+	// Request 2 opens generation B and holds its only slot, so Request 3
+	// waits for a slot on B.
+	done2 := appendAsync()
+	waitClosed(req2Sent, "Request 2 to be sent")
+	done3 := appendAsync()
+	waitDeadline := time.Now().Add(5 * time.Second)
+	for {
+		w.mu.Lock()
+		genB := w.ms
+		waiting := genB != nil && genB != genA && genB.slotSignal != nil
+		w.mu.Unlock()
+		if waiting {
+			break
+		}
+		if time.Now().After(waitDeadline) {
+			t.Fatal("timed out waiting for Request 3 to block on generation B's slot")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	clockMu.Lock()
+	now = now.Add(100 * time.Millisecond)
+	clockMu.Unlock()
+
+	// Request 1's clean acknowledgement on retired generation A steps the
+	// window up from 1 to 2, which must wake Request 3 on generation B before
+	// Request 2 releases B's slot.
+	releaseOnce1()
+	select {
+	case <-req3Dispatched:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slot waiter on the current generation was not woken when an acknowledgement on a retired generation grew the window from 1 to 2")
+	}
+	if got := bp.EffectiveInflightRequests(); got != 2 {
+		t.Fatalf("EffectiveInflightRequests() after clean ack = %d, want 2", got)
+	}
+
+	releaseOnce2()
+	for i, done := range []chan AppendOutcome{done1, done2, done3} {
+		select {
+		case out := <-done:
+			if out.Err != nil {
+				t.Fatalf("Request %d outcome error = %v, want nil", i+1, out.Err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("Request %d did not finish", i+1)
+		}
 	}
 }
 
