@@ -11,6 +11,7 @@ deploy/
   helm/bigquery-otel-collector/   Helm chart for Kubernetes / GKE
   cloudrun/service.yaml            Cloud Run v2 service manifest
   terraform/                       Terraform module for BigQuery provisioning
+  continuous-queries/              Continuous Query SQL templates for real-time alerting
 ```
 
 ## Deployment Models
@@ -175,7 +176,7 @@ require a partition filter on queries:
 | `logs_partition_expiration_days` | `0` | `otel_logs` (daily partitions on `timestamp`) |
 | `metrics_partition_expiration_days` | `0` | `otel_metrics` (daily partitions on `timestamp`) |
 | `quarantine_partition_expiration_days` | `30` | `otel_quarantine` (daily partitions on `ingest_time`) |
-| `require_partition_filter` | `false` | All four tables |
+| `require_partition_filter` | `false` | All four tables (and `otel_alerts` when `enable_continuous_queries` is `true`) |
 | `allow_unprunable_views` | `false` | `v_gen_ai_logs` and `v_gen_ai_metric_exemplars`: create them even with `require_partition_filter=true` |
 
 ```bash
@@ -197,8 +198,10 @@ spans table eventually reaches that limit; set
 `spans_partition_expiration_days` to 416 or less to stay under it.
 
 With `require_partition_filter=true`, BigQuery rejects a query over these
-tables, or over the views built on them, that has no filter BigQuery can use
-to skip partitions. See "Filtering the GenAI views by time" under
+tables, over `otel_alerts` (partitioned daily on `event_time`, when
+`enable_continuous_queries=true`), or over the views built on them, that has no
+filter BigQuery can use to skip partitions. See "Filtering the GenAI views by
+time" under
 [Operating v0alpha2 tables](../README.md#operating-v0alpha2-tables) for the
 columns the views take. Queries over `v_gen_ai_logs` and
 `v_gen_ai_metric_exemplars` are rejected even with a filter, because no such
@@ -337,3 +340,66 @@ collector that runs with `auto_create.tables` (see
 [IAM Permissions](#iam-permissions)) sends each column's policy tags back as
 they are in the schema update that adds missing columns, and a restart against
 a table that already has every column sends no update.
+
+### Real-Time Alerting (Continuous Queries)
+
+[`deploy/continuous-queries/`](continuous-queries/README.md) ships three
+stateless per-span BigQuery Continuous Query templates
+(`tool_error_rate_alert.sql`, `token_budget_burn.sql`, and
+`agent_latency_p95.sql`) that evaluate new rows on `otel_spans` via
+`APPENDS(TABLE ...)` and export alerts to Cloud Pub/Sub (with `INSERT INTO` and
+Preview `TUMBLE` window variants in the directory README). Because BigQuery
+`APPENDS` reads base tables and views using `QUALIFY` or window functions are
+ineligible, the templates read `otel_spans` directly rather than
+`otel_spans_dedup` or `v_gen_ai_*`.
+
+Each template includes an `AND start_time >= TIMESTAMP('1970-01-01 00:00:00+00')`
+filter so queries satisfy BigQuery's `require_partition_filter = true`
+requirement without dropping late-arriving, backfilled, or quarantine-replayed
+spans (this constant epoch bound satisfies the static filter requirement rather
+than pruning historical partitions; `APPENDS` itself bounds scan volume by
+commit timestamp `_CHANGE_TIMESTAMP`, whereas `start_time` is the OTLP event
+timestamp preserved across late arrivals and `cmd/bq-quarantine-replay`, with a
+30-day default retention on `otel_quarantine`). BigQuery Continuous Queries do
+not support tables with column-level security policy tags, so Terraform enforces
+a precondition that `enable_column_level_security` is `false` when
+`enable_continuous_queries` is `true`.
+
+Set `enable_continuous_queries=true` in the Terraform module (with
+`service_account_id` at most 27 characters so `<service_account_id>-cq` fits
+Google Cloud's 30-character limit) to provision the
+`otel_alerts` table, Pub/Sub topic, dedicated service account
+(`<service_account_id>-cq`), IAM bindings, and Enterprise `CONTINUOUS`
+reservation assignment:
+
+| Variable | Default | Purpose |
+|:---|:---|:---|
+| `enable_continuous_queries` | `false` | Create `otel_alerts`, the Pub/Sub alert topic, the Continuous Queries service account and IAM bindings, and the `CONTINUOUS` reservation assignment |
+| `continuous_query_slot_capacity` | `100` | Baseline slot capacity for the `CONTINUOUS` reservation (whole multiple of 50 from 50 to 500) |
+| `continuous_query_edition` | `ENTERPRISE` | BigQuery edition for the `CONTINUOUS` reservation: `ENTERPRISE` or `ENTERPRISE_PLUS` |
+| `continuous_query_max_turn_input_tokens` | `100000` | Stateless per-span input token threshold rendered into `token_budget_burn.sql` |
+| `continuous_query_max_turn_output_tokens` | `32000` | Stateless per-span output token threshold rendered into `token_budget_burn.sql` |
+| `continuous_query_max_turn_duration_ms` | `30000` | Stateless per-span duration threshold in milliseconds rendered into `agent_latency_p95.sql` |
+| `alerts_deletion_protection` | `false` | Deletion protection on the `otel_alerts` table |
+| `alerts_partition_expiration_days` | `0` | Partition expiration in days for `otel_alerts` (`0` means no expiration) |
+
+Run from the repository root (or omit `-chdir=deploy/terraform` if already
+inside `deploy/terraform`):
+
+```bash
+terraform -chdir=deploy/terraform apply \
+  -var="project_id=my-project" \
+  -var="enable_continuous_queries=true"
+```
+
+Enable `bigquery.googleapis.com`, `bigqueryreservation.googleapis.com`,
+`pubsub.googleapis.com`, and `iam.googleapis.com` first. Provisioning
+`continuous_query_slot_capacity = 100` creates 100 always-on baseline
+Enterprise slots; create a Pub/Sub subscription on `otel-alerts-<dataset_id>`
+(or the sanitized topic in `otel_alerts_pubsub_topic_id`) to consume published
+alerts. Terraform renders the SQL templates into
+`continuous_queries_rendered_sql` and prints ready-to-run stdin-piped
+`bq query --continuous=true` commands in `continuous_queries_bq_cli_commands`.
+See [`deploy/continuous-queries/README.md`](continuous-queries/README.md) for
+IAM roles, replay/watermark/150-day runtime limits, and downstream
+deduplication on `alert_id`.

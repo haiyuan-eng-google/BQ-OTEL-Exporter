@@ -670,6 +670,27 @@ ON `my-project.otel.otel_metrics` (ALL COLUMNS) OPTIONS (analyzer = 'NO_OP_ANALY
   `timestamp` or `metric_timestamp`. So that a deployment is not left with views no query can use, startup skips `v_gen_ai_logs` and `v_gen_ai_metric_exemplars` with a warning when the `otel_spans` table it finds or creates requires a partition filter, and still creates every other companion view and starts exporting; set `auto_create.allow_unprunable_views: true` (Helm: `bigquery.autoCreateAllowUnprunableViews: true`) to create them anyway. The table's metadata decides, and `traces.require_partition_filter` counts only while `otel_spans` does not exist yet, because it applies only when the table is created. Leave `traces.require_partition_filter` off for a deployment that queries those views, or
   join `otel_logs_dedup` / `v_gen_ai_metrics` against a `start_time`-bounded `otel_spans_dedup`
   subquery directly, which also lets a query choose its own window.
+- **Real-time alerting (`deploy/continuous-queries/`).**
+  [`deploy/continuous-queries/`](deploy/continuous-queries/README.md) provides
+  stateless per-span BigQuery Continuous Query templates
+  (`tool_error_rate_alert.sql`, `token_budget_burn.sql`, and
+  `agent_latency_p95.sql`) that evaluate newly appended rows on `otel_spans`
+  via `APPENDS(TABLE ...)` and stream alerts to Cloud Pub/Sub (with
+  `INSERT INTO` and Preview `TUMBLE` window variants in that README). Each
+  template includes a non-lossy `start_time >= TIMESTAMP('1970-01-01 00:00:00+00')`
+  partition filter so `traces.require_partition_filter` is satisfied without
+  dropping late batches or quarantined replays. `APPENDS` reads base tables rather than
+  `QUALIFY` views, and Continuous Queries do not support column-level security
+  policy tags. Because exporter retries, `APPENDS` lookback replay, and
+  BigQuery automatic reprocessing deliver alerts at-least-once, downstream
+  consumers deduplicate on `alert_id` (`<ALERT_KIND>:<trace_id>:<span_id>` for
+  per-span alerts, or `TOOL_ERROR_WINDOW:<json_struct_key>` via
+  `TO_JSON_STRING(STRUCT(service_name, tool_name, window_start))` in the
+  windowed Preview example).
+  Optional Terraform wiring in
+  [`deploy/terraform`](deploy/README.md#real-time-alerting-continuous-queries)
+  (`enable_continuous_queries=true`) provisions the `otel_alerts` table, Pub/Sub
+  topic, service account, IAM bindings, and `CONTINUOUS` reservation assignment.
 
 ## Delivery semantics
 

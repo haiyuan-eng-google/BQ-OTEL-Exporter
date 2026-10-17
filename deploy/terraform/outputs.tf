@@ -67,3 +67,48 @@ output "data_policy_id" {
   description = "Resource name of the data masking policy on the policy tag, or null unless enable_column_level_security is set"
   value       = var.enable_column_level_security ? google_bigquery_datapolicy_data_policy.sensitive_payload_mask[0].name : null
 }
+
+output "otel_alerts_table_id" {
+  description = "Fully-qualified otel_alerts table ID, or null unless enable_continuous_queries is set"
+  value       = var.enable_continuous_queries ? google_bigquery_table.otel_alerts[0].id : null
+}
+
+output "otel_alerts_pubsub_topic_id" {
+  description = "Fully-qualified Pub/Sub alert topic ID, or null unless enable_continuous_queries is set"
+  value       = var.enable_continuous_queries ? google_pubsub_topic.otel_alerts[0].id : null
+}
+
+output "continuous_queries_service_account_email" {
+  description = "Service account email for BigQuery Continuous Queries, or null unless enable_continuous_queries is set"
+  value       = var.enable_continuous_queries ? google_service_account.continuous_queries[0].email : null
+}
+
+output "continuous_queries_rendered_sql" {
+  description = "Rendered BigQuery Continuous Query SQL templates keyed by template name, or null unless enable_continuous_queries is set"
+  value = var.enable_continuous_queries ? {
+    for name in ["tool_error_rate_alert", "token_budget_burn", "agent_latency_p95"] :
+    name => templatefile("${path.module}/../continuous-queries/${name}.sql", {
+      project_id             = var.project_id
+      dataset_id             = google_bigquery_dataset.otel.dataset_id
+      spans_table            = google_bigquery_table.otel_spans.table_id
+      pubsub_topic           = google_pubsub_topic.otel_alerts[0].name
+      max_turn_input_tokens  = var.continuous_query_max_turn_input_tokens
+      max_turn_output_tokens = var.continuous_query_max_turn_output_tokens
+      max_turn_duration_ms   = var.continuous_query_max_turn_duration_ms
+    })
+  } : null
+}
+
+output "continuous_queries_bq_cli_commands" {
+  description = "Ready-to-run bq query CLI commands (piping SQL on stdin) for each Continuous Query template, or null unless enable_continuous_queries is set"
+  value = var.enable_continuous_queries ? {
+    for name in ["tool_error_rate_alert", "token_budget_burn", "agent_latency_p95"] :
+    name => format(
+      "terraform -chdir=deploy/terraform output -json continuous_queries_rendered_sql | jq -r '.%s' | bq query --project_id=%s --location=%s --use_legacy_sql=false --continuous=true --connection_property=service_account=%s",
+      name,
+      var.project_id,
+      var.location,
+      google_service_account.continuous_queries[0].email,
+    )
+  } : null
+}

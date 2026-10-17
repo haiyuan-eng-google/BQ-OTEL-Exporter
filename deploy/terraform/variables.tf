@@ -45,9 +45,14 @@ variable "quarantine_table" {
 }
 
 variable "service_account_id" {
-  description = "Service account ID for the collector"
+  description = "Service account ID for the collector (6 to 30 characters; at most 27 when enable_continuous_queries is true so -cq fits within 30)"
   type        = string
   default     = "otel-collector"
+
+  validation {
+    condition     = length(var.service_account_id) >= 6 && length(var.service_account_id) <= 30 && can(regex("^[a-z][-a-z0-9]{4,28}[a-z0-9]$", var.service_account_id))
+    error_message = "service_account_id must be 6 to 30 lowercase letters, digits, or hyphens, starting with a letter and ending with a letter or digit."
+  }
 }
 
 variable "grant_auto_create" {
@@ -208,4 +213,90 @@ variable "masked_reader_members" {
   description = "Principals granted the Masked Reader role on the data masking policy, who read the tagged columns masked by masking_rule. The binding is authoritative for that role on the policy. Used only when enable_column_level_security is set."
   type        = list(string)
   default     = []
+}
+
+# --- Real-time alerting (Continuous Queries) ---
+#
+# Off by default. When enable_continuous_queries is set, main.tf provisions the
+# otel_alerts sink table, Pub/Sub alert topic, dedicated service account,
+# least-privilege IAM bindings, and Enterprise CONTINUOUS reservation.
+# The shipped SQL templates are stateless per-span filters; see
+# deploy/continuous-queries/README.md for INSERT INTO and TUMBLE window variants.
+
+variable "enable_continuous_queries" {
+  description = "Provision the opt-in Continuous Queries alerting infrastructure: the otel_alerts table, Pub/Sub alert topic, service account, IAM bindings, and Enterprise CONTINUOUS slot reservation. Needs the BigQuery Reservation, Cloud Pub/Sub, and IAM APIs enabled, and cannot be combined with enable_column_level_security."
+  type        = bool
+  default     = false
+}
+
+variable "continuous_query_slot_capacity" {
+  description = "Baseline slot capacity of the BigQuery reservation created for CONTINUOUS jobs when enable_continuous_queries is set (whole multiple of 50 from 50 to 500; each continuous query job needs at least 10 slots to start, while Enterprise reservation baseline capacity is configured in multiples of 50 up to the 500-slot CONTINUOUS cap)."
+  type        = number
+  default     = 100
+
+  validation {
+    condition     = var.continuous_query_slot_capacity >= 50 && var.continuous_query_slot_capacity <= 500 && var.continuous_query_slot_capacity % 50 == 0 && floor(var.continuous_query_slot_capacity) == var.continuous_query_slot_capacity
+    error_message = "continuous_query_slot_capacity must be a whole multiple of 50 between 50 and 500."
+  }
+}
+
+variable "continuous_query_edition" {
+  description = "BigQuery edition for the CONTINUOUS reservation when enable_continuous_queries is set: ENTERPRISE or ENTERPRISE_PLUS."
+  type        = string
+  default     = "ENTERPRISE"
+
+  validation {
+    condition     = contains(["ENTERPRISE", "ENTERPRISE_PLUS"], var.continuous_query_edition)
+    error_message = "continuous_query_edition must be ENTERPRISE or ENTERPRISE_PLUS."
+  }
+}
+
+variable "continuous_query_max_turn_input_tokens" {
+  description = "Stateless per-span input token threshold rendered into deploy/continuous-queries/token_budget_burn.sql."
+  type        = number
+  default     = 100000
+
+  validation {
+    condition     = var.continuous_query_max_turn_input_tokens > 0 && floor(var.continuous_query_max_turn_input_tokens) == var.continuous_query_max_turn_input_tokens
+    error_message = "continuous_query_max_turn_input_tokens must be a positive whole number."
+  }
+}
+
+variable "continuous_query_max_turn_output_tokens" {
+  description = "Stateless per-span output token threshold rendered into deploy/continuous-queries/token_budget_burn.sql."
+  type        = number
+  default     = 32000
+
+  validation {
+    condition     = var.continuous_query_max_turn_output_tokens > 0 && floor(var.continuous_query_max_turn_output_tokens) == var.continuous_query_max_turn_output_tokens
+    error_message = "continuous_query_max_turn_output_tokens must be a positive whole number."
+  }
+}
+
+variable "continuous_query_max_turn_duration_ms" {
+  description = "Stateless per-span duration threshold in milliseconds rendered into deploy/continuous-queries/agent_latency_p95.sql."
+  type        = number
+  default     = 30000
+
+  validation {
+    condition     = var.continuous_query_max_turn_duration_ms > 0 && floor(var.continuous_query_max_turn_duration_ms) == var.continuous_query_max_turn_duration_ms
+    error_message = "continuous_query_max_turn_duration_ms must be a positive whole number."
+  }
+}
+
+variable "alerts_deletion_protection" {
+  description = "Deletion protection on the otel_alerts table when enable_continuous_queries is set."
+  type        = bool
+  default     = false
+}
+
+variable "alerts_partition_expiration_days" {
+  description = "Partition expiration in days for otel_alerts when enable_continuous_queries is set; 0 means no expiration."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.alerts_partition_expiration_days >= 0 && floor(var.alerts_partition_expiration_days) == var.alerts_partition_expiration_days
+    error_message = "alerts_partition_expiration_days must be a whole number of days, 0 or more."
+  }
 }
