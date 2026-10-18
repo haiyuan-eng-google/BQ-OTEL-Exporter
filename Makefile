@@ -1,6 +1,6 @@
 GOTEST ?= go test
 GOCMD  ?= go
-OCB_VERSION ?= v0.162.0
+OCB_VERSION ?= v0.163.0
 COLLECTOR_DIR ?= otelcol-bq-dist
 COLLECTOR_BIN ?= $(COLLECTOR_DIR)/otelcol-bq
 

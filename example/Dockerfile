@@ -13,7 +13,7 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN GOTOOLCHAIN=local go run go.opentelemetry.io/collector/cmd/builder@v0.162.0 \
+RUN GOTOOLCHAIN=local go run go.opentelemetry.io/collector/cmd/builder@v0.163.0 \
     --config example/otelcol-builder.yaml
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" \
     -o /out/healthcheck ./cmd/healthcheck
