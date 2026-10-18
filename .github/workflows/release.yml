@@ -60,7 +60,7 @@ jobs:
         run: |
           bin="${RUNNER_TEMP}/bin"
           mkdir -p "${bin}"
-          GOBIN="${bin}" GOTOOLCHAIN=local go install go.opentelemetry.io/collector/cmd/builder@v0.162.0
+          GOBIN="${bin}" GOTOOLCHAIN=local go install go.opentelemetry.io/collector/cmd/builder@v0.163.0
           ln -sf "${bin}/builder" "${bin}/ocb"
           echo "${bin}" >> "${GITHUB_PATH}"
           export PATH="${bin}:${PATH}"
