@@ -138,6 +138,7 @@ type Writer struct {
 	appendWG      sync.WaitGroup
 	constructorWG sync.WaitGroup
 	drainWG       sync.WaitGroup
+	teardownWG    sync.WaitGroup
 }
 
 const maxActiveStreamGenerations = 2
@@ -148,8 +149,12 @@ var (
 )
 
 type streamCreation struct {
-	done chan struct{}
-	err  error
+	done      chan struct{}
+	err       error
+	cancel    context.CancelFunc
+	waiters   int
+	aborted   bool
+	completed bool
 }
 
 // streamSlot owns one independent default-stream lifecycle and flow window.
@@ -175,15 +180,22 @@ type streamSlot struct {
 // generation only while it is still its slot's current stream.
 type streamGeneration struct {
 	stream
-	slot        *streamSlot
-	users       int
-	pending     int
-	unresolved  int
-	dispatched  int
-	slotSignal  chan struct{}
-	retired     bool
-	slotHeld    bool
-	retiredDone chan struct{}
+	slot         *streamSlot
+	createCancel context.CancelFunc
+	users        int
+	pending      int
+	unresolved   int
+	dispatched   int
+	slotSignal   chan struct{}
+	retired      bool
+	slotHeld     bool
+	retiredDone  chan struct{}
+
+	teardownMu            sync.Mutex
+	teardownStarted       bool
+	teardownCompleted     bool
+	teardownDeferredBytes int
+	teardownDone          chan struct{}
 }
 
 // clientUsesMultiplexing reports whether client was constructed with
@@ -356,14 +368,28 @@ func (w *Writer) acquireSlotStream(
 		}
 		if !slot.retiring && slot.creation != nil {
 			creation := slot.creation
+			creation.waiters++
 			done := creation.done
 			slot.mu.Unlock()
 			select {
 			case <-ctx.Done():
+				slot.mu.Lock()
+				creation.waiters--
+				if creation.waiters == 0 && !creation.completed && slot.creation == creation {
+					slot.abortStreamCreationLocked(ctx.Err())
+				}
+				slot.mu.Unlock()
 				return nil, false, ctx.Err()
 			case <-done:
-				if creation.err != nil {
-					return nil, false, fmt.Errorf("creating write stream for %s: %w", w.opts.TableID(), creation.err)
+				slot.mu.Lock()
+				creation.waiters--
+				err := creation.err
+				slot.mu.Unlock()
+				if err != nil {
+					if errors.Is(err, errStreamRetired) {
+						continue
+					}
+					return nil, false, fmt.Errorf("creating write stream for %s: %w", w.opts.TableID(), err)
 				}
 				continue
 			}
@@ -384,35 +410,77 @@ func (w *Writer) acquireSlotStream(
 	}
 }
 
+func (s *streamSlot) abortStreamCreationLocked(err error) {
+	c := s.creation
+	if c == nil || c.completed {
+		return
+	}
+	c.aborted = true
+	c.completed = true
+	c.err = err
+	s.creation = nil
+	s.activeGenerations--
+	if c.cancel != nil {
+		c.cancel()
+	}
+	close(c.done)
+	s.notifyGenerationChangeLocked()
+}
+
 func (w *Writer) startSlotStreamCreationLocked(slot *streamSlot) {
-	creation := &streamCreation{done: make(chan struct{})}
+	ownedCtx := slot.ownedCtx
+	if ownedCtx == nil {
+		ownedCtx = context.Background()
+	}
+	createCtx, createCancel := context.WithCancel(ownedCtx)
+	creation := &streamCreation{
+		done:   make(chan struct{}),
+		cancel: createCancel,
+	}
 	slot.creation = creation
 	slot.activeGenerations++
-	ownedCtx := slot.ownedCtx
 	w.constructorWG.Add(1)
 	go func() {
 		defer w.constructorWG.Done()
-		ms, err := w.factory(ownedCtx, w.writerOptions()...)
-		var discard stream
+		ms, err := w.factory(createCtx, w.writerOptions()...)
+		var (
+			discard      stream
+			cancelCreate bool
+		)
 
 		slot.mu.Lock()
+		if creation.aborted || creation.completed {
+			slot.mu.Unlock()
+			createCancel()
+			if ms != nil {
+				_ = ms.Close()
+			}
+			return
+		}
+		creation.completed = true
 		switch {
 		case err != nil:
 			creation.err = err
 			slot.activeGenerations--
-		case slot.closed || ownedCtx.Err() != nil:
+			cancelCreate = true
+		case slot.closed || slot.retiring || ownedCtx.Err() != nil:
 			discard = ms
+			cancelCreate = true
 			creation.err = errWriterClosed
-			if ctxErr := ownedCtx.Err(); ctxErr != nil {
+			if slot.retiring && !slot.closed {
+				creation.err = errStreamRetired
+			} else if ctxErr := ownedCtx.Err(); ctxErr != nil {
 				creation.err = ctxErr
 			}
 			slot.activeGenerations--
 		default:
 			slot.ms = &streamGeneration{
-				stream:      ms,
-				slot:        slot,
-				slotHeld:    true,
-				retiredDone: make(chan struct{}),
+				stream:       ms,
+				slot:         slot,
+				createCancel: createCancel,
+				slotHeld:     true,
+				retiredDone:  make(chan struct{}),
+				teardownDone: make(chan struct{}),
 			}
 		}
 		if slot.creation == creation {
@@ -422,6 +490,9 @@ func (w *Writer) startSlotStreamCreationLocked(slot *streamSlot) {
 		slot.notifyGenerationChangeLocked()
 		slot.mu.Unlock()
 
+		if cancelCreate {
+			createCancel()
+		}
 		if discard != nil {
 			_ = discard.Close()
 		}
@@ -503,6 +574,72 @@ func (w *Writer) trackResult(
 	}()
 }
 
+func (g *streamGeneration) teardownDoneLocked() chan struct{} {
+	if g.teardownDone == nil {
+		g.teardownDone = make(chan struct{})
+	}
+	return g.teardownDone
+}
+
+func (w *Writer) startGenerationTeardownLocked(gen *streamGeneration) {
+	markGenerationRetiredLocked(gen)
+	gen.teardownMu.Lock()
+	_ = gen.teardownDoneLocked()
+	if !gen.teardownStarted {
+		gen.teardownStarted = true
+		w.teardownWG.Add(1)
+	}
+	gen.teardownMu.Unlock()
+}
+
+func (w *Writer) completeGenerationTeardown(gen *streamGeneration) {
+	if gen == nil {
+		return
+	}
+	if gen.createCancel != nil {
+		gen.createCancel()
+	}
+	gen.teardownMu.Lock()
+	_ = gen.teardownDoneLocked()
+	var (
+		deferred  int
+		started   bool
+		completed bool
+	)
+	if !gen.teardownCompleted {
+		gen.teardownCompleted = true
+		deferred = gen.teardownDeferredBytes
+		gen.teardownDeferredBytes = 0
+		started = gen.teardownStarted
+		completed = true
+		close(gen.teardownDone)
+	}
+	gen.teardownMu.Unlock()
+	if deferred > 0 {
+		w.releaseBytes(deferred)
+	}
+	if completed && started {
+		w.teardownWG.Done()
+	}
+}
+
+func (w *Writer) waitGenerationTeardown(ctx context.Context, gen *streamGeneration) {
+	if gen == nil || ctx.Err() != nil {
+		return
+	}
+	gen.teardownMu.Lock()
+	if !gen.teardownStarted || gen.teardownCompleted {
+		gen.teardownMu.Unlock()
+		return
+	}
+	done := gen.teardownDoneLocked()
+	gen.teardownMu.Unlock()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+}
+
 func (w *Writer) retireSlotGeneration(slot *streamSlot, gen *streamGeneration) {
 	if slot == nil || gen == nil {
 		return
@@ -513,11 +650,12 @@ func (w *Writer) retireSlotGeneration(slot *streamSlot, gen *streamGeneration) {
 		return
 	}
 	slot.ms = nil
-	markGenerationRetiredLocked(gen)
+	w.startGenerationTeardownLocked(gen)
 	slot.releaseGenerationSlotLocked(gen)
 	slot.notifyGenerationChangeLocked()
 	slot.mu.Unlock()
 	_ = gen.Close()
+	w.completeGenerationTeardown(gen)
 	if w.opts.Observer != nil {
 		w.opts.Observer.RecordStreamRetirement(context.Background())
 	}
@@ -582,9 +720,6 @@ func (w *Writer) anyGenerationUnresolved(
 func (w *Writer) retireSharedMultiplexedPool(
 	slots []*streamSlot, slot *streamSlot, gen *streamGeneration,
 ) {
-	w.sharedRetireMu.Lock()
-	defer w.sharedRetireMu.Unlock()
-
 	slot.mu.Lock()
 	isCurrent := slot.ms == gen
 	unresolved := gen.unresolved
@@ -601,13 +736,29 @@ func (w *Writer) retireSharedMultiplexedPool(
 		return
 	}
 
-	var creations []<-chan struct{}
+	w.sharedRetireMu.Lock()
+	defer w.sharedRetireMu.Unlock()
+
+	slot.mu.Lock()
+	isCurrent = slot.ms == gen
+	unresolved = gen.unresolved
+	slot.mu.Unlock()
+	if !isCurrent {
+		if unresolved > 0 {
+			for range 100 {
+				if w.generationUnresolved(slot, gen) == 0 {
+					return
+				}
+				time.Sleep(200 * time.Microsecond)
+			}
+		}
+		return
+	}
+
 	for _, s := range slots {
 		s.mu.Lock()
 		s.retiring = true
-		if s.creation != nil {
-			creations = append(creations, s.creation.done)
-		}
+		s.abortStreamCreationLocked(errStreamRetired)
 		s.mu.Unlock()
 	}
 	defer func() {
@@ -619,17 +770,13 @@ func (w *Writer) retireSharedMultiplexedPool(
 		}
 	}()
 
-	for _, done := range creations {
-		<-done
-	}
-
 	detached := make([]*streamGeneration, 0, len(slots))
 	hasUnresolved := w.generationUnresolved(slot, gen) > 0
 	for _, s := range slots {
 		s.mu.Lock()
 		if g := s.ms; g != nil {
 			s.ms = nil
-			markGenerationRetiredLocked(g)
+			w.startGenerationTeardownLocked(g)
 			s.releaseGenerationSlotLocked(g)
 			if g.unresolved > 0 {
 				hasUnresolved = true
@@ -644,6 +791,9 @@ func (w *Writer) retireSharedMultiplexedPool(
 		if w.opts.Observer != nil {
 			w.opts.Observer.RecordStreamRetirement(context.Background())
 		}
+	}
+	for _, g := range detached {
+		w.completeGenerationTeardown(g)
 	}
 
 	if hasUnresolved {
@@ -661,7 +811,9 @@ func markGenerationRetiredLocked(gen *streamGeneration) {
 		return
 	}
 	gen.retired = true
-	close(gen.retiredDone)
+	if gen.retiredDone != nil {
+		close(gen.retiredDone)
+	}
 }
 
 // EffectiveMaxRequestBytes returns the current request split threshold,
@@ -835,9 +987,25 @@ func (w *Writer) waitForDispatchSlot(
 	}
 }
 
+func (w *Writer) releaseBytesAfterGenTeardown(gen *streamGeneration, reqBytes int) {
+	if reqBytes <= 0 {
+		return
+	}
+	if gen != nil {
+		gen.teardownMu.Lock()
+		if gen.teardownStarted && !gen.teardownCompleted {
+			gen.teardownDeferredBytes += reqBytes
+			gen.teardownMu.Unlock()
+			return
+		}
+		gen.teardownMu.Unlock()
+	}
+	w.releaseBytes(reqBytes)
+}
+
 func (w *Writer) releaseDispatchSlot(slot *streamSlot, gen *streamGeneration, reqBytes int) {
 	slot.pending.Add(-1)
-	w.releaseBytes(reqBytes)
+	w.releaseBytesAfterGenTeardown(gen, reqBytes)
 	slot.mu.Lock()
 	gen.dispatched--
 	w.notifySlotChangeLocked(gen)
@@ -1052,6 +1220,7 @@ func (w *Writer) classifyAndRetire(
 	verdict, attemptEnded, siblingTeardown, shouldRetire := w.classifyFailure(ctx, err, slot, gen, req)
 	if shouldRetire {
 		w.retireStream(slot, gen)
+		w.waitGenerationTeardown(ctx, gen)
 	}
 	if attemptEnded {
 		w.observeTimeoutAfterDispatch()
@@ -1667,9 +1836,10 @@ func (w *Writer) Close() error {
 	for _, slot := range slots {
 		slot.mu.Lock()
 		slot.closed = true
+		slot.abortStreamCreationLocked(errWriterClosed)
 		if gen := slot.ms; gen != nil {
 			slot.ms = nil
-			markGenerationRetiredLocked(gen)
+			w.startGenerationTeardownLocked(gen)
 			slot.releaseGenerationSlotLocked(gen)
 			gens = append(gens, gen)
 		}
@@ -1685,12 +1855,14 @@ func (w *Writer) Close() error {
 		if err := gen.Close(); err != nil {
 			errs = append(errs, err)
 		}
+		w.completeGenerationTeardown(gen)
 	}
 	w.constructorWG.Wait()
 	// All Append calls must finish registering any asynchronous result owner
 	// before cancellation and Wait; this ordering avoids Add/Wait races.
 	w.appendWG.Wait()
 	w.drainWG.Wait()
+	w.teardownWG.Wait()
 	err := errors.Join(errs...)
 	w.mu.Lock()
 	w.closeErr = err

@@ -4619,3 +4619,227 @@ func TestWriterStreamPoolSimplexDelayedResultOwnerDoesNotRetireSiblings(t *testi
 		t.Fatalf("stream retirements = %d, want 1 (only the timed-out slot)", retirements)
 	}
 }
+
+func TestWriterStreamPoolOverlapRetirementKeepsReservation(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		cancelSendCtx  bool
+		waitSendReturn bool
+	}{
+		{name: "canceled_append_returns_while_teardown_held", cancelSendCtx: true, waitSendReturn: true},
+		{name: "non_canceled_append_joins_teardown", cancelSendCtx: false, waitSendReturn: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			appendEntered := make(chan struct{})
+			releaseAppend := make(chan struct{})
+			closeEntered := make(chan struct{})
+			allowClose := make(chan struct{})
+
+			var (
+				streamsMade     atomic.Int32
+				nativeBytes     atomic.Int64
+				peakNativeBytes atomic.Int64
+				slot1Dispatched atomic.Int32
+			)
+			recordNative := func(delta int64) {
+				cur := nativeBytes.Add(delta)
+				for {
+					prev := peakNativeBytes.Load()
+					if cur <= prev || peakNativeBytes.CompareAndSwap(prev, cur) {
+						break
+					}
+				}
+			}
+
+			w := &Writer{
+				opts: WriterOptions{
+					Project:             "p",
+					Dataset:             "d",
+					Table:               "t",
+					MaxRequestBytes:     200,
+					MaxInflightRequests: 2,
+					MaxInflightBytes:    221, // exact wire bytes for one 100-byte row
+					StreamPoolSize:      2,
+				},
+				lifetimeCtx: context.Background(),
+			}
+			w.factory = func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+				if streamsMade.Add(1) == 1 {
+					var (
+						appendOnce sync.Once
+						closeOnce  sync.Once
+					)
+					return &funcStream{
+						appendFn: func(ctx context.Context, _ [][]byte) (appendResult, error) {
+							recordNative(221)
+							appendOnce.Do(func() { close(appendEntered) })
+							<-releaseAppend
+							if tc.cancelSendCtx {
+								return nil, ctx.Err()
+							}
+							return nil, status.Error(codes.Canceled, "stream closing")
+						},
+						closeFn: func() error {
+							closeOnce.Do(func() { close(closeEntered) })
+							<-allowClose
+							recordNative(-221)
+							return nil
+						},
+					}, nil
+				}
+				return &funcStream{
+					appendFn: func(context.Context, [][]byte) (appendResult, error) {
+						slot1Dispatched.Add(1)
+						recordNative(221)
+						recordNative(-221)
+						return fakeResult{}, nil
+					},
+				}, nil
+			}
+			defer func() { _ = w.Close() }()
+
+			slots, err := w.beginAppend()
+			if err != nil {
+				t.Fatal(err)
+			}
+			w.appendWG.Done()
+			for i, s := range slots {
+				gen, serr := w.ensureSlotStream(context.Background(), s)
+				if serr != nil {
+					t.Fatalf("warming slot %d: %v", i, serr)
+				}
+				w.releaseGenerationUser(s, gen)
+			}
+
+			slots[0].mu.Lock()
+			gen0 := slots[0].ms
+			slots[0].mu.Unlock()
+
+			row := make([]byte, 100)
+			sendCtx, cancelSend := context.WithCancel(context.Background())
+			defer cancelSend()
+
+			w.nextSlot.Store(0)
+			sendDone := make(chan AppendOutcome, 1)
+			go func() {
+				sendDone <- w.Append(sendCtx, [][]byte{row})
+			}()
+
+			select {
+			case <-appendEntered:
+			case <-time.After(2 * time.Second):
+				t.Fatal("slot 0 AppendRows was not entered")
+			}
+
+			// Start a concurrent retirement on slot 0 while the send is still
+			// inside AppendRows, and wait until gen0.Close() is entered and held.
+			retireDone := make(chan struct{})
+			go func() {
+				defer close(retireDone)
+				w.retireStream(slots[0], gen0)
+			}()
+
+			select {
+			case <-closeEntered:
+			case <-time.After(2 * time.Second):
+				t.Fatal("concurrent retirement did not enter Close()")
+			}
+
+			// Now fail the in-flight AppendRows while Close() is still held.
+			if tc.cancelSendCtx {
+				cancelSend()
+			}
+			close(releaseAppend)
+
+			if tc.waitSendReturn {
+				select {
+				case out0 := <-sendDone:
+					if !errors.Is(out0.Err, context.Canceled) {
+						close(allowClose)
+						t.Fatalf("canceled slot 0 outcome = %+v, want context.Canceled", out0)
+					}
+				case <-time.After(2 * time.Second):
+					close(allowClose)
+					t.Fatal("canceled Append did not return while teardown was held")
+				}
+			}
+
+			// Even after the overlapping AppendRows has returned while Close()
+			// is still held, the 221-byte reservation must remain held until
+			// Close() finishes so a sibling slot cannot raise native residency
+			// above MaxInflightBytes (221).
+			w.mu.Lock()
+			heldBytes := w.inflightBytes
+			w.mu.Unlock()
+			if heldBytes != 221 {
+				close(allowClose)
+				t.Fatalf("inflightBytes while overlapping Close() is held = %d, want 221", heldBytes)
+			}
+
+			w.nextSlot.Store(1)
+			slot1Done := make(chan AppendOutcome, 1)
+			go func() {
+				ctx1, cancel1 := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel1()
+				slot1Done <- w.Append(ctx1, [][]byte{row})
+			}()
+
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				w.mu.Lock()
+				waitingOnBytes := w.byteSignal != nil
+				w.mu.Unlock()
+				if waitingOnBytes {
+					break
+				}
+				if time.Now().After(deadline) {
+					close(allowClose)
+					t.Fatal("slot 1 did not block on w.byteSignal while overlapping Close() was held")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if got := slot1Dispatched.Load(); got != 0 {
+				close(allowClose)
+				t.Fatalf("slot 1 dispatched %d requests while Close() was held, want 0", got)
+			}
+			if peak := peakNativeBytes.Load(); peak > 221 {
+				close(allowClose)
+				t.Fatalf("peak modeled native residency while Close() was held = %d, want <= 221", peak)
+			}
+
+			// Release Close(); deferred bytes must now be refunded and wake slot 1.
+			close(allowClose)
+			<-retireDone
+
+			if !tc.waitSendReturn {
+				select {
+				case out0 := <-sendDone:
+					if out0.Err == nil {
+						t.Fatalf("overlapping slot 0 outcome = %+v, want non-nil error", out0)
+					}
+				case <-time.After(2 * time.Second):
+					t.Fatal("overlapping slot 0 Append did not finish after Close() completed")
+				}
+			}
+
+			select {
+			case out1 := <-slot1Done:
+				if out1.Err != nil || out1.AcknowledgedRows != 1 {
+					t.Fatalf("slot 1 outcome = %+v, want 1 acknowledged row and nil error", out1)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("slot 1 Append did not complete after overlapping Close() finished")
+			}
+
+			if peak := peakNativeBytes.Load(); peak > 221 {
+				t.Fatalf("peak modeled native residency = %d, want <= 221", peak)
+			}
+			w.mu.Lock()
+			finalBytes := w.inflightBytes
+			w.mu.Unlock()
+			if finalBytes != 0 {
+				t.Fatalf("final inflightBytes = %d, want 0", finalBytes)
+			}
+		})
+	}
+}

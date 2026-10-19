@@ -849,3 +849,170 @@ func TestManagedWriterMultiplexingRetiresPrimaryWhenQuarantineHasDedicatedClient
 		t.Fatalf("connections after retirement = %d, want > %d (fresh primary connection)", connsAfter, connsBefore)
 	}
 }
+
+type stalledMetadataServer struct {
+	storagepb.UnimplementedBigQueryWriteServer
+
+	getStreamCalls atomic.Int32
+	secondEntered  chan struct{}
+	secondOnce     sync.Once
+	releaseSecond  chan struct{}
+	noAck          atomic.Bool
+}
+
+func (s *stalledMetadataServer) GetWriteStream(
+	_ context.Context, req *storagepb.GetWriteStreamRequest,
+) (*storagepb.WriteStream, error) {
+	if s.getStreamCalls.Add(1) == 2 {
+		s.secondOnce.Do(func() { close(s.secondEntered) })
+		// Hold the server handler until releaseSecond even if the client
+		// cancels its context so we verify client-side cancellation + non-blocking
+		// retirement.
+		<-s.releaseSecond
+	}
+	return &storagepb.WriteStream{Name: req.GetName(), Location: "us"}, nil
+}
+
+func (s *stalledMetadataServer) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error {
+	for {
+		_, err := srv.Recv()
+		if err != nil {
+			return nil
+		}
+		if s.noAck.Load() {
+			<-srv.Context().Done()
+			return nil
+		}
+		resp := &storagepb.AppendRowsResponse{
+			Response: &storagepb.AppendRowsResponse_AppendResult_{
+				AppendResult: &storagepb.AppendRowsResponse_AppendResult{},
+			},
+		}
+		if err := srv.Send(resp); err != nil {
+			return nil
+		}
+	}
+}
+
+func TestWriterStreamPoolMultiplexRetirementDoesNotWaitForStalledMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		slot1WaiterExpired bool
+	}{
+		{name: "after_slot1_waiter_timeout", slot1WaiterExpired: true},
+		{name: "while_slot1_waiter_still_waiting", slot1WaiterExpired: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lis := bufconn.Listen(1 << 20)
+			backend := &stalledMetadataServer{
+				secondEntered: make(chan struct{}),
+				releaseSecond: make(chan struct{}),
+			}
+			server := grpc.NewServer()
+			storagepb.RegisterBigQueryWriteServer(server, backend)
+			served := make(chan struct{})
+			go func() {
+				defer close(served)
+				_ = server.Serve(lis)
+			}()
+			releaseOnce := sync.OnceFunc(func() { close(backend.releaseSecond) })
+			t.Cleanup(func() {
+				releaseOnce()
+				server.Stop()
+				<-served
+			})
+
+			client := newMultiplexedClientUnderTest(t, lis, 100, 64<<20)
+			w := NewWriter(context.Background(), client, WriterOptions{
+				Project: "p", Dataset: "d", Table: "t",
+				Descriptor:          testRowDescriptor(),
+				MaxRequestBytes:     1200,
+				MaxInflightRequests: 100,
+				MaxInflightBytes:    64 << 20,
+				StreamPoolSize:      2,
+				TraceID:             "writer-test",
+			})
+			t.Cleanup(func() {
+				releaseOnce()
+				_ = w.Close()
+			})
+
+			// 1. Warm Slot 0 (GetWriteStream #1 succeeds, initial AppendRows succeeds).
+			w.nextSlot.Store(0)
+			if out := appendWithin(w, time.Second, rowsOf(1)); out.Err != nil {
+				t.Fatalf("slot 0 warm-up append failed: %v", out.Err)
+			}
+
+			// 2. Trigger Slot 1 stream creation; GetWriteStream #2 is held on the server.
+			w.nextSlot.Store(1)
+			slot1Done := make(chan AppendOutcome, 1)
+			slot1Timeout := 2 * time.Second
+			if tc.slot1WaiterExpired {
+				slot1Timeout = 40 * time.Millisecond
+			}
+			go func() {
+				slot1Done <- appendWithin(w, slot1Timeout, rowsOf(1))
+			}()
+
+			select {
+			case <-backend.secondEntered:
+			case <-time.After(2 * time.Second):
+				t.Fatal("slot 1 GetWriteStream #2 did not reach the server")
+			}
+
+			if tc.slot1WaiterExpired {
+				select {
+				case out1 := <-slot1Done:
+					if !errors.Is(out1.Err, context.DeadlineExceeded) {
+						t.Fatalf("slot 1 timed-out constructor append = %+v, want context.DeadlineExceeded", out1)
+					}
+				case <-time.After(2 * time.Second):
+					t.Fatal("slot 1 Append did not time out while GetWriteStream #2 was held")
+				}
+			}
+
+			// 3. Switch backend to noAck and dispatch an unacknowledged request on
+			// Slot 0 with a 60ms deadline while GetWriteStream #2 is STILL held.
+			backend.noAck.Store(true)
+			w.nextSlot.Store(0)
+			start := time.Now()
+			out0 := appendWithin(w, 60*time.Millisecond, rowsOf(1))
+			elapsed := time.Since(start)
+			if !errors.Is(out0.Err, context.DeadlineExceeded) {
+				t.Fatalf("slot 0 append = %+v, want context.DeadlineExceeded", out0)
+			}
+			if elapsed > 350*time.Millisecond {
+				t.Fatalf("slot 0 retirement blocked for %v while GetWriteStream #2 was stalled, want <= 350ms", elapsed)
+			}
+
+			w.mu.Lock()
+			slots := w.ensureSlotsLocked()
+			w.mu.Unlock()
+			for i, s := range slots {
+				s.mu.Lock()
+				retiring := s.retiring
+				s.mu.Unlock()
+				if retiring {
+					t.Fatalf("slot %d remained stuck with retiring == true after retirement returned", i)
+				}
+			}
+
+			// 4. Release GetWriteStream #2 and restore backend; subsequent appends succeed.
+			backend.noAck.Store(false)
+			releaseOnce()
+			if !tc.slot1WaiterExpired {
+				select {
+				case out1 := <-slot1Done:
+					if out1.Err != nil || out1.AcknowledgedRows != 1 {
+						t.Fatalf("slot 1 append after stalled metadata release = %+v, want 1 acknowledged row", out1)
+					}
+				case <-time.After(2 * time.Second):
+					t.Fatal("slot 1 append did not finish after GetWriteStream #2 was released")
+				}
+			}
+			if out := appendWithin(w, 2*time.Second, rowsOf(1)); out.Err != nil || out.AcknowledgedRows != 1 {
+				t.Fatalf("recovery append after retirement = %+v, want 1 acknowledged row", out)
+			}
+		})
+	}
+}
