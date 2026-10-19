@@ -3094,7 +3094,7 @@ func TestSignalExporterStartBoundsEachMetadataCallRatherThanWholeSequence(t *tes
 		cfg.AutoCreate.CompanionViews = true
 		cfg.AutoCreate.SearchIndexes = true
 		cfg.Quarantine.Enabled = true
-		// 18+ sequential metadata/DDL calls * 15ms > 100ms total, but each
+		// 20+ sequential metadata/DDL calls * 15ms > 100ms total, but each
 		// individual call takes 15ms < 100ms per-call timeout.
 		cfg.TimeoutSettings.Timeout = 100 * time.Millisecond
 
@@ -3102,8 +3102,10 @@ func TestSignalExporterStartBoundsEachMetadataCallRatherThanWholeSequence(t *tes
 		if err := e.start(context.Background(), nil); err != nil {
 			t.Fatalf("start() failed when cumulative cold-start duration exceeded per-call timeout: %v", err)
 		}
-		if admin.createdTables[schema.GenAIAgentTrajectoryViewName] == nil {
-			t.Fatalf("expected %s to be created during cold start", schema.GenAIAgentTrajectoryViewName)
+		for _, viewName := range []string{schema.GenAIAgentTrajectoryViewName, schema.MCPToolUsageViewName} {
+			if admin.createdTables[viewName] == nil {
+				t.Fatalf("expected %s to be created during cold start", viewName)
+			}
 		}
 		e.client = nil
 		e.quarantineClient = nil
@@ -3124,7 +3126,7 @@ func TestSignalExporterStartBoundsEachMetadataCallRatherThanWholeSequence(t *tes
 			datasetMetadataErr: notFound(),
 			tableMetadataErr:   notFound(),
 			blockCreateByID: map[string]bool{
-				schema.GenAIAgentTrajectoryViewName: true,
+				schema.MCPToolUsageViewName: true,
 			},
 		}
 		newDestinationAdmin = func(
@@ -3151,11 +3153,65 @@ func TestSignalExporterStartBoundsEachMetadataCallRatherThanWholeSequence(t *tes
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("start() error = %v, want %v", err, context.DeadlineExceeded)
 		}
-		if !strings.Contains(err.Error(), schema.GenAIAgentTrajectoryViewName) {
-			t.Fatalf("start() error = %q, want it to name %s", err, schema.GenAIAgentTrajectoryViewName)
+		if !strings.Contains(err.Error(), schema.MCPToolUsageViewName) {
+			t.Fatalf("start() error = %q, want it to name %s", err, schema.MCPToolUsageViewName)
 		}
 		if elapsed := time.Since(started); elapsed > time.Second {
 			t.Fatalf("blocking late view creation returned after %v, want < 1s", elapsed)
+		}
+	})
+
+	t.Run("canceling Start ctx cancels an in-flight blocked metadata call", func(t *testing.T) {
+		originalAdmin := newDestinationAdmin
+		originalWriter := newManagedWriterClient
+		t.Cleanup(func() {
+			newDestinationAdmin = originalAdmin
+			newManagedWriterClient = originalWriter
+		})
+
+		admin := &fakeDestinationAdmin{
+			datasetMetadataErr: notFound(),
+			tableMetadataErr:   notFound(),
+			blockCreateByID: map[string]bool{
+				schema.MCPToolUsageViewName: true,
+			},
+		}
+		newDestinationAdmin = func(
+			context.Context, string, string, ...option.ClientOption,
+		) (destinationAdmin, error) {
+			return admin, nil
+		}
+		newManagedWriterClient = func(
+			context.Context, string, ...option.ClientOption,
+		) (*managedwriter.Client, error) {
+			t.Fatal("writer construction must not run after Start ctx is canceled")
+			return nil, nil
+		}
+
+		cfg := companionViewConfig()
+		cfg.AutoCreate.Dataset = true
+		cfg.AutoCreate.Tables = true
+		cfg.AutoCreate.CompanionViews = true
+		cfg.TimeoutSettings.Timeout = 5 * time.Second
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() {
+			time.Sleep(25 * time.Millisecond)
+			cancel()
+		}()
+
+		e := newSignalExporter(componentTelemetryForTest(), cfg, cfg.Traces.Table, schema.SpansTableSchema())
+		started := time.Now()
+		err := e.start(ctx, nil)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("start() error = %v, want %v", err, context.Canceled)
+		}
+		if !strings.Contains(err.Error(), schema.MCPToolUsageViewName) {
+			t.Fatalf("start() error = %q, want it to name %s", err, schema.MCPToolUsageViewName)
+		}
+		if elapsed := time.Since(started); elapsed > time.Second {
+			t.Fatalf("canceled Start ctx returned after %v, want < 1s", elapsed)
 		}
 	})
 }

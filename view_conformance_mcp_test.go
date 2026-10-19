@@ -474,10 +474,35 @@ func TestMCPViewsEdgeCases(t *testing.T) {
 	s5.Attributes().PutStr("gcp.vertex.agent.name", "agent-vertex")
 	s5.Attributes().PutStr("gen_ai.main_agent.name", "agent-main")
 
+	// 6 & 7. Paired CLIENT + SERVER tools/call spans in the same hour bucket
+	// for the same tool must remain separated by span_kind in v_mcp_tool_usage.
+	s6 := ss.Spans().AppendEmpty()
+	s6.SetTraceID(pcommon.TraceID{1})
+	s6.SetSpanID(pcommon.SpanID{6})
+	s6.SetName("tools/call get_schema client")
+	s6.SetKind(ptrace.SpanKindClient)
+	s6.SetStartTimestamp(pcommon.NewTimestampFromTime(baseTime.Add(400 * time.Millisecond)))
+	s6.SetEndTimestamp(pcommon.NewTimestampFromTime(baseTime.Add(480 * time.Millisecond)))
+	s6.Attributes().PutStr("mcp.method.name", "tools/call")
+	s6.Attributes().PutStr("gen_ai.tool.name", "get_schema")
+	s6.Attributes().PutStr("server.address", "mcp.internal")
+
+	s7 := ss.Spans().AppendEmpty()
+	s7.SetTraceID(pcommon.TraceID{1})
+	s7.SetSpanID(pcommon.SpanID{7})
+	s7.SetParentSpanID(pcommon.SpanID{6})
+	s7.SetName("tools/call get_schema server")
+	s7.SetKind(ptrace.SpanKindServer)
+	s7.SetStartTimestamp(pcommon.NewTimestampFromTime(baseTime.Add(410 * time.Millisecond)))
+	s7.SetEndTimestamp(pcommon.NewTimestampFromTime(baseTime.Add(470 * time.Millisecond)))
+	s7.Attributes().PutStr("mcp.method.name", "tools/call")
+	s7.Attributes().PutStr("gen_ai.tool.name", "get_schema")
+	s7.Attributes().PutStr("server.address", "mcp.internal")
+
 	rig.pushTraces(t, td)
 	mcpSpans := mcpSpansView(t, rig.srv.Rows(confSpans))
-	if len(mcpSpans) != 4 {
-		t.Fatalf("edge case v_mcp_spans rows = %d, want 4", len(mcpSpans))
+	if len(mcpSpans) != 6 {
+		t.Fatalf("edge case v_mcp_spans rows = %d, want 6", len(mcpSpans))
 	}
 
 	requireCols(t, "session-only span", onlyRow(t, "session-only", mcpSpans, "span_name", "mcp.session.heartbeat"), map[string]any{
@@ -519,6 +544,42 @@ func TestMCPViewsEdgeCases(t *testing.T) {
 		"top_error_types":          []map[string]any{},
 		"error_rate":               float64(1),
 		"avg_duration_ms":          float64(100),
+	})
+
+	var clientToolRow, serverToolRow map[string]any
+	for _, r := range usage {
+		if r["gen_ai_tool_name"] != "get_schema" {
+			continue
+		}
+		switch r["span_kind"] {
+		case int64(3):
+			clientToolRow = r
+		case int64(2):
+			serverToolRow = r
+		default:
+			t.Fatalf("unexpected span_kind %v for get_schema row", r["span_kind"])
+		}
+	}
+	if clientToolRow == nil || serverToolRow == nil {
+		t.Fatalf("expected separate CLIENT and SERVER usage rows for get_schema, got client=%v server=%v", clientToolRow, serverToolRow)
+	}
+	requireCols(t, "get_schema CLIENT usage", clientToolRow, map[string]any{
+		"mcp_method_name":  "tools/call",
+		"gen_ai_tool_name": "get_schema",
+		"mcp_target_name":  "get_schema",
+		"span_kind":        int64(3),
+		"server_address":   "mcp.internal",
+		"call_count":       int64(1),
+		"avg_duration_ms":  float64(80),
+	})
+	requireCols(t, "get_schema SERVER usage", serverToolRow, map[string]any{
+		"mcp_method_name":  "tools/call",
+		"gen_ai_tool_name": "get_schema",
+		"mcp_target_name":  "get_schema",
+		"span_kind":        int64(2),
+		"server_address":   "mcp.internal",
+		"call_count":       int64(1),
+		"avg_duration_ms":  float64(60),
 	})
 }
 

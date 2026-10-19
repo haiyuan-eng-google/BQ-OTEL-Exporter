@@ -1519,7 +1519,7 @@ func TestMCPSpansAndToolUsageViews(t *testing.T) {
 
 	usageQuery := normalizeSQL(fmt.Sprintf(MCPToolUsageViewQuery, "proj", "ds"))
 	for _, want := range []string{
-		"FROM `proj.ds.v_mcp_spans` GROUP BY usage_hour, service_name, mcp_method_name, mcp_protocol_version, gen_ai_tool_name, mcp_target_name, span_kind, server_address",
+		"FROM `proj.ds.v_mcp_spans` GROUP BY usage_hour, service_name, mcp_method_name, mcp_protocol_version, gen_ai_tool_name, mcp_target_name, span_kind, server_address )",
 		"COALESCE(gen_ai_tool_name, mcp_resource_uri, gen_ai_prompt_name) AS mcp_target_name",
 		"COUNTIF(also_in_gen_ai_view) AS gen_ai_tagged_call_count",
 		"COUNTIF(status_code = 2 OR error_type IS NOT NULL) AS error_count",
@@ -1528,6 +1528,23 @@ func TestMCPSpansAndToolUsageViews(t *testing.T) {
 	} {
 		if !strings.Contains(usageQuery, want) {
 			t.Errorf("v_mcp_tool_usage query missing %q:\n%s", want, usageQuery)
+		}
+	}
+	if _, afterGroupBy, ok := strings.Cut(usageQuery, " GROUP BY "); !ok {
+		t.Fatalf("v_mcp_tool_usage query lacks GROUP BY clause:\n%s", usageQuery)
+	} else if groupByClause, _, ok := strings.Cut(afterGroupBy, " )"); !ok {
+		t.Fatalf("v_mcp_tool_usage GROUP BY clause lacks closing paren:\n%s", afterGroupBy)
+	} else {
+		var gotGroupCols []string
+		for _, col := range strings.Split(groupByClause, ",") {
+			gotGroupCols = append(gotGroupCols, strings.TrimSpace(col))
+		}
+		wantGroupCols := []string{
+			"usage_hour", "service_name", "mcp_method_name", "mcp_protocol_version",
+			"gen_ai_tool_name", "mcp_target_name", "span_kind", "server_address",
+		}
+		if !slices.Equal(gotGroupCols, wantGroupCols) {
+			t.Errorf("v_mcp_tool_usage GROUP BY columns = %v, want exact %v", gotGroupCols, wantGroupCols)
 		}
 	}
 	if !strings.HasSuffix(usageQuery, "FROM mcp_tool_agg") {
