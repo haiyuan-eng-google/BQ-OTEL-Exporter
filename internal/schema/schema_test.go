@@ -1499,8 +1499,18 @@ func TestMCPSpansAndToolUsageViews(t *testing.T) {
 	if got, want := mcpExprs["is_tool_call"], `COALESCE(JSON_VALUE(attributes, '$."mcp.method.name"') = 'tools/call', FALSE)`; got != want {
 		t.Errorf("v_mcp_spans.is_tool_call = %q, want %q", got, want)
 	}
+	wantAgentExpr := `COALESCE( JSON_VALUE(attributes, '$."gen_ai.agent.name"'), JSON_VALUE(attributes, '$."gcp.vertex.agent.name"'), JSON_VALUE(attributes, '$."gen_ai.main_agent.name"') )`
+	if got := mcpExprs["gen_ai_agent_name"]; got != wantAgentExpr {
+		t.Errorf("v_mcp_spans.gen_ai_agent_name = %q, want %q", got, wantAgentExpr)
+	}
+	if got, want := attributeKeys(mcpExprs["gen_ai_agent_name"]), []string{"gen_ai.agent.name", "gcp.vertex.agent.name", "gen_ai.main_agent.name"}; !slices.Equal(got, want) {
+		t.Errorf("v_mcp_spans.gen_ai_agent_name keys = %v, want %v", got, want)
+	}
 
 	mcpQuery := normalizeSQL(fmt.Sprintf(MCPSpansViewQuery, "proj", "ds", "spans"))
+	if n := strings.Count(mcpQuery, " WHERE "); n != 1 {
+		t.Errorf("v_mcp_spans WHERE count = %d, want 1:\n%s", n, mcpQuery)
+	}
 	if _, mcpWhere, ok := strings.Cut(mcpQuery, " WHERE "); !ok {
 		t.Fatalf("v_mcp_spans query lacks WHERE clause:\n%s", mcpQuery)
 	} else if want := `JSON_VALUE(attributes, '$."mcp.method.name"') IS NOT NULL OR JSON_VALUE(attributes, '$."mcp.session.id"') IS NOT NULL OR JSON_VALUE(attributes, '$."mcp.resource.uri"') IS NOT NULL`; mcpWhere != want {
@@ -1509,7 +1519,7 @@ func TestMCPSpansAndToolUsageViews(t *testing.T) {
 
 	usageQuery := normalizeSQL(fmt.Sprintf(MCPToolUsageViewQuery, "proj", "ds"))
 	for _, want := range []string{
-		"FROM `proj.ds.v_mcp_spans` GROUP BY 1, 2, 3, 4, 5, 6, 7, 8",
+		"FROM `proj.ds.v_mcp_spans` GROUP BY usage_hour, service_name, mcp_method_name, mcp_protocol_version, gen_ai_tool_name, mcp_target_name, span_kind, server_address",
 		"COALESCE(gen_ai_tool_name, mcp_resource_uri, gen_ai_prompt_name) AS mcp_target_name",
 		"COUNTIF(also_in_gen_ai_view) AS gen_ai_tagged_call_count",
 		"COUNTIF(status_code = 2 OR error_type IS NOT NULL) AS error_count",
@@ -1519,6 +1529,31 @@ func TestMCPSpansAndToolUsageViews(t *testing.T) {
 		if !strings.Contains(usageQuery, want) {
 			t.Errorf("v_mcp_tool_usage query missing %q:\n%s", want, usageQuery)
 		}
+	}
+	if !strings.HasSuffix(usageQuery, "FROM mcp_tool_agg") {
+		t.Errorf("v_mcp_tool_usage outer query must end with FROM mcp_tool_agg without an outer WHERE clause:\n%s", usageQuery)
+	}
+	callCountIdx := strings.Index(usageQuery, "COUNT(*) AS call_count")
+	if callCountIdx < 0 {
+		t.Fatalf("v_mcp_tool_usage query lacks COUNT(*) AS call_count:\n%s", usageQuery)
+	}
+	cteHead := usageQuery[:callCountIdx]
+	prev := -1
+	for _, col := range []string{
+		"AS usage_hour",
+		"service_name,",
+		"mcp_method_name,",
+		"mcp_protocol_version,",
+		"gen_ai_tool_name,",
+		"AS mcp_target_name",
+		"span_kind,",
+		"server_address,",
+	} {
+		idx := strings.Index(cteHead, col)
+		if idx <= prev {
+			t.Errorf("v_mcp_tool_usage grouping column %q does not appear in order before COUNT(*) AS call_count:\n%s", col, cteHead)
+		}
+		prev = idx
 	}
 }
 

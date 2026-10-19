@@ -1764,7 +1764,7 @@ WITH mcp_tool_agg AS (
     APPROX_QUANTILES(duration_ms, 100)[OFFSET(95)] AS p95_duration_ms,
     APPROX_QUANTILES(duration_ms, 100)[OFFSET(99)] AS p99_duration_ms
   FROM ` + "`%[1]s.%[2]s." + MCPSpansViewName + "`" + `
-  GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+  GROUP BY usage_hour, service_name, mcp_method_name, mcp_protocol_version, gen_ai_tool_name, mcp_target_name, span_kind, server_address
 )
 SELECT
   usage_hour,

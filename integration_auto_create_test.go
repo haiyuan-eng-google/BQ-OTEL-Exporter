@@ -46,8 +46,8 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	// Registered via t.Cleanup (LIFO) so dataset teardown and client Close
-	// t.Cleanup hooks registered later run before ctx is canceled.
+	// Register cancel first so t.Cleanup's LIFO order runs dataset deletion
+	// and admin.Close before canceling ctx.
 	t.Cleanup(cancel)
 	dataset := fmt.Sprintf("otel_exporter_it_%d", time.Now().UnixNano())
 
@@ -75,12 +75,12 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 	})
 
 	cfg := validConfig()
-	// Bounds each individual startup metadata RPC (via timedDestinationAdmin)
-	// and each export attempt against transient live BigQuery control-plane spikes.
-	cfg.TimeoutSettings.Timeout = 10 * time.Second
 	cfg.Project = project
 	cfg.Dataset = dataset
 	cfg.Location = location
+	// Leave cfg.TimeoutSettings.Timeout at the 5s default from
+	// createDefaultConfig() so cold-dataset provisioning exercises per-call
+	// metadata timeouts rather than an artificially raised budget.
 	cfg.AutoCreate.Dataset = true
 	cfg.AutoCreate.Tables = true
 	cfg.AutoCreate.CompanionViews = true
@@ -118,6 +118,8 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 		t.Fatalf("first metric startup: %v", err)
 	}
 	defer func() { _ = metrics.shutdown(context.Background()) }()
+
+	assertIntegrationViewDryRuns(ctx, t, admin, project, dataset, cfg.Traces.Table)
 
 	if err := traces.pushTraceData(ctx, oneIntegrationTrace()); err != nil {
 		t.Fatalf("write trace: %v", err)
@@ -378,6 +380,67 @@ func assertIntegrationViewColumns(ctx context.Context, t *testing.T, client *bq.
 		}
 		if fmt.Sprint(got) != fmt.Sprint(tc.want) {
 			t.Errorf("%s columns = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func assertIntegrationViewDryRuns(ctx context.Context, t *testing.T, client *bq.Client, project, dataset, spansTable string) {
+	t.Helper()
+	for _, tc := range []struct {
+		name string
+		sql  string
+	}{
+		{
+			name: "MCPSpansViewQuery",
+			sql:  fmt.Sprintf(schema.MCPSpansViewQuery, project, dataset, spansTable),
+		},
+		{
+			name: "MCPToolUsageViewQuery",
+			sql:  fmt.Sprintf(schema.MCPToolUsageViewQuery, project, dataset),
+		},
+	} {
+		q := client.Query(tc.sql)
+		q.DryRun = true
+		job, err := q.Run(ctx)
+		if err != nil {
+			t.Errorf("%s dry-run failed: %v", tc.name, err)
+			continue
+		}
+		if err := job.LastStatus().Err(); err != nil {
+			t.Errorf("%s dry-run status error: %v", tc.name, err)
+			continue
+		}
+		if got := job.LastStatus().Statistics.TotalBytesProcessed; got != 0 {
+			t.Errorf("%s dry-run TotalBytesProcessed = %d, want 0 on empty tables", tc.name, got)
+		}
+	}
+
+	for _, view := range []string{
+		schema.SpansAsAllSpansViewName,
+		schema.GenAISpansViewName,
+		schema.GenAILogsViewName,
+		schema.GenAIMetricsViewName,
+		schema.GenAIMetricExemplarsViewName,
+		schema.GenAIModelCostsViewName,
+		schema.GenAISessionsViewName,
+		schema.GenAIToolUsageViewName,
+		schema.GenAIAgentTrajectoryViewName,
+		schema.MCPSpansViewName,
+		schema.MCPToolUsageViewName,
+	} {
+		q := client.Query(fmt.Sprintf("SELECT * FROM `%s.%s.%s` WHERE FALSE", project, dataset, view))
+		q.DryRun = true
+		job, err := q.Run(ctx)
+		if err != nil {
+			t.Errorf("view %s WHERE FALSE dry-run failed: %v", view, err)
+			continue
+		}
+		if err := job.LastStatus().Err(); err != nil {
+			t.Errorf("view %s WHERE FALSE dry-run status error: %v", view, err)
+			continue
+		}
+		if got := job.LastStatus().Statistics.TotalBytesProcessed; got != 0 {
+			t.Errorf("view %s WHERE FALSE dry-run TotalBytesProcessed = %d, want 0", view, got)
 		}
 	}
 }

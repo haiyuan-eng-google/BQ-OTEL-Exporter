@@ -1393,6 +1393,73 @@ func TestPrepareDestinationSkipsMetricExemplarsViewWhenGenAIMetricsViewPreserved
 	}
 }
 
+func TestIsRollupViewAndMCPToolUsageToleranceWhenMCPSpansPreserved(t *testing.T) {
+	if !isRollupView(schema.MCPToolUsageViewName) {
+		t.Fatal("isRollupView(v_mcp_tool_usage) = false, want true")
+	}
+	if isRollupView(schema.MCPSpansViewName) {
+		t.Fatal("isRollupView(v_mcp_spans) = true, want false")
+	}
+
+	rollupErr := status.Error(codes.InvalidArgument, "column not found in underlying v_mcp_spans view")
+	mcpSpansQuery := fmt.Sprintf(schema.MCPSpansViewQuery, "my-project", "otel", defaultSpansTable)
+	view := func(query string) fakeTableMetadataResponse {
+		return fakeTableMetadataResponse{metadata: &bq.TableMetadata{Type: bq.ViewTable, ViewQuery: query, ETag: "etag-mcp-1"}}
+	}
+	for _, tc := range []struct {
+		name        string
+		mcpView     fakeTableMetadataResponse
+		updateErr   error
+		wantErr     error
+		wantSkipped bool
+	}{
+		{
+			name:        "stale v_mcp_spans that cannot be updated preserves v_mcp_tool_usage rollup tolerance",
+			mcpView:     view("SELECT 1 AS stale_mcp_spans"),
+			updateErr:   forbidden(),
+			wantSkipped: true,
+		},
+		{
+			name:    "replaced v_mcp_spans fails startup on v_mcp_tool_usage error",
+			mcpView: view("SELECT 1 AS stale_mcp_spans"),
+			wantErr: rollupErr,
+		},
+		{
+			name:    "current v_mcp_spans fails startup on v_mcp_tool_usage error",
+			mcpView: view(mcpSpansQuery),
+			wantErr: rollupErr,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := companionViewConfig()
+			core, logs := observer.New(zap.WarnLevel)
+			e := newSignalExporter(
+				component.TelemetrySettings{Logger: zap.New(core)}, cfg, cfg.Traces.Table, schema.SpansTableSchema())
+			admin := &fakeDestinationAdmin{
+				datasetMetadata:  &bq.DatasetMetadata{},
+				tableMetadataErr: notFound(),
+				tableMetadataByID: map[string]fakeTableMetadataResponse{
+					schema.MCPSpansViewName: tc.mcpView,
+				},
+				createErrByID: map[string]error{
+					schema.MCPSpansViewName:     alreadyExists(),
+					schema.MCPToolUsageViewName: rollupErr,
+				},
+				updateErrByID: map[string]error{schema.MCPSpansViewName: tc.updateErr},
+			}
+
+			err := e.prepareDestination(context.Background(), admin)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tc.wantErr)
+			}
+			skipped := logs.FilterMessage("skipping rollup view creation over preserved companion view").Len()
+			if (skipped == 1) != tc.wantSkipped || skipped > 1 {
+				t.Errorf("%d skipped-rollup warnings, want one: %v", skipped, tc.wantSkipped)
+			}
+		})
+	}
+}
+
 // restrictiveSpansTableVariants are the two places BigQuery reports that a
 // spans table requires a partition filter.
 var restrictiveSpansTableVariants = []struct {

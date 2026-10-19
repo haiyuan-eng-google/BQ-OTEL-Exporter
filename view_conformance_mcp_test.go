@@ -449,10 +449,35 @@ func TestMCPViewsEdgeCases(t *testing.T) {
 	s3.SetEndTimestamp(pcommon.NewTimestampFromTime(baseTime.Add(10 * time.Millisecond)))
 	s3.Attributes().PutStr("http.request.method", "POST")
 
+	// 4. Conflicting agent-name keys: gen_ai.agent.name > gcp.vertex.agent.name > gen_ai.main_agent.name.
+	s4 := ss.Spans().AppendEmpty()
+	s4.SetTraceID(pcommon.TraceID{1})
+	s4.SetSpanID(pcommon.SpanID{4})
+	s4.SetName("mcp.agent.precedence.all_three")
+	s4.SetKind(ptrace.SpanKindClient)
+	s4.SetStartTimestamp(pcommon.NewTimestampFromTime(baseTime.Add(200 * time.Millisecond)))
+	s4.SetEndTimestamp(pcommon.NewTimestampFromTime(baseTime.Add(250 * time.Millisecond)))
+	s4.Attributes().PutStr("mcp.method.name", "tools/list")
+	s4.Attributes().PutStr("gen_ai.agent.name", "agent-primary")
+	s4.Attributes().PutStr("gcp.vertex.agent.name", "agent-vertex")
+	s4.Attributes().PutStr("gen_ai.main_agent.name", "agent-main")
+
+	// 5. Conflicting fallback agent-name keys: gcp.vertex.agent.name > gen_ai.main_agent.name.
+	s5 := ss.Spans().AppendEmpty()
+	s5.SetTraceID(pcommon.TraceID{1})
+	s5.SetSpanID(pcommon.SpanID{5})
+	s5.SetName("mcp.agent.precedence.vertex_vs_main")
+	s5.SetKind(ptrace.SpanKindClient)
+	s5.SetStartTimestamp(pcommon.NewTimestampFromTime(baseTime.Add(300 * time.Millisecond)))
+	s5.SetEndTimestamp(pcommon.NewTimestampFromTime(baseTime.Add(350 * time.Millisecond)))
+	s5.Attributes().PutStr("mcp.method.name", "tools/list")
+	s5.Attributes().PutStr("gcp.vertex.agent.name", "agent-vertex")
+	s5.Attributes().PutStr("gen_ai.main_agent.name", "agent-main")
+
 	rig.pushTraces(t, td)
 	mcpSpans := mcpSpansView(t, rig.srv.Rows(confSpans))
-	if len(mcpSpans) != 2 {
-		t.Fatalf("edge case v_mcp_spans rows = %d, want 2", len(mcpSpans))
+	if len(mcpSpans) != 4 {
+		t.Fatalf("edge case v_mcp_spans rows = %d, want 4", len(mcpSpans))
 	}
 
 	requireCols(t, "session-only span", onlyRow(t, "session-only", mcpSpans, "span_name", "mcp.session.heartbeat"), map[string]any{
@@ -472,6 +497,16 @@ func TestMCPViewsEdgeCases(t *testing.T) {
 		"gen_ai_agent_name":   "supervisor",
 		"is_tool_call":        false,
 		"also_in_gen_ai_view": true, // gen_ai.main_agent.name satisfies v_gen_ai_spans WHERE
+	})
+
+	requireCols(t, "agent precedence all three", onlyRow(t, "all three", mcpSpans, "span_name", "mcp.agent.precedence.all_three"), map[string]any{
+		"gen_ai_agent_name":   "agent-primary",
+		"also_in_gen_ai_view": true,
+	})
+
+	requireCols(t, "agent precedence vertex over main", onlyRow(t, "vertex vs main", mcpSpans, "span_name", "mcp.agent.precedence.vertex_vs_main"), map[string]any{
+		"gen_ai_agent_name":   "agent-vertex",
+		"also_in_gen_ai_view": true,
 	})
 
 	usage := mcpToolUsageView(mcpSpans)
@@ -528,7 +563,7 @@ func TestMCPViewModelsMatchViewSQL(t *testing.T) {
 		"APPROX_QUANTILES(duration_ms, 100)[OFFSET(95)] AS p95_duration_ms",
 		"APPROX_QUANTILES(duration_ms, 100)[OFFSET(99)] AS p99_duration_ms",
 		"FROM `"+confProject+"."+confDataset+".v_mcp_spans`",
-		"GROUP BY 1, 2, 3, 4, 5, 6, 7, 8",
+		"GROUP BY usage_hour, service_name, mcp_method_name, mcp_protocol_version, gen_ai_tool_name, mcp_target_name, span_kind, server_address",
 		"ARRAY( SELECT AS STRUCT x.value, x.count FROM UNNEST(raw_top_error_types) AS x WHERE x.value IS NOT NULL ORDER BY x.count DESC, x.value ASC LIMIT 5 ) AS top_error_types",
 		"FROM mcp_tool_agg",
 	)

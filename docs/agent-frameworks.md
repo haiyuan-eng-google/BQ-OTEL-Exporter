@@ -365,7 +365,11 @@ gen_ai_prompt_name)`) alongside `gen_ai_tool_name` so `resources/read` and
 `prompts/get` spans roll up by resource URI or prompt name, and its
 `error_count` counts `status_code = 2 OR error_type IS NOT NULL` (capturing
 JSON-RPC or MCP error responses that leave `status_code` unset, whereas
-`v_gen_ai_tool_usage.error_count` counts `status_code = 2`).
+`v_gen_ai_tool_usage.error_count` counts `status_code = 2`). It aggregates at
+the per-span observation grain (`span_kind` separates `CLIENT` and `SERVER`
+spans so paired client/server traces produce separate `CLIENT` and `SERVER`
+rows, and session-only or resource-only MCP spans without `mcp.method.name`
+group under `mcp_method_name IS NULL`).
 
 ## Synthetic scenario fixtures
 

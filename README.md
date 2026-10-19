@@ -558,7 +558,11 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
     server_address)` where `mcp_target_name` is
     `COALESCE(gen_ai_tool_name, mcp_resource_uri, gen_ai_prompt_name)` so
     `resources/read` and `prompts/get` spans group by resource URI or prompt
-    name alongside `gen_ai_tool_name`. Exposes `call_count`,
+    name alongside `gen_ai_tool_name`. Aggregates at the per-span observation
+    grain (`span_kind` separates `CLIENT` and `SERVER` spans so paired
+    client/server traces produce separate `CLIENT` and `SERVER` rows, and
+    session-only or resource-only MCP spans without `mcp.method.name` group
+    under `mcp_method_name IS NULL`). Exposes `call_count`,
     `gen_ai_tagged_call_count` (`COUNTIF(also_in_gen_ai_view)`), `error_count`
     (`status_code = 2 OR error_type IS NOT NULL`, capturing JSON-RPC or MCP
     error responses that leave `status_code` unset, whereas

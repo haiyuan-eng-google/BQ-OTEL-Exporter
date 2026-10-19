@@ -219,6 +219,12 @@ companion views, and starts; set `auto_create.allow_unprunable_views: true`
 views anyway. The collector reads the table's metadata to decide, and its own
 `traces.require_partition_filter` counts only while `otel_spans` does not exist
 yet, because that option applies only when the collector creates the table.
+`v_mcp_spans` and `v_mcp_tool_usage` read `otel_spans_dedup` once without
+row-dependent window joins, so both remain queryable with a `start_time` or
+`usage_hour` filter when `require_partition_filter=true`. `v_mcp_tool_usage`
+aggregates at the per-span observation grain (`span_kind` separates `CLIENT`
+and `SERVER` spans into distinct rows, and session-only or resource-only MCP
+spans without `mcp.method.name` group under `mcp_method_name IS NULL`).
 
 ### Labels
 
