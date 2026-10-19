@@ -200,21 +200,24 @@ type AutoCreateConfig struct {
 	// CompanionViews creates the companion views over the dedup views if absent
 	// and reconciles an existing view to the current definition (the query
 	// only, best effort): otel_spans_as_allspans, v_gen_ai_spans,
-	// v_gen_ai_model_costs, v_gen_ai_sessions, and v_gen_ai_tool_usage with the
-	// traces table, v_gen_ai_logs with the logs table once the traces dedup
-	// view exists, and v_gen_ai_metrics and v_gen_ai_metric_exemplars with the
-	// metrics table (the latter once the traces dedup view exists).
+	// v_gen_ai_model_costs, v_gen_ai_sessions, v_gen_ai_tool_usage, and
+	// v_gen_ai_agent_trajectory with the traces table, v_gen_ai_logs with the
+	// logs table once the traces dedup view exists, and v_gen_ai_metrics and
+	// v_gen_ai_metric_exemplars with the metrics table (the latter once the
+	// traces dedup view exists).
 	// Requires tables.
 	CompanionViews bool `mapstructure:"companion_views"`
-	// AllowUnprunableViews creates the cross-signal companion views
-	// (v_gen_ai_logs, v_gen_ai_metric_exemplars) even when the spans table
-	// requires a partition filter. Those views join the span deduplication
+	// AllowUnprunableViews creates the companion views that join spans on a
+	// row-dependent window (v_gen_ai_logs, v_gen_ai_metric_exemplars, and
+	// v_gen_ai_agent_trajectory) even when the spans table requires a
+	// partition filter. The cross-signal views join the span deduplication
 	// view on a row-dependent timestamp window rather than a constant
-	// start_time filter, so BigQuery rejects queries over them when the spans
-	// table requires a partition filter. By default they are therefore skipped
-	// with a warning at startup in that case; the single-signal companion
-	// views are created either way. Whether the spans table requires a
-	// partition filter is read from its metadata at startup, and
+	// start_time filter, and v_gen_ai_agent_trajectory joins each span to its
+	// parent and child spans on such a window, so BigQuery rejects queries
+	// over them when the spans table requires a partition filter. By default
+	// they are therefore skipped with a warning at startup in that case; the
+	// other companion views are created either way. Whether the spans table
+	// requires a partition filter is read from its metadata at startup, and
 	// traces.require_partition_filter is consulted only while the table does
 	// not exist yet.
 	AllowUnprunableViews bool `mapstructure:"allow_unprunable_views"`

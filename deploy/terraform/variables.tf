@@ -164,13 +164,13 @@ variable "quarantine_partition_expiration_days" {
 }
 
 variable "require_partition_filter" {
-  description = "Require a partition filter on queries against the partitioned signal and quarantine tables. A query over a view must then filter on a column BigQuery can use to skip partitions, and a query over v_gen_ai_logs or v_gen_ai_metric_exemplars is rejected even then, so those two views are created only with allow_unprunable_views (see deploy/README.md)."
+  description = "Require a partition filter on queries against the partitioned signal and quarantine tables. A query over a view must then filter on a column BigQuery can use to skip partitions, and a query over v_gen_ai_logs, v_gen_ai_metric_exemplars, or v_gen_ai_agent_trajectory is rejected even then, so those three views are created only with allow_unprunable_views (see deploy/README.md)."
   type        = bool
   default     = false
 }
 
 variable "allow_unprunable_views" {
-  description = "Create v_gen_ai_logs and v_gen_ai_metric_exemplars even when require_partition_filter is true. They join otel_spans on a time window that depends on each row, which BigQuery cannot use to skip partitions, so it rejects every query over them while otel_spans requires a partition filter, and the module leaves them out then unless this is set. Matches the collector's auto_create.allow_unprunable_views and the Helm chart's bigquery.autoCreateAllowUnprunableViews."
+  description = "Create v_gen_ai_logs, v_gen_ai_metric_exemplars, and v_gen_ai_agent_trajectory even when require_partition_filter is true. They join otel_spans on a time window that depends on each row, which BigQuery cannot use to skip partitions, so it rejects every query over them while otel_spans requires a partition filter, and the module leaves them out then unless this is set. Matches the collector's auto_create.allow_unprunable_views and the Helm chart's bigquery.autoCreateAllowUnprunableViews."
   type        = bool
   default     = false
 }

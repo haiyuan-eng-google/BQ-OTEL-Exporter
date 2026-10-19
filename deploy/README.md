@@ -177,7 +177,7 @@ require a partition filter on queries:
 | `metrics_partition_expiration_days` | `0` | `otel_metrics` (daily partitions on `timestamp`) |
 | `quarantine_partition_expiration_days` | `30` | `otel_quarantine` (daily partitions on `ingest_time`) |
 | `require_partition_filter` | `false` | All four tables (and `otel_alerts` when `enable_continuous_queries` is `true`) |
-| `allow_unprunable_views` | `false` | `v_gen_ai_logs` and `v_gen_ai_metric_exemplars`: create them even with `require_partition_filter=true` |
+| `allow_unprunable_views` | `false` | `v_gen_ai_logs`, `v_gen_ai_metric_exemplars`, and `v_gen_ai_agent_trajectory`: create them even with `require_partition_filter=true` |
 
 ```bash
 terraform apply \
@@ -203,19 +203,20 @@ tables, over `otel_alerts` (partitioned daily on `event_time`, when
 filter BigQuery can use to skip partitions. See "Filtering the GenAI views by
 time" under
 [Operating v0alpha2 tables](../README.md#operating-v0alpha2-tables) for the
-columns the views take. Queries over `v_gen_ai_logs` and
-`v_gen_ai_metric_exemplars` are rejected even with a filter, because no such
-filter reaches their scan of `otel_spans`. The module therefore does not create
-those two views while `require_partition_filter=true` unless
-`allow_unprunable_views=true`, and a `v_gen_ai_logs` that an earlier apply
-created is destroyed on the next apply. Leave `require_partition_filter` off
-for a deployment that queries those views. The collector does the same: a
-collector started with `auto_create.companion_views: true` against an
-`otel_spans` table that requires a partition filter skips those two views with
-a warning, creates the other companion views, and starts; set
-`auto_create.allow_unprunable_views: true` (Helm:
-`bigquery.autoCreateAllowUnprunableViews: true`) to create the two views
-anyway. The collector reads the table's metadata to decide, and its own
+columns the views take. Queries over `v_gen_ai_logs`,
+`v_gen_ai_metric_exemplars`, and `v_gen_ai_agent_trajectory` are rejected even
+with a filter, because each joins `otel_spans` on a time window that depends on
+each row, and no such filter reaches all of their scans of `otel_spans`. The
+module therefore does not create those three views while
+`require_partition_filter=true` unless `allow_unprunable_views=true`, and a
+`v_gen_ai_logs` that an earlier apply created is destroyed on the next apply.
+Leave `require_partition_filter` off for a deployment that queries those views.
+The collector does the same: a collector started with
+`auto_create.companion_views: true` against an `otel_spans` table that requires
+a partition filter skips those three views with a warning, creates the other
+companion views, and starts; set `auto_create.allow_unprunable_views: true`
+(Helm: `bigquery.autoCreateAllowUnprunableViews: true`) to create the three
+views anyway. The collector reads the table's metadata to decide, and its own
 `traces.require_partition_filter` counts only while `otel_spans` does not exist
 yet, because that option applies only when the collector creates the table.
 

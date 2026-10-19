@@ -106,6 +106,19 @@ func (o Options) context() context.Context {
 	return context.Background()
 }
 
+// contextExpired reports whether ctx is already canceled or its deadline has
+// passed on the wall/monotonic clock, even if the runtime's time.AfterFunc
+// goroutine for ctx has not yet been scheduled under GOMAXPROCS=1.
+func contextExpired(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+	if dl, ok := ctx.Deadline(); ok && time.Until(dl) <= 0 {
+		return true
+	}
+	return false
+}
+
 func (o Options) now() time.Time {
 	if o.Now != nil {
 		return o.Now()
@@ -1209,7 +1222,7 @@ func SpanQuarantineRows(td ptrace.Traces, entries []QuarantineEntry, opts Option
 	if len(entries) == 0 {
 		return nil
 	}
-	if err := opts.context().Err(); err != nil {
+	if contextExpired(opts.context()) {
 		return nil
 	}
 	byIndex := entriesByIndex(entries)
@@ -1218,15 +1231,15 @@ func SpanQuarantineRows(td ptrace.Traces, entries []QuarantineEntry, opts Option
 	idx := -1
 
 	for _, rs := range td.ResourceSpans().All() {
-		if builder.opts.context().Err() != nil {
+		if contextExpired(builder.opts.context()) {
 			break
 		}
 		for _, ss := range rs.ScopeSpans().All() {
-			if builder.opts.context().Err() != nil {
+			if contextExpired(builder.opts.context()) {
 				break
 			}
 			for _, span := range ss.Spans().All() {
-				if builder.opts.context().Err() != nil {
+				if contextExpired(builder.opts.context()) {
 					break
 				}
 				idx++
@@ -1279,7 +1292,7 @@ func LogQuarantineRows(ld plog.Logs, entries []QuarantineEntry, opts Options) []
 	if len(entries) == 0 {
 		return nil
 	}
-	if err := opts.context().Err(); err != nil {
+	if contextExpired(opts.context()) {
 		return nil
 	}
 	byIndex := entriesByIndex(entries)
@@ -1288,15 +1301,15 @@ func LogQuarantineRows(ld plog.Logs, entries []QuarantineEntry, opts Options) []
 	idx := -1
 
 	for _, rl := range ld.ResourceLogs().All() {
-		if builder.opts.context().Err() != nil {
+		if contextExpired(builder.opts.context()) {
 			break
 		}
 		for _, sl := range rl.ScopeLogs().All() {
-			if builder.opts.context().Err() != nil {
+			if contextExpired(builder.opts.context()) {
 				break
 			}
 			for _, lr := range sl.LogRecords().All() {
-				if builder.opts.context().Err() != nil {
+				if contextExpired(builder.opts.context()) {
 					break
 				}
 				idx++
@@ -1395,7 +1408,7 @@ func newQuarantineRowBuilder(opts Options, numEntries int) *quarantineRowBuilder
 }
 
 func (b *quarantineRowBuilder) add(rec quarantinedRecord, group []QuarantineEntry) bool {
-	if b.opts.context().Err() != nil {
+	if contextExpired(b.opts.context()) {
 		return false
 	}
 	if b.conc > 1 && len(rec.payload) > b.inlineLimit {
@@ -1410,7 +1423,7 @@ func (b *quarantineRowBuilder) add(rec quarantinedRecord, group []QuarantineEntr
 	}
 	inlineRows := make([]Row, 0, len(group))
 	for _, e := range group {
-		if b.opts.context().Err() != nil {
+		if contextExpired(b.opts.context()) {
 			if len(inlineRows) > 0 {
 				b.slots = append(b.slots, quarantineSlot{inlineRows: inlineRows})
 			}
@@ -1419,11 +1432,11 @@ func (b *quarantineRowBuilder) add(rec quarantinedRecord, group []QuarantineEntr
 		inlineRows = append(inlineRows, rec.row(e, b.ingest, b.opts))
 	}
 	b.slots = append(b.slots, quarantineSlot{inlineRows: inlineRows})
-	return b.opts.context().Err() == nil
+	return !contextExpired(b.opts.context())
 }
 
 func (b *quarantineRowBuilder) rows() []Row {
-	if len(b.deferredIdxs) > 0 && b.opts.context().Err() == nil {
+	if len(b.deferredIdxs) > 0 && !contextExpired(b.opts.context()) {
 		if len(b.deferredIdxs) == 1 {
 			si := b.deferredIdxs[0]
 			rec := &b.slots[si].rec
@@ -1443,7 +1456,7 @@ func (b *quarantineRowBuilder) rows() []Row {
 				go func() {
 					defer wg.Done()
 					for si := range jobs {
-						if b.opts.context().Err() != nil {
+						if contextExpired(b.opts.context()) {
 							return
 						}
 						rec := &b.slots[si].rec
@@ -1467,7 +1480,7 @@ func (b *quarantineRowBuilder) rows() []Row {
 			return out
 		}
 		for _, e := range slot.group {
-			if b.opts.context().Err() != nil {
+			if contextExpired(b.opts.context()) {
 				return out
 			}
 			out = append(out, slot.rec.row(e, b.ingest, b.opts))
@@ -1524,7 +1537,7 @@ func (q *quarantinedRecord) row(e QuarantineEntry, ingest int64, opts Options) R
 	}
 	if q.payload != nil {
 		if !q.hasPreOffload && opts.QuarantinePayloadOffloader != nil {
-			if err := opts.context().Err(); err != nil {
+			if contextExpired(opts.context()) {
 				return r
 			}
 			q.offloaded = opts.QuarantinePayloadOffloader(opts.context(), q.signal, q.payload).ToRow()

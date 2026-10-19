@@ -40,13 +40,14 @@ exporters:
       tables: true
       # Companion views (otel_spans_as_allspans, v_gen_ai_spans, v_gen_ai_logs,
       # v_gen_ai_metrics, v_gen_ai_metric_exemplars, v_gen_ai_model_costs,
-      # v_gen_ai_sessions, v_gen_ai_tool_usage) are opt-in. Uncomment to have
-      # auto_create build them.
+      # v_gen_ai_sessions, v_gen_ai_tool_usage, v_gen_ai_agent_trajectory) are
+      # opt-in. Uncomment to have auto_create build them.
       # companion_views: true
-      # v_gen_ai_logs and v_gen_ai_metric_exemplars cannot be queried when
-      # otel_spans requires a partition filter (see traces.require_partition_filter
-      # below), so startup skips those two with a warning in that case and
-      # builds the rest. Uncomment to build them anyway.
+      # v_gen_ai_logs, v_gen_ai_metric_exemplars, and v_gen_ai_agent_trajectory
+      # cannot be queried when otel_spans requires a partition filter (see
+      # traces.require_partition_filter below), so startup skips those three
+      # with a warning in that case and builds the rest. Uncomment to build
+      # them anyway.
       # allow_unprunable_views: true
       # Search indexes on (trace_id, span_id) for otel_spans and otel_logs,
       # and all columns on otel_metrics. Requires auto_create.tables and

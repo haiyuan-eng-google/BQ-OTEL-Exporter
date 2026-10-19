@@ -234,8 +234,8 @@ as log events rather than span attributes.
 | `endpoint.without_authentication` | `false`             | Sends no credentials. Refused unless the endpoint is loopback. |
 | `auto_create.dataset`           | `false`               | Create the dataset if absent. Requires `location`. |
 | `auto_create.tables`            | `false`               | Create the active signal's destination table (plus `quarantine.table` when enabled) and `_dedup` view if absent, and reconcile additive nullable columns on existing tables (`ReconcileAdditiveSchema`). An existing `_dedup` view is reconciled to the current definition (the query only, best effort), which needs `bigquery.tables.update`. |
-| `auto_create.companion_views`   | `false`               | Create the companion views if absent and reconcile existing ones to the current definition (the query only, best effort): `otel_spans_as_allspans`, `v_gen_ai_spans`, `v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_gen_ai_tool_usage`, `v_gen_ai_logs`, `v_gen_ai_metrics`, and `v_gen_ai_metric_exemplars`. Requires `auto_create.tables`. |
-| `auto_create.allow_unprunable_views` | `false`          | Create `v_gen_ai_logs` and `v_gen_ai_metric_exemplars` even when the spans table requires a partition filter (Helm: `bigquery.autoCreateAllowUnprunableViews`). BigQuery rejects every query over those two views when `otel_spans` requires a partition filter, so by default startup skips them in that case and logs a warning; the other companion views are created either way, and startup does not fail. The spans table's metadata decides; `traces.require_partition_filter` counts only while that table does not exist yet. |
+| `auto_create.companion_views`   | `false`               | Create the companion views if absent and reconcile existing ones to the current definition (the query only, best effort): `otel_spans_as_allspans`, `v_gen_ai_spans`, `v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_gen_ai_tool_usage`, `v_gen_ai_agent_trajectory`, `v_gen_ai_logs`, `v_gen_ai_metrics`, and `v_gen_ai_metric_exemplars`. Requires `auto_create.tables`. |
+| `auto_create.allow_unprunable_views` | `false`          | Create `v_gen_ai_logs`, `v_gen_ai_metric_exemplars`, and `v_gen_ai_agent_trajectory` even when the spans table requires a partition filter (Helm: `bigquery.autoCreateAllowUnprunableViews`). BigQuery rejects every query over those three views when `otel_spans` requires a partition filter, so by default startup skips them in that case and logs a warning; the other companion views are created either way, and startup does not fail. The spans table's metadata decides; `traces.require_partition_filter` counts only while that table does not exist yet. |
 | `auto_create.search_indexes`    | `false`               | Execute `CREATE SEARCH INDEX IF NOT EXISTS ... OPTIONS (analyzer = 'NO_OP_ANALYZER')` on `(trace_id, span_id)` for `otel_spans` and `otel_logs` and on `(ALL COLUMNS)` for `otel_metrics`. Requires `auto_create.tables` and `bigquery.jobs.create`. |
 | `write.max_request_bytes`       | `8388608` (8 MiB)     | Our request-size headroom threshold, enforced after protobuf serialization and before `AppendRows`. Distinct from, and below, the API's own per-request limit. |
 | `write.max_row_bytes`           | `1048576` (1 MiB)     | Rejects individual serialized signal rows above this size and bounds quarantine rows by truncating `raw_payload`. |
@@ -250,7 +250,7 @@ as log events rather than span attributes.
 | `limits.*`                      | see below             | Structural bounds applied before serialization. |
 | `sending_queue`                 | 8 consumers           | Standard `exporterhelper` queue, including the persistent queue. Consumer concurrency defaults to the managedwriter request window. |
 | `retry_on_failure`              | `max_elapsed_time: 900s` | Standard `exporterhelper` retry. The horizon must be finite. |
-| `timeout`                       | `5s`                  | Budget for one export attempt, including slot waits and every acknowledgement. See [Timeout and concurrency envelope](#timeout-and-concurrency-envelope). |
+| `timeout`                       | `5s`                  | Budget for one export attempt (including slot waits and every acknowledgement) and for each individual startup metadata or provisioning API call. See [Timeout and concurrency envelope](#timeout-and-concurrency-envelope). |
 | `offload.enabled`               | `false`               | Route oversized span/log values and quarantine payloads to Google Cloud Storage, recording BigQuery ObjectRef references. |
 | `offload.bucket`                | —                     | GCS bucket name for offloaded payloads. Required when `offload.enabled` is true. |
 | `offload.prefix`                | `otel-offload`        | Object name prefix within the bucket. |
@@ -476,6 +476,66 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
   - `v_gen_ai_tool_usage`: hourly tool invocation count, error rate, typed error
     count (`typed_error_count`, `top_error_types`), and latency
     rollups over `v_gen_ai_spans` grouped by `(usage_hour, service_name, gen_ai_agent_name, gen_ai_tool_name, gen_ai_tool_type)`.
+  - `v_gen_ai_agent_trajectory`: recursive span DAG over `v_gen_ai_spans` (`WITH
+    RECURSIVE`, depth cap `16`, `visited_span_ids` cycle guard) with 40 columns:
+    31 base span and GenAI columns plus `depth`, `root_span_id`,
+    `nearest_agent_span_id`, `nearest_agent_name`, `agent_path` (consecutive
+    duplicates skipped), `is_orphan` (true when `parent_span_id` is absent from
+    `v_gen_ai_spans` for the same `trace_id` and null-safe `service_name` within
+    24 hours before to 1 hour after the child's `start_time`), `step_index`
+    (`ROW_NUMBER()` per `(trace_id, service_name)` ordered by `(start_time ASC,
+    span_id ASC)`), `is_leaf`, and `is_token_leaf`. Before the recursion runs,
+    `spans` keeps one canonical row per `(trace_id, service_name, span_id)`
+    (`ORDER BY start_time ASC, end_time DESC, span_name ASC, duration_nano DESC`),
+    so duplicate span IDs that survive `otel_spans_dedup` with a different
+    `start_time` or `name` cannot multiply child paths. The agent columns use the
+    agent name a span declares itself (`gen_ai.agent.name`, then
+    `gcp.vertex.agent.name`) rather than the `service_name` fallback of
+    `gen_ai_agent_name`: an `invoke_agent` or `create_agent` span always starts
+    a new nearest agent, a span that only declares an agent name starts one
+    when no span above it has one, and a `chat` or `execute_tool` span that
+    declares no agent inherits its parent's nearest agent and adds nothing to
+    `agent_path`. `is_token_leaf` is true for a span that has at least one
+    uncovered non-null token family (`input`, `output`, or `reasoning`; an
+    explicit `0` counts) after aggregating per-family coverage
+    (`token_parent_coverage` via `LOGICAL_OR` over the recursive
+    `emitted_ancestors` CTE) across all emitted trajectory descendants up to 32
+    parent hops (even across tokenless intermediate spans such as
+    `execute_tool` and across parent/child links that straddle the `[-24h,
+    +1h]` recursion window, such as an out-of-window child emitted as an orphan
+    root or a child of a `depth = 16` span, regardless of
+    `gen_ai_operation_name`). When a span is only partially covered by
+    descendants (for example, a parent reports `input`, `output`, and
+    `reasoning` while its child reports only `input` and `output`),
+    `is_token_leaf` remains `TRUE` for the uncovered family and the covered
+    token families on that row are projected as `NULL` so summing
+    `gen_ai_usage_*_tokens WHERE is_token_leaf = TRUE` neither double-counts
+    covered families nor drops uncovered ones; fully covered rollup rows
+    (`is_token_leaf = FALSE`) retain their raw token counts. When spans
+    form a parent cycle broken by the `[-24h, +1h]` window,
+    `token_parent_coverage` detects mutual reachability via a self-join on
+    `emitted_ancestors` (`reverse_path`) and breaks cycle ties on
+    `(start_time, span_id)` without discarding acyclic earlier children of
+    orphan trees. A `depth = 16` span
+    is never suppressed by unemitted `depth > 16` children so it retains the
+    leaf token totals for its truncated subtree when ancestors report subtree
+    rollups (tokens reported only on unemitted `depth > 16` spans are outside
+    this view). Unlike
+    `v_gen_ai_model_costs` (hourly direct-child check over inference spans with
+    `gen_ai_request_model` and input/output tokens) and `v_gen_ai_sessions`
+    (UTC-date, session-scoped direct-child check over input/output tokens),
+    `is_token_leaf` follows multi-hop trajectory paths up to `depth <= 16`
+    (17 levels, `0..16`) across the `[-24h, +1h]`
+    parent/child window and checks token-family coverage across input, output,
+    and reasoning tokens. A group of
+    spans whose parent links form a cycle with no root or orphan to start from
+    (a span that names itself as its parent included) produces no rows, while a
+    cycle reached from a root stops at the first repeated span
+    (`visited_span_ids`) and every path stops at depth `16`. Like
+    `v_gen_ai_logs` and `v_gen_ai_metric_exemplars`, it joins spans on a time
+    window that depends on each row, so it cannot be queried when `otel_spans`
+    requires a partition filter, and startup then skips it with a warning
+    unless `auto_create.allow_unprunable_views` is set.
   - `v_gen_ai_logs`: filters `otel_logs_dedup` to GenAI/agent log events and
     left-joins `otel_spans_dedup` on `(trace_id, span_id)` and a null-safe
     `service_name` match, within the window described under *Time-bounded
@@ -525,8 +585,8 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
     each keep their row. An exemplar whose span
     is absent or outside that window remains in the view with `NULL` `span_*`
     columns. Like `v_gen_ai_logs`, it cannot be queried when `otel_spans`
-    requires a partition filter, and startup then skips both views with a
-    warning unless `auto_create.allow_unprunable_views` is set.
+    requires a partition filter, and startup then skips it with a warning
+    unless `auto_create.allow_unprunable_views` is set.
   - The two rollup views, `v_gen_ai_model_costs` and `v_gen_ai_sessions`, read
     `v_gen_ai_spans` once. A window function over that read finds the parents
     that report the sum of their children's tokens, and each view computes one
@@ -667,7 +727,7 @@ ON `my-project.otel.otel_metrics` (ALL COLUMNS) OPTIONS (analyzer = 'NO_OP_ANALY
   unchanged. No filter that BigQuery can use for partition elimination reaches
   the span scan, so queries over `v_gen_ai_logs` and `v_gen_ai_metric_exemplars` are rejected when
   `traces.require_partition_filter` is `true`, with or without a filter on
-  `timestamp` or `metric_timestamp`. So that a deployment is not left with views no query can use, startup skips `v_gen_ai_logs` and `v_gen_ai_metric_exemplars` with a warning when the `otel_spans` table it finds or creates requires a partition filter, and still creates every other companion view and starts exporting; set `auto_create.allow_unprunable_views: true` (Helm: `bigquery.autoCreateAllowUnprunableViews: true`) to create them anyway. The table's metadata decides, and `traces.require_partition_filter` counts only while `otel_spans` does not exist yet, because it applies only when the table is created. Leave `traces.require_partition_filter` off for a deployment that queries those views, or
+  `timestamp` or `metric_timestamp`. So that a deployment is not left with views no query can use, startup skips `v_gen_ai_logs` and `v_gen_ai_metric_exemplars`, as well as `v_gen_ai_agent_trajectory`, which joins each span to its parent and child spans on such a window, with a warning when the `otel_spans` table it finds or creates requires a partition filter, and still creates every other companion view and starts exporting; set `auto_create.allow_unprunable_views: true` (Helm: `bigquery.autoCreateAllowUnprunableViews: true`) to create them anyway. The table's metadata decides, and `traces.require_partition_filter` counts only while `otel_spans` does not exist yet, because it applies only when the table is created. Leave `traces.require_partition_filter` off for a deployment that queries those views, or
   join `otel_logs_dedup` / `v_gen_ai_metrics` against a `start_time`-bounded `otel_spans_dedup`
   subquery directly, which also lets a query choose its own window.
 - **Real-time alerting (`deploy/continuous-queries/`).**

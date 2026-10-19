@@ -1113,6 +1113,363 @@ resource "google_bigquery_table" "v_gen_ai_tool_usage" {
   }
 }
 
+resource "google_bigquery_table" "v_gen_ai_agent_trajectory" {
+  # Like v_gen_ai_logs, left out while otel_spans requires a partition filter
+  # unless allow_unprunable_views: it joins each span to its parent and child
+  # spans on a window that depends on each row.
+  count = (!var.require_partition_filter || var.allow_unprunable_views) ? 1 : 0
+
+  dataset_id = google_bigquery_dataset.otel.dataset_id
+  table_id   = "v_gen_ai_agent_trajectory"
+
+  labels = var.labels
+
+  view {
+    use_legacy_sql = false
+    query          = <<EOT
+      WITH RECURSIVE
+        spans AS (
+          SELECT
+            start_time,
+            end_time,
+            duration_nano,
+            duration_ms,
+            trace_id,
+            span_id,
+            parent_span_id,
+            service_name,
+            span_name,
+            span_kind,
+            status_code,
+            status_message,
+            gen_ai_operation_name,
+            gen_ai_system,
+            gen_ai_provider_name,
+            gen_ai_request_model,
+            gen_ai_response_model,
+            gen_ai_agent_id,
+            gen_ai_agent_name,
+            gen_ai_agent_version,
+            gen_ai_main_agent_id,
+            gen_ai_main_agent_name,
+            gen_ai_tool_name,
+            gen_ai_tool_call_id,
+            gen_ai_usage_input_tokens,
+            gen_ai_usage_output_tokens,
+            gen_ai_usage_reasoning_tokens,
+            adk_session_id,
+            adk_invocation_id,
+            adk_user_id,
+            error_type,
+            COALESCE(
+              JSON_VALUE(attributes, '$."gen_ai.agent.name"'),
+              JSON_VALUE(attributes, '$."gcp.vertex.agent.name"')
+            ) AS declared_agent_name,
+            COALESCE(
+              JSON_VALUE(attributes, '$."gen_ai.agent.name"'),
+              JSON_VALUE(attributes, '$."gcp.vertex.agent.name"'),
+              IF(gen_ai_operation_name IN ('invoke_agent', 'create_agent'), gen_ai_agent_name, NULL)
+            ) AS agent_path_name
+          FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.v_gen_ai_spans.table_id}`
+          QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY trace_id, service_name, span_id
+            ORDER BY start_time ASC, end_time DESC, span_name ASC, duration_nano DESC
+          ) = 1
+        ),
+        parent_ids AS (
+          SELECT DISTINCT
+            trace_id,
+            service_name,
+            parent_span_id AS span_id
+          FROM spans
+          WHERE parent_span_id IS NOT NULL
+            AND parent_span_id != ''
+        ),
+        trajectory AS (
+          SELECT
+            s.start_time,
+            s.end_time,
+            s.duration_nano,
+            s.duration_ms,
+            s.trace_id,
+            s.span_id,
+            s.parent_span_id,
+            s.service_name,
+            s.span_name,
+            s.span_kind,
+            s.status_code,
+            s.status_message,
+            s.gen_ai_operation_name,
+            s.gen_ai_system,
+            s.gen_ai_provider_name,
+            s.gen_ai_request_model,
+            s.gen_ai_response_model,
+            s.gen_ai_agent_id,
+            s.gen_ai_agent_name,
+            s.gen_ai_agent_version,
+            s.gen_ai_main_agent_id,
+            s.gen_ai_main_agent_name,
+            s.gen_ai_tool_name,
+            s.gen_ai_tool_call_id,
+            s.gen_ai_usage_input_tokens,
+            s.gen_ai_usage_output_tokens,
+            s.gen_ai_usage_reasoning_tokens,
+            s.adk_session_id,
+            s.adk_invocation_id,
+            s.adk_user_id,
+            s.error_type,
+            0 AS depth,
+            s.span_id AS root_span_id,
+            CASE
+              WHEN s.gen_ai_operation_name IN ('invoke_agent', 'create_agent')
+                OR s.declared_agent_name IS NOT NULL
+              THEN s.span_id
+              ELSE CAST(NULL AS STRING)
+            END AS nearest_agent_span_id,
+            CASE
+              WHEN s.gen_ai_operation_name IN ('invoke_agent', 'create_agent')
+                OR s.declared_agent_name IS NOT NULL
+              THEN COALESCE(s.declared_agent_name, s.gen_ai_agent_name)
+              ELSE CAST(NULL AS STRING)
+            END AS nearest_agent_name,
+            CASE
+              WHEN s.agent_path_name IS NOT NULL THEN [s.agent_path_name]
+              ELSE ARRAY<STRING>[]
+            END AS agent_path,
+            (s.parent_span_id IS NOT NULL AND s.parent_span_id != '') AS is_orphan,
+            [s.span_id] AS visited_span_ids
+          FROM spans AS s
+          LEFT JOIN spans AS p
+            ON s.trace_id = p.trace_id
+            AND s.parent_span_id = p.span_id
+            AND s.service_name IS NOT DISTINCT FROM p.service_name
+            AND p.start_time BETWEEN TIMESTAMP_SUB(s.start_time, INTERVAL 24 HOUR) AND TIMESTAMP_ADD(s.start_time, INTERVAL 1 HOUR)
+          WHERE s.parent_span_id IS NULL
+             OR s.parent_span_id = ''
+             OR p.span_id IS NULL
+
+          UNION ALL
+
+          SELECT
+            c.start_time,
+            c.end_time,
+            c.duration_nano,
+            c.duration_ms,
+            c.trace_id,
+            c.span_id,
+            c.parent_span_id,
+            c.service_name,
+            c.span_name,
+            c.span_kind,
+            c.status_code,
+            c.status_message,
+            c.gen_ai_operation_name,
+            c.gen_ai_system,
+            c.gen_ai_provider_name,
+            c.gen_ai_request_model,
+            c.gen_ai_response_model,
+            c.gen_ai_agent_id,
+            c.gen_ai_agent_name,
+            c.gen_ai_agent_version,
+            c.gen_ai_main_agent_id,
+            c.gen_ai_main_agent_name,
+            c.gen_ai_tool_name,
+            c.gen_ai_tool_call_id,
+            c.gen_ai_usage_input_tokens,
+            c.gen_ai_usage_output_tokens,
+            c.gen_ai_usage_reasoning_tokens,
+            c.adk_session_id,
+            c.adk_invocation_id,
+            c.adk_user_id,
+            c.error_type,
+            t.depth + 1 AS depth,
+            t.root_span_id AS root_span_id,
+            CASE
+              WHEN c.gen_ai_operation_name IN ('invoke_agent', 'create_agent')
+                OR (t.nearest_agent_span_id IS NULL AND c.declared_agent_name IS NOT NULL)
+              THEN c.span_id
+              ELSE t.nearest_agent_span_id
+            END AS nearest_agent_span_id,
+            CASE
+              WHEN c.gen_ai_operation_name IN ('invoke_agent', 'create_agent')
+                OR (t.nearest_agent_span_id IS NULL AND c.declared_agent_name IS NOT NULL)
+              THEN COALESCE(c.declared_agent_name, c.gen_ai_agent_name)
+              ELSE t.nearest_agent_name
+            END AS nearest_agent_name,
+            CASE
+              WHEN c.agent_path_name IS NOT NULL
+                AND (
+                  ARRAY_LENGTH(t.agent_path) = 0
+                  OR t.agent_path[SAFE_OFFSET(ARRAY_LENGTH(t.agent_path) - 1)] != c.agent_path_name
+                )
+              THEN ARRAY_CONCAT(t.agent_path, [c.agent_path_name])
+              ELSE t.agent_path
+            END AS agent_path,
+            t.is_orphan AS is_orphan,
+            ARRAY_CONCAT(t.visited_span_ids, [c.span_id]) AS visited_span_ids
+          FROM trajectory AS t
+          JOIN spans AS c
+            ON c.trace_id = t.trace_id
+            AND c.parent_span_id = t.span_id
+            AND c.service_name IS NOT DISTINCT FROM t.service_name
+            AND c.start_time BETWEEN TIMESTAMP_SUB(t.start_time, INTERVAL 1 HOUR) AND TIMESTAMP_ADD(t.start_time, INTERVAL 24 HOUR)
+          WHERE t.depth < 16
+            AND c.span_id NOT IN UNNEST(t.visited_span_ids)
+        ),
+        emitted_ancestors AS (
+          SELECT
+            c.trace_id,
+            c.service_name,
+            c.span_id AS descendant_span_id,
+            c.start_time AS descendant_start_time,
+            c.gen_ai_usage_input_tokens IS NOT NULL AS has_input,
+            c.gen_ai_usage_output_tokens IS NOT NULL AS has_output,
+            c.gen_ai_usage_reasoning_tokens IS NOT NULL AS has_reasoning,
+            p.span_id AS ancestor_span_id,
+            p.parent_span_id AS ancestor_parent_span_id,
+            p.start_time AS ancestor_start_time,
+            1 AS hop,
+            [c.span_id, p.span_id] AS path_span_ids
+          FROM trajectory AS c
+          JOIN trajectory AS p
+            ON p.trace_id = c.trace_id
+            AND p.span_id = c.parent_span_id
+            AND p.service_name IS NOT DISTINCT FROM c.service_name
+          WHERE p.span_id != c.span_id
+
+          UNION ALL
+
+          SELECT
+            ea.trace_id,
+            ea.service_name,
+            ea.descendant_span_id,
+            ea.descendant_start_time,
+            ea.has_input,
+            ea.has_output,
+            ea.has_reasoning,
+            p.span_id AS ancestor_span_id,
+            p.parent_span_id AS ancestor_parent_span_id,
+            p.start_time AS ancestor_start_time,
+            ea.hop + 1 AS hop,
+            ARRAY_CONCAT(ea.path_span_ids, [p.span_id]) AS path_span_ids
+          FROM emitted_ancestors AS ea
+          JOIN trajectory AS p
+            ON p.trace_id = ea.trace_id
+            AND p.span_id = ea.ancestor_parent_span_id
+            AND p.service_name IS NOT DISTINCT FROM ea.service_name
+          WHERE ea.hop < 32
+            AND p.span_id NOT IN UNNEST(ea.path_span_ids)
+        ),
+        token_parent_coverage AS (
+          SELECT
+            ea.trace_id,
+            ea.service_name,
+            ea.ancestor_span_id AS span_id,
+            LOGICAL_OR(ea.has_input) AS has_input,
+            LOGICAL_OR(ea.has_output) AS has_output,
+            LOGICAL_OR(ea.has_reasoning) AS has_reasoning
+          FROM emitted_ancestors AS ea
+          LEFT JOIN emitted_ancestors AS reverse_path
+            ON reverse_path.trace_id = ea.trace_id
+            AND reverse_path.service_name IS NOT DISTINCT FROM ea.service_name
+            AND reverse_path.descendant_span_id = ea.ancestor_span_id
+            AND reverse_path.ancestor_span_id = ea.descendant_span_id
+          WHERE (ea.has_input OR ea.has_output OR ea.has_reasoning)
+            AND (
+              reverse_path.ancestor_span_id IS NULL
+              OR ea.descendant_start_time > ea.ancestor_start_time
+              OR (
+                ea.descendant_start_time = ea.ancestor_start_time
+                AND ea.descendant_span_id > ea.ancestor_span_id
+              )
+            )
+          GROUP BY ea.trace_id, ea.service_name, ea.ancestor_span_id
+        )
+      SELECT
+        t.start_time,
+        t.end_time,
+        t.duration_nano,
+        t.duration_ms,
+        t.trace_id,
+        t.span_id,
+        t.parent_span_id,
+        t.service_name,
+        t.span_name,
+        t.span_kind,
+        t.status_code,
+        t.status_message,
+        t.gen_ai_operation_name,
+        t.gen_ai_system,
+        t.gen_ai_provider_name,
+        t.gen_ai_request_model,
+        t.gen_ai_response_model,
+        t.gen_ai_agent_id,
+        t.gen_ai_agent_name,
+        t.gen_ai_agent_version,
+        t.gen_ai_main_agent_id,
+        t.gen_ai_main_agent_name,
+        t.gen_ai_tool_name,
+        t.gen_ai_tool_call_id,
+        IF(
+          COALESCE(token_leaf_check.has_input, FALSE)
+          AND (
+            (t.gen_ai_usage_output_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_output, FALSE))
+            OR (t.gen_ai_usage_reasoning_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_reasoning, FALSE))
+          ),
+          CAST(NULL AS INT64),
+          t.gen_ai_usage_input_tokens
+        ) AS gen_ai_usage_input_tokens,
+        IF(
+          COALESCE(token_leaf_check.has_output, FALSE)
+          AND (
+            (t.gen_ai_usage_input_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_input, FALSE))
+            OR (t.gen_ai_usage_reasoning_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_reasoning, FALSE))
+          ),
+          CAST(NULL AS INT64),
+          t.gen_ai_usage_output_tokens
+        ) AS gen_ai_usage_output_tokens,
+        IF(
+          COALESCE(token_leaf_check.has_reasoning, FALSE)
+          AND (
+            (t.gen_ai_usage_input_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_input, FALSE))
+            OR (t.gen_ai_usage_output_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_output, FALSE))
+          ),
+          CAST(NULL AS INT64),
+          t.gen_ai_usage_reasoning_tokens
+        ) AS gen_ai_usage_reasoning_tokens,
+        t.adk_session_id,
+        t.adk_invocation_id,
+        t.adk_user_id,
+        t.error_type,
+        t.depth,
+        t.root_span_id,
+        t.nearest_agent_span_id,
+        t.nearest_agent_name,
+        t.agent_path,
+        t.is_orphan,
+        ROW_NUMBER() OVER (
+          PARTITION BY t.trace_id, t.service_name
+          ORDER BY t.start_time ASC, t.span_id ASC
+        ) AS step_index,
+        (leaf_check.span_id IS NULL) AS is_leaf,
+        (
+          (t.gen_ai_usage_input_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_input, FALSE))
+          OR (t.gen_ai_usage_output_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_output, FALSE))
+          OR (t.gen_ai_usage_reasoning_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_reasoning, FALSE))
+        ) AS is_token_leaf
+      FROM trajectory AS t
+      LEFT JOIN parent_ids AS leaf_check
+        ON t.trace_id = leaf_check.trace_id
+        AND t.span_id = leaf_check.span_id
+        AND t.service_name IS NOT DISTINCT FROM leaf_check.service_name
+      LEFT JOIN token_parent_coverage AS token_leaf_check
+        ON t.trace_id = token_leaf_check.trace_id
+        AND t.span_id = token_leaf_check.span_id
+        AND t.service_name IS NOT DISTINCT FROM token_leaf_check.service_name
+    EOT
+  }
+}
+
 # --- IAM: least privilege ---
 #
 # This module provisions the dataset and every table and view, so by default

@@ -253,11 +253,12 @@ func TestCompanionViewsMetadata(t *testing.T) {
 			name:    "spans",
 			isSpans: true,
 			want: map[string]string{
-				"otel_spans_as_allspans": fmt.Sprintf(SpansAsAllSpansViewQuery, "proj", "ds", "spans_tbl"),
-				"v_gen_ai_spans":         fmt.Sprintf(GenAISpansViewQuery, "proj", "ds", "spans_tbl"),
-				"v_gen_ai_model_costs":   fmt.Sprintf(GenAIModelCostsViewQuery, "proj", "ds"),
-				"v_gen_ai_sessions":      fmt.Sprintf(GenAISessionsViewQuery, "proj", "ds"),
-				"v_gen_ai_tool_usage":    fmt.Sprintf(GenAIToolUsageViewQuery, "proj", "ds"),
+				"otel_spans_as_allspans":    fmt.Sprintf(SpansAsAllSpansViewQuery, "proj", "ds", "spans_tbl"),
+				"v_gen_ai_spans":            fmt.Sprintf(GenAISpansViewQuery, "proj", "ds", "spans_tbl"),
+				"v_gen_ai_model_costs":      fmt.Sprintf(GenAIModelCostsViewQuery, "proj", "ds"),
+				"v_gen_ai_sessions":         fmt.Sprintf(GenAISessionsViewQuery, "proj", "ds"),
+				"v_gen_ai_tool_usage":       fmt.Sprintf(GenAIToolUsageViewQuery, "proj", "ds"),
+				"v_gen_ai_agent_trajectory": fmt.Sprintf(GenAIAgentTrajectoryViewQuery, "proj", "ds"),
 			},
 		},
 		{

@@ -33,6 +33,11 @@ output "v_gen_ai_metric_exemplars_table_id" {
   value       = one(google_bigquery_table.v_gen_ai_metric_exemplars[*].id)
 }
 
+output "v_gen_ai_agent_trajectory_table_id" {
+  description = "Fully-qualified v_gen_ai_agent_trajectory view ID, or null when require_partition_filter is set without allow_unprunable_views"
+  value       = one(google_bigquery_table.v_gen_ai_agent_trajectory[*].id)
+}
+
 output "service_account_email" {
   description = "Service account email for the collector"
   value       = google_service_account.otel_collector.email
