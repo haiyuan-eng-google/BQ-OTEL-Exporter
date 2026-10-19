@@ -195,11 +195,11 @@ func clientUsesMultiplexing(client *managedwriter.Client) bool {
 		return false
 	}
 	v := reflect.ValueOf(client)
-	if v.Kind() != reflect.Ptr || v.IsNil() {
+	if v.Kind() != reflect.Pointer || v.IsNil() {
 		return false
 	}
 	cfg := v.Elem().FieldByName("cfg")
-	if !cfg.IsValid() || cfg.Kind() != reflect.Ptr || cfg.IsNil() {
+	if !cfg.IsValid() || cfg.Kind() != reflect.Pointer || cfg.IsNil() {
 		return false
 	}
 	useMultiplex := cfg.Elem().FieldByName("useMultiplex")
