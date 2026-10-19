@@ -1265,6 +1265,24 @@ CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAIAgentTrajectoryViewName + "`" 
 // the child's start_time. Recursive steps traverse child spans within the
 // symmetric [-1h, +24h] window up to depth < 16 and guard against cycles with
 // visited_span_ids.
+//
+// The agent columns read declared_agent_name, the agent name a span's own
+// attributes declare (gen_ai.agent.name, then gcp.vertex.agent.name), because
+// gen_ai_agent_name falls back to service_name and so names every span. An
+// invoke_agent or create_agent span always starts a new nearest agent, and a
+// span that only declares an agent name starts one when no span above it has
+// one. Such a span is its own nearest_agent_span_id, and its
+// nearest_agent_name is its declared name, or gen_ai_agent_name for an agent
+// span that declares none; every other span inherits both columns from its
+// parent. agent_path appends agent_path_name (the declared name or, for an
+// agent span without one, gen_ai_agent_name) unless it repeats the last entry,
+// so a chat or tool span without an agent attribute adds nothing to it.
+//
+// is_token_leaf uses the token-parent test of the rollup views (see
+// genAITokenParentsAgg): a span reports tokens when its input or output token
+// count IS NOT NULL, so an explicit 0 counts. A span that reports tokens is a
+// token leaf unless a direct child in the same trace and service reports them
+// too.
 const GenAIAgentTrajectoryViewQuery = `
 WITH RECURSIVE
   spans AS (
@@ -1299,7 +1317,16 @@ WITH RECURSIVE
       adk_session_id,
       adk_invocation_id,
       adk_user_id,
-      error_type
+      error_type,
+      COALESCE(
+        JSON_VALUE(attributes, '$."gen_ai.agent.name"'),
+        JSON_VALUE(attributes, '$."gcp.vertex.agent.name"')
+      ) AS declared_agent_name,
+      COALESCE(
+        JSON_VALUE(attributes, '$."gen_ai.agent.name"'),
+        JSON_VALUE(attributes, '$."gcp.vertex.agent.name"'),
+        IF(gen_ai_operation_name IN ('invoke_agent', 'create_agent'), gen_ai_agent_name, NULL)
+      ) AS agent_path_name
     FROM ` + "`%[1]s.%[2]s." + GenAISpansViewName + "`" + `
   ),
   parent_ids AS (
@@ -1319,7 +1346,7 @@ WITH RECURSIVE
     FROM spans
     WHERE parent_span_id IS NOT NULL
       AND parent_span_id != ''
-      AND (COALESCE(gen_ai_usage_input_tokens, 0) + COALESCE(gen_ai_usage_output_tokens, 0) > 0)
+      AND (gen_ai_usage_input_tokens IS NOT NULL OR gen_ai_usage_output_tokens IS NOT NULL)
   ),
   trajectory AS (
     SELECT
@@ -1358,18 +1385,18 @@ WITH RECURSIVE
       s.span_id AS root_span_id,
       CASE
         WHEN s.gen_ai_operation_name IN ('invoke_agent', 'create_agent')
-          OR s.gen_ai_agent_name IS NOT NULL
+          OR s.declared_agent_name IS NOT NULL
         THEN s.span_id
         ELSE CAST(NULL AS STRING)
       END AS nearest_agent_span_id,
       CASE
         WHEN s.gen_ai_operation_name IN ('invoke_agent', 'create_agent')
-          OR s.gen_ai_agent_name IS NOT NULL
-        THEN s.gen_ai_agent_name
+          OR s.declared_agent_name IS NOT NULL
+        THEN COALESCE(s.declared_agent_name, s.gen_ai_agent_name)
         ELSE CAST(NULL AS STRING)
       END AS nearest_agent_name,
       CASE
-        WHEN s.gen_ai_agent_name IS NOT NULL THEN [s.gen_ai_agent_name]
+        WHEN s.agent_path_name IS NOT NULL THEN [s.agent_path_name]
         ELSE ARRAY<STRING>[]
       END AS agent_path,
       (s.parent_span_id IS NOT NULL AND s.parent_span_id != '') AS is_orphan,
@@ -1422,24 +1449,23 @@ WITH RECURSIVE
       t.root_span_id AS root_span_id,
       CASE
         WHEN c.gen_ai_operation_name IN ('invoke_agent', 'create_agent')
-          OR (t.nearest_agent_span_id IS NULL AND c.gen_ai_agent_name IS NOT NULL)
+          OR (t.nearest_agent_span_id IS NULL AND c.declared_agent_name IS NOT NULL)
         THEN c.span_id
         ELSE t.nearest_agent_span_id
       END AS nearest_agent_span_id,
       CASE
         WHEN c.gen_ai_operation_name IN ('invoke_agent', 'create_agent')
-        THEN COALESCE(c.gen_ai_agent_name, t.nearest_agent_name)
-        WHEN t.nearest_agent_name IS NULL
-        THEN c.gen_ai_agent_name
+          OR (t.nearest_agent_span_id IS NULL AND c.declared_agent_name IS NOT NULL)
+        THEN COALESCE(c.declared_agent_name, c.gen_ai_agent_name)
         ELSE t.nearest_agent_name
       END AS nearest_agent_name,
       CASE
-        WHEN c.gen_ai_agent_name IS NOT NULL
+        WHEN c.agent_path_name IS NOT NULL
           AND (
             ARRAY_LENGTH(t.agent_path) = 0
-            OR t.agent_path[OFFSET(ARRAY_LENGTH(t.agent_path) - 1)] != c.gen_ai_agent_name
+            OR t.agent_path[OFFSET(ARRAY_LENGTH(t.agent_path) - 1)] != c.agent_path_name
           )
-        THEN ARRAY_CONCAT(t.agent_path, [c.gen_ai_agent_name])
+        THEN ARRAY_CONCAT(t.agent_path, [c.agent_path_name])
         ELSE t.agent_path
       END AS agent_path,
       t.is_orphan AS is_orphan,
@@ -1497,7 +1523,7 @@ SELECT
   ) AS step_index,
   (leaf_check.span_id IS NULL) AS is_leaf,
   (
-    (COALESCE(t.gen_ai_usage_input_tokens, 0) + COALESCE(t.gen_ai_usage_output_tokens, 0) > 0)
+    (t.gen_ai_usage_input_tokens IS NOT NULL OR t.gen_ai_usage_output_tokens IS NOT NULL)
     AND token_leaf_check.span_id IS NULL
   ) AS is_token_leaf
 FROM trajectory AS t

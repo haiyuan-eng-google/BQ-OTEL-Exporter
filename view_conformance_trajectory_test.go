@@ -4,6 +4,7 @@
 package bigqueryexporter
 
 import (
+	"encoding/json"
 	"fmt"
 	"slices"
 	"sort"
@@ -62,9 +63,64 @@ func copyTrajectoryBaseCols(src map[string]any) map[string]any {
 	return dst
 }
 
+// declaredAgentName is declared_agent_name in the spans CTE of
+// v_gen_ai_agent_trajectory: the agent name a span's own attributes declare,
+// gen_ai.agent.name and then gcp.vertex.agent.name, without the service_name
+// fallback that gen_ai_agent_name has.
+func declaredAgentName(t testing.TB, s map[string]any) (string, bool) {
+	t.Helper()
+	a := parseAttrs(t, s)
+	if name, ok := a.jsonValue("gen_ai.agent.name"); ok {
+		return name, true
+	}
+	return a.jsonValue("gcp.vertex.agent.name")
+}
+
+// agentPathName is agent_path_name in the spans CTE: the declared agent name,
+// or gen_ai_agent_name for an invoke_agent or create_agent span that declares
+// none.
+func agentPathName(t testing.TB, s map[string]any) (string, bool) {
+	t.Helper()
+	if name, ok := declaredAgentName(t, s); ok {
+		return name, true
+	}
+	if op, _ := colString(s, "gen_ai_operation_name"); isAgentOperation(op) {
+		return colString(s, "gen_ai_agent_name")
+	}
+	return "", false
+}
+
+// reportsTokens is the token test of genAITokenParentsAgg that the view reuses:
+// an input or output token count that is not NULL, an explicit 0 included.
+func reportsTokens(s map[string]any) bool {
+	_, hasIn := colInt(s, "gen_ai_usage_input_tokens")
+	_, hasOut := colInt(s, "gen_ai_usage_output_tokens")
+	return hasIn || hasOut
+}
+
+// trajectorySpans is v_gen_ai_spans as v_gen_ai_agent_trajectory reads it:
+// the genAISpansView rows together with the attributes column that the view
+// passes through and genAISpansView leaves out, which declared_agent_name is
+// read from. Each deduplicated span goes through genAISpansView on its own, so
+// the rows and their order are those of genAISpansView over all of them.
+func trajectorySpans(t *testing.T, rawSpans []map[string]any) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for _, s := range spansDedup.apply(rawSpans) {
+		for _, row := range genAISpansView(t, []map[string]any{s}) {
+			if a, ok := s["attributes"]; ok {
+				row["attributes"] = a
+			}
+			out = append(out, row)
+		}
+	}
+	return out
+}
+
 // genAIAgentTrajectoryView evaluates v_gen_ai_agent_trajectory over the rows
-// of v_gen_ai_spans.
-func genAIAgentTrajectoryView(spans []map[string]any) []map[string]any {
+// of v_gen_ai_spans, attributes column included.
+func genAIAgentTrajectoryView(t testing.TB, spans []map[string]any) []map[string]any {
+	t.Helper()
 	parentIDs := make(map[string]bool)
 	tokenParentIDs := make(map[string]bool)
 	for _, s := range spans {
@@ -74,7 +130,7 @@ func genAIAgentTrajectoryView(spans []map[string]any) []map[string]any {
 		}
 		key := groupKey(s["trace_id"], s["service_name"], parent)
 		parentIDs[key] = true
-		if intOrZero(s, "gen_ai_usage_input_tokens")+intOrZero(s, "gen_ai_usage_output_tokens") > 0 {
+		if reportsTokens(s) {
 			tokenParentIDs[key] = true
 		}
 	}
@@ -114,18 +170,20 @@ func genAIAgentTrajectoryView(spans []map[string]any) []map[string]any {
 		row := copyTrajectoryBaseCols(s)
 		spanID, _ := colString(s, "span_id")
 		op, _ := colString(s, "gen_ai_operation_name")
-		agentName, hasAgentName := colString(s, "gen_ai_agent_name")
+		declared, hasDeclared := declaredAgentName(t, s)
 
 		row["depth"] = int64(0)
 		row["root_span_id"] = spanID
-		if isAgentOperation(op) || hasAgentName {
+		if isAgentOperation(op) || hasDeclared {
 			row["nearest_agent_span_id"] = spanID
-			if hasAgentName {
-				row["nearest_agent_name"] = agentName
+			if hasDeclared {
+				row["nearest_agent_name"] = declared
+			} else if name, ok := colString(s, "gen_ai_agent_name"); ok {
+				row["nearest_agent_name"] = name
 			}
 		}
-		if hasAgentName {
-			row["agent_path"] = []string{agentName}
+		if name, ok := agentPathName(t, s); ok {
+			row["agent_path"] = []string{name}
 		} else {
 			row["agent_path"] = []string{}
 		}
@@ -172,36 +230,30 @@ func genAIAgentTrajectoryView(spans []map[string]any) []map[string]any {
 
 				row := copyTrajectoryBaseCols(c)
 				cOp, _ := colString(c, "gen_ai_operation_name")
-				cAgentName, cHasAgentName := colString(c, "gen_ai_agent_name")
+				cDeclared, cHasDeclared := declaredAgentName(t, c)
 
 				row["depth"] = tItem.depth + 1
 				row["root_span_id"] = tRow["root_span_id"]
 
-				if isAgentOperation(cOp) || (tRow["nearest_agent_span_id"] == nil && cHasAgentName) {
+				if isAgentOperation(cOp) || (tRow["nearest_agent_span_id"] == nil && cHasDeclared) {
 					row["nearest_agent_span_id"] = cSpanID
-				} else if tRow["nearest_agent_span_id"] != nil {
-					row["nearest_agent_span_id"] = tRow["nearest_agent_span_id"]
-				}
-
-				switch {
-				case isAgentOperation(cOp):
-					if cHasAgentName {
-						row["nearest_agent_name"] = cAgentName
-					} else if tRow["nearest_agent_name"] != nil {
-						row["nearest_agent_name"] = tRow["nearest_agent_name"]
+					if cHasDeclared {
+						row["nearest_agent_name"] = cDeclared
+					} else if name, ok := colString(c, "gen_ai_agent_name"); ok {
+						row["nearest_agent_name"] = name
 					}
-				case tRow["nearest_agent_name"] == nil:
-					if cHasAgentName {
-						row["nearest_agent_name"] = cAgentName
+				} else {
+					for _, col := range []string{"nearest_agent_span_id", "nearest_agent_name"} {
+						if v := tRow[col]; v != nil {
+							row[col] = v
+						}
 					}
-				default:
-					row["nearest_agent_name"] = tRow["nearest_agent_name"]
 				}
 
 				prevPath := tRow["agent_path"].([]string)
 				nextPath := slices.Clone(prevPath)
-				if cHasAgentName && (len(nextPath) == 0 || nextPath[len(nextPath)-1] != cAgentName) {
-					nextPath = append(nextPath, cAgentName)
+				if name, ok := agentPathName(t, c); ok && (len(nextPath) == 0 || nextPath[len(nextPath)-1] != name) {
+					nextPath = append(nextPath, name)
 				}
 				row["agent_path"] = nextPath
 				row["is_orphan"] = tRow["is_orphan"]
@@ -246,8 +298,7 @@ func genAIAgentTrajectoryView(spans []map[string]any) []map[string]any {
 			row["step_index"] = int64(idx + 1)
 			lk := groupKey(row["trace_id"], row["service_name"], row["span_id"])
 			row["is_leaf"] = !parentIDs[lk]
-			hasTokens := intOrZero(row, "gen_ai_usage_input_tokens")+intOrZero(row, "gen_ai_usage_output_tokens") > 0
-			row["is_token_leaf"] = hasTokens && !tokenParentIDs[lk]
+			row["is_token_leaf"] = reportsTokens(row) && !tokenParentIDs[lk]
 			out = append(out, row)
 		}
 	}
@@ -259,8 +310,8 @@ func TestScenarioMultiAgentTrajectoryView(t *testing.T) {
 	rig.pushTraces(t, loadTraces(t, "multi_agent/traces.json"))
 
 	rawSpans := rig.srv.Rows("otel_spans")
-	spans := genAISpansView(t, rawSpans)
-	traj := genAIAgentTrajectoryView(spans)
+	spans := trajectorySpans(t, rawSpans)
+	traj := genAIAgentTrajectoryView(t, spans)
 
 	if len(traj) != 8 {
 		t.Fatalf("v_gen_ai_agent_trajectory rows = %d, want 8", len(traj))
@@ -417,6 +468,17 @@ func TestScenarioMultiAgentTrajectoryView(t *testing.T) {
 
 func TestAgentTrajectoryViewEdgeCases(t *testing.T) {
 	baseTime := time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC).UnixMicro()
+	// attributes renders a v_gen_ai_spans attributes column.
+	attributes := func(kv map[string]string) string {
+		raw, err := json.Marshal(kv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(raw)
+	}
+	// makeSpan builds a v_gen_ai_spans row. A non-empty agent is declared as
+	// gen_ai.agent.name in attributes; without one, gen_ai_agent_name falls
+	// back to service_name as it does in v_gen_ai_spans.
 	makeSpan := func(traceID, spanID, parentID string, service any, op, agent string, offsetMicros, inTokens int64) map[string]any {
 		row := map[string]any{
 			"start_time":            baseTime + offsetMicros,
@@ -438,6 +500,9 @@ func TestAgentTrajectoryViewEdgeCases(t *testing.T) {
 		}
 		if agent != "" {
 			row["gen_ai_agent_name"] = agent
+			row["attributes"] = attributes(map[string]string{"gen_ai.agent.name": agent})
+		} else if service != nil {
+			row["gen_ai_agent_name"] = service
 		}
 		if inTokens > 0 {
 			row["gen_ai_usage_input_tokens"] = inTokens
@@ -450,7 +515,7 @@ func TestAgentTrajectoryViewEdgeCases(t *testing.T) {
 			makeSpan("t-cycle-2", "span-a", "span-b", "svc", "invoke_agent", "agent-a", 0, 10),
 			makeSpan("t-cycle-2", "span-b", "span-a", "svc", "invoke_agent", "agent-b", 10, 10),
 		}
-		got := genAIAgentTrajectoryView(spans)
+		got := genAIAgentTrajectoryView(t, spans)
 		if len(got) != 0 {
 			t.Fatalf("disconnected 2-node cycle rows = %d, want 0", len(got))
 		}
@@ -464,7 +529,7 @@ func TestAgentTrajectoryViewEdgeCases(t *testing.T) {
 			makeSpan("t-cycle-2r", "span-b", "span-r", "svc", "invoke_agent", "child", 10, 10),
 			makeSpan("t-cycle-2r", "span-r", "span-b", "svc", "invoke_agent", "root", 20, 10),
 		}
-		got := genAIAgentTrajectoryView(spans)
+		got := genAIAgentTrajectoryView(t, spans)
 		if len(got) != 2 {
 			t.Fatalf("rooted 2-node cycle rows = %d, want 2 (cycle stopped by visited_span_ids)", len(got))
 		}
@@ -481,7 +546,7 @@ func TestAgentTrajectoryViewEdgeCases(t *testing.T) {
 			makeSpan("t-cycle-3r", "span-b", "span-a", "svc", "invoke_agent", "b", 20, 0),
 			makeSpan("t-cycle-3r", "span-a", "span-b", "svc", "invoke_agent", "a", 30, 0),
 		}
-		got := genAIAgentTrajectoryView(spans)
+		got := genAIAgentTrajectoryView(t, spans)
 		if len(got) != 3 {
 			t.Fatalf("rooted 3-node cycle rows = %d, want 3 (cycle stopped by visited_span_ids)", len(got))
 		}
@@ -501,7 +566,7 @@ func TestAgentTrajectoryViewEdgeCases(t *testing.T) {
 			}
 			spans = append(spans, makeSpan("t-deep", id, parent, "svc", "invoke_agent", id, int64(i)*100, 1))
 		}
-		got := genAIAgentTrajectoryView(spans)
+		got := genAIAgentTrajectoryView(t, spans)
 		if len(got) != 17 {
 			t.Fatalf("20-level chain rows = %d, want 17 (depths 0..16)", len(got))
 		}
@@ -527,7 +592,7 @@ func TestAgentTrajectoryViewEdgeCases(t *testing.T) {
 			makeSpan("t-null-svc", "s2", "s1", nil, "chat", "root", 10, 50),
 			makeSpan("t-null-svc", "s3", "s1", "other-svc", "chat", "other", 20, 50),
 		}
-		got := genAIAgentTrajectoryView(spans)
+		got := genAIAgentTrajectoryView(t, spans)
 		if len(got) != 3 {
 			t.Fatalf("null_service_name rows = %d, want 3", len(got))
 		}
@@ -564,7 +629,7 @@ func TestAgentTrajectoryViewEdgeCases(t *testing.T) {
 			makeSpan("t-orphan-tree", "o2", "o1", "svc", "invoke_agent", "worker_b", 10, 100),
 			makeSpan("t-orphan-tree", "o3", "o2", "svc", "chat", "worker_b", 20, 100),
 		}
-		got := genAIAgentTrajectoryView(spans)
+		got := genAIAgentTrajectoryView(t, spans)
 		if len(got) != 3 {
 			t.Fatalf("orphan tree rows = %d, want 3", len(got))
 		}
@@ -606,7 +671,7 @@ func TestAgentTrajectoryViewEdgeCases(t *testing.T) {
 			// 2 hours before root -> outside -1h skew window -> becomes orphan root.
 			makeSpan("t-window", "too-early", "root", "svc", "chat", "planner", -int64(2*time.Hour/time.Microsecond), 10),
 		}
-		got := genAIAgentTrajectoryView(spans)
+		got := genAIAgentTrajectoryView(t, spans)
 		if len(got) != 3 {
 			t.Fatalf("temporal_window_bounds rows = %d, want 3", len(got))
 		}
@@ -621,26 +686,149 @@ func TestAgentTrajectoryViewEdgeCases(t *testing.T) {
 			"is_orphan":    true,
 		})
 	})
+
+	// gen_ai_agent_name names every span, because v_gen_ai_spans falls back to
+	// service_name, so the agent columns read the declared agent name instead:
+	// a chat or tool span that declares no agent keeps its agent's path and
+	// nearest agent rather than adding the service name.
+	t.Run("undeclared_children_inherit_the_agent", func(t *testing.T) {
+		spans := []map[string]any{
+			makeSpan("t-undeclared", "planner", "", "my-service", "invoke_agent", "planner", 0, 0),
+			makeSpan("t-undeclared", "chat", "planner", "my-service", "chat", "", 10, 20),
+			makeSpan("t-undeclared", "tool", "planner", "my-service", "execute_tool", "", 20, 0),
+			makeSpan("t-undeclared", "researcher", "planner", "my-service", "invoke_agent", "researcher", 30, 0),
+			makeSpan("t-undeclared", "research-chat", "researcher", "my-service", "chat", "", 40, 30),
+		}
+		got := genAIAgentTrajectoryView(t, spans)
+		if len(got) != 5 {
+			t.Fatalf("rows = %d, want 5", len(got))
+		}
+		for _, id := range []string{"chat", "tool"} {
+			requireCols(t, id+" under planner without an agent attribute", onlyRow(t, id, got, "span_id", id), map[string]any{
+				"gen_ai_agent_name":     "my-service",
+				"nearest_agent_span_id": "planner",
+				"nearest_agent_name":    "planner",
+				"agent_path":            []string{"planner"},
+			})
+		}
+		requireCols(t, "research-chat under researcher without an agent attribute", onlyRow(t, "research-chat", got, "span_id", "research-chat"), map[string]any{
+			"gen_ai_agent_name":     "my-service",
+			"nearest_agent_span_id": "researcher",
+			"nearest_agent_name":    "researcher",
+			"agent_path":            []string{"planner", "researcher"},
+		})
+	})
+
+	// Without an invoke_agent span, a root that declares no agent has no
+	// nearest agent and an empty path, and so do its undeclared descendants,
+	// until a span declares an agent name (gen_ai.agent.name, or else
+	// gcp.vertex.agent.name) and becomes the nearest agent of its subtree.
+	t.Run("declared_name_starts_an_agent_only_below_no_agent", func(t *testing.T) {
+		vertexRoot := makeSpan("t-vertex", "vertex-root", "", "svc", "chat", "", 0, 0)
+		vertexRoot["gen_ai_agent_name"] = "solo"
+		vertexRoot["attributes"] = attributes(map[string]string{"gcp.vertex.agent.name": "solo"})
+		spans := []map[string]any{
+			makeSpan("t-no-agent", "root-chat", "", "svc", "chat", "", 0, 0),
+			makeSpan("t-no-agent", "root-tool", "root-chat", "svc", "execute_tool", "", 10, 0),
+			makeSpan("t-no-agent", "late-chat", "root-tool", "svc", "chat", "late", 20, 0),
+			vertexRoot,
+			makeSpan("t-vertex", "vertex-tool", "vertex-root", "svc", "execute_tool", "", 10, 0),
+		}
+		got := genAIAgentTrajectoryView(t, spans)
+		if len(got) != 5 {
+			t.Fatalf("rows = %d, want 5", len(got))
+		}
+		for _, id := range []string{"root-chat", "root-tool"} {
+			requireCols(t, id+" without any agent", onlyRow(t, id, got, "span_id", id), map[string]any{
+				"gen_ai_agent_name":     "svc",
+				"nearest_agent_span_id": nil,
+				"nearest_agent_name":    nil,
+				"agent_path":            []string{},
+			})
+		}
+		requireCols(t, "late-chat declares the first agent", onlyRow(t, "late-chat", got, "span_id", "late-chat"), map[string]any{
+			"nearest_agent_span_id": "late-chat",
+			"nearest_agent_name":    "late",
+			"agent_path":            []string{"late"},
+		})
+		requireCols(t, "vertex-root declares gcp.vertex.agent.name only", onlyRow(t, "vertex-root", got, "span_id", "vertex-root"), map[string]any{
+			"nearest_agent_span_id": "vertex-root",
+			"nearest_agent_name":    "solo",
+			"agent_path":            []string{"solo"},
+		})
+		requireCols(t, "vertex-tool under vertex-root", onlyRow(t, "vertex-tool", got, "span_id", "vertex-tool"), map[string]any{
+			"nearest_agent_span_id": "vertex-root",
+			"nearest_agent_name":    "solo",
+			"agent_path":            []string{"solo"},
+		})
+	})
+
+	// A token count of 0 is reported, not missing, as in the rollup views: the
+	// child is the token leaf and its parent is not. A child whose counts are
+	// NULL is not a token leaf and leaves its parent one.
+	t.Run("explicit_zero_token_child_is_the_token_leaf", func(t *testing.T) {
+		zero := makeSpan("t-zero-tokens", "zero-chat", "agent", "svc", "chat", "", 10, 0)
+		zero["gen_ai_usage_input_tokens"] = int64(0)
+		zero["gen_ai_usage_output_tokens"] = int64(0)
+		spans := []map[string]any{
+			makeSpan("t-zero-tokens", "agent", "", "svc", "invoke_agent", "worker", 0, 25),
+			zero,
+			makeSpan("t-zero-tokens", "other-agent", "", "svc", "invoke_agent", "other", 20, 5),
+			makeSpan("t-zero-tokens", "no-tokens", "other-agent", "svc", "execute_tool", "", 30, 0),
+		}
+		got := genAIAgentTrajectoryView(t, spans)
+		if len(got) != 4 {
+			t.Fatalf("rows = %d, want 4", len(got))
+		}
+		requireCols(t, "zero-chat reports 0 tokens", onlyRow(t, "zero-chat", got, "span_id", "zero-chat"), map[string]any{
+			"gen_ai_usage_input_tokens":  int64(0),
+			"gen_ai_usage_output_tokens": int64(0),
+			"is_token_leaf":              true,
+		})
+		requireCols(t, "agent is the parent of a 0-token child", onlyRow(t, "agent", got, "span_id", "agent"), map[string]any{
+			"gen_ai_usage_input_tokens": int64(25),
+			"is_token_leaf":             false,
+		})
+		requireCols(t, "no-tokens reports no tokens", onlyRow(t, "no-tokens", got, "span_id", "no-tokens"), map[string]any{
+			"gen_ai_usage_input_tokens": nil,
+			"is_token_leaf":             false,
+		})
+		requireCols(t, "other-agent has only a child without tokens", onlyRow(t, "other-agent", got, "span_id", "other-agent"), map[string]any{
+			"gen_ai_usage_input_tokens": int64(5),
+			"is_token_leaf":             true,
+		})
+	})
 }
 
 func TestTrajectoryViewModelMatchesViewSQL(t *testing.T) {
 	sql := fmt.Sprintf(schema.GenAIAgentTrajectoryViewQuery, confProject, confDataset)
 	requireSQL(t, "v_gen_ai_agent_trajectory", sql,
 		"WITH RECURSIVE spans AS (",
+		// declaredAgentName and agentPathName.
+		`error_type, COALESCE( JSON_VALUE(attributes, '$."gen_ai.agent.name"'), JSON_VALUE(attributes, '$."gcp.vertex.agent.name"') ) AS declared_agent_name, `+
+			`COALESCE( JSON_VALUE(attributes, '$."gen_ai.agent.name"'), JSON_VALUE(attributes, '$."gcp.vertex.agent.name"'), `+
+			`IF(gen_ai_operation_name IN ('invoke_agent', 'create_agent'), gen_ai_agent_name, NULL) ) AS agent_path_name FROM`,
 		"FROM `"+confProject+"."+confDataset+".v_gen_ai_spans`",
 		"parent_ids AS ( SELECT DISTINCT trace_id, service_name, parent_span_id AS span_id FROM spans WHERE parent_span_id IS NOT NULL AND parent_span_id != '' )",
-		"token_parent_ids AS ( SELECT DISTINCT trace_id, service_name, parent_span_id AS span_id FROM spans WHERE parent_span_id IS NOT NULL AND parent_span_id != '' AND (COALESCE(gen_ai_usage_input_tokens, 0) + COALESCE(gen_ai_usage_output_tokens, 0) > 0) )",
+		// reportsTokens.
+		"token_parent_ids AS ( SELECT DISTINCT trace_id, service_name, parent_span_id AS span_id FROM spans WHERE parent_span_id IS NOT NULL AND parent_span_id != '' AND (gen_ai_usage_input_tokens IS NOT NULL OR gen_ai_usage_output_tokens IS NOT NULL) )",
 		"trajectory AS (",
-		"0 AS depth, s.span_id AS root_span_id,",
-		"(s.parent_span_id IS NOT NULL AND s.parent_span_id != '') AS is_orphan, [s.span_id] AS visited_span_ids",
+		"0 AS depth, s.span_id AS root_span_id, "+
+			"CASE WHEN s.gen_ai_operation_name IN ('invoke_agent', 'create_agent') OR s.declared_agent_name IS NOT NULL THEN s.span_id ELSE CAST(NULL AS STRING) END AS nearest_agent_span_id, "+
+			"CASE WHEN s.gen_ai_operation_name IN ('invoke_agent', 'create_agent') OR s.declared_agent_name IS NOT NULL THEN COALESCE(s.declared_agent_name, s.gen_ai_agent_name) ELSE CAST(NULL AS STRING) END AS nearest_agent_name, "+
+			"CASE WHEN s.agent_path_name IS NOT NULL THEN [s.agent_path_name] ELSE ARRAY<STRING>[] END AS agent_path, "+
+			"(s.parent_span_id IS NOT NULL AND s.parent_span_id != '') AS is_orphan, [s.span_id] AS visited_span_ids",
 		"FROM spans AS s LEFT JOIN spans AS p ON s.trace_id = p.trace_id AND s.parent_span_id = p.span_id AND s.service_name IS NOT DISTINCT FROM p.service_name AND p.start_time BETWEEN TIMESTAMP_SUB(s.start_time, INTERVAL 24 HOUR) AND TIMESTAMP_ADD(s.start_time, INTERVAL 1 HOUR) WHERE s.parent_span_id IS NULL OR s.parent_span_id = '' OR p.span_id IS NULL",
 		"UNION ALL",
-		"t.depth + 1 AS depth, t.root_span_id AS root_span_id,",
-		"t.is_orphan AS is_orphan, ARRAY_CONCAT(t.visited_span_ids, [c.span_id]) AS visited_span_ids",
+		"t.depth + 1 AS depth, t.root_span_id AS root_span_id, "+
+			"CASE WHEN c.gen_ai_operation_name IN ('invoke_agent', 'create_agent') OR (t.nearest_agent_span_id IS NULL AND c.declared_agent_name IS NOT NULL) THEN c.span_id ELSE t.nearest_agent_span_id END AS nearest_agent_span_id, "+
+			"CASE WHEN c.gen_ai_operation_name IN ('invoke_agent', 'create_agent') OR (t.nearest_agent_span_id IS NULL AND c.declared_agent_name IS NOT NULL) THEN COALESCE(c.declared_agent_name, c.gen_ai_agent_name) ELSE t.nearest_agent_name END AS nearest_agent_name, "+
+			"CASE WHEN c.agent_path_name IS NOT NULL AND ( ARRAY_LENGTH(t.agent_path) = 0 OR t.agent_path[OFFSET(ARRAY_LENGTH(t.agent_path) - 1)] != c.agent_path_name ) THEN ARRAY_CONCAT(t.agent_path, [c.agent_path_name]) ELSE t.agent_path END AS agent_path, "+
+			"t.is_orphan AS is_orphan, ARRAY_CONCAT(t.visited_span_ids, [c.span_id]) AS visited_span_ids",
 		"FROM trajectory AS t JOIN spans AS c ON c.trace_id = t.trace_id AND c.parent_span_id = t.span_id AND c.service_name IS NOT DISTINCT FROM t.service_name AND c.start_time BETWEEN TIMESTAMP_SUB(t.start_time, INTERVAL 1 HOUR) AND TIMESTAMP_ADD(t.start_time, INTERVAL 24 HOUR) WHERE t.depth < 16 AND c.span_id NOT IN UNNEST(t.visited_span_ids)",
 		"ROW_NUMBER() OVER ( PARTITION BY t.trace_id, t.service_name ORDER BY t.start_time ASC, t.span_id ASC ) AS step_index,",
 		"(leaf_check.span_id IS NULL) AS is_leaf,",
-		"( (COALESCE(t.gen_ai_usage_input_tokens, 0) + COALESCE(t.gen_ai_usage_output_tokens, 0) > 0) AND token_leaf_check.span_id IS NULL ) AS is_token_leaf",
+		"( (t.gen_ai_usage_input_tokens IS NOT NULL OR t.gen_ai_usage_output_tokens IS NOT NULL) AND token_leaf_check.span_id IS NULL ) AS is_token_leaf",
 		"FROM trajectory AS t LEFT JOIN parent_ids AS leaf_check ON t.trace_id = leaf_check.trace_id AND t.span_id = leaf_check.span_id AND t.service_name IS NOT DISTINCT FROM leaf_check.service_name LEFT JOIN token_parent_ids AS token_leaf_check ON t.trace_id = token_leaf_check.trace_id AND t.span_id = token_leaf_check.span_id AND t.service_name IS NOT DISTINCT FROM token_leaf_check.service_name",
 	)
 }

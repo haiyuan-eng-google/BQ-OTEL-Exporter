@@ -1155,7 +1155,16 @@ resource "google_bigquery_table" "v_gen_ai_agent_trajectory" {
             adk_session_id,
             adk_invocation_id,
             adk_user_id,
-            error_type
+            error_type,
+            COALESCE(
+              JSON_VALUE(attributes, '$."gen_ai.agent.name"'),
+              JSON_VALUE(attributes, '$."gcp.vertex.agent.name"')
+            ) AS declared_agent_name,
+            COALESCE(
+              JSON_VALUE(attributes, '$."gen_ai.agent.name"'),
+              JSON_VALUE(attributes, '$."gcp.vertex.agent.name"'),
+              IF(gen_ai_operation_name IN ('invoke_agent', 'create_agent'), gen_ai_agent_name, NULL)
+            ) AS agent_path_name
           FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.v_gen_ai_spans.table_id}`
         ),
         parent_ids AS (
@@ -1175,7 +1184,7 @@ resource "google_bigquery_table" "v_gen_ai_agent_trajectory" {
           FROM spans
           WHERE parent_span_id IS NOT NULL
             AND parent_span_id != ''
-            AND (COALESCE(gen_ai_usage_input_tokens, 0) + COALESCE(gen_ai_usage_output_tokens, 0) > 0)
+            AND (gen_ai_usage_input_tokens IS NOT NULL OR gen_ai_usage_output_tokens IS NOT NULL)
         ),
         trajectory AS (
           SELECT
@@ -1214,18 +1223,18 @@ resource "google_bigquery_table" "v_gen_ai_agent_trajectory" {
             s.span_id AS root_span_id,
             CASE
               WHEN s.gen_ai_operation_name IN ('invoke_agent', 'create_agent')
-                OR s.gen_ai_agent_name IS NOT NULL
+                OR s.declared_agent_name IS NOT NULL
               THEN s.span_id
               ELSE CAST(NULL AS STRING)
             END AS nearest_agent_span_id,
             CASE
               WHEN s.gen_ai_operation_name IN ('invoke_agent', 'create_agent')
-                OR s.gen_ai_agent_name IS NOT NULL
-              THEN s.gen_ai_agent_name
+                OR s.declared_agent_name IS NOT NULL
+              THEN COALESCE(s.declared_agent_name, s.gen_ai_agent_name)
               ELSE CAST(NULL AS STRING)
             END AS nearest_agent_name,
             CASE
-              WHEN s.gen_ai_agent_name IS NOT NULL THEN [s.gen_ai_agent_name]
+              WHEN s.agent_path_name IS NOT NULL THEN [s.agent_path_name]
               ELSE ARRAY<STRING>[]
             END AS agent_path,
             (s.parent_span_id IS NOT NULL AND s.parent_span_id != '') AS is_orphan,
@@ -1278,24 +1287,23 @@ resource "google_bigquery_table" "v_gen_ai_agent_trajectory" {
             t.root_span_id AS root_span_id,
             CASE
               WHEN c.gen_ai_operation_name IN ('invoke_agent', 'create_agent')
-                OR (t.nearest_agent_span_id IS NULL AND c.gen_ai_agent_name IS NOT NULL)
+                OR (t.nearest_agent_span_id IS NULL AND c.declared_agent_name IS NOT NULL)
               THEN c.span_id
               ELSE t.nearest_agent_span_id
             END AS nearest_agent_span_id,
             CASE
               WHEN c.gen_ai_operation_name IN ('invoke_agent', 'create_agent')
-              THEN COALESCE(c.gen_ai_agent_name, t.nearest_agent_name)
-              WHEN t.nearest_agent_name IS NULL
-              THEN c.gen_ai_agent_name
+                OR (t.nearest_agent_span_id IS NULL AND c.declared_agent_name IS NOT NULL)
+              THEN COALESCE(c.declared_agent_name, c.gen_ai_agent_name)
               ELSE t.nearest_agent_name
             END AS nearest_agent_name,
             CASE
-              WHEN c.gen_ai_agent_name IS NOT NULL
+              WHEN c.agent_path_name IS NOT NULL
                 AND (
                   ARRAY_LENGTH(t.agent_path) = 0
-                  OR t.agent_path[OFFSET(ARRAY_LENGTH(t.agent_path) - 1)] != c.gen_ai_agent_name
+                  OR t.agent_path[OFFSET(ARRAY_LENGTH(t.agent_path) - 1)] != c.agent_path_name
                 )
-              THEN ARRAY_CONCAT(t.agent_path, [c.gen_ai_agent_name])
+              THEN ARRAY_CONCAT(t.agent_path, [c.agent_path_name])
               ELSE t.agent_path
             END AS agent_path,
             t.is_orphan AS is_orphan,
@@ -1353,7 +1361,7 @@ resource "google_bigquery_table" "v_gen_ai_agent_trajectory" {
         ) AS step_index,
         (leaf_check.span_id IS NULL) AS is_leaf,
         (
-          (COALESCE(t.gen_ai_usage_input_tokens, 0) + COALESCE(t.gen_ai_usage_output_tokens, 0) > 0)
+          (t.gen_ai_usage_input_tokens IS NOT NULL OR t.gen_ai_usage_output_tokens IS NOT NULL)
           AND token_leaf_check.span_id IS NULL
         ) AS is_token_leaf
       FROM trajectory AS t

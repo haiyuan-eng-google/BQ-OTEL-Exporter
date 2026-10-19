@@ -234,7 +234,7 @@ as log events rather than span attributes.
 | `endpoint.without_authentication` | `false`             | Sends no credentials. Refused unless the endpoint is loopback. |
 | `auto_create.dataset`           | `false`               | Create the dataset if absent. Requires `location`. |
 | `auto_create.tables`            | `false`               | Create the active signal's destination table (plus `quarantine.table` when enabled) and `_dedup` view if absent, and reconcile additive nullable columns on existing tables (`ReconcileAdditiveSchema`). An existing `_dedup` view is reconciled to the current definition (the query only, best effort), which needs `bigquery.tables.update`. |
-| `auto_create.companion_views`   | `false`               | Create the companion views if absent and reconcile existing ones to the current definition (the query only, best effort): `otel_spans_as_allspans`, `v_gen_ai_spans`, `v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_gen_ai_tool_usage`, `v_gen_ai_logs`, `v_gen_ai_metrics`, and `v_gen_ai_metric_exemplars`. Requires `auto_create.tables`. |
+| `auto_create.companion_views`   | `false`               | Create the companion views if absent and reconcile existing ones to the current definition (the query only, best effort): `otel_spans_as_allspans`, `v_gen_ai_spans`, `v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_gen_ai_tool_usage`, `v_gen_ai_agent_trajectory`, `v_gen_ai_logs`, `v_gen_ai_metrics`, and `v_gen_ai_metric_exemplars`. Requires `auto_create.tables`. |
 | `auto_create.allow_unprunable_views` | `false`          | Create `v_gen_ai_logs` and `v_gen_ai_metric_exemplars` even when the spans table requires a partition filter (Helm: `bigquery.autoCreateAllowUnprunableViews`). BigQuery rejects every query over those two views when `otel_spans` requires a partition filter, so by default startup skips them in that case and logs a warning; the other companion views are created either way, and startup does not fail. The spans table's metadata decides; `traces.require_partition_filter` counts only while that table does not exist yet. |
 | `auto_create.search_indexes`    | `false`               | Execute `CREATE SEARCH INDEX IF NOT EXISTS ... OPTIONS (analyzer = 'NO_OP_ANALYZER')` on `(trace_id, span_id)` for `otel_spans` and `otel_logs` and on `(ALL COLUMNS)` for `otel_metrics`. Requires `auto_create.tables` and `bigquery.jobs.create`. |
 | `write.max_request_bytes`       | `8388608` (8 MiB)     | Our request-size headroom threshold, enforced after protobuf serialization and before `AppendRows`. Distinct from, and below, the API's own per-request limit. |
@@ -484,9 +484,23 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
     `v_gen_ai_spans` for the same `trace_id` and null-safe `service_name` within
     24 hours before to 1 hour after the child's `start_time`), `step_index`
     (`ROW_NUMBER()` per `(trace_id, service_name)` ordered by `(start_time ASC,
-    span_id ASC)`), `is_leaf`, and `is_token_leaf`. Like `v_gen_ai_logs` and
-    `v_gen_ai_metric_exemplars`, it joins spans across a bounded time window and
-    cannot be queried when `traces.require_partition_filter` is `true`.
+    span_id ASC)`), `is_leaf`, and `is_token_leaf`. The agent columns use the
+    agent name a span declares itself (`gen_ai.agent.name`, then
+    `gcp.vertex.agent.name`) rather than the `service_name` fallback of
+    `gen_ai_agent_name`: an `invoke_agent` or `create_agent` span always starts
+    a new nearest agent, a span that only declares an agent name starts one
+    when no span above it has one, and a `chat` or `execute_tool` span that
+    declares no agent inherits its parent's nearest agent and adds nothing to
+    `agent_path`. `is_token_leaf` is true for a span that reports input or
+    output tokens (an explicit `0` counts, as in the rollup views) when no
+    direct child in the same trace and service reports them too. A group of
+    spans whose parent links form a cycle with no root or orphan to start from
+    (a span that names itself as its parent included) produces no rows, while a
+    cycle reached from a root stops at the first repeated span
+    (`visited_span_ids`) and every path stops at depth `16`. Like
+    `v_gen_ai_logs` and `v_gen_ai_metric_exemplars`, it joins spans across a
+    bounded time window and cannot be queried when
+    `traces.require_partition_filter` is `true`.
   - `v_gen_ai_logs`: filters `otel_logs_dedup` to GenAI/agent log events and
     left-joins `otel_spans_dedup` on `(trace_id, span_id)` and a null-safe
     `service_name` match, within the window described under *Time-bounded
