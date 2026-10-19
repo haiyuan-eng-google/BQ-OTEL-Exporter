@@ -18,6 +18,7 @@ import (
 
 	bq "cloud.google.com/go/bigquery"
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
+	"cloud.google.com/go/bigquery/storage/managedwriter"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/config/configopaque"
 	"go.uber.org/zap"
@@ -59,6 +60,8 @@ type fakeDestinationAdmin struct {
 	// next result in order, repeating the last one once it is the only one
 	// left. It is consulted ahead of updateErrByID.
 	updateSequenceByID map[string][]error
+	perCallDelay       time.Duration
+	blockCreateByID    map[string]bool
 
 	createdDataset    *bq.DatasetMetadata
 	createdTables     map[string]*bq.TableMetadata
@@ -84,20 +87,46 @@ type fakeUpdateCall struct {
 	md   bq.TableMetadataToUpdate
 }
 
+func (f *fakeDestinationAdmin) waitCall(ctx context.Context, createID string) error {
+	if createID != "" && f.blockCreateByID[createID] {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	if f.perCallDelay > 0 {
+		timer := time.NewTimer(f.perCallDelay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return nil
+}
+
 func (f *fakeDestinationAdmin) DatasetMetadata(ctx context.Context) (*bq.DatasetMetadata, error) {
 	if f.blockDatasetRead {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
+	if err := f.waitCall(ctx, ""); err != nil {
+		return nil, err
+	}
 	return f.datasetMetadata, f.datasetMetadataErr
 }
 
-func (f *fakeDestinationAdmin) CreateDataset(_ context.Context, md *bq.DatasetMetadata) error {
+func (f *fakeDestinationAdmin) CreateDataset(ctx context.Context, md *bq.DatasetMetadata) error {
+	if err := f.waitCall(ctx, ""); err != nil {
+		return err
+	}
 	f.createdDataset = md
 	return f.createDatasetErr
 }
 
-func (f *fakeDestinationAdmin) TableMetadata(_ context.Context, id string) (*bq.TableMetadata, error) {
+func (f *fakeDestinationAdmin) TableMetadata(ctx context.Context, id string) (*bq.TableMetadata, error) {
+	if err := f.waitCall(ctx, ""); err != nil {
+		return nil, err
+	}
 	f.tableReadIDs = append(f.tableReadIDs, id)
 	if sequence := f.tableSequenceByID[id]; len(sequence) > 0 {
 		response := sequence[0]
@@ -118,7 +147,10 @@ func (f *fakeDestinationAdmin) TableMetadata(_ context.Context, id string) (*bq.
 	return f.tableMetadata, f.tableMetadataErr
 }
 
-func (f *fakeDestinationAdmin) CreateTable(_ context.Context, id string, md *bq.TableMetadata) error {
+func (f *fakeDestinationAdmin) CreateTable(ctx context.Context, id string, md *bq.TableMetadata) error {
+	if err := f.waitCall(ctx, id); err != nil {
+		return err
+	}
 	if f.createdTables == nil {
 		f.createdTables = make(map[string]*bq.TableMetadata)
 	}
@@ -133,7 +165,10 @@ func (f *fakeDestinationAdmin) CreateTable(_ context.Context, id string, md *bq.
 	return f.createTableErr
 }
 
-func (f *fakeDestinationAdmin) UpdateTable(_ context.Context, id string, md bq.TableMetadataToUpdate, etag string) error {
+func (f *fakeDestinationAdmin) UpdateTable(ctx context.Context, id string, md bq.TableMetadataToUpdate, etag string) error {
+	if err := f.waitCall(ctx, ""); err != nil {
+		return err
+	}
 	if f.updatedTables == nil {
 		f.updatedTables = make(map[string]bq.TableMetadataToUpdate)
 	}
@@ -156,7 +191,10 @@ func (f *fakeDestinationAdmin) UpdateTable(_ context.Context, id string, md bq.T
 	return f.updateTableErr
 }
 
-func (f *fakeDestinationAdmin) RunDDL(_ context.Context, sql string) error {
+func (f *fakeDestinationAdmin) RunDDL(ctx context.Context, sql string) error {
+	if err := f.waitCall(ctx, ""); err != nil {
+		return err
+	}
 	f.ranDDLs = append(f.ranDDLs, sql)
 	return f.runDDLErr
 }
@@ -2938,4 +2976,101 @@ func TestNewDestinationAdminAppliesUniverseDomain(t *testing.T) {
 	if _, err := admin.DatasetMetadata(context.Background()); err != nil {
 		t.Fatalf("DatasetMetadata() error = %v", err)
 	}
+}
+
+func TestSignalExporterStartBoundsEachMetadataCallRatherThanWholeSequence(t *testing.T) {
+	t.Run("cold start sequence exceeding single-call timeout succeeds when each call fits", func(t *testing.T) {
+		originalAdmin := newDestinationAdmin
+		originalWriter := newManagedWriterClient
+		t.Cleanup(func() {
+			newDestinationAdmin = originalAdmin
+			newManagedWriterClient = originalWriter
+		})
+
+		admin := &fakeDestinationAdmin{
+			datasetMetadataErr: notFound(),
+			tableMetadataErr:   notFound(),
+			perCallDelay:       15 * time.Millisecond,
+		}
+		newDestinationAdmin = func(
+			context.Context, string, string, ...option.ClientOption,
+		) (destinationAdmin, error) {
+			return admin, nil
+		}
+		newManagedWriterClient = func(
+			context.Context, string, ...option.ClientOption,
+		) (*managedwriter.Client, error) {
+			return &managedwriter.Client{}, nil
+		}
+
+		cfg := companionViewConfig()
+		cfg.AutoCreate.Dataset = true
+		cfg.AutoCreate.Tables = true
+		cfg.AutoCreate.CompanionViews = true
+		cfg.AutoCreate.SearchIndexes = true
+		cfg.Quarantine.Enabled = true
+		// 18+ sequential metadata/DDL calls * 15ms > 100ms total, but each
+		// individual call takes 15ms < 100ms per-call timeout.
+		cfg.TimeoutSettings.Timeout = 100 * time.Millisecond
+
+		e := newSignalExporter(componentTelemetryForTest(), cfg, cfg.Traces.Table, schema.SpansTableSchema())
+		if err := e.start(context.Background(), nil); err != nil {
+			t.Fatalf("start() failed when cumulative cold-start duration exceeded per-call timeout: %v", err)
+		}
+		if admin.createdTables[schema.GenAIAgentTrajectoryViewName] == nil {
+			t.Fatalf("expected %s to be created during cold start", schema.GenAIAgentTrajectoryViewName)
+		}
+		e.client = nil
+		e.quarantineClient = nil
+		if err := e.shutdown(context.Background()); err != nil {
+			t.Fatalf("shutdown() error = %v", err)
+		}
+	})
+
+	t.Run("blocking late view creation times out at per-call deadline", func(t *testing.T) {
+		originalAdmin := newDestinationAdmin
+		originalWriter := newManagedWriterClient
+		t.Cleanup(func() {
+			newDestinationAdmin = originalAdmin
+			newManagedWriterClient = originalWriter
+		})
+
+		admin := &fakeDestinationAdmin{
+			datasetMetadataErr: notFound(),
+			tableMetadataErr:   notFound(),
+			blockCreateByID: map[string]bool{
+				schema.GenAIAgentTrajectoryViewName: true,
+			},
+		}
+		newDestinationAdmin = func(
+			context.Context, string, string, ...option.ClientOption,
+		) (destinationAdmin, error) {
+			return admin, nil
+		}
+		newManagedWriterClient = func(
+			context.Context, string, ...option.ClientOption,
+		) (*managedwriter.Client, error) {
+			t.Fatal("writer construction must not run after view creation times out")
+			return nil, nil
+		}
+
+		cfg := companionViewConfig()
+		cfg.AutoCreate.Dataset = true
+		cfg.AutoCreate.Tables = true
+		cfg.AutoCreate.CompanionViews = true
+		cfg.TimeoutSettings.Timeout = 25 * time.Millisecond
+
+		e := newSignalExporter(componentTelemetryForTest(), cfg, cfg.Traces.Table, schema.SpansTableSchema())
+		started := time.Now()
+		err := e.start(context.Background(), nil)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("start() error = %v, want %v", err, context.DeadlineExceeded)
+		}
+		if !strings.Contains(err.Error(), schema.GenAIAgentTrajectoryViewName) {
+			t.Fatalf("start() error = %q, want it to name %s", err, schema.GenAIAgentTrajectoryViewName)
+		}
+		if elapsed := time.Since(started); elapsed > time.Second {
+			t.Fatalf("blocking late view creation returned after %v, want < 1s", elapsed)
+		}
+	})
 }

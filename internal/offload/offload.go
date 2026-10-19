@@ -708,10 +708,13 @@ func (o *Offloader) upload(
 	}
 
 	cacheKey := o.bucket + "/" + objectKey
-	uploadTimeout := o.timeout
+	uploadDeadline := time.Now().Add(o.timeout)
 	if dl, ok := ctx.Deadline(); ok {
-		if rem := time.Until(dl); rem < uploadTimeout {
-			uploadTimeout = max(rem, 0)
+		if time.Until(dl) <= 0 {
+			return transform.PayloadRef{}, context.DeadlineExceeded
+		}
+		if dl.Before(uploadDeadline) {
+			uploadDeadline = dl
 		}
 	}
 
@@ -721,7 +724,15 @@ func (o *Offloader) upload(
 			lruHit = true
 			return gen, nil
 		}
-		uploadCtx, cancel := context.WithTimeout(leaderCtx, uploadTimeout)
+		if time.Until(uploadDeadline) <= 0 {
+			err := context.DeadlineExceeded
+			if o.onOffload != nil {
+				errClass, _ := ClassifyOffloadError(err)
+				o.onOffload(0, 0, errClass)
+			}
+			return "", err
+		}
+		uploadCtx, cancel := context.WithDeadline(leaderCtx, uploadDeadline)
 		defer cancel()
 		if o.sem != nil {
 			select {

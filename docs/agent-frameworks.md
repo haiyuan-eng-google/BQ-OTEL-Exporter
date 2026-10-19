@@ -327,12 +327,17 @@ parent/child window), adding `depth`, `root_span_id`, `nearest_agent_span_id`,
 `nearest_agent_name`, `agent_path` (consecutive duplicates collapsed),
 `is_orphan` (for child spans whose parent span was not exported), `step_index`,
 `is_leaf`, and `is_token_leaf`. Queries can filter `is_token_leaf = TRUE` to sum
-input, output, and reasoning token usage across arbitrary delegation depth
-(even across tokenless intermediate spans such as `execute_tool`, plus direct
-children at depth `17`) without double-counting ancestor `invoke_agent` spans;
-unlike `v_gen_ai_model_costs` and `v_gen_ai_sessions`, which check only direct
-children within an hour or UTC session date, `is_token_leaf` follows the full
-trajectory path.
+input, output, and reasoning token usage across the 17 emitted levels (`depth`
+`0..16`, even across tokenless intermediate spans such as `execute_tool`)
+without double-counting ancestor spans (regardless of `gen_ai_operation_name`)
+whose reported token families (`input`, `output`, `reasoning`) are all covered
+by a descendant. A `depth = 16` span is never suppressed by unemitted
+`depth > 16` children, so it retains the leaf token totals for its truncated
+subtree when ancestors report subtree rollups (whereas tokens reported only on
+unemitted `depth > 16` spans are outside this view). Unlike
+`v_gen_ai_model_costs` and `v_gen_ai_sessions`, which check only direct
+children within an hour or UTC session date, `is_token_leaf` follows the
+emitted trajectory path.
 
 ## Synthetic scenario fixtures
 

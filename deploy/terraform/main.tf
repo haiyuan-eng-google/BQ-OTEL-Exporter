@@ -1318,30 +1318,44 @@ resource "google_bigquery_table" "v_gen_ai_agent_trajectory" {
         ),
         token_parent_ids AS (
           SELECT DISTINCT
-            d.trace_id,
-            d.service_name,
-            anc_span_id AS span_id
-          FROM trajectory AS d,
-          UNNEST(d.visited_span_ids) AS anc_span_id WITH OFFSET AS anc_idx
+            p.trace_id,
+            p.service_name,
+            p.span_id AS span_id
+          FROM trajectory AS d
+          CROSS JOIN UNNEST(d.visited_span_ids) AS anc_span_id WITH OFFSET AS anc_idx
+          JOIN spans AS p
+            ON p.trace_id = d.trace_id
+            AND p.span_id = anc_span_id
+            AND p.service_name IS NOT DISTINCT FROM d.service_name
           WHERE anc_idx < ARRAY_LENGTH(d.visited_span_ids) - 1
             AND (
               d.gen_ai_usage_input_tokens IS NOT NULL
               OR d.gen_ai_usage_output_tokens IS NOT NULL
               OR d.gen_ai_usage_reasoning_tokens IS NOT NULL
             )
+            AND (p.gen_ai_usage_input_tokens IS NULL OR d.gen_ai_usage_input_tokens IS NOT NULL)
+            AND (p.gen_ai_usage_output_tokens IS NULL OR d.gen_ai_usage_output_tokens IS NOT NULL)
+            AND (p.gen_ai_usage_reasoning_tokens IS NULL OR d.gen_ai_usage_reasoning_tokens IS NOT NULL)
           UNION DISTINCT
           SELECT DISTINCT
-            trace_id,
-            service_name,
-            parent_span_id AS span_id
-          FROM spans
-          WHERE parent_span_id IS NOT NULL
-            AND parent_span_id != ''
+            p.trace_id,
+            p.service_name,
+            p.span_id AS span_id
+          FROM trajectory AS p
+          JOIN spans AS c
+            ON c.trace_id = p.trace_id
+            AND c.parent_span_id = p.span_id
+            AND c.service_name IS NOT DISTINCT FROM p.service_name
+          WHERE p.depth < 16
+            AND c.span_id != p.span_id
             AND (
-              gen_ai_usage_input_tokens IS NOT NULL
-              OR gen_ai_usage_output_tokens IS NOT NULL
-              OR gen_ai_usage_reasoning_tokens IS NOT NULL
+              c.gen_ai_usage_input_tokens IS NOT NULL
+              OR c.gen_ai_usage_output_tokens IS NOT NULL
+              OR c.gen_ai_usage_reasoning_tokens IS NOT NULL
             )
+            AND (p.gen_ai_usage_input_tokens IS NULL OR c.gen_ai_usage_input_tokens IS NOT NULL)
+            AND (p.gen_ai_usage_output_tokens IS NULL OR c.gen_ai_usage_output_tokens IS NOT NULL)
+            AND (p.gen_ai_usage_reasoning_tokens IS NULL OR c.gen_ai_usage_reasoning_tokens IS NOT NULL)
         )
       SELECT
         t.start_time,

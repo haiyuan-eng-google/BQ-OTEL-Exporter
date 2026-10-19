@@ -250,7 +250,7 @@ as log events rather than span attributes.
 | `limits.*`                      | see below             | Structural bounds applied before serialization. |
 | `sending_queue`                 | 8 consumers           | Standard `exporterhelper` queue, including the persistent queue. Consumer concurrency defaults to the managedwriter request window. |
 | `retry_on_failure`              | `max_elapsed_time: 900s` | Standard `exporterhelper` retry. The horizon must be finite. |
-| `timeout`                       | `5s`                  | Budget for one export attempt, including slot waits and every acknowledgement. See [Timeout and concurrency envelope](#timeout-and-concurrency-envelope). |
+| `timeout`                       | `5s`                  | Budget for one export attempt (including slot waits and every acknowledgement) and for each individual startup metadata or provisioning API call. See [Timeout and concurrency envelope](#timeout-and-concurrency-envelope). |
 | `offload.enabled`               | `false`               | Route oversized span/log values and quarantine payloads to Google Cloud Storage, recording BigQuery ObjectRef references. |
 | `offload.bucket`                | —                     | GCS bucket name for offloaded payloads. Required when `offload.enabled` is true. |
 | `offload.prefix`                | `otel-offload`        | Object name prefix within the bucket. |
@@ -498,13 +498,20 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
     `agent_path`. `is_token_leaf` is true for a span that reports input, output,
     or reasoning tokens (an explicit `0` counts) when no trajectory descendant
     along `visited_span_ids` (even across tokenless intermediate spans such as
-    `execute_tool`) and no direct child in `spans` (covering depth-16 parents of
-    depth-17 token-reporting children) also reports tokens. Unlike
+    `execute_tool`, regardless of `gen_ai_operation_name`) and, for spans at
+    `depth < 16`, no direct child in `spans` covers all non-null token families
+    (`input`, `output`, `reasoning`) reported on the span. A `depth = 16` span
+    is never suppressed by unemitted `depth > 16` children so it retains the
+    leaf token totals for its truncated subtree when ancestors report subtree
+    rollups (tokens reported only on unemitted `depth > 16` spans are outside
+    this view). Unlike
     `v_gen_ai_model_costs` (hourly direct-child check over inference spans with
     `gen_ai_request_model` and input/output tokens) and `v_gen_ai_sessions`
     (UTC-date, session-scoped direct-child check over input/output tokens),
-    `is_token_leaf` follows multi-hop trajectory paths across the `[-24h, +1h]`
-    parent/child window and includes reasoning-only token spans. A group of
+    `is_token_leaf` follows multi-hop trajectory paths up to `depth <= 16`
+    (17 levels, `0..16`) across the `[-24h, +1h]`
+    parent/child window and checks token-family coverage across input, output,
+    and reasoning tokens. A group of
     spans whose parent links form a cycle with no root or orphan to start from
     (a span that names itself as its parent included) produces no rows, while a
     cycle reached from a root stops at the first repeated span

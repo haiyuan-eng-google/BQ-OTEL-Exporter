@@ -1413,7 +1413,7 @@ func TestGenAIAgentTrajectoryView(t *testing.T) {
 			"CASE WHEN c.agent_path_name IS NOT NULL AND ( ARRAY_LENGTH(t.agent_path) = 0 OR t.agent_path[SAFE_OFFSET(ARRAY_LENGTH(t.agent_path) - 1)] != c.agent_path_name ) THEN ARRAY_CONCAT(t.agent_path, [c.agent_path_name]) ELSE t.agent_path END AS agent_path, " +
 			"t.is_orphan AS is_orphan, ARRAY_CONCAT(t.visited_span_ids, [c.span_id]) AS visited_span_ids " +
 			"FROM trajectory AS t JOIN spans AS c ON c.trace_id = t.trace_id AND c.parent_span_id = t.span_id AND c.service_name IS NOT DISTINCT FROM t.service_name AND c.start_time BETWEEN TIMESTAMP_SUB(t.start_time, INTERVAL 1 HOUR) AND TIMESTAMP_ADD(t.start_time, INTERVAL 24 HOUR) WHERE t.depth < 16 AND c.span_id NOT IN UNNEST(t.visited_span_ids) )",
-		"token_parent_ids AS ( SELECT DISTINCT d.trace_id, d.service_name, anc_span_id AS span_id FROM trajectory AS d, UNNEST(d.visited_span_ids) AS anc_span_id WITH OFFSET AS anc_idx WHERE anc_idx < ARRAY_LENGTH(d.visited_span_ids) - 1 AND ( d.gen_ai_usage_input_tokens IS NOT NULL OR d.gen_ai_usage_output_tokens IS NOT NULL OR d.gen_ai_usage_reasoning_tokens IS NOT NULL ) UNION DISTINCT SELECT DISTINCT trace_id, service_name, parent_span_id AS span_id FROM spans WHERE parent_span_id IS NOT NULL AND parent_span_id != '' AND ( gen_ai_usage_input_tokens IS NOT NULL OR gen_ai_usage_output_tokens IS NOT NULL OR gen_ai_usage_reasoning_tokens IS NOT NULL ) )",
+		"token_parent_ids AS ( SELECT DISTINCT p.trace_id, p.service_name, p.span_id AS span_id FROM trajectory AS d CROSS JOIN UNNEST(d.visited_span_ids) AS anc_span_id WITH OFFSET AS anc_idx JOIN spans AS p ON p.trace_id = d.trace_id AND p.span_id = anc_span_id AND p.service_name IS NOT DISTINCT FROM d.service_name WHERE anc_idx < ARRAY_LENGTH(d.visited_span_ids) - 1 AND ( d.gen_ai_usage_input_tokens IS NOT NULL OR d.gen_ai_usage_output_tokens IS NOT NULL OR d.gen_ai_usage_reasoning_tokens IS NOT NULL ) AND (p.gen_ai_usage_input_tokens IS NULL OR d.gen_ai_usage_input_tokens IS NOT NULL) AND (p.gen_ai_usage_output_tokens IS NULL OR d.gen_ai_usage_output_tokens IS NOT NULL) AND (p.gen_ai_usage_reasoning_tokens IS NULL OR d.gen_ai_usage_reasoning_tokens IS NOT NULL) UNION DISTINCT SELECT DISTINCT p.trace_id, p.service_name, p.span_id AS span_id FROM trajectory AS p JOIN spans AS c ON c.trace_id = p.trace_id AND c.parent_span_id = p.span_id AND c.service_name IS NOT DISTINCT FROM p.service_name WHERE p.depth < 16 AND c.span_id != p.span_id AND ( c.gen_ai_usage_input_tokens IS NOT NULL OR c.gen_ai_usage_output_tokens IS NOT NULL OR c.gen_ai_usage_reasoning_tokens IS NOT NULL ) AND (p.gen_ai_usage_input_tokens IS NULL OR c.gen_ai_usage_input_tokens IS NOT NULL) AND (p.gen_ai_usage_output_tokens IS NULL OR c.gen_ai_usage_output_tokens IS NOT NULL) AND (p.gen_ai_usage_reasoning_tokens IS NULL OR c.gen_ai_usage_reasoning_tokens IS NOT NULL) )",
 		"ROW_NUMBER() OVER ( PARTITION BY t.trace_id, t.service_name ORDER BY t.start_time ASC, t.span_id ASC ) AS step_index",
 		"( ( t.gen_ai_usage_input_tokens IS NOT NULL OR t.gen_ai_usage_output_tokens IS NOT NULL OR t.gen_ai_usage_reasoning_tokens IS NOT NULL ) AND token_leaf_check.span_id IS NULL ) AS is_token_leaf",
 		"LEFT JOIN parent_ids AS leaf_check ON t.trace_id = leaf_check.trace_id AND t.span_id = leaf_check.span_id AND t.service_name IS NOT DISTINCT FROM leaf_check.service_name",
@@ -1423,8 +1423,8 @@ func TestGenAIAgentTrajectoryView(t *testing.T) {
 			t.Errorf("v_gen_ai_agent_trajectory query missing %q:\n%s", want, query)
 		}
 	}
-	if n := strings.Count(query, "IS NOT DISTINCT FROM"); n != 4 {
-		t.Errorf("v_gen_ai_agent_trajectory query has %d IS NOT DISTINCT FROM clauses, want 4", n)
+	if n := strings.Count(query, "IS NOT DISTINCT FROM"); n != 6 {
+		t.Errorf("v_gen_ai_agent_trajectory query has %d IS NOT DISTINCT FROM clauses, want 6", n)
 	}
 }
 

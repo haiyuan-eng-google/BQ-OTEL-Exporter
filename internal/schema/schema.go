@@ -1287,9 +1287,13 @@ CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAIAgentTrajectoryViewName + "`" 
 // chat or tool span without an agent attribute adds nothing to it.
 //
 // is_token_leaf marks spans that report input, output, or reasoning tokens
-// (an explicit 0 counts) and have no token-reporting descendant along their
-// trajectory path (including across tokenless intermediate spans) and no
-// direct token-reporting child in spans (covering children beyond depth 16).
+// (an explicit 0 counts) and have no emitted trajectory descendant along their
+// trajectory path (including across tokenless intermediate spans) and, for
+// spans at depth < 16, no direct child in spans that covers all non-null token
+// families (input, output, reasoning) reported on the span. A depth = 16 span
+// is never suppressed by unemitted depth > 16 children so it retains the leaf
+// token totals for its truncated subtree when ancestors report subtree rollups
+// (tokens reported only on unemitted depth > 16 spans are outside this view).
 // Its scope is the trajectory within (trace_id, service_name), so totals over
 // is_token_leaf can differ from v_gen_ai_model_costs (hourly inference-only
 // direct-child check) and v_gen_ai_sessions (UTC-date session-scoped
@@ -1486,30 +1490,44 @@ WITH RECURSIVE
   ),
   token_parent_ids AS (
     SELECT DISTINCT
-      d.trace_id,
-      d.service_name,
-      anc_span_id AS span_id
-    FROM trajectory AS d,
-    UNNEST(d.visited_span_ids) AS anc_span_id WITH OFFSET AS anc_idx
+      p.trace_id,
+      p.service_name,
+      p.span_id AS span_id
+    FROM trajectory AS d
+    CROSS JOIN UNNEST(d.visited_span_ids) AS anc_span_id WITH OFFSET AS anc_idx
+    JOIN spans AS p
+      ON p.trace_id = d.trace_id
+      AND p.span_id = anc_span_id
+      AND p.service_name IS NOT DISTINCT FROM d.service_name
     WHERE anc_idx < ARRAY_LENGTH(d.visited_span_ids) - 1
       AND (
         d.gen_ai_usage_input_tokens IS NOT NULL
         OR d.gen_ai_usage_output_tokens IS NOT NULL
         OR d.gen_ai_usage_reasoning_tokens IS NOT NULL
       )
+      AND (p.gen_ai_usage_input_tokens IS NULL OR d.gen_ai_usage_input_tokens IS NOT NULL)
+      AND (p.gen_ai_usage_output_tokens IS NULL OR d.gen_ai_usage_output_tokens IS NOT NULL)
+      AND (p.gen_ai_usage_reasoning_tokens IS NULL OR d.gen_ai_usage_reasoning_tokens IS NOT NULL)
     UNION DISTINCT
     SELECT DISTINCT
-      trace_id,
-      service_name,
-      parent_span_id AS span_id
-    FROM spans
-    WHERE parent_span_id IS NOT NULL
-      AND parent_span_id != ''
+      p.trace_id,
+      p.service_name,
+      p.span_id AS span_id
+    FROM trajectory AS p
+    JOIN spans AS c
+      ON c.trace_id = p.trace_id
+      AND c.parent_span_id = p.span_id
+      AND c.service_name IS NOT DISTINCT FROM p.service_name
+    WHERE p.depth < 16
+      AND c.span_id != p.span_id
       AND (
-        gen_ai_usage_input_tokens IS NOT NULL
-        OR gen_ai_usage_output_tokens IS NOT NULL
-        OR gen_ai_usage_reasoning_tokens IS NOT NULL
+        c.gen_ai_usage_input_tokens IS NOT NULL
+        OR c.gen_ai_usage_output_tokens IS NOT NULL
+        OR c.gen_ai_usage_reasoning_tokens IS NOT NULL
       )
+      AND (p.gen_ai_usage_input_tokens IS NULL OR c.gen_ai_usage_input_tokens IS NOT NULL)
+      AND (p.gen_ai_usage_output_tokens IS NULL OR c.gen_ai_usage_output_tokens IS NOT NULL)
+      AND (p.gen_ai_usage_reasoning_tokens IS NULL OR c.gen_ai_usage_reasoning_tokens IS NOT NULL)
   )
 SELECT
   t.start_time,

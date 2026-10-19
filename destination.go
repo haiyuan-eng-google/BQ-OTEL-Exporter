@@ -88,6 +88,65 @@ func (a *bigQueryDestinationAdmin) Close() error {
 	return err
 }
 
+// timedDestinationAdmin bounds each individual BigQuery metadata or DDL RPC
+// with the configured timeout while still honoring cancellation of the parent
+// Start context. That prevents a cold-start provisioning sequence (dataset,
+// signal table, dedup view, companion views, quarantine table, search index)
+// from exhausting a single shared 5s deadline across 14+ sequential calls.
+type timedDestinationAdmin struct {
+	inner   destinationAdmin
+	timeout time.Duration
+}
+
+func withPerCallTimeout(admin destinationAdmin, timeout time.Duration) destinationAdmin {
+	if timeout <= 0 {
+		return admin
+	}
+	return &timedDestinationAdmin{inner: admin, timeout: timeout}
+}
+
+func (a *timedDestinationAdmin) DatasetMetadata(ctx context.Context) (*bq.DatasetMetadata, error) {
+	callCtx, cancel := context.WithTimeout(ctx, a.timeout)
+	defer cancel()
+	return a.inner.DatasetMetadata(callCtx)
+}
+
+func (a *timedDestinationAdmin) CreateDataset(ctx context.Context, md *bq.DatasetMetadata) error {
+	callCtx, cancel := context.WithTimeout(ctx, a.timeout)
+	defer cancel()
+	return a.inner.CreateDataset(callCtx, md)
+}
+
+func (a *timedDestinationAdmin) TableMetadata(ctx context.Context, id string) (*bq.TableMetadata, error) {
+	callCtx, cancel := context.WithTimeout(ctx, a.timeout)
+	defer cancel()
+	return a.inner.TableMetadata(callCtx, id)
+}
+
+func (a *timedDestinationAdmin) CreateTable(ctx context.Context, id string, md *bq.TableMetadata) error {
+	callCtx, cancel := context.WithTimeout(ctx, a.timeout)
+	defer cancel()
+	return a.inner.CreateTable(callCtx, id, md)
+}
+
+func (a *timedDestinationAdmin) UpdateTable(
+	ctx context.Context, id string, md bq.TableMetadataToUpdate, etag string,
+) error {
+	callCtx, cancel := context.WithTimeout(ctx, a.timeout)
+	defer cancel()
+	return a.inner.UpdateTable(callCtx, id, md, etag)
+}
+
+func (a *timedDestinationAdmin) RunDDL(ctx context.Context, sql string) error {
+	callCtx, cancel := context.WithTimeout(ctx, a.timeout)
+	defer cancel()
+	return a.inner.RunDDL(callCtx, sql)
+}
+
+func (a *timedDestinationAdmin) Close() error {
+	return a.inner.Close()
+}
+
 var newBigQueryHTTPClient = func(
 	ctx context.Context, opts ...option.ClientOption,
 ) (*stdhttp.Client, *stdhttp.Transport, error) {

@@ -460,15 +460,15 @@ func (e *signalExporter) start(ctx context.Context, host component.Host) (err er
 	}()
 
 	if !e.cfg.Endpoint.WithoutAuthentication {
-		startupCtx, startupCancel := context.WithTimeout(ctx, e.cfg.TimeoutSettings.Timeout)
-		defer startupCancel()
+		clientCtx, clientCancel := context.WithTimeout(ctx, e.cfg.TimeoutSettings.Timeout)
+		defer clientCancel()
 
-		metadataOpts, metadataErr := e.metadataClientOptions(startupCtx)
+		metadataOpts, metadataErr := e.metadataClientOptions(clientCtx)
 		if metadataErr != nil {
 			return metadataErr
 		}
 		admin, adminErr := newDestinationAdmin(
-			startupCtx, e.cfg.Project, e.cfg.Dataset, metadataOpts...)
+			clientCtx, e.cfg.Project, e.cfg.Dataset, metadataOpts...)
 		if adminErr != nil {
 			return fmt.Errorf("creating BigQuery metadata client: %w", adminErr)
 		}
@@ -484,7 +484,7 @@ func (e *signalExporter) start(ctx context.Context, host component.Host) (err er
 			}
 			e.logger.Warn("closing BigQuery metadata client failed", zap.Error(closeErr))
 		}()
-		if prepareErr := e.prepareDestination(startupCtx, admin); prepareErr != nil {
+		if prepareErr := e.prepareDestination(ctx, withPerCallTimeout(admin, e.cfg.TimeoutSettings.Timeout)); prepareErr != nil {
 			return prepareErr
 		}
 	}

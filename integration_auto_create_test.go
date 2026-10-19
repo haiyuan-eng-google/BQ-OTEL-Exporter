@@ -46,6 +46,8 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	// Registered via t.Cleanup (LIFO) so dataset teardown and client Close
+	// t.Cleanup hooks registered later run before ctx is canceled.
 	t.Cleanup(cancel)
 	dataset := fmt.Sprintf("otel_exporter_it_%d", time.Now().UnixNano())
 
@@ -73,7 +75,9 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 	})
 
 	cfg := validConfig()
-	cfg.TimeoutSettings.Timeout = 60 * time.Second
+	// Bounds each individual startup metadata RPC (via timedDestinationAdmin)
+	// and each export attempt against transient live BigQuery control-plane spikes.
+	cfg.TimeoutSettings.Timeout = 10 * time.Second
 	cfg.Project = project
 	cfg.Dataset = dataset
 	cfg.Location = location
@@ -210,12 +214,28 @@ func oneIntegrationTrace() ptrace.Traces {
 	attrs.PutInt("gen_ai.usage.output_tokens", 5)
 	attrs.PutStr("error.type", "rate_limited")
 
-	// A healthy span in the same session, model, and tool group ensures live
-	// BigQuery tests prove top_error_types excludes NULL error_type values.
+	// A root invoke_agent span and its healthy child chat span in TraceID{2}
+	// exercise both top_error_types NULL exclusion and recursive depth-1
+	// traversal + ancestor token-leaf suppression in v_gen_ai_agent_trajectory.
+	rootAgent := spans.AppendEmpty()
+	rootAgent.SetName("invoke_agent planner")
+	rootAgent.SetTraceID(pcommon.TraceID{2})
+	rootAgent.SetSpanID(pcommon.SpanID{3})
+	rootAgent.SetStartTimestamp(pcommon.NewTimestampFromTime(now.Add(-600 * time.Millisecond)))
+	rootAgent.SetEndTimestamp(pcommon.NewTimestampFromTime(now))
+	rootAgent.Status().SetCode(ptrace.StatusCodeOk)
+	rootAttrs := rootAgent.Attributes()
+	rootAttrs.PutStr("gen_ai.operation.name", "invoke_agent")
+	rootAttrs.PutStr("gen_ai.system", "gcp.vertex.agent")
+	rootAttrs.PutStr("gen_ai.agent.name", "planner")
+	rootAttrs.PutInt("gen_ai.usage.input_tokens", 8)
+	rootAttrs.PutInt("gen_ai.usage.output_tokens", 4)
+
 	okSpan := spans.AppendEmpty()
 	okSpan.SetName("chat gemini-2.5-pro ok")
 	okSpan.SetTraceID(pcommon.TraceID{2})
 	okSpan.SetSpanID(pcommon.SpanID{2})
+	okSpan.SetParentSpanID(pcommon.SpanID{3})
 	okSpan.SetStartTimestamp(pcommon.NewTimestampFromTime(now.Add(-500 * time.Millisecond)))
 	okSpan.SetEndTimestamp(pcommon.NewTimestampFromTime(now))
 	okSpan.Status().SetCode(ptrace.StatusCodeOk)
@@ -320,6 +340,16 @@ func assertIntegrationViewColumns(ctx context.Context, t *testing.T, client *bq.
 			name: "v_gen_ai_agent_trajectory",
 			sql:  fmt.Sprintf("SELECT depth, is_orphan, is_leaf, is_token_leaf FROM `%s.%s.v_gen_ai_agent_trajectory` WHERE error_type IS NOT NULL LIMIT 1", project, dataset),
 			want: []bq.Value{int64(0), false, true, true},
+		},
+		{
+			name: "v_gen_ai_agent_trajectory (recursive parent suppressed)",
+			sql:  fmt.Sprintf("SELECT depth, is_orphan, is_leaf, is_token_leaf FROM `%s.%s.v_gen_ai_agent_trajectory` WHERE span_id = '0300000000000000' LIMIT 1", project, dataset),
+			want: []bq.Value{int64(0), false, false, false},
+		},
+		{
+			name: "v_gen_ai_agent_trajectory (recursive depth 1 child)",
+			sql:  fmt.Sprintf("SELECT depth, root_span_id, nearest_agent_name, is_orphan, is_leaf, is_token_leaf FROM `%s.%s.v_gen_ai_agent_trajectory` WHERE depth = 1 LIMIT 1", project, dataset),
+			want: []bq.Value{int64(1), "0300000000000000", "planner", false, true, true},
 		},
 	} {
 		rows, err := client.Query(tc.sql).Read(ctx)
