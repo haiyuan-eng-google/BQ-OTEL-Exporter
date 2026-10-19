@@ -152,7 +152,6 @@ type streamCreation struct {
 	done      chan struct{}
 	err       error
 	cancel    context.CancelFunc
-	waiters   int
 	aborted   bool
 	completed bool
 }
@@ -253,17 +252,6 @@ func (w *Writer) ensureSlotsLocked() []*streamSlot {
 	return w.slots
 }
 
-func (w *Writer) perSlotMaxInflightBytes() int {
-	if w.opts.MaxInflightBytes <= 0 || w.opts.StreamPoolSize <= 1 {
-		return w.opts.MaxInflightBytes
-	}
-	perSlot := w.opts.MaxInflightBytes / w.opts.StreamPoolSize
-	if perSlot < w.opts.MaxRequestBytes {
-		perSlot = w.opts.MaxRequestBytes
-	}
-	return perSlot
-}
-
 // writerOptions renders the managedwriter configuration for this destination.
 func (w *Writer) writerOptions() []managedwriter.WriterOption {
 	return []managedwriter.WriterOption{
@@ -273,7 +261,7 @@ func (w *Writer) writerOptions() []managedwriter.WriterOption {
 		managedwriter.WithDestinationTable(w.opts.TableRef()),
 		managedwriter.WithSchemaDescriptor(w.opts.Descriptor),
 		managedwriter.WithMaxInflightRequests(w.opts.MaxInflightRequests),
-		managedwriter.WithMaxInflightBytes(w.perSlotMaxInflightBytes()),
+		managedwriter.WithMaxInflightBytes(w.opts.MaxInflightBytes),
 		managedwriter.WithTraceID(w.opts.TraceID),
 
 		// Set explicitly even though write retries are already off by
@@ -368,21 +356,13 @@ func (w *Writer) acquireSlotStream(
 		}
 		if !slot.retiring && slot.creation != nil {
 			creation := slot.creation
-			creation.waiters++
 			done := creation.done
 			slot.mu.Unlock()
 			select {
 			case <-ctx.Done():
-				slot.mu.Lock()
-				creation.waiters--
-				if creation.waiters == 0 && !creation.completed && slot.creation == creation {
-					slot.abortStreamCreationLocked(ctx.Err())
-				}
-				slot.mu.Unlock()
 				return nil, false, ctx.Err()
 			case <-done:
 				slot.mu.Lock()
-				creation.waiters--
 				err := creation.err
 				slot.mu.Unlock()
 				if err != nil {

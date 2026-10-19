@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -15,8 +16,12 @@ import (
 
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
+	"google.golang.org/api/option"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/test/bufconn"
 )
 
 func TestSplitRequests(t *testing.T) {
@@ -4762,6 +4767,13 @@ func TestWriterStreamPoolOverlapRetirementKeepsReservation(t *testing.T) {
 					close(allowClose)
 					t.Fatal("canceled Append did not return while teardown was held")
 				}
+			} else {
+				select {
+				case out0 := <-sendDone:
+					close(allowClose)
+					t.Fatalf("non-canceled Append returned %+v before overlapping Close() completed", out0)
+				case <-time.After(20 * time.Millisecond):
+				}
 			}
 
 			// Even after the overlapping AppendRows has returned while Close()
@@ -4841,5 +4853,286 @@ func TestWriterStreamPoolOverlapRetirementKeepsReservation(t *testing.T) {
 				t.Fatalf("final inflightBytes = %d, want 0", finalBytes)
 			}
 		})
+	}
+}
+
+type slowGetWriteStreamServer struct {
+	storagepb.UnimplementedBigQueryWriteServer
+
+	delay          time.Duration
+	getStreamCalls atomic.Int32
+	canceledCalls  atomic.Int32
+}
+
+func (s *slowGetWriteStreamServer) GetWriteStream(
+	ctx context.Context, req *storagepb.GetWriteStreamRequest,
+) (*storagepb.WriteStream, error) {
+	s.getStreamCalls.Add(1)
+	select {
+	case <-time.After(s.delay):
+		return &storagepb.WriteStream{Name: req.GetName(), Location: "us"}, nil
+	case <-ctx.Done():
+		s.canceledCalls.Add(1)
+		return nil, ctx.Err()
+	}
+}
+
+func (s *slowGetWriteStreamServer) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error {
+	for {
+		if _, err := srv.Recv(); err != nil {
+			return nil
+		}
+		resp := &storagepb.AppendRowsResponse{
+			Response: &storagepb.AppendRowsResponse_AppendResult_{
+				AppendResult: &storagepb.AppendRowsResponse_AppendResult{},
+			},
+		}
+		if err := srv.Send(resp); err != nil {
+			return nil
+		}
+	}
+}
+
+func TestWriterStreamPoolCreationLatencyExceedsAttemptTimeout(t *testing.T) {
+	t.Run("fake_constructor", func(t *testing.T) {
+		var (
+			factoryCalls  atomic.Int32
+			canceledCalls atomic.Int32
+		)
+		w := &Writer{
+			opts: WriterOptions{
+				Project:             "p",
+				Dataset:             "d",
+				Table:               "t",
+				MaxRequestBytes:     1 << 20,
+				MaxInflightRequests: 8,
+				MaxInflightBytes:    64 << 20,
+			},
+			lifetimeCtx: context.Background(),
+		}
+		w.factory = func(ctx context.Context, _ ...managedwriter.WriterOption) (stream, error) {
+			factoryCalls.Add(1)
+			select {
+			case <-time.After(150 * time.Millisecond):
+				return &funcStream{
+					appendFn: func(context.Context, [][]byte) (appendResult, error) {
+						return fakeResult{}, nil
+					},
+				}, nil
+			case <-ctx.Done():
+				canceledCalls.Add(1)
+				return nil, ctx.Err()
+			}
+		}
+		defer func() { _ = w.Close() }()
+
+		var succeeded int
+		for range 10 {
+			out := appendWithin(w, 100*time.Millisecond, [][]byte{{1}})
+			if out.Err == nil && out.AcknowledgedRows == 1 {
+				succeeded++
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if succeeded == 0 {
+			t.Fatalf("0 of 10 attempts succeeded (factoryCalls=%d, canceledCalls=%d); stream creation livelocked",
+				factoryCalls.Load(), canceledCalls.Load())
+		}
+		if got := factoryCalls.Load(); got != 1 {
+			t.Fatalf("factoryCalls = %d, want 1", got)
+		}
+		if got := canceledCalls.Load(); got != 0 {
+			t.Fatalf("canceledCalls = %d, want 0", got)
+		}
+	})
+
+	t.Run("real_managedwriter", func(t *testing.T) {
+		lis := bufconn.Listen(1 << 20)
+		backend := &slowGetWriteStreamServer{delay: 150 * time.Millisecond}
+		server := grpc.NewServer()
+		storagepb.RegisterBigQueryWriteServer(server, backend)
+		served := make(chan struct{})
+		go func() {
+			defer close(served)
+			_ = server.Serve(lis)
+		}()
+		t.Cleanup(func() {
+			server.Stop()
+			<-served
+		})
+
+		conn, err := grpc.NewClient("passthrough:///slow-get-write-stream",
+			grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+				return lis.DialContext(ctx)
+			}),
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lifetimeCtx, cancelLifetime := context.WithCancel(context.Background())
+		client, err := managedwriter.NewClient(lifetimeCtx, "p",
+			option.WithGRPCConn(conn),
+			option.WithoutAuthentication(),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_ = client.Close()
+			cancelLifetime()
+			_ = conn.Close()
+		})
+
+		w := NewWriter(lifetimeCtx, client, WriterOptions{
+			Project: "p", Dataset: "d", Table: "t",
+			Descriptor:          testRowDescriptor(),
+			MaxRequestBytes:     1 << 20,
+			MaxInflightRequests: 8,
+			MaxInflightBytes:    64 << 20,
+			TraceID:             "writer-test",
+		})
+		t.Cleanup(func() { _ = w.Close() })
+
+		var succeeded int
+		for range 10 {
+			out := appendWithin(w, 100*time.Millisecond, rowsOf(1))
+			if out.Err == nil && out.AcknowledgedRows == 1 {
+				succeeded++
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if succeeded == 0 {
+			t.Fatalf("0 of 10 attempts succeeded (getStreamCalls=%d, canceledCalls=%d); stream creation livelocked",
+				backend.getStreamCalls.Load(), backend.canceledCalls.Load())
+		}
+		if got := backend.getStreamCalls.Load(); got != 1 {
+			t.Fatalf("GetWriteStream calls = %d, want 1", got)
+		}
+		if got := backend.canceledCalls.Load(); got != 0 {
+			t.Fatalf("canceled GetWriteStream calls = %d, want 0", got)
+		}
+	})
+}
+
+type twoRequestsBeforeAckServer struct {
+	storagepb.UnimplementedBigQueryWriteServer
+
+	streamsOpened         atomic.Int32
+	bothReceivedBeforeAck atomic.Bool
+}
+
+func (s *twoRequestsBeforeAckServer) GetWriteStream(
+	_ context.Context, req *storagepb.GetWriteStreamRequest,
+) (*storagepb.WriteStream, error) {
+	return &storagepb.WriteStream{Name: req.GetName(), Location: "us"}, nil
+}
+
+func (s *twoRequestsBeforeAckServer) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error {
+	s.streamsOpened.Add(1)
+	// Require two requests to arrive on the same stream before sending the first ack.
+	if _, err := srv.Recv(); err != nil {
+		return nil
+	}
+	if _, err := srv.Recv(); err != nil {
+		return nil
+	}
+	s.bothReceivedBeforeAck.Store(true)
+	ack := &storagepb.AppendRowsResponse{
+		Response: &storagepb.AppendRowsResponse_AppendResult_{
+			AppendResult: &storagepb.AppendRowsResponse_AppendResult{},
+		},
+	}
+	for range 2 {
+		if err := srv.Send(ack); err != nil {
+			return nil
+		}
+	}
+	for {
+		if _, err := srv.Recv(); err != nil {
+			return nil
+		}
+		if err := srv.Send(ack); err != nil {
+			return nil
+		}
+	}
+}
+
+func TestWriterStreamPoolMultipleRequestsOnSingleSlotDoNotBlockInManagedWriter(t *testing.T) {
+	lis := bufconn.Listen(1 << 20)
+	backend := &twoRequestsBeforeAckServer{}
+	server := grpc.NewServer()
+	storagepb.RegisterBigQueryWriteServer(server, backend)
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		_ = server.Serve(lis)
+	}()
+	t.Cleanup(func() {
+		server.Stop()
+		<-served
+	})
+
+	conn, err := grpc.NewClient("passthrough:///single-slot-two-requests",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifetimeCtx, cancelLifetime := context.WithCancel(context.Background())
+	client, err := managedwriter.NewClient(lifetimeCtx, "p",
+		option.WithGRPCConn(conn),
+		option.WithoutAuthentication(),
+		managedwriter.WithDefaultInflightRequests(2),
+		managedwriter.WithDefaultInflightBytes(3000),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = client.Close()
+		cancelLifetime()
+		_ = conn.Close()
+	})
+
+	w := NewWriter(lifetimeCtx, client, WriterOptions{
+		Project: "p", Dataset: "d", Table: "t",
+		Descriptor:          testRowDescriptor(),
+		MaxRequestBytes:     1200,
+		MaxInflightRequests: 2,
+		MaxInflightBytes:    3000,
+		StreamPoolSize:      2,
+		TraceID:             "writer-test",
+	})
+	t.Cleanup(func() { _ = w.Close() })
+
+	// Mark slot 1 as having higher pending work so selectSlot places both
+	// ~1.1 KB sub-requests (total ~2.3 KB <= MaxInflightBytes 3000) onto slot 0.
+	w.mu.Lock()
+	slots := w.ensureSlotsLocked()
+	w.mu.Unlock()
+	slots[1].pending.Store(2)
+	defer slots[1].pending.Store(0)
+
+	row1000 := make([]byte, 1000)
+	row1000[0] = 0x0a
+	row1000[1] = 0xe4
+	row1000[2] = 0x07
+
+	w.nextSlot.Store(0)
+	out := appendWithin(w, 500*time.Millisecond, [][]byte{row1000, row1000})
+	if out.Err != nil || out.AcknowledgedRows != 2 {
+		t.Fatalf("Append outcome = %+v, want 2 acknowledged rows and nil error", out)
+	}
+	if !backend.bothReceivedBeforeAck.Load() {
+		t.Fatal("both sub-requests did not reach the wire on slot 0 before the first ack")
+	}
+	if got := backend.streamsOpened.Load(); got != 1 {
+		t.Fatalf("streamsOpened = %d, want 1 (both requests placed on slot 0)", got)
 	}
 }

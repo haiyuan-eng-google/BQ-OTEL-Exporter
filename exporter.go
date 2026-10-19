@@ -387,17 +387,6 @@ func (e *signalExporter) metadataScopes() []string {
 	return []string{scopeRead}
 }
 
-func (e *signalExporter) perSlotMaxInflightBytes() int {
-	if e.cfg.Write.MaxInflightBytes <= 0 || e.cfg.Write.StreamPoolSize <= 1 {
-		return e.cfg.Write.MaxInflightBytes
-	}
-	perSlot := e.cfg.Write.MaxInflightBytes / e.cfg.Write.StreamPoolSize
-	if perSlot < e.cfg.Write.MaxRequestBytes {
-		perSlot = e.cfg.Write.MaxRequestBytes
-	}
-	return perSlot
-}
-
 func (e *signalExporter) writerClientOptions(ctx context.Context) ([]option.ClientOption, error) {
 	var opts []option.ClientOption
 	if !e.cfg.Endpoint.WithoutAuthentication {
@@ -429,7 +418,7 @@ func (e *signalExporter) writerClientOptions(ctx context.Context) ([]option.Clie
 	}
 	opts = append(opts,
 		managedwriter.WithDefaultInflightRequests(e.cfg.Write.MaxInflightRequests),
-		managedwriter.WithDefaultInflightBytes(e.perSlotMaxInflightBytes()),
+		managedwriter.WithDefaultInflightBytes(e.cfg.Write.MaxInflightBytes),
 	)
 	connPool := e.cfg.Write.ConnectionPoolSize
 	if e.cfg.Write.StreamPoolSize > 1 && e.cfg.Write.StreamPoolSize > connPool {

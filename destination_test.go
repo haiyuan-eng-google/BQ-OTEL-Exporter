@@ -2144,7 +2144,12 @@ func TestWriterClientOptionsStreamPoolUsesDedicatedConnections(t *testing.T) {
 			t.Fatal(cerr)
 		}
 		defer func() { _ = client.Close() }()
-		return reflect.ValueOf(client).Elem().FieldByName("cfg").Elem().FieldByName("useMultiplex").Bool()
+		cfgVal := reflect.ValueOf(client).Elem().FieldByName("cfg").Elem()
+		if gotBytes := cfgVal.FieldByName("defaultInflightBytes").Int(); gotBytes != int64(c.Write.MaxInflightBytes) {
+			t.Fatalf("stream_pool_size=%d defaultInflightBytes = %d, want full MaxInflightBytes %d",
+				poolSize, gotBytes, c.Write.MaxInflightBytes)
+		}
+		return cfgVal.FieldByName("useMultiplex").Bool()
 	}
 	if clientUsesMultiplex(t, 8) {
 		t.Fatal("stream_pool_size=8 with enable_multiplexing=true constructed a multiplexed client, want dedicated connections (useMultiplex=false)")
