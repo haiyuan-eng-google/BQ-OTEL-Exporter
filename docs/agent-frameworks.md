@@ -330,13 +330,21 @@ parent/child window), adding `depth`, `root_span_id`, `nearest_agent_span_id`,
 input, output, and reasoning token usage across the 17 emitted levels (`depth`
 `0..16`, even across tokenless intermediate spans such as `execute_tool`)
 without double-counting ancestor spans (regardless of `gen_ai_operation_name`)
-whose reported token families (`input`, `output`, `reasoning`) are all covered
-by a descendant. A `depth = 16` span is never suppressed by unemitted
-`depth > 16` children, so it retains the leaf token totals for its truncated
-subtree when ancestors report subtree rollups (whereas tokens reported only on
-unemitted `depth > 16` spans are outside this view). Unlike
-`v_gen_ai_model_costs` and `v_gen_ai_sessions`, which check only direct
-children within an hour or UTC session date, `is_token_leaf` follows the
+whose reported token families (`input`, `output`, `reasoning`) are covered
+across emitted trajectory descendants or non-cyclic emitted direct children
+(such as out-of-window orphan children, including when the parent is at
+`depth = 16`). When a parent is only partially covered by descendants (for
+example, a parent reports `input`, `output`, and `reasoning` while its child
+reports only `input` and `output`), `is_token_leaf` stays `TRUE` for the
+uncovered family and the covered token columns on that row are projected as
+`NULL` so summing `WHERE is_token_leaf = TRUE` neither double-counts covered
+families nor drops uncovered ones, while fully covered rollup rows
+(`is_token_leaf = FALSE`) retain their raw token counts. A `depth = 16` span is
+never suppressed by unemitted `depth > 16` children, so it retains the leaf
+token totals for its truncated subtree when ancestors report subtree rollups
+(whereas tokens reported only on unemitted `depth > 16` spans are outside this
+view). Unlike `v_gen_ai_model_costs` and `v_gen_ai_sessions`, which check only
+direct children within an hour or UTC session date, `is_token_leaf` follows the
 emitted trajectory path.
 
 ## Synthetic scenario fixtures

@@ -495,12 +495,26 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
     a new nearest agent, a span that only declares an agent name starts one
     when no span above it has one, and a `chat` or `execute_tool` span that
     declares no agent inherits its parent's nearest agent and adds nothing to
-    `agent_path`. `is_token_leaf` is true for a span that reports input, output,
-    or reasoning tokens (an explicit `0` counts) when no trajectory descendant
-    along `visited_span_ids` (even across tokenless intermediate spans such as
-    `execute_tool`, regardless of `gen_ai_operation_name`) and, for spans at
-    `depth < 16`, no direct child in `spans` covers all non-null token families
-    (`input`, `output`, `reasoning`) reported on the span. A `depth = 16` span
+    `agent_path`. `is_token_leaf` is true for a span that has at least one
+    uncovered non-null token family (`input`, `output`, or `reasoning`; an
+    explicit `0` counts) after aggregating per-family coverage
+    (`token_parent_coverage` via `LOGICAL_OR`) across all trajectory
+    descendants along `visited_span_ids` (even across tokenless intermediate
+    spans such as `execute_tool`, regardless of `gen_ai_operation_name`) and
+    across non-cyclic emitted direct children in `trajectory` (such as an
+    out-of-window child emitted as an orphan root, including when the parent
+    sits at `depth = 16`). When a span is only partially covered by
+    descendants (for example, a parent reports `input`, `output`, and
+    `reasoning` while its child reports only `input` and `output`),
+    `is_token_leaf` remains `TRUE` for the uncovered family and the covered
+    token families on that row are projected as `NULL` so summing
+    `gen_ai_usage_*_tokens WHERE is_token_leaf = TRUE` neither double-counts
+    covered families nor drops uncovered ones; fully covered rollup rows
+    (`is_token_leaf = FALSE`) retain their raw token counts. When two spans
+    form a parent cycle broken by the `[-24h, +1h]` window, the direct-child
+    fallback excludes ancestors in `p.visited_span_ids` and orders
+    cross-orphan links by `(start_time, span_id)` so a cycle cannot suppress
+    all token leaves. A `depth = 16` span
     is never suppressed by unemitted `depth > 16` children so it retains the
     leaf token totals for its truncated subtree when ancestors report subtree
     rollups (tokens reported only on unemitted `depth > 16` spans are outside

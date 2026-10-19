@@ -1316,46 +1316,56 @@ resource "google_bigquery_table" "v_gen_ai_agent_trajectory" {
           WHERE t.depth < 16
             AND c.span_id NOT IN UNNEST(t.visited_span_ids)
         ),
-        token_parent_ids AS (
-          SELECT DISTINCT
-            p.trace_id,
-            p.service_name,
-            p.span_id AS span_id
-          FROM trajectory AS d
-          CROSS JOIN UNNEST(d.visited_span_ids) AS anc_span_id WITH OFFSET AS anc_idx
-          JOIN spans AS p
-            ON p.trace_id = d.trace_id
-            AND p.span_id = anc_span_id
-            AND p.service_name IS NOT DISTINCT FROM d.service_name
-          WHERE anc_idx < ARRAY_LENGTH(d.visited_span_ids) - 1
-            AND (
-              d.gen_ai_usage_input_tokens IS NOT NULL
-              OR d.gen_ai_usage_output_tokens IS NOT NULL
-              OR d.gen_ai_usage_reasoning_tokens IS NOT NULL
-            )
-            AND (p.gen_ai_usage_input_tokens IS NULL OR d.gen_ai_usage_input_tokens IS NOT NULL)
-            AND (p.gen_ai_usage_output_tokens IS NULL OR d.gen_ai_usage_output_tokens IS NOT NULL)
-            AND (p.gen_ai_usage_reasoning_tokens IS NULL OR d.gen_ai_usage_reasoning_tokens IS NOT NULL)
-          UNION DISTINCT
-          SELECT DISTINCT
-            p.trace_id,
-            p.service_name,
-            p.span_id AS span_id
-          FROM trajectory AS p
-          JOIN spans AS c
-            ON c.trace_id = p.trace_id
-            AND c.parent_span_id = p.span_id
-            AND c.service_name IS NOT DISTINCT FROM p.service_name
-          WHERE p.depth < 16
-            AND c.span_id != p.span_id
-            AND (
-              c.gen_ai_usage_input_tokens IS NOT NULL
-              OR c.gen_ai_usage_output_tokens IS NOT NULL
-              OR c.gen_ai_usage_reasoning_tokens IS NOT NULL
-            )
-            AND (p.gen_ai_usage_input_tokens IS NULL OR c.gen_ai_usage_input_tokens IS NOT NULL)
-            AND (p.gen_ai_usage_output_tokens IS NULL OR c.gen_ai_usage_output_tokens IS NOT NULL)
-            AND (p.gen_ai_usage_reasoning_tokens IS NULL OR c.gen_ai_usage_reasoning_tokens IS NOT NULL)
+        token_parent_coverage AS (
+          SELECT
+            trace_id,
+            service_name,
+            span_id,
+            LOGICAL_OR(has_input) AS has_input,
+            LOGICAL_OR(has_output) AS has_output,
+            LOGICAL_OR(has_reasoning) AS has_reasoning
+          FROM (
+            SELECT
+              d.trace_id,
+              d.service_name,
+              anc_span_id AS span_id,
+              d.gen_ai_usage_input_tokens IS NOT NULL AS has_input,
+              d.gen_ai_usage_output_tokens IS NOT NULL AS has_output,
+              d.gen_ai_usage_reasoning_tokens IS NOT NULL AS has_reasoning
+            FROM trajectory AS d
+            CROSS JOIN UNNEST(d.visited_span_ids) AS anc_span_id WITH OFFSET AS anc_idx
+            WHERE anc_idx < ARRAY_LENGTH(d.visited_span_ids) - 1
+              AND (
+                d.gen_ai_usage_input_tokens IS NOT NULL
+                OR d.gen_ai_usage_output_tokens IS NOT NULL
+                OR d.gen_ai_usage_reasoning_tokens IS NOT NULL
+              )
+            UNION ALL
+            SELECT
+              p.trace_id,
+              p.service_name,
+              p.span_id AS span_id,
+              c.gen_ai_usage_input_tokens IS NOT NULL AS has_input,
+              c.gen_ai_usage_output_tokens IS NOT NULL AS has_output,
+              c.gen_ai_usage_reasoning_tokens IS NOT NULL AS has_reasoning
+            FROM trajectory AS p
+            JOIN trajectory AS c
+              ON c.trace_id = p.trace_id
+              AND c.parent_span_id = p.span_id
+              AND c.service_name IS NOT DISTINCT FROM p.service_name
+            WHERE c.span_id NOT IN UNNEST(p.visited_span_ids)
+              AND (
+                NOT p.is_orphan
+                OR c.start_time > p.start_time
+                OR (c.start_time = p.start_time AND c.span_id > p.span_id)
+              )
+              AND (
+                c.gen_ai_usage_input_tokens IS NOT NULL
+                OR c.gen_ai_usage_output_tokens IS NOT NULL
+                OR c.gen_ai_usage_reasoning_tokens IS NOT NULL
+              )
+          )
+          GROUP BY trace_id, service_name, span_id
         )
       SELECT
         t.start_time,
@@ -1382,9 +1392,33 @@ resource "google_bigquery_table" "v_gen_ai_agent_trajectory" {
         t.gen_ai_main_agent_name,
         t.gen_ai_tool_name,
         t.gen_ai_tool_call_id,
-        t.gen_ai_usage_input_tokens,
-        t.gen_ai_usage_output_tokens,
-        t.gen_ai_usage_reasoning_tokens,
+        IF(
+          COALESCE(token_leaf_check.has_input, FALSE)
+          AND (
+            (t.gen_ai_usage_output_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_output, FALSE))
+            OR (t.gen_ai_usage_reasoning_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_reasoning, FALSE))
+          ),
+          CAST(NULL AS INT64),
+          t.gen_ai_usage_input_tokens
+        ) AS gen_ai_usage_input_tokens,
+        IF(
+          COALESCE(token_leaf_check.has_output, FALSE)
+          AND (
+            (t.gen_ai_usage_input_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_input, FALSE))
+            OR (t.gen_ai_usage_reasoning_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_reasoning, FALSE))
+          ),
+          CAST(NULL AS INT64),
+          t.gen_ai_usage_output_tokens
+        ) AS gen_ai_usage_output_tokens,
+        IF(
+          COALESCE(token_leaf_check.has_reasoning, FALSE)
+          AND (
+            (t.gen_ai_usage_input_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_input, FALSE))
+            OR (t.gen_ai_usage_output_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_output, FALSE))
+          ),
+          CAST(NULL AS INT64),
+          t.gen_ai_usage_reasoning_tokens
+        ) AS gen_ai_usage_reasoning_tokens,
         t.adk_session_id,
         t.adk_invocation_id,
         t.adk_user_id,
@@ -1401,19 +1435,16 @@ resource "google_bigquery_table" "v_gen_ai_agent_trajectory" {
         ) AS step_index,
         (leaf_check.span_id IS NULL) AS is_leaf,
         (
-          (
-            t.gen_ai_usage_input_tokens IS NOT NULL
-            OR t.gen_ai_usage_output_tokens IS NOT NULL
-            OR t.gen_ai_usage_reasoning_tokens IS NOT NULL
-          )
-          AND token_leaf_check.span_id IS NULL
+          (t.gen_ai_usage_input_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_input, FALSE))
+          OR (t.gen_ai_usage_output_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_output, FALSE))
+          OR (t.gen_ai_usage_reasoning_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_reasoning, FALSE))
         ) AS is_token_leaf
       FROM trajectory AS t
       LEFT JOIN parent_ids AS leaf_check
         ON t.trace_id = leaf_check.trace_id
         AND t.span_id = leaf_check.span_id
         AND t.service_name IS NOT DISTINCT FROM leaf_check.service_name
-      LEFT JOIN token_parent_ids AS token_leaf_check
+      LEFT JOIN token_parent_coverage AS token_leaf_check
         ON t.trace_id = token_leaf_check.trace_id
         AND t.span_id = token_leaf_check.span_id
         AND t.service_name IS NOT DISTINCT FROM token_leaf_check.service_name

@@ -1286,18 +1286,29 @@ CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAIAgentTrajectoryViewName + "`" 
 // (checked with SAFE_OFFSET so an empty path cannot index out of bounds), so a
 // chat or tool span without an agent attribute adds nothing to it.
 //
-// is_token_leaf marks spans that report input, output, or reasoning tokens
-// (an explicit 0 counts) and have no emitted trajectory descendant along their
-// trajectory path (including across tokenless intermediate spans) and, for
-// spans at depth < 16, no direct child in spans that covers all non-null token
-// families (input, output, reasoning) reported on the span. A depth = 16 span
-// is never suppressed by unemitted depth > 16 children so it retains the leaf
-// token totals for its truncated subtree when ancestors report subtree rollups
-// (tokens reported only on unemitted depth > 16 spans are outside this view).
-// Its scope is the trajectory within (trace_id, service_name), so totals over
-// is_token_leaf can differ from v_gen_ai_model_costs (hourly inference-only
-// direct-child check) and v_gen_ai_sessions (UTC-date session-scoped
-// direct-child check).
+// is_token_leaf marks spans that have at least one uncovered non-null token
+// family (input, output, or reasoning; an explicit 0 counts) after aggregating
+// per-family coverage (token_parent_coverage via LOGICAL_OR) across all
+// emitted trajectory descendants along visited_span_ids (including across
+// tokenless intermediate spans) and across non-cyclic emitted direct children
+// in trajectory (such as an out-of-window child emitted as an orphan root,
+// including when the parent sits at depth = 16). When a span is only partially
+// covered (for example, a parent reports input, output, and reasoning while its
+// child reports only input and output), is_token_leaf remains TRUE for the
+// uncovered family and the covered families on that row are projected as NULL
+// so summing gen_ai_usage_*_tokens WHERE is_token_leaf = TRUE neither
+// double-counts covered families nor drops uncovered ones; fully covered
+// rollup rows (is_token_leaf = FALSE) retain their raw token counts. When two
+// spans form a parent cycle broken by the [-24h, +1h] window, the direct-child
+// fallback excludes ancestors in p.visited_span_ids and orders cross-orphan
+// links by (start_time, span_id) so a cycle cannot suppress all token leaves.
+// A depth = 16 span is never suppressed by unemitted depth > 16 children so it
+// retains the leaf token totals for its truncated subtree when ancestors report
+// subtree rollups (tokens reported only on unemitted depth > 16 spans are
+// outside this view). Its scope is the trajectory within (trace_id,
+// service_name), so totals over is_token_leaf can differ from
+// v_gen_ai_model_costs (hourly inference-only direct-child check) and
+// v_gen_ai_sessions (UTC-date session-scoped direct-child check).
 const GenAIAgentTrajectoryViewQuery = `
 WITH RECURSIVE
   spans AS (
@@ -1488,46 +1499,56 @@ WITH RECURSIVE
     WHERE t.depth < 16
       AND c.span_id NOT IN UNNEST(t.visited_span_ids)
   ),
-  token_parent_ids AS (
-    SELECT DISTINCT
-      p.trace_id,
-      p.service_name,
-      p.span_id AS span_id
-    FROM trajectory AS d
-    CROSS JOIN UNNEST(d.visited_span_ids) AS anc_span_id WITH OFFSET AS anc_idx
-    JOIN spans AS p
-      ON p.trace_id = d.trace_id
-      AND p.span_id = anc_span_id
-      AND p.service_name IS NOT DISTINCT FROM d.service_name
-    WHERE anc_idx < ARRAY_LENGTH(d.visited_span_ids) - 1
-      AND (
-        d.gen_ai_usage_input_tokens IS NOT NULL
-        OR d.gen_ai_usage_output_tokens IS NOT NULL
-        OR d.gen_ai_usage_reasoning_tokens IS NOT NULL
-      )
-      AND (p.gen_ai_usage_input_tokens IS NULL OR d.gen_ai_usage_input_tokens IS NOT NULL)
-      AND (p.gen_ai_usage_output_tokens IS NULL OR d.gen_ai_usage_output_tokens IS NOT NULL)
-      AND (p.gen_ai_usage_reasoning_tokens IS NULL OR d.gen_ai_usage_reasoning_tokens IS NOT NULL)
-    UNION DISTINCT
-    SELECT DISTINCT
-      p.trace_id,
-      p.service_name,
-      p.span_id AS span_id
-    FROM trajectory AS p
-    JOIN spans AS c
-      ON c.trace_id = p.trace_id
-      AND c.parent_span_id = p.span_id
-      AND c.service_name IS NOT DISTINCT FROM p.service_name
-    WHERE p.depth < 16
-      AND c.span_id != p.span_id
-      AND (
-        c.gen_ai_usage_input_tokens IS NOT NULL
-        OR c.gen_ai_usage_output_tokens IS NOT NULL
-        OR c.gen_ai_usage_reasoning_tokens IS NOT NULL
-      )
-      AND (p.gen_ai_usage_input_tokens IS NULL OR c.gen_ai_usage_input_tokens IS NOT NULL)
-      AND (p.gen_ai_usage_output_tokens IS NULL OR c.gen_ai_usage_output_tokens IS NOT NULL)
-      AND (p.gen_ai_usage_reasoning_tokens IS NULL OR c.gen_ai_usage_reasoning_tokens IS NOT NULL)
+  token_parent_coverage AS (
+    SELECT
+      trace_id,
+      service_name,
+      span_id,
+      LOGICAL_OR(has_input) AS has_input,
+      LOGICAL_OR(has_output) AS has_output,
+      LOGICAL_OR(has_reasoning) AS has_reasoning
+    FROM (
+      SELECT
+        d.trace_id,
+        d.service_name,
+        anc_span_id AS span_id,
+        d.gen_ai_usage_input_tokens IS NOT NULL AS has_input,
+        d.gen_ai_usage_output_tokens IS NOT NULL AS has_output,
+        d.gen_ai_usage_reasoning_tokens IS NOT NULL AS has_reasoning
+      FROM trajectory AS d
+      CROSS JOIN UNNEST(d.visited_span_ids) AS anc_span_id WITH OFFSET AS anc_idx
+      WHERE anc_idx < ARRAY_LENGTH(d.visited_span_ids) - 1
+        AND (
+          d.gen_ai_usage_input_tokens IS NOT NULL
+          OR d.gen_ai_usage_output_tokens IS NOT NULL
+          OR d.gen_ai_usage_reasoning_tokens IS NOT NULL
+        )
+      UNION ALL
+      SELECT
+        p.trace_id,
+        p.service_name,
+        p.span_id AS span_id,
+        c.gen_ai_usage_input_tokens IS NOT NULL AS has_input,
+        c.gen_ai_usage_output_tokens IS NOT NULL AS has_output,
+        c.gen_ai_usage_reasoning_tokens IS NOT NULL AS has_reasoning
+      FROM trajectory AS p
+      JOIN trajectory AS c
+        ON c.trace_id = p.trace_id
+        AND c.parent_span_id = p.span_id
+        AND c.service_name IS NOT DISTINCT FROM p.service_name
+      WHERE c.span_id NOT IN UNNEST(p.visited_span_ids)
+        AND (
+          NOT p.is_orphan
+          OR c.start_time > p.start_time
+          OR (c.start_time = p.start_time AND c.span_id > p.span_id)
+        )
+        AND (
+          c.gen_ai_usage_input_tokens IS NOT NULL
+          OR c.gen_ai_usage_output_tokens IS NOT NULL
+          OR c.gen_ai_usage_reasoning_tokens IS NOT NULL
+        )
+    )
+    GROUP BY trace_id, service_name, span_id
   )
 SELECT
   t.start_time,
@@ -1554,9 +1575,33 @@ SELECT
   t.gen_ai_main_agent_name,
   t.gen_ai_tool_name,
   t.gen_ai_tool_call_id,
-  t.gen_ai_usage_input_tokens,
-  t.gen_ai_usage_output_tokens,
-  t.gen_ai_usage_reasoning_tokens,
+  IF(
+    COALESCE(token_leaf_check.has_input, FALSE)
+    AND (
+      (t.gen_ai_usage_output_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_output, FALSE))
+      OR (t.gen_ai_usage_reasoning_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_reasoning, FALSE))
+    ),
+    CAST(NULL AS INT64),
+    t.gen_ai_usage_input_tokens
+  ) AS gen_ai_usage_input_tokens,
+  IF(
+    COALESCE(token_leaf_check.has_output, FALSE)
+    AND (
+      (t.gen_ai_usage_input_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_input, FALSE))
+      OR (t.gen_ai_usage_reasoning_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_reasoning, FALSE))
+    ),
+    CAST(NULL AS INT64),
+    t.gen_ai_usage_output_tokens
+  ) AS gen_ai_usage_output_tokens,
+  IF(
+    COALESCE(token_leaf_check.has_reasoning, FALSE)
+    AND (
+      (t.gen_ai_usage_input_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_input, FALSE))
+      OR (t.gen_ai_usage_output_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_output, FALSE))
+    ),
+    CAST(NULL AS INT64),
+    t.gen_ai_usage_reasoning_tokens
+  ) AS gen_ai_usage_reasoning_tokens,
   t.adk_session_id,
   t.adk_invocation_id,
   t.adk_user_id,
@@ -1573,19 +1618,16 @@ SELECT
   ) AS step_index,
   (leaf_check.span_id IS NULL) AS is_leaf,
   (
-    (
-      t.gen_ai_usage_input_tokens IS NOT NULL
-      OR t.gen_ai_usage_output_tokens IS NOT NULL
-      OR t.gen_ai_usage_reasoning_tokens IS NOT NULL
-    )
-    AND token_leaf_check.span_id IS NULL
+    (t.gen_ai_usage_input_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_input, FALSE))
+    OR (t.gen_ai_usage_output_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_output, FALSE))
+    OR (t.gen_ai_usage_reasoning_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_reasoning, FALSE))
   ) AS is_token_leaf
 FROM trajectory AS t
 LEFT JOIN parent_ids AS leaf_check
   ON t.trace_id = leaf_check.trace_id
   AND t.span_id = leaf_check.span_id
   AND t.service_name IS NOT DISTINCT FROM leaf_check.service_name
-LEFT JOIN token_parent_ids AS token_leaf_check
+LEFT JOIN token_parent_coverage AS token_leaf_check
   ON t.trace_id = token_leaf_check.trace_id
   AND t.span_id = token_leaf_check.span_id
   AND t.service_name IS NOT DISTINCT FROM token_leaf_check.service_name
