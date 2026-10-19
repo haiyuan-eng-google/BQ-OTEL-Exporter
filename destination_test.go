@@ -2124,6 +2124,34 @@ func TestWriterClientOptionsStreamPoolUsesDedicatedConnections(t *testing.T) {
 	if len(opts) != 4 {
 		t.Fatalf("stream pool writer options = %d, want 4 (ADC scope, default inflight requests/bytes, connection pool without multiplexing)", len(opts))
 	}
+
+	clientUsesMultiplex := func(t *testing.T, poolSize int) bool {
+		t.Helper()
+		c := validConfig()
+		c.Endpoint.URL = "localhost:9050"
+		c.Endpoint.Insecure = true
+		c.Endpoint.WithoutAuthentication = true
+		c.Write.EnableMultiplexing = true
+		c.Write.StreamPoolSize = poolSize
+		c.Write.ConnectionPoolSize = 4
+		se := newTestSignalExporter(c, c.Traces.Table, schema.SpansTableSchema())
+		wopts, werr := se.writerClientOptions(context.Background())
+		if werr != nil {
+			t.Fatal(werr)
+		}
+		client, cerr := newManagedWriterClient(context.Background(), c.Project, wopts...)
+		if cerr != nil {
+			t.Fatal(cerr)
+		}
+		defer func() { _ = client.Close() }()
+		return reflect.ValueOf(client).Elem().FieldByName("cfg").Elem().FieldByName("useMultiplex").Bool()
+	}
+	if clientUsesMultiplex(t, 8) {
+		t.Fatal("stream_pool_size=8 with enable_multiplexing=true constructed a multiplexed client, want dedicated connections (useMultiplex=false)")
+	}
+	if !clientUsesMultiplex(t, 1) {
+		t.Fatal("stream_pool_size=1 with enable_multiplexing=true constructed a non-multiplexed client, want useMultiplex=true")
+	}
 }
 
 func TestMetadataScopesAreLeastPrivilege(t *testing.T) {

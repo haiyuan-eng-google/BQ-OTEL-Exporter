@@ -4334,3 +4334,288 @@ func TestWriterStreamPoolReleasesBytesOnSyncAppendRowsError(t *testing.T) {
 		t.Fatalf("second Append after sync error = %+v, want 1 acknowledged row and nil error", second)
 	}
 }
+
+func TestWriterStreamPoolSyncCancellationKeepsNativeBytesReservedUntilTeardown(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		returnNilErrRes bool
+	}{
+		{name: "sync_error", returnNilErrRes: false},
+		{name: "ambiguous_res_with_canceled_ctx", returnNilErrRes: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			closeEntered := make(chan struct{})
+			allowClose := make(chan struct{})
+			var (
+				streamsMade     atomic.Int32
+				slot1Dispatched atomic.Int32
+			)
+
+			w := &Writer{
+				opts: WriterOptions{
+					Project:             "p",
+					Dataset:             "d",
+					Table:               "t",
+					MaxRequestBytes:     250,
+					MaxInflightRequests: 2,
+					MaxInflightBytes:    221, // exact wire bytes for one 100-byte row
+					StreamPoolSize:      2,
+				},
+				lifetimeCtx: context.Background(),
+			}
+			w.factory = func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+				if streamsMade.Add(1) == 1 {
+					var closeOnce sync.Once
+					return &funcStream{
+						appendFn: func(_ context.Context, _ [][]byte) (appendResult, error) {
+							if tc.returnNilErrRes {
+								return newControlledResult(), nil
+							}
+							return nil, context.Canceled
+						},
+						closeFn: func() error {
+							closeOnce.Do(func() { close(closeEntered) })
+							<-allowClose
+							return nil
+						},
+					}, nil
+				}
+				return &funcStream{
+					appendFn: func(context.Context, [][]byte) (appendResult, error) {
+						slot1Dispatched.Add(1)
+						return fakeResult{}, nil
+					},
+				}, nil
+			}
+			defer func() { _ = w.Close() }()
+
+			// Warm both slots so slot 1 already has a live stream generation before
+			// slot 0's synchronous cancellation races teardown.
+			slots, err := w.beginAppend()
+			if err != nil {
+				t.Fatal(err)
+			}
+			w.appendWG.Done()
+			for i, s := range slots {
+				gen, serr := w.ensureSlotStream(context.Background(), s)
+				if serr != nil {
+					t.Fatalf("warming slot %d: %v", i, serr)
+				}
+				w.releaseGenerationUser(s, gen)
+			}
+
+			row := make([]byte, 100)
+			ctx0, cancel0 := context.WithCancel(context.Background())
+			cancel0()
+			// Create a child context that is still live during pre-dispatch acquisition
+			// and canceled inside AppendRows.
+			ctx0Live, cancel0Live := context.WithCancel(context.Background())
+			defer cancel0Live()
+			slots[0].mu.Lock()
+			slot0Stream := slots[0].ms.stream.(*funcStream)
+			origAppend := slot0Stream.appendFn
+			slot0Stream.appendFn = func(_ context.Context, data [][]byte) (appendResult, error) {
+				cancel0Live()
+				return origAppend(ctx0, data)
+			}
+			slots[0].mu.Unlock()
+
+			w.nextSlot.Store(0)
+			done0 := make(chan AppendOutcome, 1)
+			go func() {
+				done0 <- w.Append(ctx0Live, [][]byte{row})
+			}()
+
+			select {
+			case <-closeEntered:
+			case <-time.After(2 * time.Second):
+				t.Fatal("slot 0 Close() was not entered during synchronous failure retirement")
+			}
+
+			// While slot 0's stream Close() is blocked in teardown, the 221-byte
+			// reservation must remain held in w.inflightBytes.
+			w.mu.Lock()
+			heldBytes := w.inflightBytes
+			w.mu.Unlock()
+			if heldBytes != 221 {
+				close(allowClose)
+				t.Fatalf("inflightBytes during slot 0 Close() teardown = %d, want 221", heldBytes)
+			}
+
+			// Launch a concurrent append on slot 1; it must wait on the pool-wide
+			// byte gate while slot 0's teardown is still in progress.
+			w.nextSlot.Store(1)
+			done1 := make(chan AppendOutcome, 1)
+			go func() {
+				ctx1, cancel1 := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel1()
+				done1 <- w.Append(ctx1, [][]byte{row})
+			}()
+
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				w.mu.Lock()
+				waitingOnBytes := w.byteSignal != nil
+				w.mu.Unlock()
+				if waitingOnBytes {
+					break
+				}
+				if time.Now().After(deadline) {
+					close(allowClose)
+					t.Fatal("slot 1 did not block on w.byteSignal while slot 0 teardown was in progress")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if got := slot1Dispatched.Load(); got != 0 {
+				close(allowClose)
+				t.Fatalf("slot 1 dispatched %d requests before slot 0 Close() completed, want 0", got)
+			}
+
+			close(allowClose)
+
+			select {
+			case out0 := <-done0:
+				if !errors.Is(out0.Err, context.Canceled) {
+					t.Fatalf("slot 0 outcome = %+v, want context.Canceled", out0)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("slot 0 Append did not return after Close() completed")
+			}
+
+			select {
+			case out1 := <-done1:
+				if out1.Err != nil || out1.AcknowledgedRows != 1 {
+					t.Fatalf("slot 1 outcome = %+v, want 1 acknowledged row and nil error", out1)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("slot 1 Append did not complete after slot 0 released bytes")
+			}
+
+			w.mu.Lock()
+			finalBytes := w.inflightBytes
+			w.mu.Unlock()
+			if finalBytes != 0 {
+				t.Fatalf("final inflightBytes = %d, want 0", finalBytes)
+			}
+		})
+	}
+}
+
+func TestWriterStreamPoolSimplexDelayedResultOwnerDoesNotRetireSiblings(t *testing.T) {
+	const poolSize = 4
+	results := make([]*controlledResult, poolSize)
+	var (
+		completeOnce [poolSize]sync.Once
+		closed       [poolSize]atomic.Int32
+	)
+	for i := range poolSize {
+		results[i] = newControlledResult()
+	}
+	completeResult := func(i int, err error) {
+		completeOnce[i].Do(func() {
+			results[i].complete(err)
+		})
+	}
+
+	obs := &fakeObserver{}
+	var streamsMade atomic.Int32
+	w := &Writer{
+		opts: WriterOptions{
+			Project:             "p",
+			Dataset:             "d",
+			Table:               "t",
+			MaxRequestBytes:     250,
+			MaxInflightRequests: 2,
+			MaxInflightBytes:    1 << 20,
+			StreamPoolSize:      poolSize,
+			Observer:            obs,
+		},
+		lifetimeCtx: context.Background(),
+	}
+	w.factory = func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+		idx := int(streamsMade.Add(1) - 1)
+		if idx >= poolSize {
+			return &funcStream{
+				appendFn: func(context.Context, [][]byte) (appendResult, error) {
+					return fakeResult{}, nil
+				},
+			}, nil
+		}
+		return &funcStream{
+			appendFn: func(context.Context, [][]byte) (appendResult, error) {
+				return results[idx], nil
+			},
+			closeFn: func() error {
+				closed[idx].Add(1)
+				// Simulate a result-owner goroutine that takes 20ms (> 5ms) after
+				// stream Close() to observe the closed connection and resolve.
+				go func(slotIdx int) {
+					time.Sleep(20 * time.Millisecond)
+					completeResult(slotIdx, status.Error(codes.Canceled, "simplex stream closed"))
+				}(idx)
+				return nil
+			},
+		}, nil
+	}
+	defer func() { _ = w.Close() }()
+
+	slots, err := w.beginAppend()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.appendWG.Done()
+	for i, s := range slots {
+		gen, serr := w.ensureSlotStream(context.Background(), s)
+		if serr != nil {
+			t.Fatalf("warming slot %d: %v", i, serr)
+		}
+		w.releaseGenerationUser(s, gen)
+	}
+
+	row := make([]byte, 60)
+	siblingDone := make([]chan AppendOutcome, poolSize)
+	for i := 1; i < poolSize; i++ {
+		siblingDone[i] = make(chan AppendOutcome, 1)
+		w.nextSlot.Store(uint64(i))
+		go func(slotIdx int) {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			siblingDone[slotIdx] <- w.Append(ctx, [][]byte{row})
+		}(i)
+		results[i].waitForCalls(t, 1)
+	}
+
+	// Slot 0 times out after 30ms; its Close() takes 20ms to resolve results[0].
+	// Because this is a non-multiplexed pool, slots 1..3 must not be retired.
+	w.nextSlot.Store(0)
+	ctx0, cancel0 := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel0()
+	out0 := w.Append(ctx0, [][]byte{row})
+	if !errors.Is(out0.Err, context.DeadlineExceeded) {
+		t.Fatalf("slot 0 outcome = %+v, want context.DeadlineExceeded", out0)
+	}
+
+	if got := closed[0].Load(); got != 1 {
+		t.Fatalf("slot 0 close count = %d, want 1", got)
+	}
+	for i := 1; i < poolSize; i++ {
+		if got := closed[i].Load(); got != 0 {
+			t.Fatalf("healthy sibling slot %d close count = %d, want 0", i, got)
+		}
+		completeResult(i, nil)
+		select {
+		case out := <-siblingDone[i]:
+			if out.Err != nil || out.AcknowledgedRows != 1 {
+				t.Fatalf("sibling slot %d outcome = %+v, want 1 acknowledged row and nil error", i, out)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("sibling slot %d did not complete", i)
+		}
+	}
+	obs.mu.Lock()
+	retirements := obs.retirements
+	obs.mu.Unlock()
+	if retirements != 1 {
+		t.Fatalf("stream retirements = %d, want 1 (only the timed-out slot)", retirements)
+	}
+}

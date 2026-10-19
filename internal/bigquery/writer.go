@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -115,6 +116,11 @@ type Writer struct {
 	lifetimeCtx context.Context
 	ownedCtx    context.Context
 	ownedCancel context.CancelFunc
+	multiplexed bool
+
+	// sharedRetireMu serializes shared-connection retirement when a caller
+	// constructs a multiplexed managedwriter.Client with StreamPoolSize > 1.
+	sharedRetireMu sync.Mutex
 
 	// mu guards writer-wide lifecycle (closed, closeDone, closeErr,
 	// ownedCtx, ownedCancel, slots) and the pool-wide in-flight byte budget
@@ -153,13 +159,14 @@ type streamSlot struct {
 	pending  atomic.Int64
 
 	// mu guards this slot's stream lifecycle (ms, creation, generationSignal,
-	// activeGenerations, closed) and every streamGeneration created on it.
-	// It is never held at the same time as Writer.mu.
+	// activeGenerations, retiring, closed) and every streamGeneration created
+	// on it. It is never held at the same time as Writer.mu.
 	mu                sync.Mutex
 	ms                *streamGeneration
 	creation          *streamCreation
 	generationSignal  chan struct{}
 	activeGenerations int
+	retiring          bool
 	closed            bool
 }
 
@@ -179,6 +186,26 @@ type streamGeneration struct {
 	retiredDone chan struct{}
 }
 
+// clientUsesMultiplexing reports whether client was constructed with
+// managedwriter.WithMultiplexing(). Dedicated (simplex) stream pools do not
+// share an underlying connection across ManagedStreams, so retiring one slot
+// must never tear down sibling slots.
+func clientUsesMultiplexing(client *managedwriter.Client) bool {
+	if client == nil {
+		return false
+	}
+	v := reflect.ValueOf(client)
+	if v.Kind() != reflect.Ptr || v.IsNil() {
+		return false
+	}
+	cfg := v.Elem().FieldByName("cfg")
+	if !cfg.IsValid() || cfg.Kind() != reflect.Ptr || cfg.IsNil() {
+		return false
+	}
+	useMultiplex := cfg.Elem().FieldByName("useMultiplex")
+	return useMultiplex.IsValid() && useMultiplex.Kind() == reflect.Bool && useMultiplex.Bool()
+}
+
 // NewWriter builds a writer whose managed streams retain lifetimeCtx for their
 // entire component lifetime.
 func NewWriter(
@@ -187,6 +214,7 @@ func NewWriter(
 	w := &Writer{
 		opts:        opts,
 		lifetimeCtx: lifetimeCtx,
+		multiplexed: clientUsesMultiplexing(client),
 		factory: func(ctx context.Context, wopts ...managedwriter.WriterOption) (stream, error) {
 			ms, err := client.NewManagedStream(ctx, wopts...)
 			if err != nil {
@@ -248,7 +276,7 @@ func (w *Writer) writerOptions() []managedwriter.WriterOption {
 func slotHasOpenWindow(slot *streamSlot, effectiveInflight int) bool {
 	slot.mu.Lock()
 	defer slot.mu.Unlock()
-	if slot.closed {
+	if slot.closed || slot.retiring {
 		return false
 	}
 	if slot.ms == nil {
@@ -316,17 +344,18 @@ func (w *Writer) acquireSlotStream(
 			slot.mu.Unlock()
 			return nil, false, err
 		}
-		if slot.ms != nil {
+		if !slot.retiring && slot.ms != nil {
 			gen := slot.ms
 			gen.users++
 			slot.mu.Unlock()
 			return gen, true, nil
 		}
 
-		if slot.creation == nil && slot.activeGenerations < maxActiveStreamGenerations {
+		if !slot.retiring && slot.creation == nil && slot.activeGenerations < maxActiveStreamGenerations {
 			w.startSlotStreamCreationLocked(slot)
 		}
-		if creation := slot.creation; creation != nil {
+		if !slot.retiring && slot.creation != nil {
+			creation := slot.creation
 			done := creation.done
 			slot.mu.Unlock()
 			select {
@@ -507,49 +536,123 @@ func (w *Writer) generationUnresolved(slot *streamSlot, gen *streamGeneration) i
 // append on this slot may already have retired gen and installed a replacement;
 // a late result from the old generation must not close that replacement.
 //
+// On a dedicated (simplex) stream pool (!w.multiplexed), each slot owns an
+// independent connection and retireStream closes only slot's generation.
+//
 // When a caller constructs a managedwriter.Client with WithMultiplexing() and
 // StreamPoolSize > 1, closing one slot's ManagedStream detaches that slot from
-// multiConn without closing multiConn while sibling slots remain attached,
-// leaving any timed-out AppendResult unresolved. If gen still has tracked
-// unresolved results after closing its own stream, retireStream also retires
-// sibling slots so multiConn closes and releases the pool-wide byte budget.
+// multiConn without closing multiConn while sibling slots remain attached, and
+// a concurrent replacement stream created before all siblings detach would
+// attach to the same stalled multiConn. retireSharedMultiplexedPool therefore
+// quiesces replacement creation across all slots, detaches and closes every
+// attached slot together so multiConn closes, and releases the barrier once
+// tracked unresolved results on the retired generation finish draining.
 func (w *Writer) retireStream(slot *streamSlot, gen *streamGeneration) {
 	if slot == nil || gen == nil {
 		return
 	}
-	hadUnresolved := w.generationUnresolved(slot, gen) > 0
-	w.retireSlotGeneration(slot, gen)
-	if !hadUnresolved {
+	if !w.multiplexed {
+		w.retireSlotGeneration(slot, gen)
 		return
 	}
 	w.mu.Lock()
 	slots := w.ensureSlotsLocked()
 	w.mu.Unlock()
 	if len(slots) <= 1 {
+		w.retireSlotGeneration(slot, gen)
 		return
 	}
-	for range 50 {
-		if w.generationUnresolved(slot, gen) == 0 {
-			return
-		}
-		time.Sleep(100 * time.Microsecond)
+	w.retireSharedMultiplexedPool(slots, slot, gen)
+}
+
+func (w *Writer) anyGenerationUnresolved(
+	slot *streamSlot, gen *streamGeneration, detached []*streamGeneration,
+) bool {
+	if w.generationUnresolved(slot, gen) > 0 {
+		return true
 	}
-	for _, sib := range slots {
-		if sib == slot {
-			continue
-		}
-		sib.mu.Lock()
-		sibGen := sib.ms
-		sib.mu.Unlock()
-		if sibGen != nil {
-			w.retireSlotGeneration(sib, sibGen)
+	for _, g := range detached {
+		if g != nil && w.generationUnresolved(g.slot, g) > 0 {
+			return true
 		}
 	}
-	for range 100 {
-		if w.generationUnresolved(slot, gen) == 0 {
-			return
+	return false
+}
+
+func (w *Writer) retireSharedMultiplexedPool(
+	slots []*streamSlot, slot *streamSlot, gen *streamGeneration,
+) {
+	w.sharedRetireMu.Lock()
+	defer w.sharedRetireMu.Unlock()
+
+	slot.mu.Lock()
+	isCurrent := slot.ms == gen
+	unresolved := gen.unresolved
+	slot.mu.Unlock()
+	if !isCurrent {
+		if unresolved > 0 {
+			for range 100 {
+				if w.generationUnresolved(slot, gen) == 0 {
+					return
+				}
+				time.Sleep(200 * time.Microsecond)
+			}
 		}
-		time.Sleep(200 * time.Microsecond)
+		return
+	}
+
+	var creations []<-chan struct{}
+	for _, s := range slots {
+		s.mu.Lock()
+		s.retiring = true
+		if s.creation != nil {
+			creations = append(creations, s.creation.done)
+		}
+		s.mu.Unlock()
+	}
+	defer func() {
+		for _, s := range slots {
+			s.mu.Lock()
+			s.retiring = false
+			s.notifyGenerationChangeLocked()
+			s.mu.Unlock()
+		}
+	}()
+
+	for _, done := range creations {
+		<-done
+	}
+
+	detached := make([]*streamGeneration, 0, len(slots))
+	hasUnresolved := w.generationUnresolved(slot, gen) > 0
+	for _, s := range slots {
+		s.mu.Lock()
+		if g := s.ms; g != nil {
+			s.ms = nil
+			markGenerationRetiredLocked(g)
+			s.releaseGenerationSlotLocked(g)
+			if g.unresolved > 0 {
+				hasUnresolved = true
+			}
+			detached = append(detached, g)
+		}
+		s.mu.Unlock()
+	}
+
+	for _, g := range detached {
+		_ = g.Close()
+		if w.opts.Observer != nil {
+			w.opts.Observer.RecordStreamRetirement(context.Background())
+		}
+	}
+
+	if hasUnresolved {
+		for range 100 {
+			if !w.anyGenerationUnresolved(slot, gen, detached) {
+				return
+			}
+			time.Sleep(200 * time.Microsecond)
+		}
 	}
 }
 
@@ -1320,11 +1423,13 @@ dispatch:
 			}
 		}
 		if aerr != nil {
-			w.releaseDispatchSlot(slot, gen, reqBytes)
 			// AppendRows can return the attempt-context error after handing a
 			// request to the bidirectional stream. Its acknowledgement is then
-			// ambiguous, and this generation cannot safely be reused.
+			// ambiguous, and this generation cannot safely be reused. Retire
+			// the stream before releasing the dispatch slot and byte budget so
+			// teardown completes before a sibling slot can reuse those bytes.
 			v, attemptEnded, siblingTeardown := w.classifyAndRetire(ctx, aerr, slot, gen, req)
+			w.releaseDispatchSlot(slot, gen, reqBytes)
 			w.recordFailureFeedback(v, attemptEnded, siblingTeardown, w.now().Sub(dispatched))
 			fail(v, aerr)
 			continue
