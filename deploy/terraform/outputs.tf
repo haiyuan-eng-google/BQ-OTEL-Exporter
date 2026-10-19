@@ -34,8 +34,8 @@ output "v_gen_ai_metric_exemplars_table_id" {
 }
 
 output "v_gen_ai_agent_trajectory_table_id" {
-  description = "Fully-qualified v_gen_ai_agent_trajectory view ID"
-  value       = google_bigquery_table.v_gen_ai_agent_trajectory.id
+  description = "Fully-qualified v_gen_ai_agent_trajectory view ID, or null when require_partition_filter is set without allow_unprunable_views"
+  value       = one(google_bigquery_table.v_gen_ai_agent_trajectory[*].id)
 }
 
 output "service_account_email" {

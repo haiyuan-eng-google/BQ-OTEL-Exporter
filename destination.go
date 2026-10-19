@@ -512,15 +512,16 @@ func (e *signalExporter) createDedupView(
 // is skipped with a warning because companion views are a convenience and must
 // not block export.
 //
-// The cross-signal views join spans on a window that depends on each row, so
-// BigQuery cannot use it to skip span partitions and rejects every query over
-// them when the spans table requires a partition filter. Unless
-// auto_create.allow_unprunable_views is set, the two cross-signal views are
-// therefore skipped with a warning when the spans table in effect requires
+// The cross-signal views join spans on a window that depends on each row, and
+// v_gen_ai_agent_trajectory joins each span to its parent and child spans on
+// such a window, so BigQuery cannot use it to skip span partitions and rejects
+// every query over these views when the spans table requires a partition
+// filter. Unless auto_create.allow_unprunable_views is set, these three views
+// are therefore skipped with a warning when the spans table in effect requires
 // one: for the traces exporter the existing table, the table it created, or
 // the winner of a concurrent creation; for the logs and metrics exporters the
 // table's metadata, or traces.require_partition_filter while the table does
-// not exist yet. The single-signal views are created either way, and this
+// not exist yet. The other companion views are created either way, and this
 // never fails startup.
 func (e *signalExporter) createCompanionViews(
 	ctx context.Context, admin destinationAdmin, effectiveTableMD *bq.TableMetadata,
@@ -564,15 +565,21 @@ func (e *signalExporter) createCompanionViews(
 
 	views := schema.CompanionViewsMetadata(e.cfg.Project, e.cfg.Dataset, spansTable, logsTable, isSpans)
 	order := slices.Sorted(maps.Keys(views))
+	spansRequireFilter := false
 	if isSpans {
 		order = schema.SpanCompanionViewOrder
+		spansRequireFilter = tableRequiresPartitionFilter(effectiveTableMD)
+		// ensureCompanionViews passes over an id without metadata, so the other
+		// span views are still created when the trajectory view is skipped.
+		if e.skipCrossSignalView(spansTable, schema.GenAIAgentTrajectoryViewName, spansRequireFilter) {
+			delete(views, schema.GenAIAgentTrajectoryViewName)
+		}
 	}
 	if _, err := e.ensureCompanionViews(ctx, admin, order, views, e.destinationOptions().Labels, false); err != nil {
 		return err
 	}
 
 	if isSpans {
-		spansRequireFilter := tableRequiresPartitionFilter(effectiveTableMD)
 		ok, err := e.probePeerDedupView(ctx, admin, "log", logsTable, schema.GenAILogsViewName)
 		if err != nil {
 			return err
@@ -611,10 +618,12 @@ func tableRequiresPartitionFilter(md *bq.TableMetadata) bool {
 		(md.TimePartitioning != nil && md.TimePartitioning.RequirePartitionFilter))
 }
 
-// skipCrossSignalView reports whether the cross-signal companion view over
-// spansTable is skipped: when that table requires a partition filter and
-// auto_create.allow_unprunable_views is off, BigQuery would reject every query
-// over the view, so it is left out with a warning instead of failing startup.
+// skipCrossSignalView reports whether a companion view that joins spansTable on
+// a window that depends on each row (a cross-signal view or
+// v_gen_ai_agent_trajectory) is skipped: when that table requires a partition
+// filter and auto_create.allow_unprunable_views is off, BigQuery would reject
+// every query over the view, so it is left out with a warning instead of
+// failing startup.
 func (e *signalExporter) skipCrossSignalView(spansTable, view string, spansRequireFilter bool) bool {
 	if !spansRequireFilter || e.cfg.AutoCreate.AllowUnprunableViews {
 		return false
@@ -625,9 +634,10 @@ func (e *signalExporter) skipCrossSignalView(spansTable, view string, spansRequi
 	return true
 }
 
-// crossSignalViewSkippedMessage is the warning logged when a cross-signal
-// companion view is skipped because the spans table requires a partition filter.
-const crossSignalViewSkippedMessage = "skipping cross-signal companion view because the spans table requires a partition filter; " +
+// crossSignalViewSkippedMessage is the warning logged when a companion view
+// that BigQuery cannot prune by span partition (see skipCrossSignalView) is
+// skipped because the spans table requires a partition filter.
+const crossSignalViewSkippedMessage = "skipping unprunable companion view because the spans table requires a partition filter; " +
 	"set auto_create.allow_unprunable_views: true to create it anyway"
 
 // peerSpanTableAllowsCrossSignalView reads the spans table that a cross-signal

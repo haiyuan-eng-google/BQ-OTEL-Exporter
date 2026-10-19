@@ -80,8 +80,8 @@ exporters:
       companion_views: true
       # The default. With traces.require_partition_filter on as well, this is
       # the combination that must keep validating: startup skips only the
-      # cross-signal views, with a warning, when the spans table in effect
-      # requires a partition filter.
+      # cross-signal views and v_gen_ai_agent_trajectory, with a warning, when
+      # the spans table in effect requires a partition filter.
       allow_unprunable_views: false
       search_indexes: true
     # Enterprise governance.

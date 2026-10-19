@@ -1114,6 +1114,11 @@ resource "google_bigquery_table" "v_gen_ai_tool_usage" {
 }
 
 resource "google_bigquery_table" "v_gen_ai_agent_trajectory" {
+  # Like v_gen_ai_logs, left out while otel_spans requires a partition filter
+  # unless allow_unprunable_views: it joins each span to its parent and child
+  # spans on a window that depends on each row.
+  count = (!var.require_partition_filter || var.allow_unprunable_views) ? 1 : 0
+
   dataset_id = google_bigquery_dataset.otel.dataset_id
   table_id   = "v_gen_ai_agent_trajectory"
 
