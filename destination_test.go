@@ -1208,6 +1208,74 @@ func TestPrepareDestinationRollupFailureToleranceFollowsPreservedViews(t *testin
 	}
 }
 
+func TestPrepareDestinationTrajectoryRollupToleranceFollowsPreservedViews(t *testing.T) {
+	if !isRollupView(schema.GenAIAgentTrajectoryViewName) {
+		t.Fatalf("isRollupView(%q) = false, want true", schema.GenAIAgentTrajectoryViewName)
+	}
+	rollupErr := status.Error(codes.InvalidArgument, "column not found in underlying view")
+	spansQuery := fmt.Sprintf(schema.GenAISpansViewQuery, "my-project", "otel", defaultSpansTable)
+	view := func(query string) fakeTableMetadataResponse {
+		return fakeTableMetadataResponse{metadata: &bq.TableMetadata{Type: bq.ViewTable, ViewQuery: query, ETag: "etag-1"}}
+	}
+	for _, tc := range []struct {
+		name        string
+		spansView   fakeTableMetadataResponse
+		updateErr   error
+		wantErr     error
+		wantSkipped bool
+	}{
+		{
+			name:        "preserved stale v_gen_ai_spans skips failing trajectory view with warning",
+			spansView:   view("SELECT 1 AS stale"),
+			updateErr:   forbidden(),
+			wantSkipped: true,
+		},
+		{
+			name:      "replaced v_gen_ai_spans fails startup on trajectory view error",
+			spansView: view("SELECT 1 AS stale"),
+			wantErr:   rollupErr,
+		},
+		{
+			name:      "current v_gen_ai_spans fails startup on trajectory view error",
+			spansView: view(spansQuery),
+			wantErr:   rollupErr,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := companionViewConfig()
+			core, logs := observer.New(zap.WarnLevel)
+			e := newSignalExporter(
+				component.TelemetrySettings{Logger: zap.New(core)}, cfg, cfg.Traces.Table, schema.SpansTableSchema())
+			admin := &fakeDestinationAdmin{
+				datasetMetadata:   &bq.DatasetMetadata{},
+				tableMetadataErr:  notFound(),
+				tableMetadataByID: map[string]fakeTableMetadataResponse{schema.GenAISpansViewName: tc.spansView},
+				createErrByID: map[string]error{
+					schema.GenAISpansViewName:           alreadyExists(),
+					schema.GenAIAgentTrajectoryViewName: rollupErr,
+				},
+				updateErrByID: map[string]error{schema.GenAISpansViewName: tc.updateErr},
+			}
+
+			err := e.prepareDestination(context.Background(), admin)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tc.wantErr)
+			}
+			viewName := "my-project.otel." + schema.GenAIAgentTrajectoryViewName
+			if tc.wantErr != nil && !strings.Contains(err.Error(), viewName) {
+				t.Errorf("error %q must name the trajectory view %q", err, viewName)
+			}
+			skipped := logs.FilterMessage("skipping rollup view creation over preserved companion view").All()
+			if (len(skipped) == 1) != tc.wantSkipped || len(skipped) > 1 {
+				t.Fatalf("skipped-rollup warnings = %v, want one: %v", skipped, tc.wantSkipped)
+			}
+			if tc.wantSkipped && skipped[0].ContextMap()["view"] != viewName {
+				t.Errorf("warning view = %v, want %q", skipped[0].ContextMap()["view"], viewName)
+			}
+		})
+	}
+}
+
 func TestPrepareDestinationSkipsMetricExemplarsViewWhenGenAIMetricsViewPreserved(t *testing.T) {
 	rollupErr := status.Error(codes.InvalidArgument, "column not found in underlying view")
 	view := func(query string) fakeTableMetadataResponse {

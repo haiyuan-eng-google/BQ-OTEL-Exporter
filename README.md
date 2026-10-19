@@ -484,16 +484,27 @@ The published BigQuery schema (`schema_version = "v0alpha2"`, defined in
     `v_gen_ai_spans` for the same `trace_id` and null-safe `service_name` within
     24 hours before to 1 hour after the child's `start_time`), `step_index`
     (`ROW_NUMBER()` per `(trace_id, service_name)` ordered by `(start_time ASC,
-    span_id ASC)`), `is_leaf`, and `is_token_leaf`. The agent columns use the
+    span_id ASC)`), `is_leaf`, and `is_token_leaf`. Before the recursion runs,
+    `spans` keeps one canonical row per `(trace_id, service_name, span_id)`
+    (`ORDER BY start_time ASC, end_time DESC, span_name ASC, duration_nano DESC`),
+    so duplicate span IDs that survive `otel_spans_dedup` with a different
+    `start_time` or `name` cannot multiply child paths. The agent columns use the
     agent name a span declares itself (`gen_ai.agent.name`, then
     `gcp.vertex.agent.name`) rather than the `service_name` fallback of
     `gen_ai_agent_name`: an `invoke_agent` or `create_agent` span always starts
     a new nearest agent, a span that only declares an agent name starts one
     when no span above it has one, and a `chat` or `execute_tool` span that
     declares no agent inherits its parent's nearest agent and adds nothing to
-    `agent_path`. `is_token_leaf` is true for a span that reports input or
-    output tokens (an explicit `0` counts, as in the rollup views) when no
-    direct child in the same trace and service reports them too. A group of
+    `agent_path`. `is_token_leaf` is true for a span that reports input, output,
+    or reasoning tokens (an explicit `0` counts) when no trajectory descendant
+    along `visited_span_ids` (even across tokenless intermediate spans such as
+    `execute_tool`) and no direct child in `spans` (covering depth-16 parents of
+    depth-17 token-reporting children) also reports tokens. Unlike
+    `v_gen_ai_model_costs` (hourly direct-child check over inference spans with
+    `gen_ai_request_model` and input/output tokens) and `v_gen_ai_sessions`
+    (UTC-date, session-scoped direct-child check over input/output tokens),
+    `is_token_leaf` follows multi-hop trajectory paths across the `[-24h, +1h]`
+    parent/child window and includes reasoning-only token spans. A group of
     spans whose parent links form a cycle with no root or orphan to start from
     (a span that names itself as its parent included) produces no rows, while a
     cycle reached from a root stops at the first repeated span

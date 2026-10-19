@@ -320,14 +320,19 @@ a span that has a direct child reporting tokens, so each model call is counted
 once; the [README](../README.md) states the rule and its limits.
 
 For multi-agent runs that link parent and child spans through `parent_span_id`,
-`v_gen_ai_agent_trajectory` walks `v_gen_ai_spans` with `WITH RECURSIVE` up to
+`v_gen_ai_agent_trajectory` canonicalizes `v_gen_ai_spans` to one row per
+`(trace_id, service_name, span_id)` and walks it with `WITH RECURSIVE` up to
 depth `16` (with a `visited_span_ids` cycle guard and a `[-24h, +1h]`
-parent/child window) and adds `depth`, `root_span_id`, `nearest_agent_span_id`,
+parent/child window), adding `depth`, `root_span_id`, `nearest_agent_span_id`,
 `nearest_agent_name`, `agent_path` (consecutive duplicates collapsed),
 `is_orphan` (for child spans whose parent span was not exported), `step_index`,
 `is_leaf`, and `is_token_leaf`. Queries can filter `is_token_leaf = TRUE` to sum
-token usage across arbitrary delegation depth without double-counting parent
-`invoke_agent` spans.
+input, output, and reasoning token usage across arbitrary delegation depth
+(even across tokenless intermediate spans such as `execute_tool`, plus direct
+children at depth `17`) without double-counting ancestor `invoke_agent` spans;
+unlike `v_gen_ai_model_costs` and `v_gen_ai_sessions`, which check only direct
+children within an hour or UTC session date, `is_token_leaf` follows the full
+trajectory path.
 
 ## Synthetic scenario fixtures
 

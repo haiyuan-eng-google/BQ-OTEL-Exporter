@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,6 +25,8 @@ import (
 	bigqueryapi "google.golang.org/api/bigquery/v2"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
+
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 )
 
 // TestAutoCreateLiveBigQuery proves the complete control-plane lifecycle with
@@ -43,7 +46,7 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
+	t.Cleanup(cancel)
 	dataset := fmt.Sprintf("otel_exporter_it_%d", time.Now().UnixNano())
 
 	httpClient, httpBase, err := newBigQueryHTTPClient(ctx, option.WithScopes(bigqueryapi.BigqueryScope))
@@ -70,6 +73,7 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 	})
 
 	cfg := validConfig()
+	cfg.TimeoutSettings.Timeout = 60 * time.Second
 	cfg.Project = project
 	cfg.Dataset = dataset
 	cfg.Location = location
@@ -90,6 +94,8 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 		t.Fatalf("first trace startup: %v", err)
 	}
 	defer func() { _ = traces.shutdown(context.Background()) }()
+
+	assertIntegrationTrajectoryDryRunAndPartitionFilter(ctx, t, admin, project, dataset)
 
 	logs, err := newLogsExporter(settings, cfg)
 	if err != nil {
@@ -353,4 +359,72 @@ func waitForRows(ctx context.Context, client *bq.Client, project, dataset, table
 		}
 		time.Sleep(time.Second)
 	}
+}
+
+func assertIntegrationTrajectoryDryRunAndPartitionFilter(ctx context.Context, t *testing.T, client *bq.Client, project, dataset string) {
+	t.Helper()
+
+	dryRunQuery := client.Query(fmt.Sprintf(schema.GenAIAgentTrajectoryViewQuery, project, dataset))
+	dryRunQuery.DryRun = true
+	dryRunJob, err := dryRunQuery.Run(ctx)
+	if err != nil {
+		t.Fatalf("dry-run GenAIAgentTrajectoryViewQuery: %v", err)
+	}
+	dryRunStatus := dryRunJob.LastStatus()
+	if dryRunStatus.Statistics == nil {
+		t.Fatal("dry-run GenAIAgentTrajectoryViewQuery returned nil statistics")
+	}
+	if dryRunStatus.Statistics.TotalBytesProcessed != 0 {
+		t.Errorf("dry-run TotalBytesProcessed on empty table = %d, want 0", dryRunStatus.Statistics.TotalBytesProcessed)
+	}
+	t.Logf("dry-run GenAIAgentTrajectoryViewQuery succeeded (TotalBytesProcessed=%d)", dryRunStatus.Statistics.TotalBytesProcessed)
+
+	const rpfTable = "otel_spans_rpf"
+	rpfMD, rpfDedupQuery, err := schema.DestinationMetadataWithOptions(
+		schema.SpansTableSchema(), project, dataset, rpfTable, schema.DestinationOptions{RequirePartitionFilter: true})
+	if err != nil {
+		t.Fatalf("derive %s metadata: %v", rpfTable, err)
+	}
+	if err := client.Dataset(dataset).Table(rpfTable).Create(ctx, rpfMD); err != nil {
+		t.Fatalf("create %s: %v", rpfTable, err)
+	}
+	if err := client.Dataset(dataset).Table(rpfTable+"_dedup").Create(ctx, &bq.TableMetadata{
+		ViewQuery:    rpfDedupQuery,
+		UseLegacySQL: false,
+	}); err != nil {
+		t.Fatalf("create %s_dedup: %v", rpfTable, err)
+	}
+	if err := client.Dataset(dataset).Table("v_gen_ai_spans_rpf").Create(ctx, &bq.TableMetadata{
+		ViewQuery:    fmt.Sprintf(schema.GenAISpansViewQuery, project, dataset, rpfTable),
+		UseLegacySQL: false,
+	}); err != nil {
+		t.Fatalf("create v_gen_ai_spans_rpf: %v", err)
+	}
+	rpfTrajectoryQuery := strings.ReplaceAll(
+		fmt.Sprintf(schema.GenAIAgentTrajectoryViewQuery, project, dataset),
+		"`"+project+"."+dataset+"."+schema.GenAISpansViewName+"`",
+		"`"+project+"."+dataset+".v_gen_ai_spans_rpf`",
+	)
+	if err := client.Dataset(dataset).Table("v_gen_ai_agent_trajectory_rpf").Create(ctx, &bq.TableMetadata{
+		ViewQuery:    rpfTrajectoryQuery,
+		UseLegacySQL: false,
+	}); err != nil {
+		t.Fatalf("create v_gen_ai_agent_trajectory_rpf: %v", err)
+	}
+
+	rpfSelect := client.Query(fmt.Sprintf(
+		"SELECT * FROM `%s.%s.v_gen_ai_agent_trajectory_rpf` WHERE start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)",
+		project, dataset,
+	))
+	rpfSelect.DryRun = true
+	_, rpfErr := rpfSelect.Run(ctx)
+	if rpfErr == nil {
+		t.Fatal("dry-run SELECT over v_gen_ai_agent_trajectory_rpf with require_partition_filter=true succeeded, want rejection")
+	}
+	lowerErr := strings.ToLower(rpfErr.Error())
+	if !strings.Contains(lowerErr, "partition") || !strings.Contains(lowerErr, "filter") {
+		t.Fatalf("dry-run SELECT over v_gen_ai_agent_trajectory_rpf error = %v, want partition filter rejection", rpfErr)
+	}
+	t.Logf("dry-run SELECT over v_gen_ai_agent_trajectory_rpf rejected as expected under require_partition_filter=true: %s",
+		strings.SplitN(strings.ReplaceAll(rpfErr.Error(), project, "<scratch-project>"), "\n", 2)[0])
 }

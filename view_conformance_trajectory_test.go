@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -90,12 +91,71 @@ func agentPathName(t testing.TB, s map[string]any) (string, bool) {
 	return "", false
 }
 
-// reportsTokens is the token test of genAITokenParentsAgg that the view reuses:
-// an input or output token count that is not NULL, an explicit 0 included.
+// reportsTokens matches the token-bearing test of v_gen_ai_agent_trajectory:
+// an input, output, or reasoning token count that is not NULL, an explicit 0
+// included.
 func reportsTokens(s map[string]any) bool {
 	_, hasIn := colInt(s, "gen_ai_usage_input_tokens")
 	_, hasOut := colInt(s, "gen_ai_usage_output_tokens")
-	return hasIn || hasOut
+	_, hasReasoning := colInt(s, "gen_ai_usage_reasoning_tokens")
+	return hasIn || hasOut || hasReasoning
+}
+
+// canonicalSpanBetter reports whether row a wins over row b in the spans CTE's
+// QUALIFY ROW_NUMBER() OVER (PARTITION BY trace_id, service_name, span_id
+// ORDER BY start_time ASC, end_time DESC, span_name ASC, duration_nano DESC).
+// In GoogleSQL, ASC orders NULLS FIRST and DESC orders NULLS LAST.
+func canonicalSpanBetter(a, b map[string]any) bool {
+	aStart, aHasStart := colInt(a, "start_time")
+	bStart, bHasStart := colInt(b, "start_time")
+	if aHasStart != bHasStart {
+		return !aHasStart
+	}
+	if aStart != bStart {
+		return aStart < bStart
+	}
+	aEnd, aHasEnd := colInt(a, "end_time")
+	bEnd, bHasEnd := colInt(b, "end_time")
+	if aHasEnd != bHasEnd {
+		return aHasEnd
+	}
+	if aEnd != bEnd {
+		return aEnd > bEnd
+	}
+	aName, aHasName := colString(a, "span_name")
+	bName, bHasName := colString(b, "span_name")
+	if aHasName != bHasName {
+		return !aHasName
+	}
+	if aName != bName {
+		return aName < bName
+	}
+	aDur, aHasDur := colInt(a, "duration_nano")
+	bDur, bHasDur := colInt(b, "duration_nano")
+	if aHasDur != bHasDur {
+		return aHasDur
+	}
+	return aDur > bDur
+}
+
+func canonicalizeTrajectorySpans(spans []map[string]any) []map[string]any {
+	winners := make(map[string]map[string]any, len(spans))
+	var order []string
+	for _, s := range spans {
+		k := groupKey(s["trace_id"], s["service_name"], s["span_id"])
+		cur, seen := winners[k]
+		if !seen {
+			order = append(order, k)
+		}
+		if !seen || canonicalSpanBetter(s, cur) {
+			winners[k] = s
+		}
+	}
+	out := make([]map[string]any, 0, len(order))
+	for _, k := range order {
+		out = append(out, winners[k])
+	}
+	return out
 }
 
 // trajectorySpans is v_gen_ai_spans as v_gen_ai_agent_trajectory reads it:
@@ -121,6 +181,7 @@ func trajectorySpans(t *testing.T, rawSpans []map[string]any) []map[string]any {
 // of v_gen_ai_spans, attributes column included.
 func genAIAgentTrajectoryView(t testing.TB, spans []map[string]any) []map[string]any {
 	t.Helper()
+	spans = canonicalizeTrajectorySpans(spans)
 	parentIDs := make(map[string]bool)
 	tokenParentIDs := make(map[string]bool)
 	for _, s := range spans {
@@ -136,6 +197,7 @@ func genAIAgentTrajectoryView(t testing.TB, spans []map[string]any) []map[string
 	}
 
 	var emitted []map[string]any
+	var allItems []trajectoryWorkItem
 	var frontier []trajectoryWorkItem
 
 	// Anchor member: true roots and orphan roots whose parent_span_id is absent
@@ -189,12 +251,14 @@ func genAIAgentTrajectoryView(t testing.TB, spans []map[string]any) []map[string
 		}
 		row["is_orphan"] = hasParent && parent != ""
 
-		emitted = append(emitted, row)
-		frontier = append(frontier, trajectoryWorkItem{
+		item := trajectoryWorkItem{
 			row:     row,
 			depth:   0,
 			visited: []string{spanID},
-		})
+		}
+		emitted = append(emitted, row)
+		allItems = append(allItems, item)
+		frontier = append(frontier, item)
 	}
 
 	// Recursive member: breadth-first traversal up to depth < 16 with cycle guard.
@@ -259,15 +323,29 @@ func genAIAgentTrajectoryView(t testing.TB, spans []map[string]any) []map[string
 				row["is_orphan"] = tRow["is_orphan"]
 
 				nextVisited := append(slices.Clone(tItem.visited), cSpanID)
-				emitted = append(emitted, row)
-				nextFrontier = append(nextFrontier, trajectoryWorkItem{
+				item := trajectoryWorkItem{
 					row:     row,
 					depth:   tItem.depth + 1,
 					visited: nextVisited,
-				})
+				}
+				emitted = append(emitted, row)
+				allItems = append(allItems, item)
+				nextFrontier = append(nextFrontier, item)
 			}
 		}
 		frontier = nextFrontier
+	}
+
+	// token_parent_ids first branch: proper ancestors along visited_span_ids of
+	// any trajectory row that reports input, output, or reasoning tokens.
+	for _, item := range allItems {
+		if !reportsTokens(item.row) {
+			continue
+		}
+		for _, ancSpanID := range item.visited[:len(item.visited)-1] {
+			key := groupKey(item.row["trace_id"], item.row["service_name"], ancSpanID)
+			tokenParentIDs[key] = true
+		}
 	}
 
 	// Outer SELECT: step_index, is_leaf, and is_token_leaf per (trace_id, service_name).
@@ -798,20 +876,96 @@ func TestAgentTrajectoryViewEdgeCases(t *testing.T) {
 			"is_token_leaf":             true,
 		})
 	})
+
+	t.Run("duplicate_span_id_with_different_name_canonicalized_without_child_fanout", func(t *testing.T) {
+		// Two rows for root "p" with different span_name survive otel_spans_dedup;
+		// canonicalization in spans picks the earlier/longer/alphabetically first
+		// row so child "c" is emitted once rather than fanned out twice.
+		rootLaterName := makeSpan("t-dup-parent", "p", "", "svc", "invoke_agent", "planner", 0, 100)
+		rootLaterName["span_name"] = "invoke_agent z-name"
+		rootEarlierName := makeSpan("t-dup-parent", "p", "", "svc", "invoke_agent", "planner", 0, 100)
+		rootEarlierName["span_name"] = "invoke_agent a-name"
+		child := makeSpan("t-dup-parent", "c", "p", "svc", "chat", "planner", 10, 100)
+
+		got := genAIAgentTrajectoryView(t, []map[string]any{rootLaterName, rootEarlierName, child})
+		if len(got) != 2 {
+			t.Fatalf("duplicate parent trajectory rows = %d, want 2 (1 root + 1 child)", len(got))
+		}
+		requireCols(t, "canonical root p", onlyRow(t, "p", got, "span_id", "p"), map[string]any{
+			"span_name":     "invoke_agent a-name",
+			"depth":         int64(0),
+			"step_index":    int64(1),
+			"is_leaf":       false,
+			"is_token_leaf": false,
+		})
+		requireCols(t, "single child c", onlyRow(t, "c", got, "span_id", "c"), map[string]any{
+			"parent_span_id":            "p",
+			"depth":                     int64(1),
+			"step_index":                int64(2),
+			"is_leaf":                   true,
+			"is_token_leaf":             true,
+			"gen_ai_usage_input_tokens": int64(100),
+		})
+	})
+
+	t.Run("reasoning_only_leaf_is_token_leaf", func(t *testing.T) {
+		parent := makeSpan("t-reasoning-only", "p", "", "svc", "invoke_agent", "planner", 0, 0)
+		parent["gen_ai_usage_reasoning_tokens"] = int64(7)
+		child := makeSpan("t-reasoning-only", "c", "p", "svc", "chat", "planner", 10, 0)
+		child["gen_ai_usage_reasoning_tokens"] = int64(7)
+
+		got := genAIAgentTrajectoryView(t, []map[string]any{parent, child})
+		if len(got) != 2 {
+			t.Fatalf("reasoning_only_leaf rows = %d, want 2", len(got))
+		}
+		requireCols(t, "parent with reasoning-only child", onlyRow(t, "p", got, "span_id", "p"), map[string]any{
+			"gen_ai_usage_reasoning_tokens": int64(7),
+			"is_token_leaf":                 false,
+		})
+		requireCols(t, "reasoning-only leaf child", onlyRow(t, "c", got, "span_id", "c"), map[string]any{
+			"gen_ai_usage_reasoning_tokens": int64(7),
+			"is_token_leaf":                 true,
+		})
+	})
+
+	t.Run("tokenless_intermediate_span_suppresses_ancestor_is_token_leaf", func(t *testing.T) {
+		root := makeSpan("t-tokenless-mid", "r", "", "svc", "invoke_agent", "planner", 0, 100)
+		tool := makeSpan("t-tokenless-mid", "tool", "r", "svc", "execute_tool", "", 10, 0)
+		chat := makeSpan("t-tokenless-mid", "chat", "tool", "svc", "chat", "", 20, 100)
+
+		got := genAIAgentTrajectoryView(t, []map[string]any{root, tool, chat})
+		if len(got) != 3 {
+			t.Fatalf("tokenless_intermediate_span rows = %d, want 3", len(got))
+		}
+		requireCols(t, "root suppressed across tokenless intermediate", onlyRow(t, "r", got, "span_id", "r"), map[string]any{
+			"gen_ai_usage_input_tokens": int64(100),
+			"is_token_leaf":             false,
+		})
+		requireCols(t, "tokenless intermediate tool", onlyRow(t, "tool", got, "span_id", "tool"), map[string]any{
+			"gen_ai_usage_input_tokens": nil,
+			"is_token_leaf":             false,
+		})
+		requireCols(t, "grandchild chat is sole token leaf", onlyRow(t, "chat", got, "span_id", "chat"), map[string]any{
+			"gen_ai_usage_input_tokens": int64(100),
+			"is_token_leaf":             true,
+		})
+	})
 }
 
 func TestTrajectoryViewModelMatchesViewSQL(t *testing.T) {
 	sql := fmt.Sprintf(schema.GenAIAgentTrajectoryViewQuery, confProject, confDataset)
+	if strings.Contains(sql, "[OFFSET(ARRAY_LENGTH(t.agent_path)") {
+		t.Fatalf("v_gen_ai_agent_trajectory must use SAFE_OFFSET on t.agent_path, got:\n%s", sql)
+	}
 	requireSQL(t, "v_gen_ai_agent_trajectory", sql,
 		"WITH RECURSIVE spans AS (",
 		// declaredAgentName and agentPathName.
 		`error_type, COALESCE( JSON_VALUE(attributes, '$."gen_ai.agent.name"'), JSON_VALUE(attributes, '$."gcp.vertex.agent.name"') ) AS declared_agent_name, `+
 			`COALESCE( JSON_VALUE(attributes, '$."gen_ai.agent.name"'), JSON_VALUE(attributes, '$."gcp.vertex.agent.name"'), `+
 			`IF(gen_ai_operation_name IN ('invoke_agent', 'create_agent'), gen_ai_agent_name, NULL) ) AS agent_path_name FROM`,
-		"FROM `"+confProject+"."+confDataset+".v_gen_ai_spans`",
+		"FROM `"+confProject+"."+confDataset+".v_gen_ai_spans` "+
+			"QUALIFY ROW_NUMBER() OVER ( PARTITION BY trace_id, service_name, span_id ORDER BY start_time ASC, end_time DESC, span_name ASC, duration_nano DESC ) = 1",
 		"parent_ids AS ( SELECT DISTINCT trace_id, service_name, parent_span_id AS span_id FROM spans WHERE parent_span_id IS NOT NULL AND parent_span_id != '' )",
-		// reportsTokens.
-		"token_parent_ids AS ( SELECT DISTINCT trace_id, service_name, parent_span_id AS span_id FROM spans WHERE parent_span_id IS NOT NULL AND parent_span_id != '' AND (gen_ai_usage_input_tokens IS NOT NULL OR gen_ai_usage_output_tokens IS NOT NULL) )",
 		"trajectory AS (",
 		"0 AS depth, s.span_id AS root_span_id, "+
 			"CASE WHEN s.gen_ai_operation_name IN ('invoke_agent', 'create_agent') OR s.declared_agent_name IS NOT NULL THEN s.span_id ELSE CAST(NULL AS STRING) END AS nearest_agent_span_id, "+
@@ -823,12 +977,14 @@ func TestTrajectoryViewModelMatchesViewSQL(t *testing.T) {
 		"t.depth + 1 AS depth, t.root_span_id AS root_span_id, "+
 			"CASE WHEN c.gen_ai_operation_name IN ('invoke_agent', 'create_agent') OR (t.nearest_agent_span_id IS NULL AND c.declared_agent_name IS NOT NULL) THEN c.span_id ELSE t.nearest_agent_span_id END AS nearest_agent_span_id, "+
 			"CASE WHEN c.gen_ai_operation_name IN ('invoke_agent', 'create_agent') OR (t.nearest_agent_span_id IS NULL AND c.declared_agent_name IS NOT NULL) THEN COALESCE(c.declared_agent_name, c.gen_ai_agent_name) ELSE t.nearest_agent_name END AS nearest_agent_name, "+
-			"CASE WHEN c.agent_path_name IS NOT NULL AND ( ARRAY_LENGTH(t.agent_path) = 0 OR t.agent_path[OFFSET(ARRAY_LENGTH(t.agent_path) - 1)] != c.agent_path_name ) THEN ARRAY_CONCAT(t.agent_path, [c.agent_path_name]) ELSE t.agent_path END AS agent_path, "+
+			"CASE WHEN c.agent_path_name IS NOT NULL AND ( ARRAY_LENGTH(t.agent_path) = 0 OR t.agent_path[SAFE_OFFSET(ARRAY_LENGTH(t.agent_path) - 1)] != c.agent_path_name ) THEN ARRAY_CONCAT(t.agent_path, [c.agent_path_name]) ELSE t.agent_path END AS agent_path, "+
 			"t.is_orphan AS is_orphan, ARRAY_CONCAT(t.visited_span_ids, [c.span_id]) AS visited_span_ids",
 		"FROM trajectory AS t JOIN spans AS c ON c.trace_id = t.trace_id AND c.parent_span_id = t.span_id AND c.service_name IS NOT DISTINCT FROM t.service_name AND c.start_time BETWEEN TIMESTAMP_SUB(t.start_time, INTERVAL 1 HOUR) AND TIMESTAMP_ADD(t.start_time, INTERVAL 24 HOUR) WHERE t.depth < 16 AND c.span_id NOT IN UNNEST(t.visited_span_ids)",
+		// reportsTokens + arbitrary-depth token_parent_ids.
+		"token_parent_ids AS ( SELECT DISTINCT d.trace_id, d.service_name, anc_span_id AS span_id FROM trajectory AS d, UNNEST(d.visited_span_ids) AS anc_span_id WITH OFFSET AS anc_idx WHERE anc_idx < ARRAY_LENGTH(d.visited_span_ids) - 1 AND ( d.gen_ai_usage_input_tokens IS NOT NULL OR d.gen_ai_usage_output_tokens IS NOT NULL OR d.gen_ai_usage_reasoning_tokens IS NOT NULL ) UNION DISTINCT SELECT DISTINCT trace_id, service_name, parent_span_id AS span_id FROM spans WHERE parent_span_id IS NOT NULL AND parent_span_id != '' AND ( gen_ai_usage_input_tokens IS NOT NULL OR gen_ai_usage_output_tokens IS NOT NULL OR gen_ai_usage_reasoning_tokens IS NOT NULL ) )",
 		"ROW_NUMBER() OVER ( PARTITION BY t.trace_id, t.service_name ORDER BY t.start_time ASC, t.span_id ASC ) AS step_index,",
 		"(leaf_check.span_id IS NULL) AS is_leaf,",
-		"( (t.gen_ai_usage_input_tokens IS NOT NULL OR t.gen_ai_usage_output_tokens IS NOT NULL) AND token_leaf_check.span_id IS NULL ) AS is_token_leaf",
+		"( ( t.gen_ai_usage_input_tokens IS NOT NULL OR t.gen_ai_usage_output_tokens IS NOT NULL OR t.gen_ai_usage_reasoning_tokens IS NOT NULL ) AND token_leaf_check.span_id IS NULL ) AS is_token_leaf",
 		"FROM trajectory AS t LEFT JOIN parent_ids AS leaf_check ON t.trace_id = leaf_check.trace_id AND t.span_id = leaf_check.span_id AND t.service_name IS NOT DISTINCT FROM leaf_check.service_name LEFT JOIN token_parent_ids AS token_leaf_check ON t.trace_id = token_leaf_check.trace_id AND t.span_id = token_leaf_check.span_id AND t.service_name IS NOT DISTINCT FROM token_leaf_check.service_name",
 	)
 }

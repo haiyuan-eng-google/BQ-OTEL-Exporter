@@ -1171,6 +1171,10 @@ resource "google_bigquery_table" "v_gen_ai_agent_trajectory" {
               IF(gen_ai_operation_name IN ('invoke_agent', 'create_agent'), gen_ai_agent_name, NULL)
             ) AS agent_path_name
           FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.v_gen_ai_spans.table_id}`
+          QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY trace_id, service_name, span_id
+            ORDER BY start_time ASC, end_time DESC, span_name ASC, duration_nano DESC
+          ) = 1
         ),
         parent_ids AS (
           SELECT DISTINCT
@@ -1180,16 +1184,6 @@ resource "google_bigquery_table" "v_gen_ai_agent_trajectory" {
           FROM spans
           WHERE parent_span_id IS NOT NULL
             AND parent_span_id != ''
-        ),
-        token_parent_ids AS (
-          SELECT DISTINCT
-            trace_id,
-            service_name,
-            parent_span_id AS span_id
-          FROM spans
-          WHERE parent_span_id IS NOT NULL
-            AND parent_span_id != ''
-            AND (gen_ai_usage_input_tokens IS NOT NULL OR gen_ai_usage_output_tokens IS NOT NULL)
         ),
         trajectory AS (
           SELECT
@@ -1306,7 +1300,7 @@ resource "google_bigquery_table" "v_gen_ai_agent_trajectory" {
               WHEN c.agent_path_name IS NOT NULL
                 AND (
                   ARRAY_LENGTH(t.agent_path) = 0
-                  OR t.agent_path[OFFSET(ARRAY_LENGTH(t.agent_path) - 1)] != c.agent_path_name
+                  OR t.agent_path[SAFE_OFFSET(ARRAY_LENGTH(t.agent_path) - 1)] != c.agent_path_name
                 )
               THEN ARRAY_CONCAT(t.agent_path, [c.agent_path_name])
               ELSE t.agent_path
@@ -1321,6 +1315,33 @@ resource "google_bigquery_table" "v_gen_ai_agent_trajectory" {
             AND c.start_time BETWEEN TIMESTAMP_SUB(t.start_time, INTERVAL 1 HOUR) AND TIMESTAMP_ADD(t.start_time, INTERVAL 24 HOUR)
           WHERE t.depth < 16
             AND c.span_id NOT IN UNNEST(t.visited_span_ids)
+        ),
+        token_parent_ids AS (
+          SELECT DISTINCT
+            d.trace_id,
+            d.service_name,
+            anc_span_id AS span_id
+          FROM trajectory AS d,
+          UNNEST(d.visited_span_ids) AS anc_span_id WITH OFFSET AS anc_idx
+          WHERE anc_idx < ARRAY_LENGTH(d.visited_span_ids) - 1
+            AND (
+              d.gen_ai_usage_input_tokens IS NOT NULL
+              OR d.gen_ai_usage_output_tokens IS NOT NULL
+              OR d.gen_ai_usage_reasoning_tokens IS NOT NULL
+            )
+          UNION DISTINCT
+          SELECT DISTINCT
+            trace_id,
+            service_name,
+            parent_span_id AS span_id
+          FROM spans
+          WHERE parent_span_id IS NOT NULL
+            AND parent_span_id != ''
+            AND (
+              gen_ai_usage_input_tokens IS NOT NULL
+              OR gen_ai_usage_output_tokens IS NOT NULL
+              OR gen_ai_usage_reasoning_tokens IS NOT NULL
+            )
         )
       SELECT
         t.start_time,
@@ -1366,7 +1387,11 @@ resource "google_bigquery_table" "v_gen_ai_agent_trajectory" {
         ) AS step_index,
         (leaf_check.span_id IS NULL) AS is_leaf,
         (
-          (t.gen_ai_usage_input_tokens IS NOT NULL OR t.gen_ai_usage_output_tokens IS NOT NULL)
+          (
+            t.gen_ai_usage_input_tokens IS NOT NULL
+            OR t.gen_ai_usage_output_tokens IS NOT NULL
+            OR t.gen_ai_usage_reasoning_tokens IS NOT NULL
+          )
           AND token_leaf_check.span_id IS NULL
         ) AS is_token_leaf
       FROM trajectory AS t

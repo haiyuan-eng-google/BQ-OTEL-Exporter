@@ -1259,10 +1259,17 @@ CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAIAgentTrajectoryViewName + "`" 
 // GenAIAgentTrajectoryViewQuery is shared by operator-run DDL and metadata-API
 // view creation. It takes (project, dataset) and reads v_gen_ai_spans.
 //
+// Because otel_spans_dedup includes start_time and name in its deduplication
+// key, v_gen_ai_spans can hold more than one row for the same (trace_id,
+// service_name, span_id). The spans CTE canonicalizes to one row per
+// (trace_id, service_name, span_id), ordered by (start_time ASC, end_time DESC,
+// span_name ASC, duration_nano DESC), so each span has at most one parent row
+// and never fans out child subtrees.
+//
 // Anchor rows are true roots (parent_span_id IS NULL or empty) and orphan
-// roots whose parent_span_id does not appear in v_gen_ai_spans for the same
-// trace_id and null-safe service_name within 24 hours before to 1 hour after
-// the child's start_time. Recursive steps traverse child spans within the
+// roots whose parent_span_id does not appear in spans for the same trace_id
+// and null-safe service_name within 24 hours before to 1 hour after the
+// child's start_time. Recursive steps traverse child spans within the
 // symmetric [-1h, +24h] window up to depth < 16 and guard against cycles with
 // visited_span_ids.
 //
@@ -1275,14 +1282,18 @@ CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAIAgentTrajectoryViewName + "`" 
 // nearest_agent_name is its declared name, or gen_ai_agent_name for an agent
 // span that declares none; every other span inherits both columns from its
 // parent. agent_path appends agent_path_name (the declared name or, for an
-// agent span without one, gen_ai_agent_name) unless it repeats the last entry,
-// so a chat or tool span without an agent attribute adds nothing to it.
+// agent span without one, gen_ai_agent_name) unless it repeats the last entry
+// (checked with SAFE_OFFSET so an empty path cannot index out of bounds), so a
+// chat or tool span without an agent attribute adds nothing to it.
 //
-// is_token_leaf uses the token-parent test of the rollup views (see
-// genAITokenParentsAgg): a span reports tokens when its input or output token
-// count IS NOT NULL, so an explicit 0 counts. A span that reports tokens is a
-// token leaf unless a direct child in the same trace and service reports them
-// too.
+// is_token_leaf marks spans that report input, output, or reasoning tokens
+// (an explicit 0 counts) and have no token-reporting descendant along their
+// trajectory path (including across tokenless intermediate spans) and no
+// direct token-reporting child in spans (covering children beyond depth 16).
+// Its scope is the trajectory within (trace_id, service_name), so totals over
+// is_token_leaf can differ from v_gen_ai_model_costs (hourly inference-only
+// direct-child check) and v_gen_ai_sessions (UTC-date session-scoped
+// direct-child check).
 const GenAIAgentTrajectoryViewQuery = `
 WITH RECURSIVE
   spans AS (
@@ -1328,6 +1339,10 @@ WITH RECURSIVE
         IF(gen_ai_operation_name IN ('invoke_agent', 'create_agent'), gen_ai_agent_name, NULL)
       ) AS agent_path_name
     FROM ` + "`%[1]s.%[2]s." + GenAISpansViewName + "`" + `
+    QUALIFY ROW_NUMBER() OVER (
+      PARTITION BY trace_id, service_name, span_id
+      ORDER BY start_time ASC, end_time DESC, span_name ASC, duration_nano DESC
+    ) = 1
   ),
   parent_ids AS (
     SELECT DISTINCT
@@ -1337,16 +1352,6 @@ WITH RECURSIVE
     FROM spans
     WHERE parent_span_id IS NOT NULL
       AND parent_span_id != ''
-  ),
-  token_parent_ids AS (
-    SELECT DISTINCT
-      trace_id,
-      service_name,
-      parent_span_id AS span_id
-    FROM spans
-    WHERE parent_span_id IS NOT NULL
-      AND parent_span_id != ''
-      AND (gen_ai_usage_input_tokens IS NOT NULL OR gen_ai_usage_output_tokens IS NOT NULL)
   ),
   trajectory AS (
     SELECT
@@ -1463,7 +1468,7 @@ WITH RECURSIVE
         WHEN c.agent_path_name IS NOT NULL
           AND (
             ARRAY_LENGTH(t.agent_path) = 0
-            OR t.agent_path[OFFSET(ARRAY_LENGTH(t.agent_path) - 1)] != c.agent_path_name
+            OR t.agent_path[SAFE_OFFSET(ARRAY_LENGTH(t.agent_path) - 1)] != c.agent_path_name
           )
         THEN ARRAY_CONCAT(t.agent_path, [c.agent_path_name])
         ELSE t.agent_path
@@ -1478,6 +1483,33 @@ WITH RECURSIVE
       AND c.start_time BETWEEN TIMESTAMP_SUB(t.start_time, INTERVAL 1 HOUR) AND TIMESTAMP_ADD(t.start_time, INTERVAL 24 HOUR)
     WHERE t.depth < 16
       AND c.span_id NOT IN UNNEST(t.visited_span_ids)
+  ),
+  token_parent_ids AS (
+    SELECT DISTINCT
+      d.trace_id,
+      d.service_name,
+      anc_span_id AS span_id
+    FROM trajectory AS d,
+    UNNEST(d.visited_span_ids) AS anc_span_id WITH OFFSET AS anc_idx
+    WHERE anc_idx < ARRAY_LENGTH(d.visited_span_ids) - 1
+      AND (
+        d.gen_ai_usage_input_tokens IS NOT NULL
+        OR d.gen_ai_usage_output_tokens IS NOT NULL
+        OR d.gen_ai_usage_reasoning_tokens IS NOT NULL
+      )
+    UNION DISTINCT
+    SELECT DISTINCT
+      trace_id,
+      service_name,
+      parent_span_id AS span_id
+    FROM spans
+    WHERE parent_span_id IS NOT NULL
+      AND parent_span_id != ''
+      AND (
+        gen_ai_usage_input_tokens IS NOT NULL
+        OR gen_ai_usage_output_tokens IS NOT NULL
+        OR gen_ai_usage_reasoning_tokens IS NOT NULL
+      )
   )
 SELECT
   t.start_time,
@@ -1523,7 +1555,11 @@ SELECT
   ) AS step_index,
   (leaf_check.span_id IS NULL) AS is_leaf,
   (
-    (t.gen_ai_usage_input_tokens IS NOT NULL OR t.gen_ai_usage_output_tokens IS NOT NULL)
+    (
+      t.gen_ai_usage_input_tokens IS NOT NULL
+      OR t.gen_ai_usage_output_tokens IS NOT NULL
+      OR t.gen_ai_usage_reasoning_tokens IS NOT NULL
+    )
     AND token_leaf_check.span_id IS NULL
   ) AS is_token_leaf
 FROM trajectory AS t
