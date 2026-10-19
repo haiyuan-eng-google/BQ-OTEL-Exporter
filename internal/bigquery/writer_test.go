@@ -3826,3 +3826,276 @@ func TestWriterStreamPoolSizeOneMatchesSingleStream(t *testing.T) {
 		t.Fatalf("created %d streams, want 2 (initial + replacement)", len(*createdWith))
 	}
 }
+
+func TestWriterStreamPoolDrainsInflightInsteadOfBlockingOnExhaustedSlotGenerations(t *testing.T) {
+	var created atomic.Int32
+	w := &Writer{
+		opts: WriterOptions{
+			Project:             "p",
+			Dataset:             "d",
+			Table:               "t",
+			MaxRequestBytes:     200, // one 100-byte row per request (166 wire bytes)
+			MaxInflightRequests: 1,   // per-slot window
+			MaxInflightBytes:    166, // pool-wide budget == one request
+			StreamPoolSize:      2,
+		},
+		lifetimeCtx: context.Background(),
+	}
+	w.factory = func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+		created.Add(1)
+		return &funcStream{
+			appendFn: func(context.Context, [][]byte) (appendResult, error) {
+				return fakeResult{}, nil
+			},
+		}, nil
+	}
+	defer func() { _ = w.Close() }()
+
+	slots, err := w.beginAppend()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.appendWG.Done()
+	slotB := slots[1]
+	ctx := context.Background()
+
+	// Pin both generation slots on slot B with retired generations held by
+	// simulated concurrent callers so slot B has ms == nil and activeGenerations == 2.
+	genB1, err := w.ensureSlotStream(ctx, slotB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.retireStream(slotB, genB1)
+	defer w.releaseGenerationUser(slotB, genB1)
+
+	genB2, err := w.ensureSlotStream(ctx, slotB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.retireStream(slotB, genB2)
+	defer w.releaseGenerationUser(slotB, genB2)
+
+	slotB.mu.Lock()
+	bExhausted := slotB.ms == nil && slotB.creation == nil && slotB.activeGenerations == maxActiveStreamGenerations
+	slotB.mu.Unlock()
+	if !bExhausted {
+		t.Fatal("slot B did not reach exhausted generation state")
+	}
+
+	row := make([]byte, 100)
+	// Caller O sends two 166-byte requests. Request 1 goes to slot A; Request 2
+	// sees slot B exhausted while Request 1 is still in flight, drains Request 1,
+	// frees slot A's window and the 166-byte pool budget, and finishes on slot A
+	// without blocking on slot B's generationSignal.
+	w.nextSlot.Store(0)
+	ctxO, cancelO := context.WithTimeout(ctx, time.Second)
+	defer cancelO()
+	outO := w.Append(ctxO, [][]byte{row, row})
+	if outO.Err != nil || outO.AcknowledgedRows != 2 {
+		t.Fatalf("caller O outcome = %+v, want 2 acknowledged rows and nil error while slot B is exhausted", outO)
+	}
+
+	ctxU, cancelU := context.WithTimeout(ctx, time.Second)
+	defer cancelU()
+	outU := w.Append(ctxU, [][]byte{row})
+	if outU.Err != nil || outU.AcknowledgedRows != 1 {
+		t.Fatalf("caller U outcome = %+v, want 1 acknowledged row and nil error", outU)
+	}
+}
+
+func TestWriterStreamPoolReleasesRetiredCachedGenerationBeforeBlockingWait(t *testing.T) {
+	rA1 := newControlledResult()
+	rB1 := newControlledResult()
+	var streamsMade atomic.Int32
+	w := &Writer{
+		opts: WriterOptions{
+			Project:             "p",
+			Dataset:             "d",
+			Table:               "t",
+			MaxRequestBytes:     200,
+			MaxInflightRequests: 1,
+			MaxInflightBytes:    1 << 20,
+			StreamPoolSize:      2,
+		},
+		lifetimeCtx: context.Background(),
+	}
+	w.factory = func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+		switch streamsMade.Add(1) {
+		case 1:
+			// Slot A initial stream: held by Caller A1 so slot A's window stays full.
+			return &funcStream{
+				appendFn: func(context.Context, [][]byte) (appendResult, error) {
+					return rA1, nil
+				},
+			}, nil
+		case 2:
+			// Slot B generation 1: first request blocks on rB1.
+			return &funcStream{
+				appendFn: func(context.Context, [][]byte) (appendResult, error) {
+					return rB1, nil
+				},
+			}, nil
+		default:
+			return &funcStream{
+				appendFn: func(context.Context, [][]byte) (appendResult, error) {
+					return fakeResult{}, nil
+				},
+			}, nil
+		}
+	}
+	defer func() { _ = w.Close() }()
+	completeA1 := sync.OnceFunc(func() { rA1.complete(nil) })
+	defer completeA1()
+	completeB1 := sync.OnceFunc(func() { rB1.complete(nil) })
+	defer completeB1()
+
+	slots, err := w.beginAppend()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.appendWG.Done()
+	slotB := slots[1]
+	ctx := context.Background()
+
+	// Caller A1 occupies slot A's single window slot.
+	w.nextSlot.Store(0)
+	doneA1 := make(chan AppendOutcome, 1)
+	go func() {
+		doneA1 <- w.Append(ctx, [][]byte{make([]byte, 100)})
+	}()
+	rA1.waitForCalls(t, 1)
+
+	// Caller P sends 2 requests starting at slot B: Request 1 dispatches on
+	// slot B (genB1) and blocks in drainOne(rB1) when Request 2 finds both
+	// slots' windows full.
+	w.nextSlot.Store(1)
+	doneP := make(chan AppendOutcome, 1)
+	go func() {
+		row := make([]byte, 100)
+		doneP <- w.Append(ctx, [][]byte{row, row})
+	}()
+	rB1.waitForCalls(t, 1)
+
+	slotB.mu.Lock()
+	genB1 := slotB.ms
+	slotB.mu.Unlock()
+	if genB1 == nil {
+		t.Fatal("slot B generation 1 was not created")
+	}
+
+	// Retire genB1, then open and retire genB2 with a pinned user ref.
+	// Slot B now has activeGenerations == 2: genB1 is held by Caller P's
+	// cached slotGens[1] + rB1, and genB2 is held by this test.
+	w.retireStream(slotB, genB1)
+	genB2, err := w.ensureSlotStream(ctx, slotB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.retireStream(slotB, genB2)
+	defer w.releaseGenerationUser(slotB, genB2)
+
+	// Complete rB1: Caller P finishes draining Request 1, releases its retired
+	// cached slotGens[1] (genB1) before its next slot selection/wait, freeing
+	// one generation slot on slot B so Request 2 opens genB3 and completes
+	// while slot A is still blocked by Caller A1.
+	completeB1()
+	select {
+	case outP := <-doneP:
+		if outP.Err != nil || outP.AcknowledgedRows != 2 {
+			t.Fatalf("caller P outcome = %+v, want 2 acknowledged rows and nil error", outP)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("caller P did not release retired cached slotGens[1] before blocking on full slot A")
+	}
+
+	completeA1()
+	select {
+	case outA1 := <-doneA1:
+		if outA1.Err != nil || outA1.AcknowledgedRows != 1 {
+			t.Fatalf("caller A1 outcome = %+v, want 1 acknowledged row", outA1)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("caller A1 did not finish")
+	}
+}
+
+func TestWriterStreamPoolRefreshesRetiredCachedGenerationOnHealthyReplacement(t *testing.T) {
+	rB1 := newControlledResult()
+	var streamsMade atomic.Int32
+	w := &Writer{
+		opts: WriterOptions{
+			Project:             "p",
+			Dataset:             "d",
+			Table:               "t",
+			MaxRequestBytes:     200, // one 100-byte row per request
+			MaxInflightRequests: 1,
+			MaxInflightBytes:    1 << 20,
+			StreamPoolSize:      2,
+		},
+		lifetimeCtx: context.Background(),
+	}
+	w.factory = func(context.Context, ...managedwriter.WriterOption) (stream, error) {
+		first := streamsMade.Add(1) == 1
+		return &funcStream{
+			appendFn: func(context.Context, [][]byte) (appendResult, error) {
+				if first {
+					first = false
+					return rB1, nil // slot B, generation 1: resolved by the test
+				}
+				return fakeResult{}, nil
+			},
+		}, nil
+	}
+	defer func() { _ = w.Close() }()
+	completeB1 := sync.OnceFunc(func() { rB1.complete(nil) })
+	defer completeB1()
+
+	slots, err := w.beginAppend()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.appendWG.Done()
+	slotB := slots[1]
+	ctx := context.Background()
+
+	row := make([]byte, 100)
+	w.nextSlot.Store(1) // request 1 -> B, request 2 -> A, request 3 re-selects
+	done := make(chan AppendOutcome, 1)
+	go func() {
+		done <- w.Append(ctx, [][]byte{row, row, row})
+	}()
+
+	// Wait until the caller is draining its slot-B request (both windows full).
+	rB1.waitForCalls(t, 1)
+	slotB.mu.Lock()
+	genB1 := slotB.ms
+	slotB.mu.Unlock()
+	if genB1 == nil {
+		t.Fatal("slot B has no generation")
+	}
+
+	// Another caller retires B's generation and opens a healthy replacement.
+	w.retireStream(slotB, genB1)
+	genB2, err := w.ensureSlotStream(ctx, slotB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.releaseGenerationUser(slotB, genB2)
+
+	// Acknowledge Request 1; the caller must refresh its retired cached
+	// slotGens[1] to genB2 (or pick an open slot) and finish all 3 rows
+	// instead of failing pre-dispatch with errStreamRetired.
+	completeB1()
+	var out AppendOutcome
+	select {
+	case out = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Append did not return")
+	}
+	if out.Err != nil {
+		t.Fatalf("Append outcome error = %v (verdict %+v), want nil", out.Err, out.Verdict)
+	}
+	if out.AcknowledgedRows != 3 {
+		t.Fatalf("acknowledged %d rows, want 3", out.AcknowledgedRows)
+	}
+}

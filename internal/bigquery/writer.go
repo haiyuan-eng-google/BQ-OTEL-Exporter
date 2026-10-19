@@ -292,21 +292,33 @@ func (w *Writer) selectSlot(slots []*streamSlot) *streamSlot {
 func (w *Writer) ensureSlotStream(
 	ctx context.Context, slot *streamSlot,
 ) (*streamGeneration, error) {
+	gen, _, err := w.acquireSlotStream(ctx, slot, true)
+	return gen, err
+}
+
+// acquireSlotStream returns the live stream generation for slot, starting
+// creation when a generation slot is free. When waitForGenerationSlot is false
+// and all generation slots on slot are occupied by draining retired streams,
+// it returns (nil, false, nil) instead of blocking on generationSignal so a
+// caller with in-flight work can drain first.
+func (w *Writer) acquireSlotStream(
+	ctx context.Context, slot *streamSlot, waitForGenerationSlot bool,
+) (*streamGeneration, bool, error) {
 	for {
 		slot.mu.Lock()
 		if slot.closed {
 			slot.mu.Unlock()
-			return nil, errWriterClosed
+			return nil, false, errWriterClosed
 		}
 		if err := ctx.Err(); err != nil {
 			slot.mu.Unlock()
-			return nil, err
+			return nil, false, err
 		}
 		if slot.ms != nil {
 			gen := slot.ms
 			gen.users++
 			slot.mu.Unlock()
-			return gen, nil
+			return gen, true, nil
 		}
 
 		if slot.creation == nil && slot.activeGenerations < maxActiveStreamGenerations {
@@ -317,20 +329,25 @@ func (w *Writer) ensureSlotStream(
 			slot.mu.Unlock()
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return nil, false, ctx.Err()
 			case <-done:
 				if creation.err != nil {
-					return nil, fmt.Errorf("creating write stream for %s: %w", w.opts.TableID(), creation.err)
+					return nil, false, fmt.Errorf("creating write stream for %s: %w", w.opts.TableID(), creation.err)
 				}
 				continue
 			}
+		}
+
+		if !waitForGenerationSlot {
+			slot.mu.Unlock()
+			return nil, false, nil
 		}
 
 		signal := slot.generationSignalLocked()
 		slot.mu.Unlock()
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, false, ctx.Err()
 		case <-signal:
 		}
 	}
@@ -680,6 +697,31 @@ func (w *Writer) releaseGenerationUser(slot *streamSlot, gen *streamGeneration) 
 	gen.users--
 	slot.releaseGenerationSlotLocked(gen)
 	slot.mu.Unlock()
+}
+
+func (w *Writer) releaseRetiredSlotGen(slot *streamSlot, gen *streamGeneration) bool {
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	if !gen.retired {
+		return false
+	}
+	gen.users--
+	slot.releaseGenerationSlotLocked(gen)
+	return true
+}
+
+// releaseRetiredSlotGens drops cached user references to stream generations
+// that have already been retired so a caller blocked on another slot or
+// draining in-flight work does not pin activeGenerations until Append returns.
+func (w *Writer) releaseRetiredSlotGens(slots []*streamSlot, slotGens []*streamGeneration) {
+	if len(slots) <= 1 {
+		return
+	}
+	for i, g := range slotGens {
+		if g != nil && w.releaseRetiredSlotGen(slots[i], g) {
+			slotGens[i] = nil
+		}
+	}
 }
 
 func (s *streamSlot) releaseGenerationSlotLocked(gen *streamGeneration) {
@@ -1131,19 +1173,33 @@ dispatch:
 			if replayOwed() {
 				break dispatch
 			}
+			w.releaseRetiredSlotGens(slots, slotGens)
 			slot = w.selectSlot(slots)
 			gen = slotGens[slot.index]
 			if gen == nil {
-				var serr error
-				gen, serr = w.ensureSlotStream(ctx, slot)
+				var (
+					ensured bool
+					serr    error
+				)
+				gen, ensured, serr = w.acquireSlotStream(ctx, slot, len(inflight) == 0)
 				if serr != nil {
 					fail(classifyPreDispatchFailure(serr), serr)
 					break dispatch
+				}
+				if !ensured {
+					w.releaseRetiredSlotGens(slots, slotGens)
+					drainOne(inflight[0])
+					inflight = inflight[1:]
+					continue
 				}
 				slotGens[slot.index] = gen
 			}
 			acquired, acquireErr := w.tryAcquireDispatchSlot(ctx, slot, gen, reqBytes)
 			if acquireErr != nil {
+				if len(slots) > 1 && errors.Is(acquireErr, errStreamRetired) {
+					w.releaseRetiredSlotGens(slots, slotGens)
+					continue
+				}
 				fail(classifyPreDispatchFailure(acquireErr), acquireErr)
 				break dispatch
 			}
@@ -1151,11 +1207,17 @@ dispatch:
 				break
 			}
 			if len(inflight) > 0 {
+				w.releaseRetiredSlotGens(slots, slotGens)
 				drainOne(inflight[0])
 				inflight = inflight[1:]
 				continue
 			}
+			w.releaseRetiredSlotGens(slots, slotGens)
 			if acquireErr := w.waitForDispatchSlot(ctx, slot, gen, reqBytes); acquireErr != nil {
+				if len(slots) > 1 && errors.Is(acquireErr, errStreamRetired) {
+					w.releaseRetiredSlotGens(slots, slotGens)
+					continue
+				}
 				fail(classifyPreDispatchFailure(acquireErr), acquireErr)
 				break dispatch
 			}
@@ -1208,6 +1270,7 @@ dispatch:
 		inflight = append(inflight, p)
 	}
 
+	w.releaseRetiredSlotGens(slots, slotGens)
 	for _, p := range inflight {
 		drainOne(p)
 	}
