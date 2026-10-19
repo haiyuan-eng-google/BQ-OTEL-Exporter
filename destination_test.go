@@ -2330,9 +2330,59 @@ func TestWriterClientOptionsMultiplexingKeepaliveAndCompression(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 1 ADC scope + 1 keepalive dial option + 1 gzip compressor dial option = 3.
-	if len(opts) != 3 {
-		t.Fatalf("writer options = %d, want 3 (ADC scope, keepalive, gzip)", len(opts))
+	// 1 ADC scope + 2 default inflight options + 1 keepalive dial option + 1 gzip compressor dial option = 5.
+	if len(opts) != 5 {
+		t.Fatalf("writer options = %d, want 5 (ADC scope, default inflight requests/bytes, keepalive, gzip)", len(opts))
+	}
+}
+
+func TestWriterClientOptionsStreamPoolUsesDedicatedConnections(t *testing.T) {
+	cfg := validConfig()
+	cfg.Write.EnableMultiplexing = true
+	cfg.Write.StreamPoolSize = 8
+	cfg.Write.ConnectionPoolSize = 4
+	e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+
+	opts, err := e.writerClientOptions(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 1 ADC scope + 2 default inflight options + 1 gRPC connection pool (max(4,8)=8) = 4 (no WithMultiplexing).
+	if len(opts) != 4 {
+		t.Fatalf("stream pool writer options = %d, want 4 (ADC scope, default inflight requests/bytes, connection pool without multiplexing)", len(opts))
+	}
+
+	clientUsesMultiplex := func(t *testing.T, poolSize int) bool {
+		t.Helper()
+		c := validConfig()
+		c.Endpoint.URL = "localhost:9050"
+		c.Endpoint.Insecure = true
+		c.Endpoint.WithoutAuthentication = true
+		c.Write.EnableMultiplexing = true
+		c.Write.StreamPoolSize = poolSize
+		c.Write.ConnectionPoolSize = 4
+		se := newTestSignalExporter(c, c.Traces.Table, schema.SpansTableSchema())
+		wopts, werr := se.writerClientOptions(context.Background())
+		if werr != nil {
+			t.Fatal(werr)
+		}
+		client, cerr := newManagedWriterClient(context.Background(), c.Project, wopts...)
+		if cerr != nil {
+			t.Fatal(cerr)
+		}
+		defer func() { _ = client.Close() }()
+		cfgVal := reflect.ValueOf(client).Elem().FieldByName("cfg").Elem()
+		if gotBytes := cfgVal.FieldByName("defaultInflightBytes").Int(); gotBytes != int64(c.Write.MaxInflightBytes) {
+			t.Fatalf("stream_pool_size=%d defaultInflightBytes = %d, want full MaxInflightBytes %d",
+				poolSize, gotBytes, c.Write.MaxInflightBytes)
+		}
+		return cfgVal.FieldByName("useMultiplex").Bool()
+	}
+	if clientUsesMultiplex(t, 8) {
+		t.Fatal("stream_pool_size=8 with enable_multiplexing=true constructed a multiplexed client, want dedicated connections (useMultiplex=false)")
+	}
+	if !clientUsesMultiplex(t, 1) {
+		t.Fatal("stream_pool_size=1 with enable_multiplexing=true constructed a non-multiplexed client, want useMultiplex=true")
 	}
 }
 

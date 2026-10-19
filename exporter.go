@@ -407,15 +407,25 @@ func (e *signalExporter) writerClientOptions(ctx context.Context) ([]option.Clie
 			opts = append(opts, option.WithoutAuthentication())
 		}
 	}
-	if e.cfg.Write.EnableMultiplexing {
-		opts = append(opts,
-			managedwriter.WithMultiplexing(),
-			managedwriter.WithDefaultInflightRequests(e.cfg.Write.MaxInflightRequests),
-			managedwriter.WithDefaultInflightBytes(e.cfg.Write.MaxInflightBytes),
-		)
+	// Each signalExporter creates its own managedwriter.Client for one table.
+	// Passing WithMultiplexing() when StreamPoolSize > 1 attaches all N
+	// default-stream slots onto a single shared multiConn (1 AppendRows stream),
+	// defeating stream-pool concurrency. Only enable multiplexing for a
+	// single-slot stream; when StreamPoolSize > 1, use dedicated per-stream
+	// connections and size the gRPC connection pool to at least StreamPoolSize.
+	if e.cfg.Write.EnableMultiplexing && e.cfg.Write.StreamPoolSize <= 1 {
+		opts = append(opts, managedwriter.WithMultiplexing())
 	}
-	if e.cfg.Write.ConnectionPoolSize > 0 {
-		opts = append(opts, option.WithGRPCConnectionPool(e.cfg.Write.ConnectionPoolSize))
+	opts = append(opts,
+		managedwriter.WithDefaultInflightRequests(e.cfg.Write.MaxInflightRequests),
+		managedwriter.WithDefaultInflightBytes(e.cfg.Write.MaxInflightBytes),
+	)
+	connPool := e.cfg.Write.ConnectionPoolSize
+	if e.cfg.Write.StreamPoolSize > 1 && e.cfg.Write.StreamPoolSize > connPool {
+		connPool = e.cfg.Write.StreamPoolSize
+	}
+	if connPool > 0 {
+		opts = append(opts, option.WithGRPCConnectionPool(connPool))
 	}
 	if ka := e.cfg.Write.Keepalive; ka.Time > 0 || ka.Timeout > 0 || ka.PermitWithoutStream {
 		opts = append(opts, option.WithGRPCDialOption(grpc.WithKeepaliveParams(keepalive.ClientParameters{
@@ -530,6 +540,7 @@ func (e *signalExporter) start(ctx context.Context, host component.Host) (err er
 		MaxRequestBytes:     e.cfg.Write.MaxRequestBytes,
 		MaxInflightRequests: e.cfg.Write.MaxInflightRequests,
 		MaxInflightBytes:    e.cfg.Write.MaxInflightBytes,
+		StreamPoolSize:      e.cfg.Write.StreamPoolSize,
 		TraceID:             writeAPITraceID,
 		Observer:            e.tel,
 		Backpressure:        bp,

@@ -599,6 +599,9 @@ func helmEnterpriseValues(maskReplacement string) map[string]any {
 			"maskReplacement":      maskReplacement,
 			"redactLogBody":        true,
 		},
+		"write": map[string]any{
+			"streamPoolSize": int64(4),
+		},
 	}
 }
 
@@ -643,6 +646,9 @@ func TestHelmConfigMapDecodesAndValidates(t *testing.T) {
 		cfg := decodeExporterConfig(t, "default values", exporterBlock(t, conf, "bigquery"))
 		if cfg.Metrics.Table != "otel_metrics" {
 			t.Errorf("metrics.table = %q, want otel_metrics", cfg.Metrics.Table)
+		}
+		if cfg.Write.StreamPoolSize != 1 {
+			t.Errorf("write.stream_pool_size = %d, want 1", cfg.Write.StreamPoolSize)
 		}
 		for _, signal := range []string{"traces", "logs", "metrics"} {
 			if got := yamlPath(doc, "service", "pipelines", signal, "exporters"); !reflect.DeepEqual(got, []any{"bigquery"}) {
@@ -692,6 +698,9 @@ func TestHelmConfigMapDecodesAndValidates(t *testing.T) {
 			if !reflect.DeepEqual(cfg.Redaction.BlockedKeys, []string{"x-custom-secret", "*.ssn"}) ||
 				len(cfg.Redaction.BlockedValuePatterns) != 2 {
 				t.Errorf("redaction lists = %v and %v", cfg.Redaction.BlockedKeys, cfg.Redaction.BlockedValuePatterns)
+			}
+			if cfg.Write.StreamPoolSize != 4 {
+				t.Errorf("write.stream_pool_size = %d, want 4", cfg.Write.StreamPoolSize)
 			}
 		})
 	}

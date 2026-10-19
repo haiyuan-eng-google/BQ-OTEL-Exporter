@@ -949,3 +949,81 @@ func TestBackpressureConfigKeys(t *testing.T) {
 		}
 	}
 }
+
+func TestStreamPoolConfigValidation(t *testing.T) {
+	if got := validConfig().Write.StreamPoolSize; got != 1 {
+		t.Fatalf("default Write.StreamPoolSize = %d, want 1", got)
+	}
+	f, ok := reflect.TypeOf(WriteConfig{}).FieldByName("StreamPoolSize")
+	if !ok || f.Tag.Get("mapstructure") != "stream_pool_size" {
+		t.Fatalf("WriteConfig.StreamPoolSize mapstructure tag = %q, want %q", f.Tag.Get("mapstructure"), "stream_pool_size")
+	}
+
+	accepts := map[string]func(*Config){
+		"min pool size 1":  func(c *Config) { c.Write.StreamPoolSize = 1 },
+		"max pool size 16": func(c *Config) { c.Write.StreamPoolSize = 16 },
+		"non-multiplexed with matching connection pool": func(c *Config) {
+			c.Write.EnableMultiplexing = false
+			c.Write.StreamPoolSize = 4
+			c.Write.ConnectionPoolSize = 4
+		},
+		"non-multiplexed pool size 1 with zero connection pool": func(c *Config) {
+			c.Write.EnableMultiplexing = false
+			c.Write.StreamPoolSize = 1
+			c.Write.ConnectionPoolSize = 0
+		},
+	}
+	for name, mutate := range accepts {
+		t.Run("accept/"+name, func(t *testing.T) {
+			cfg := validConfig()
+			mutate(cfg)
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate() = %v, want nil", err)
+			}
+		})
+	}
+
+	rejects := map[string]struct {
+		mutate func(*Config)
+		want   string
+	}{
+		"zero stream_pool_size": {
+			func(c *Config) { c.Write.StreamPoolSize = 0 },
+			"write.stream_pool_size (0) must be between 1 and 16",
+		},
+		"negative stream_pool_size": {
+			func(c *Config) { c.Write.StreamPoolSize = -1 },
+			"write.stream_pool_size (-1) must be between 1 and 16",
+		},
+		"above max stream_pool_size": {
+			func(c *Config) { c.Write.StreamPoolSize = 17 },
+			"write.stream_pool_size (17) must be between 1 and 16",
+		},
+		"non-multiplexed connection pool smaller than stream pool": {
+			func(c *Config) {
+				c.Write.EnableMultiplexing = false
+				c.Write.StreamPoolSize = 4
+				c.Write.ConnectionPoolSize = 2
+			},
+			"write.connection_pool_size (2) must be at least write.stream_pool_size (4) when write.enable_multiplexing is false",
+		},
+		"non-multiplexed stream pool with zero connection pool": {
+			func(c *Config) {
+				c.Write.EnableMultiplexing = false
+				c.Write.StreamPoolSize = 4
+				c.Write.ConnectionPoolSize = 0
+			},
+			"write.connection_pool_size (0) must be at least write.stream_pool_size (4) when write.enable_multiplexing is false",
+		},
+	}
+	for name, tc := range rejects {
+		t.Run("reject/"+name, func(t *testing.T) {
+			cfg := validConfig()
+			tc.mutate(cfg)
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate() = %v, want error containing %q", err, tc.want)
+			}
+		})
+	}
+}

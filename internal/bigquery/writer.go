@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protowire"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/descriptorpb"
 )
 
@@ -39,12 +41,19 @@ type WriterOptions struct {
 	// per-request limit. Requests are split to stay under it.
 	MaxRequestBytes int
 
-	// MaxInflightRequests and MaxInflightBytes bound asynchronous appends.
-	// managedwriter enforces the native limits; the exporter mirrors the
-	// request-count window so concurrent calls drain results before they can
-	// collectively block inside AppendRows.
+	// MaxInflightRequests bounds asynchronous appends per stream slot.
+	// MaxInflightBytes bounds the total memory held by in-flight appends
+	// across the entire stream pool.
+	// managedwriter enforces the per-stream limits; the exporter mirrors the
+	// per-slot request-count window and enforces the pool-wide byte budget so
+	// concurrent calls drain results before they can collectively block inside
+	// AppendRows.
 	MaxInflightRequests int
 	MaxInflightBytes    int
+
+	// StreamPoolSize sets the number of default-stream ManagedStream slots
+	// opened per destination table (1..16). Values <= 1 open a single stream.
+	StreamPoolSize int
 
 	// TraceID identifies this client to the Write API backend, which makes
 	// producer-side attribution possible when the service team is debugging
@@ -100,26 +109,36 @@ type appendResult interface {
 	FullResponse(ctx context.Context) (*storagepb.AppendRowsResponse, error)
 }
 
-// Writer owns one default-stream ManagedStream per destination table.
+// Writer owns a pool of default-stream ManagedStream slots per destination table.
 type Writer struct {
 	opts        WriterOptions
 	factory     streamFactory
 	lifetimeCtx context.Context
 	ownedCtx    context.Context
 	ownedCancel context.CancelFunc
+	multiplexed bool
 
-	mu                sync.Mutex
-	ms                *streamGeneration
-	creation          *streamCreation
-	generationSignal  chan struct{}
-	activeGenerations int
-	closed            bool
-	closeDone         chan struct{}
-	closeErr          error
+	// sharedRetireMu serializes shared-connection retirement when a caller
+	// constructs a multiplexed managedwriter.Client with StreamPoolSize > 1.
+	sharedRetireMu sync.Mutex
+
+	// mu guards writer-wide lifecycle (closed, closeDone, closeErr,
+	// ownedCtx, ownedCancel, slots) and the pool-wide in-flight byte budget
+	// (inflightBytes, byteSignal). It is never held at the same time as any
+	// slot.mu.
+	mu            sync.Mutex
+	slots         []*streamSlot
+	nextSlot      atomic.Uint64
+	inflightBytes int
+	byteSignal    chan struct{}
+	closed        bool
+	closeDone     chan struct{}
+	closeErr      error
 
 	appendWG      sync.WaitGroup
 	constructorWG sync.WaitGroup
 	drainWG       sync.WaitGroup
+	teardownWG    sync.WaitGroup
 }
 
 const maxActiveStreamGenerations = 2
@@ -130,22 +149,72 @@ var (
 )
 
 type streamCreation struct {
-	done chan struct{}
-	err  error
+	done      chan struct{}
+	err       error
+	cancel    context.CancelFunc
+	aborted   bool
+	completed bool
+}
+
+// streamSlot owns one independent default-stream lifecycle and flow window.
+type streamSlot struct {
+	index    int
+	ownedCtx context.Context
+	pending  atomic.Int64
+
+	// mu guards this slot's stream lifecycle (ms, creation, generationSignal,
+	// activeGenerations, retiring, closed) and every streamGeneration created
+	// on it. It is never held at the same time as Writer.mu.
+	mu                sync.Mutex
+	ms                *streamGeneration
+	creation          *streamCreation
+	generationSignal  chan struct{}
+	activeGenerations int
+	retiring          bool
+	closed            bool
 }
 
 // streamGeneration binds an append result to the exact stream that dispatched
 // it. Pointer identity is the generation token: a late failure can retire this
-// generation only while it is still the writer's current stream.
+// generation only while it is still its slot's current stream.
 type streamGeneration struct {
 	stream
-	users       int
-	pending     int
-	dispatched  int
-	slotSignal  chan struct{}
-	retired     bool
-	slotHeld    bool
-	retiredDone chan struct{}
+	slot         *streamSlot
+	createCancel context.CancelFunc
+	users        int
+	pending      int
+	unresolved   int
+	dispatched   int
+	slotSignal   chan struct{}
+	retired      bool
+	slotHeld     bool
+	retiredDone  chan struct{}
+
+	teardownMu            sync.Mutex
+	teardownStarted       bool
+	teardownCompleted     bool
+	teardownDeferredBytes int
+	teardownDone          chan struct{}
+}
+
+// clientUsesMultiplexing reports whether client was constructed with
+// managedwriter.WithMultiplexing(). Dedicated (simplex) stream pools do not
+// share an underlying connection across ManagedStreams, so retiring one slot
+// must never tear down sibling slots.
+func clientUsesMultiplexing(client *managedwriter.Client) bool {
+	if client == nil {
+		return false
+	}
+	v := reflect.ValueOf(client)
+	if v.Kind() != reflect.Pointer || v.IsNil() {
+		return false
+	}
+	cfg := v.Elem().FieldByName("cfg")
+	if !cfg.IsValid() || cfg.Kind() != reflect.Pointer || cfg.IsNil() {
+		return false
+	}
+	useMultiplex := cfg.Elem().FieldByName("useMultiplex")
+	return useMultiplex.IsValid() && useMultiplex.Kind() == reflect.Bool && useMultiplex.Bool()
 }
 
 // NewWriter builds a writer whose managed streams retain lifetimeCtx for their
@@ -153,9 +222,10 @@ type streamGeneration struct {
 func NewWriter(
 	lifetimeCtx context.Context, client *managedwriter.Client, opts WriterOptions,
 ) *Writer {
-	return &Writer{
+	w := &Writer{
 		opts:        opts,
 		lifetimeCtx: lifetimeCtx,
+		multiplexed: clientUsesMultiplexing(client),
 		factory: func(ctx context.Context, wopts ...managedwriter.WriterOption) (stream, error) {
 			ms, err := client.NewManagedStream(ctx, wopts...)
 			if err != nil {
@@ -164,6 +234,22 @@ func NewWriter(
 			return realStream{ms}, nil
 		},
 	}
+	w.ensureSlotsLocked()
+	return w
+}
+
+func (w *Writer) ensureSlotsLocked() []*streamSlot {
+	if len(w.slots) == 0 {
+		n := max(1, w.opts.StreamPoolSize)
+		w.slots = make([]*streamSlot, n)
+		for i := range n {
+			w.slots[i] = &streamSlot{
+				index:  i,
+				closed: w.closed,
+			}
+		}
+	}
+	return w.slots
 }
 
 // writerOptions renders the managedwriter configuration for this destination.
@@ -187,93 +273,292 @@ func (w *Writer) writerOptions() []managedwriter.WriterOption {
 	}
 }
 
-// ensureStream returns the live stream generation, creating it on first use.
+// slotReadiness describes how soon a slot can take a dispatch.
+type slotReadiness int
+
+const (
+	// slotBlocked cannot take a dispatch now: it is closed or retiring, every
+	// generation slot is held by a stream that is still draining, or its live
+	// stream has no free dispatch window.
+	slotBlocked slotReadiness = iota
+	// slotCold has no stream and none being created, but may start one.
+	slotCold
+	// slotCreating has no stream yet; one is being created.
+	slotCreating
+	// slotLive has a live stream with a free dispatch window.
+	slotLive
+)
+
+func slotReadinessOf(slot *streamSlot, effectiveInflight int) slotReadiness {
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	switch {
+	case slot.closed || slot.retiring:
+		return slotBlocked
+	case slot.ms != nil:
+		if slot.ms.retired || slot.ms.dispatched >= effectiveInflight {
+			return slotBlocked
+		}
+		return slotLive
+	case slot.activeGenerations >= maxActiveStreamGenerations:
+		return slotBlocked
+	case slot.creation != nil:
+		return slotCreating
+	default:
+		return slotCold
+	}
+}
+
+// slotHasOpenWindow reports whether slot can take a dispatch now, or can start
+// a stream that will.
+func slotHasOpenWindow(slot *streamSlot, effectiveInflight int) bool {
+	return slotReadinessOf(slot, effectiveInflight) != slotBlocked
+}
+
+// nextSlotStart returns the index at which the next sub-request begins its
+// scan for a slot. The start rotates so equally loaded slots take turns.
+func (w *Writer) nextSlotStart(slotCount int) int {
+	if slotCount <= 1 {
+		return 0
+	}
+	return int((w.nextSlot.Add(1) - 1) % uint64(slotCount))
+}
+
+// anyLiveSlot reports whether some slot has a live stream with a free
+// dispatch window.
+func anyLiveSlot(slots []*streamSlot, effectiveInflight int) bool {
+	for _, s := range slots {
+		if slotReadinessOf(s, effectiveInflight) == slotLive {
+			return true
+		}
+	}
+	return false
+}
+
+// selectSlot picks the slot for the next sub-request. Scanning from start, it
+// takes the first slot that can accept a dispatch and has nothing pending, and
+// otherwise the open slot with the fewest pending requests. Equally loaded
+// slots therefore take turns, and a pool that has just been created fills
+// evenly instead of piling onto its first stream.
+//
+// A slot whose stream is still being created counts as open only when no slot
+// has a live stream with a free window, or when it is waitOn: the slot whose
+// creation the caller itself started and may now wait for. Routing any other
+// caller into it would park that sub-request behind a stream that may not
+// exist before the attempt ends while healthy slots go unused. A slot with no
+// stream and no creation stays attractive, because selecting it is what starts
+// its creation (see acquireSlotStream).
+func (w *Writer) selectSlot(
+	slots []*streamSlot, start int, waitOn *streamSlot,
+) *streamSlot {
+	if len(slots) == 1 {
+		return slots[0]
+	}
+	effectiveInflight := w.EffectiveMaxInflightRequests()
+	var liveKnown, anyLive bool
+	open := func(s *streamSlot) bool {
+		switch slotReadinessOf(s, effectiveInflight) {
+		case slotLive, slotCold:
+			return true
+		case slotCreating:
+			if s == waitOn {
+				return true
+			}
+			if !liveKnown {
+				anyLive, liveKnown = anyLiveSlot(slots, effectiveInflight), true
+			}
+			return !anyLive
+		default:
+			return false
+		}
+	}
+	best := slots[start]
+	bestOpen := open(best)
+	bestPending := best.pending.Load()
+	if bestOpen && bestPending == 0 {
+		return best
+	}
+	for i := 1; i < len(slots); i++ {
+		cand := slots[(start+i)%len(slots)]
+		candOpen := open(cand)
+		candPending := cand.pending.Load()
+		if (candOpen && !bestOpen) || (candOpen == bestOpen && candPending < bestPending) {
+			best = cand
+			bestOpen = candOpen
+			bestPending = candPending
+			if bestOpen && bestPending == 0 {
+				break
+			}
+		}
+	}
+	return best
+}
+
+// ensureSlotStream returns the live stream generation for slot, creating it on
+// first use.
 //
 // managedwriter retains the stream-construction context. It must therefore be
 // the component-owned lifetime context, never an exporterhelper attempt
 // context that is canceled as soon as one Consume call returns.
-func (w *Writer) ensureStream(ctx context.Context) (*streamGeneration, error) {
+func (w *Writer) ensureSlotStream(
+	ctx context.Context, slot *streamSlot,
+) (*streamGeneration, error) {
+	gen, _, err := w.acquireSlotStream(ctx, slot, true)
+	return gen, err
+}
+
+// acquireSlotStream returns the live stream generation for slot, starting
+// creation when a generation slot is free.
+//
+// When waitForGenerationSlot is false the call never blocks. A slot without a
+// live generation starts creating one if it may, and the call returns
+// (nil, false, nil) rather than waiting on that creation or on a generation
+// slot held by a draining retired stream, so a caller with in-flight work
+// drains one result and reselects. Waiting would leave those results unread
+// past the attempt deadline, where an acknowledgement is indistinguishable
+// from a lost one. The creation belongs to the slot, not to the caller: it
+// outlives the call and is reused by whoever needs the slot next.
+func (w *Writer) acquireSlotStream(
+	ctx context.Context, slot *streamSlot, waitForGenerationSlot bool,
+) (*streamGeneration, bool, error) {
 	for {
-		w.mu.Lock()
-		if w.closed {
-			w.mu.Unlock()
-			return nil, errWriterClosed
+		slot.mu.Lock()
+		if slot.closed {
+			slot.mu.Unlock()
+			return nil, false, errWriterClosed
 		}
 		if err := ctx.Err(); err != nil {
-			w.mu.Unlock()
-			return nil, err
+			slot.mu.Unlock()
+			return nil, false, err
 		}
-		if w.ms != nil {
-			gen := w.ms
+		if !slot.retiring && slot.ms != nil {
+			gen := slot.ms
 			gen.users++
-			w.mu.Unlock()
-			return gen, nil
+			slot.mu.Unlock()
+			return gen, true, nil
 		}
 
-		if w.creation == nil && w.activeGenerations < maxActiveStreamGenerations {
-			w.startStreamCreationLocked()
+		if !slot.retiring && slot.creation == nil && slot.activeGenerations < maxActiveStreamGenerations {
+			w.startSlotStreamCreationLocked(slot)
 		}
-		if creation := w.creation; creation != nil {
+		if !waitForGenerationSlot {
+			slot.mu.Unlock()
+			return nil, false, nil
+		}
+		if !slot.retiring && slot.creation != nil {
+			creation := slot.creation
 			done := creation.done
-			w.mu.Unlock()
+			slot.mu.Unlock()
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return nil, false, ctx.Err()
 			case <-done:
-				if creation.err != nil {
-					return nil, fmt.Errorf("creating write stream for %s: %w", w.opts.TableID(), creation.err)
+				slot.mu.Lock()
+				err := creation.err
+				slot.mu.Unlock()
+				if err != nil {
+					if errors.Is(err, errStreamRetired) {
+						continue
+					}
+					return nil, false, fmt.Errorf("creating write stream for %s: %w", w.opts.TableID(), err)
 				}
 				continue
 			}
 		}
 
-		signal := w.generationSignalLocked()
-		w.mu.Unlock()
+		signal := slot.generationSignalLocked()
+		slot.mu.Unlock()
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, false, ctx.Err()
 		case <-signal:
 		}
 	}
 }
 
-func (w *Writer) startStreamCreationLocked() {
-	creation := &streamCreation{done: make(chan struct{})}
-	w.creation = creation
-	w.activeGenerations++
-	ctx := w.ownedContextLocked()
+func (s *streamSlot) abortStreamCreationLocked(err error) {
+	c := s.creation
+	if c == nil || c.completed {
+		return
+	}
+	c.aborted = true
+	c.completed = true
+	c.err = err
+	s.creation = nil
+	s.activeGenerations--
+	if c.cancel != nil {
+		c.cancel()
+	}
+	close(c.done)
+	s.notifyGenerationChangeLocked()
+}
+
+func (w *Writer) startSlotStreamCreationLocked(slot *streamSlot) {
+	ownedCtx := slot.ownedCtx
+	if ownedCtx == nil {
+		ownedCtx = context.Background()
+	}
+	createCtx, createCancel := context.WithCancel(ownedCtx)
+	creation := &streamCreation{
+		done:   make(chan struct{}),
+		cancel: createCancel,
+	}
+	slot.creation = creation
+	slot.activeGenerations++
 	w.constructorWG.Add(1)
 	go func() {
 		defer w.constructorWG.Done()
-		ms, err := w.factory(ctx, w.writerOptions()...)
-		var discard stream
+		ms, err := w.factory(createCtx, w.writerOptions()...)
+		var (
+			discard      stream
+			cancelCreate bool
+		)
 
-		w.mu.Lock()
+		slot.mu.Lock()
+		if creation.aborted || creation.completed {
+			slot.mu.Unlock()
+			createCancel()
+			if ms != nil {
+				_ = ms.Close()
+			}
+			return
+		}
+		creation.completed = true
 		switch {
 		case err != nil:
 			creation.err = err
-			w.activeGenerations--
-		case w.closed || ctx.Err() != nil:
+			slot.activeGenerations--
+			cancelCreate = true
+		case slot.closed || slot.retiring || ownedCtx.Err() != nil:
 			discard = ms
+			cancelCreate = true
 			creation.err = errWriterClosed
-			if ctxErr := ctx.Err(); ctxErr != nil {
+			if slot.retiring && !slot.closed {
+				creation.err = errStreamRetired
+			} else if ctxErr := ownedCtx.Err(); ctxErr != nil {
 				creation.err = ctxErr
 			}
-			w.activeGenerations--
+			slot.activeGenerations--
 		default:
-			w.ms = &streamGeneration{
-				stream:      ms,
-				slotHeld:    true,
-				retiredDone: make(chan struct{}),
+			slot.ms = &streamGeneration{
+				stream:       ms,
+				slot:         slot,
+				createCancel: createCancel,
+				slotHeld:     true,
+				retiredDone:  make(chan struct{}),
+				teardownDone: make(chan struct{}),
 			}
 		}
-		if w.creation == creation {
-			w.creation = nil
+		if slot.creation == creation {
+			slot.creation = nil
 		}
 		close(creation.done)
-		w.notifyGenerationChangeLocked()
-		w.mu.Unlock()
+		slot.notifyGenerationChangeLocked()
+		slot.mu.Unlock()
 
+		if cancelCreate {
+			createCancel()
+		}
 		if discard != nil {
 			_ = discard.Close()
 		}
@@ -291,40 +576,51 @@ func (w *Writer) ownedContextLocked() context.Context {
 	return w.ownedCtx
 }
 
-func (w *Writer) generationSignalLocked() <-chan struct{} {
-	if w.generationSignal == nil {
-		w.generationSignal = make(chan struct{})
+func (s *streamSlot) generationSignalLocked() <-chan struct{} {
+	if s.generationSignal == nil {
+		s.generationSignal = make(chan struct{})
 	}
-	return w.generationSignal
+	return s.generationSignal
 }
 
-func (w *Writer) notifyGenerationChangeLocked() {
-	if w.generationSignal != nil {
-		close(w.generationSignal)
-		w.generationSignal = nil
+func (s *streamSlot) notifyGenerationChangeLocked() {
+	if s.generationSignal != nil {
+		close(s.generationSignal)
+		s.generationSignal = nil
 	}
 }
 
 // beginAppend prevents shutdown from starting a Wait while a new append can
 // still register work. The WaitGroup Add happens under the same lock that
 // closes the writer, so Close's Wait cannot race an Add from a new call.
-func (w *Writer) beginAppend() error {
+func (w *Writer) beginAppend() ([]*streamSlot, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
-		return errWriterClosed
+		return nil, errWriterClosed
 	}
-	w.ownedContextLocked()
+	ctx := w.ownedContextLocked()
+	slots := w.ensureSlotsLocked()
+	for _, slot := range slots {
+		if slot.ownedCtx == nil {
+			slot.ownedCtx = ctx
+		}
+	}
 	w.appendWG.Add(1)
-	return nil
+	return slots, nil
 }
 
 // trackResult keeps terminal ownership after an attempt context expires.
 // managedwriter's GetResult only reports that caller cancellation; it does not
 // make the underlying AppendResult terminal. This waiter lives until the
 // result resolves or Writer.Close cancels the component lifecycle context.
-func (w *Writer) trackResult(gen *streamGeneration, res appendResult, started time.Time) {
+func (w *Writer) trackResult(
+	slot *streamSlot, gen *streamGeneration, reqBytes int, res appendResult, started time.Time,
+) {
 	w.drainWG.Add(1)
+	slot.mu.Lock()
+	gen.unresolved++
+	slot.mu.Unlock()
 	w.mu.Lock()
 	ctx := w.ownedCtx
 	w.mu.Unlock()
@@ -334,39 +630,256 @@ func (w *Writer) trackResult(gen *streamGeneration, res appendResult, started ti
 			w.observeInflight(-1)
 			w.observeUnresolved(-1)
 			w.observeResultWait(started)
-			w.releaseResult(gen)
+			w.releaseResult(slot, gen, reqBytes)
+			slot.mu.Lock()
+			gen.unresolved--
+			slot.mu.Unlock()
 			w.drainWG.Done()
 		}()
 		_, _ = res.GetResult(ctx)
 	}()
 }
 
-// retireStream tears down gen only if it is still current. Another append may
-// already have retired gen and installed a replacement; a late result from the
-// old generation must not close that replacement.
-func (w *Writer) retireStream(gen *streamGeneration) {
-	w.mu.Lock()
-	if w.ms != gen {
-		w.mu.Unlock()
+func (g *streamGeneration) teardownDoneLocked() chan struct{} {
+	if g.teardownDone == nil {
+		g.teardownDone = make(chan struct{})
+	}
+	return g.teardownDone
+}
+
+func (w *Writer) startGenerationTeardownLocked(gen *streamGeneration) {
+	markGenerationRetiredLocked(gen)
+	gen.teardownMu.Lock()
+	_ = gen.teardownDoneLocked()
+	if !gen.teardownStarted {
+		gen.teardownStarted = true
+		w.teardownWG.Add(1)
+	}
+	gen.teardownMu.Unlock()
+}
+
+func (w *Writer) completeGenerationTeardown(gen *streamGeneration) {
+	if gen == nil {
 		return
 	}
-	w.ms = nil
-	w.markGenerationRetiredLocked(gen)
-	w.releaseGenerationSlotLocked(gen)
-	w.notifyGenerationChangeLocked()
-	w.mu.Unlock()
+	if gen.createCancel != nil {
+		gen.createCancel()
+	}
+	gen.teardownMu.Lock()
+	_ = gen.teardownDoneLocked()
+	var (
+		deferred  int
+		started   bool
+		completed bool
+	)
+	if !gen.teardownCompleted {
+		gen.teardownCompleted = true
+		deferred = gen.teardownDeferredBytes
+		gen.teardownDeferredBytes = 0
+		started = gen.teardownStarted
+		completed = true
+		close(gen.teardownDone)
+	}
+	gen.teardownMu.Unlock()
+	if deferred > 0 {
+		w.releaseBytes(deferred)
+	}
+	if completed && started {
+		w.teardownWG.Done()
+	}
+}
+
+func (w *Writer) waitGenerationTeardown(ctx context.Context, gen *streamGeneration) {
+	if gen == nil || ctx.Err() != nil {
+		return
+	}
+	gen.teardownMu.Lock()
+	if !gen.teardownStarted || gen.teardownCompleted {
+		gen.teardownMu.Unlock()
+		return
+	}
+	done := gen.teardownDoneLocked()
+	gen.teardownMu.Unlock()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+}
+
+func (w *Writer) retireSlotGeneration(slot *streamSlot, gen *streamGeneration) {
+	if slot == nil || gen == nil {
+		return
+	}
+	slot.mu.Lock()
+	if slot.ms != gen {
+		slot.mu.Unlock()
+		return
+	}
+	slot.ms = nil
+	w.startGenerationTeardownLocked(gen)
+	slot.releaseGenerationSlotLocked(gen)
+	slot.notifyGenerationChangeLocked()
+	slot.mu.Unlock()
 	_ = gen.Close()
+	w.completeGenerationTeardown(gen)
 	if w.opts.Observer != nil {
 		w.opts.Observer.RecordStreamRetirement(context.Background())
 	}
 }
 
-func (w *Writer) markGenerationRetiredLocked(gen *streamGeneration) {
+func (w *Writer) generationUnresolved(slot *streamSlot, gen *streamGeneration) int {
+	if slot == nil || gen == nil {
+		return 0
+	}
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	return gen.unresolved
+}
+
+// retireStream tears down gen only if it is still current on its slot. Another
+// append on this slot may already have retired gen and installed a replacement;
+// a late result from the old generation must not close that replacement.
+//
+// On a dedicated (simplex) stream pool (!w.multiplexed), each slot owns an
+// independent connection and retireStream closes only slot's generation.
+//
+// When a caller constructs a managedwriter.Client with WithMultiplexing() and
+// StreamPoolSize > 1, closing one slot's ManagedStream detaches that slot from
+// multiConn without closing multiConn while sibling slots remain attached, and
+// a concurrent replacement stream created before all siblings detach would
+// attach to the same stalled multiConn. retireSharedMultiplexedPool therefore
+// quiesces replacement creation across all slots, detaches and closes every
+// attached slot together so multiConn closes, and releases the barrier once
+// tracked unresolved results on the retired generation finish draining.
+func (w *Writer) retireStream(slot *streamSlot, gen *streamGeneration) {
+	if slot == nil || gen == nil {
+		return
+	}
+	if !w.multiplexed {
+		w.retireSlotGeneration(slot, gen)
+		return
+	}
+	w.mu.Lock()
+	slots := w.ensureSlotsLocked()
+	w.mu.Unlock()
+	if len(slots) <= 1 {
+		w.retireSlotGeneration(slot, gen)
+		return
+	}
+	w.retireSharedMultiplexedPool(slots, slot, gen)
+}
+
+func (w *Writer) anyGenerationUnresolved(
+	slot *streamSlot, gen *streamGeneration, detached []*streamGeneration,
+) bool {
+	if w.generationUnresolved(slot, gen) > 0 {
+		return true
+	}
+	for _, g := range detached {
+		if g != nil && w.generationUnresolved(g.slot, g) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *Writer) retireSharedMultiplexedPool(
+	slots []*streamSlot, slot *streamSlot, gen *streamGeneration,
+) {
+	slot.mu.Lock()
+	isCurrent := slot.ms == gen
+	unresolved := gen.unresolved
+	slot.mu.Unlock()
+	if !isCurrent {
+		if unresolved > 0 {
+			for range 100 {
+				if w.generationUnresolved(slot, gen) == 0 {
+					return
+				}
+				time.Sleep(200 * time.Microsecond)
+			}
+		}
+		return
+	}
+
+	w.sharedRetireMu.Lock()
+	defer w.sharedRetireMu.Unlock()
+
+	slot.mu.Lock()
+	isCurrent = slot.ms == gen
+	unresolved = gen.unresolved
+	slot.mu.Unlock()
+	if !isCurrent {
+		if unresolved > 0 {
+			for range 100 {
+				if w.generationUnresolved(slot, gen) == 0 {
+					return
+				}
+				time.Sleep(200 * time.Microsecond)
+			}
+		}
+		return
+	}
+
+	for _, s := range slots {
+		s.mu.Lock()
+		s.retiring = true
+		s.abortStreamCreationLocked(errStreamRetired)
+		s.mu.Unlock()
+	}
+	defer func() {
+		for _, s := range slots {
+			s.mu.Lock()
+			s.retiring = false
+			s.notifyGenerationChangeLocked()
+			s.mu.Unlock()
+		}
+	}()
+
+	detached := make([]*streamGeneration, 0, len(slots))
+	hasUnresolved := w.generationUnresolved(slot, gen) > 0
+	for _, s := range slots {
+		s.mu.Lock()
+		if g := s.ms; g != nil {
+			s.ms = nil
+			w.startGenerationTeardownLocked(g)
+			s.releaseGenerationSlotLocked(g)
+			if g.unresolved > 0 {
+				hasUnresolved = true
+			}
+			detached = append(detached, g)
+		}
+		s.mu.Unlock()
+	}
+
+	for _, g := range detached {
+		_ = g.Close()
+		if w.opts.Observer != nil {
+			w.opts.Observer.RecordStreamRetirement(context.Background())
+		}
+	}
+	for _, g := range detached {
+		w.completeGenerationTeardown(g)
+	}
+
+	if hasUnresolved {
+		for range 100 {
+			if !w.anyGenerationUnresolved(slot, gen, detached) {
+				return
+			}
+			time.Sleep(200 * time.Microsecond)
+		}
+	}
+}
+
+func markGenerationRetiredLocked(gen *streamGeneration) {
 	if gen.retired {
 		return
 	}
 	gen.retired = true
-	close(gen.retiredDone)
+	if gen.retiredDone != nil {
+		close(gen.retiredDone)
+	}
 }
 
 // EffectiveMaxRequestBytes returns the current request split threshold,
@@ -394,7 +907,7 @@ func (w *Writer) EffectiveMaxInflightRequests() int {
 	return 1
 }
 
-func (w *Writer) slotSignalLocked(gen *streamGeneration) <-chan struct{} {
+func slotSignalLocked(gen *streamGeneration) <-chan struct{} {
 	if gen.slotSignal == nil {
 		gen.slotSignal = make(chan struct{})
 	}
@@ -408,40 +921,46 @@ func (w *Writer) notifySlotChangeLocked(gen *streamGeneration) {
 	}
 }
 
-func (w *Writer) tryAcquireDispatchSlot(
-	ctx context.Context, gen *streamGeneration,
-) (bool, error) {
-	if err := ctx.Err(); err != nil {
-		return false, err
+func (w *Writer) byteSignalLocked() <-chan struct{} {
+	if w.byteSignal == nil {
+		w.byteSignal = make(chan struct{})
+	}
+	return w.byteSignal
+}
+
+func (w *Writer) tryAcquireBytes(reqBytes int) bool {
+	if reqBytes <= 0 {
+		return true
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if gen.retired {
-		return false, errStreamRetired
+	if w.inflightBytes+reqBytes > w.opts.MaxInflightBytes && w.inflightBytes != 0 {
+		return false
 	}
-	if gen.dispatched >= w.EffectiveMaxInflightRequests() {
-		return false, nil
-	}
-	gen.dispatched++
-	return true, nil
+	w.inflightBytes += reqBytes
+	return true
 }
 
-func (w *Writer) waitForDispatchSlot(ctx context.Context, gen *streamGeneration) error {
+func (w *Writer) waitForBytes(ctx context.Context, gen *streamGeneration, reqBytes int) error {
+	if reqBytes <= 0 {
+		return nil
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		w.mu.Lock()
-		if gen.retired {
-			w.mu.Unlock()
+		select {
+		case <-gen.retiredDone:
 			return errStreamRetired
+		default:
 		}
-		if gen.dispatched < w.EffectiveMaxInflightRequests() {
-			gen.dispatched++
+		w.mu.Lock()
+		if w.inflightBytes+reqBytes <= w.opts.MaxInflightBytes || w.inflightBytes == 0 {
+			w.inflightBytes += reqBytes
 			w.mu.Unlock()
 			return nil
 		}
-		sig := w.slotSignalLocked(gen)
+		sig := w.byteSignalLocked()
 		w.mu.Unlock()
 
 		select {
@@ -454,42 +973,167 @@ func (w *Writer) waitForDispatchSlot(ctx context.Context, gen *streamGeneration)
 	}
 }
 
-func (w *Writer) releaseDispatchSlot(gen *streamGeneration) {
+func (w *Writer) releaseBytes(reqBytes int) {
+	if reqBytes <= 0 {
+		return
+	}
 	w.mu.Lock()
+	w.inflightBytes -= reqBytes
+	if w.byteSignal != nil {
+		close(w.byteSignal)
+		w.byteSignal = nil
+	}
+	w.mu.Unlock()
+}
+
+func (w *Writer) tryAcquireDispatchSlot(
+	ctx context.Context, slot *streamSlot, gen *streamGeneration, reqBytes int,
+) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	slot.mu.Lock()
+	if gen.retired {
+		slot.mu.Unlock()
+		return false, errStreamRetired
+	}
+	if gen.dispatched >= w.EffectiveMaxInflightRequests() {
+		slot.mu.Unlock()
+		return false, nil
+	}
+	gen.dispatched++
+	slot.mu.Unlock()
+
+	if !w.tryAcquireBytes(reqBytes) {
+		slot.mu.Lock()
+		gen.dispatched--
+		w.notifySlotChangeLocked(gen)
+		slot.mu.Unlock()
+		return false, nil
+	}
+	slot.pending.Add(1)
+	return true, nil
+}
+
+func (w *Writer) waitForDispatchSlot(
+	ctx context.Context, slot *streamSlot, gen *streamGeneration, reqBytes int,
+) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		slot.mu.Lock()
+		if gen.retired {
+			slot.mu.Unlock()
+			return errStreamRetired
+		}
+		if gen.dispatched < w.EffectiveMaxInflightRequests() {
+			gen.dispatched++
+			slot.mu.Unlock()
+			if err := w.waitForBytes(ctx, gen, reqBytes); err != nil {
+				slot.mu.Lock()
+				gen.dispatched--
+				w.notifySlotChangeLocked(gen)
+				slot.mu.Unlock()
+				return err
+			}
+			slot.pending.Add(1)
+			return nil
+		}
+		sig := slotSignalLocked(gen)
+		slot.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-gen.retiredDone:
+			return errStreamRetired
+		case <-sig:
+		}
+	}
+}
+
+func (w *Writer) releaseBytesAfterGenTeardown(gen *streamGeneration, reqBytes int) {
+	if reqBytes <= 0 {
+		return
+	}
+	if gen != nil {
+		gen.teardownMu.Lock()
+		if gen.teardownStarted && !gen.teardownCompleted {
+			gen.teardownDeferredBytes += reqBytes
+			gen.teardownMu.Unlock()
+			return
+		}
+		gen.teardownMu.Unlock()
+	}
+	w.releaseBytes(reqBytes)
+}
+
+func (w *Writer) releaseDispatchSlot(slot *streamSlot, gen *streamGeneration, reqBytes int) {
+	slot.pending.Add(-1)
+	w.releaseBytesAfterGenTeardown(gen, reqBytes)
+	slot.mu.Lock()
 	gen.dispatched--
 	w.notifySlotChangeLocked(gen)
-	w.mu.Unlock()
+	slot.mu.Unlock()
 }
 
-func (w *Writer) registerResult(gen *streamGeneration) {
-	w.mu.Lock()
+func (w *Writer) registerResult(slot *streamSlot, gen *streamGeneration) {
+	slot.mu.Lock()
 	gen.pending++
-	w.mu.Unlock()
+	slot.mu.Unlock()
 }
 
-func (w *Writer) releaseResult(gen *streamGeneration) {
-	w.mu.Lock()
+func (w *Writer) releaseResult(slot *streamSlot, gen *streamGeneration, reqBytes int) {
+	slot.pending.Add(-1)
+	w.releaseBytes(reqBytes)
+	slot.mu.Lock()
 	gen.pending--
 	gen.dispatched--
 	w.notifySlotChangeLocked(gen)
-	w.releaseGenerationSlotLocked(gen)
-	w.mu.Unlock()
+	slot.releaseGenerationSlotLocked(gen)
+	slot.mu.Unlock()
 }
 
-func (w *Writer) releaseGenerationUser(gen *streamGeneration) {
-	w.mu.Lock()
+func (w *Writer) releaseGenerationUser(slot *streamSlot, gen *streamGeneration) {
+	slot.mu.Lock()
 	gen.users--
-	w.releaseGenerationSlotLocked(gen)
-	w.mu.Unlock()
+	slot.releaseGenerationSlotLocked(gen)
+	slot.mu.Unlock()
 }
 
-func (w *Writer) releaseGenerationSlotLocked(gen *streamGeneration) {
+func (w *Writer) releaseRetiredSlotGen(slot *streamSlot, gen *streamGeneration) bool {
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	if !gen.retired {
+		return false
+	}
+	gen.users--
+	slot.releaseGenerationSlotLocked(gen)
+	return true
+}
+
+// releaseRetiredSlotGens drops cached user references to stream generations
+// that have already been retired so a caller blocked on another slot or
+// draining in-flight work does not pin activeGenerations until Append returns.
+func (w *Writer) releaseRetiredSlotGens(slots []*streamSlot, slotGens []*streamGeneration) {
+	if len(slots) <= 1 {
+		return
+	}
+	for i, g := range slotGens {
+		if g != nil && w.releaseRetiredSlotGen(slots[i], g) {
+			slotGens[i] = nil
+		}
+	}
+}
+
+func (s *streamSlot) releaseGenerationSlotLocked(gen *streamGeneration) {
 	if !gen.slotHeld || !gen.retired || gen.users != 0 || gen.pending != 0 {
 		return
 	}
 	gen.slotHeld = false
-	w.activeGenerations--
-	w.notifyGenerationChangeLocked()
+	s.activeGenerations--
+	s.notifyGenerationChangeLocked()
 }
 
 func (w *Writer) observeInflight(delta int64) {
@@ -587,34 +1231,44 @@ func (w *Writer) recordCleanOrSlowAck(elapsed time.Duration, gen *streamGenerati
 		return
 	}
 	if bp.OnCleanAck(elapsed) {
-		w.mu.Lock()
-		// The larger window applies to every generation. gen may already be
-		// retired and draining while callers wait for a slot on the current
-		// generation, so wake those waiters too rather than leaving them until
-		// the current generation's next slot release. Only the current
-		// generation can be live; waiters on a retired one have already left
-		// through retiredDone.
-		w.notifySlotChangeLocked(gen)
-		if cur := w.ms; cur != nil && cur != gen {
-			w.notifySlotChangeLocked(cur)
+		// The larger window applies to every slot's live generation. gen may
+		// already be retired and draining while callers wait for a slot on a
+		// current generation, so wake those waiters too rather than leaving
+		// them until the next slot release. Only current generations can be
+		// live; waiters on retired ones have already left through retiredDone.
+		if gen != nil && gen.slot != nil {
+			gen.slot.mu.Lock()
+			w.notifySlotChangeLocked(gen)
+			gen.slot.mu.Unlock()
 		}
+		w.mu.Lock()
+		slots := w.ensureSlotsLocked()
 		w.mu.Unlock()
+		for _, s := range slots {
+			s.mu.Lock()
+			if cur := s.ms; cur != nil && cur != gen {
+				w.notifySlotChangeLocked(cur)
+			}
+			s.mu.Unlock()
+		}
 		w.observeBackpressureTransition("recovery")
 	}
 }
 
-func (w *Writer) finishResult(gen *streamGeneration, started time.Time) {
+func (w *Writer) finishResult(
+	slot *streamSlot, gen *streamGeneration, reqBytes int, started time.Time,
+) {
 	w.observeInflight(-1)
 	w.observeResultWait(started)
-	w.releaseResult(gen)
+	w.releaseResult(slot, gen, reqBytes)
 }
 
-func (w *Writer) classifyAndRetire(
-	ctx context.Context, err error, gen *streamGeneration, req requestSlice,
-) (Verdict, bool, bool) {
+func (w *Writer) classifyFailure(
+	ctx context.Context, err error, slot *streamSlot, gen *streamGeneration, req requestSlice,
+) (Verdict, bool, bool, bool) {
 	verdict, attemptEnded := w.classifyAppendFailure(ctx, err, req)
 	siblingTeardown := false
-	if !attemptEnded && verdict.Label != LabelShutdown && isTeardown(err) && w.isRetired(gen) {
+	if !attemptEnded && verdict.Label != LabelShutdown && isTeardown(err) && w.isRetired(slot, gen) {
 		// Another attempt retired this generation and closed the connection
 		// under this request. It may already have reached the service, so the
 		// outcome is as ambiguous as an expired attempt's and its replay can
@@ -622,8 +1276,17 @@ func (w *Writer) classifyAndRetire(
 		verdict = Verdict{Uncertain, OwnerExporterHelper, LabelUncertainAck, false}
 		siblingTeardown = true
 	}
-	if verdict.StreamRecreate || attemptEnded || verdict.Class == Uncertain {
-		w.retireStream(gen)
+	shouldRetire := verdict.StreamRecreate || attemptEnded || verdict.Class == Uncertain
+	return verdict, attemptEnded, siblingTeardown, shouldRetire
+}
+
+func (w *Writer) classifyAndRetire(
+	ctx context.Context, err error, slot *streamSlot, gen *streamGeneration, req requestSlice,
+) (Verdict, bool, bool) {
+	verdict, attemptEnded, siblingTeardown, shouldRetire := w.classifyFailure(ctx, err, slot, gen, req)
+	if shouldRetire {
+		w.retireStream(slot, gen)
+		w.waitGenerationTeardown(ctx, gen)
 	}
 	if attemptEnded {
 		w.observeTimeoutAfterDispatch()
@@ -647,10 +1310,40 @@ func deliveryRank(v Verdict) int {
 	}
 }
 
-func (w *Writer) isRetired(gen *streamGeneration) bool {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+func (w *Writer) isRetired(slot *streamSlot, gen *streamGeneration) bool {
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
 	return gen.retired
+}
+
+func (w *Writer) hasCurrentStream() bool {
+	w.mu.Lock()
+	slots := w.ensureSlotsLocked()
+	w.mu.Unlock()
+	for _, slot := range slots {
+		slot.mu.Lock()
+		has := slot.ms != nil
+		slot.mu.Unlock()
+		if has {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *Writer) isCurrentStream(s stream) bool {
+	w.mu.Lock()
+	slots := w.ensureSlotsLocked()
+	w.mu.Unlock()
+	for _, slot := range slots {
+		slot.mu.Lock()
+		match := slot.ms != nil && slot.ms.stream == s
+		slot.mu.Unlock()
+		if match {
+			return true
+		}
+	}
+	return false
 }
 
 func classifyPreDispatchFailure(err error) Verdict {
@@ -720,6 +1413,9 @@ type requestSlice struct {
 // completion time as soon as Ready() closes so later local dispatch or drain
 // delays do not inflate acknowledgement latency.
 type pendingAppend struct {
+	slot              *streamSlot
+	gen               *streamGeneration
+	reqBytes          int
 	res               appendResult
 	req               requestSlice
 	start             int
@@ -791,16 +1487,32 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 	if len(rows) == 0 {
 		return AppendOutcome{}
 	}
-	if err := w.beginAppend(); err != nil {
+	slots, err := w.beginAppend()
+	if err != nil {
 		return AppendOutcome{Verdict: classifyPreDispatchFailure(err), Err: err}
 	}
 	defer w.appendWG.Done()
 
-	gen, err := w.ensureStream(ctx)
-	if err != nil {
-		return AppendOutcome{Verdict: classifyPreDispatchFailure(err), Err: err}
+	var slotGenBuf [16]*streamGeneration
+	slotGens := slotGenBuf[:len(slots)]
+	if len(slots) > len(slotGenBuf) {
+		slotGens = make([]*streamGeneration, len(slots))
 	}
-	defer w.releaseGenerationUser(gen)
+	defer func() {
+		for i, g := range slotGens {
+			if g != nil {
+				w.releaseGenerationUser(slots[i], g)
+			}
+		}
+	}()
+
+	if len(slots) == 1 {
+		gen, serr := w.ensureSlotStream(ctx, slots[0])
+		if serr != nil {
+			return AppendOutcome{Verdict: classifyPreDispatchFailure(serr), Err: serr}
+		}
+		slotGens[0] = gen
+	}
 
 	requests := splitRequestSlices(rows, w.EffectiveMaxRequestBytes())
 
@@ -830,31 +1542,50 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 	drainOne := func(p *pendingAppend) {
 		defer p.stopWatcher()
 		pollInflightReady(inflight, w.now)
-		_, rerr := p.res.GetResult(ctx)
+		// A result that has already arrived is read under a context that
+		// cannot end. GetResult picks pseudo-randomly between a ready result
+		// and a finished context, so with the attempt context over it would
+		// report an acknowledged request as attempt-ended half the time,
+		// retire the healthy stream that served it and replay rows the
+		// service already holds. Only a result still outstanding when the
+		// attempt ends is ambiguous.
+		readCtx := ctx
+		select {
+		case <-p.res.Ready():
+			readCtx = context.Background()
+		default:
+		}
+		_, rerr := p.res.GetResult(readCtx)
 		pollInflightReady(inflight, w.now)
 		elapsed := p.ackDuration(w.now)
 		if rerr != nil {
 			// Row errors arrive alongside the error; the whole request is not
 			// appended when any row in it fails.
-			rowErrs := extractRowErrors(ctx, p.res, p.start)
+			rowErrs := extractRowErrors(readCtx, p.res, p.start)
 			if len(rowErrs) > 0 {
-				w.finishResult(gen, p.dispatched)
+				w.finishResult(p.slot, p.gen, p.reqBytes, p.dispatched)
 				out.RowErrors = append(out.RowErrors, rowErrs...)
 				return
 			}
-			v, attemptEnded, siblingTeardown := w.classifyAndRetire(ctx, rerr, gen, p.req)
+			v, attemptEnded, siblingTeardown, shouldRetire := w.classifyFailure(ctx, rerr, p.slot, p.gen, p.req)
 			if attemptEnded {
-				w.trackResult(gen, p.res, p.dispatched)
+				w.trackResult(p.slot, p.gen, p.reqBytes, p.res, p.dispatched)
 			} else {
-				w.finishResult(gen, p.dispatched)
+				w.finishResult(p.slot, p.gen, p.reqBytes, p.dispatched)
+			}
+			if shouldRetire {
+				w.retireStream(p.slot, p.gen)
+			}
+			if attemptEnded {
+				w.observeTimeoutAfterDispatch()
 			}
 			w.recordFailureFeedback(v, attemptEnded, siblingTeardown, elapsed)
 			// Keep draining all other results already dispatched by this call.
 			fail(v, rerr)
 			return
 		}
-		w.finishResult(gen, p.dispatched)
-		w.recordCleanOrSlowAck(elapsed, gen)
+		w.finishResult(p.slot, p.gen, p.reqBytes, p.dispatched)
+		w.recordCleanOrSlowAck(elapsed, p.gen)
 		out.AcknowledgedRows += p.count
 		out.AckedRanges = append(out.AckedRanges, [2]int{p.start, p.start + p.count})
 	}
@@ -864,12 +1595,59 @@ dispatch:
 	for _, req := range requests {
 		start := offset
 		offset += len(req.rows)
+		reqBytes := w.boundedRequestBytes(req.rows)
+		var (
+			slot *streamSlot
+			gen  *streamGeneration
+			// slotStart is where this sub-request's slot scan begins. It is
+			// drawn once, so a retry after draining reconsiders the slot the
+			// first pass chose instead of advancing the rotation.
+			slotStart = -1
+			// kicked is the last slot this sub-request found without a live
+			// stream and could not wait for because results were in flight.
+			// Once those are drained the caller has nothing left to lose by
+			// waiting on it.
+			kicked *streamSlot
+		)
 		for {
 			if replayOwed() {
 				break dispatch
 			}
-			acquired, acquireErr := w.tryAcquireDispatchSlot(ctx, gen)
+			w.releaseRetiredSlotGens(slots, slotGens)
+			if slotStart < 0 {
+				slotStart = w.nextSlotStart(len(slots))
+			}
+			var waitOn *streamSlot
+			if len(inflight) == 0 {
+				waitOn = kicked
+			}
+			slot = w.selectSlot(slots, slotStart, waitOn)
+			gen = slotGens[slot.index]
+			if gen == nil {
+				var (
+					ensured bool
+					serr    error
+				)
+				gen, ensured, serr = w.acquireSlotStream(ctx, slot, len(inflight) == 0)
+				if serr != nil {
+					fail(classifyPreDispatchFailure(serr), serr)
+					break dispatch
+				}
+				if !ensured {
+					kicked = slot
+					w.releaseRetiredSlotGens(slots, slotGens)
+					drainOne(inflight[0])
+					inflight = inflight[1:]
+					continue
+				}
+				slotGens[slot.index] = gen
+			}
+			acquired, acquireErr := w.tryAcquireDispatchSlot(ctx, slot, gen, reqBytes)
 			if acquireErr != nil {
+				if len(slots) > 1 && errors.Is(acquireErr, errStreamRetired) {
+					w.releaseRetiredSlotGens(slots, slotGens)
+					continue
+				}
 				fail(classifyPreDispatchFailure(acquireErr), acquireErr)
 				break dispatch
 			}
@@ -877,11 +1655,17 @@ dispatch:
 				break
 			}
 			if len(inflight) > 0 {
+				w.releaseRetiredSlotGens(slots, slotGens)
 				drainOne(inflight[0])
 				inflight = inflight[1:]
 				continue
 			}
-			if acquireErr := w.waitForDispatchSlot(ctx, gen); acquireErr != nil {
+			w.releaseRetiredSlotGens(slots, slotGens)
+			if acquireErr := w.waitForDispatchSlot(ctx, slot, gen, reqBytes); acquireErr != nil {
+				if len(slots) > 1 && errors.Is(acquireErr, errStreamRetired) {
+					w.releaseRetiredSlotGens(slots, slotGens)
+					continue
+				}
 				fail(classifyPreDispatchFailure(acquireErr), acquireErr)
 				break dispatch
 			}
@@ -899,23 +1683,26 @@ dispatch:
 			// such a success is as ambiguous as the attempt error itself.
 			if err := ctx.Err(); err != nil {
 				aerr = err
-			} else if w.isRetired(gen) {
+			} else if w.isRetired(slot, gen) {
 				aerr = errStreamRetired
 			}
 		}
 		if aerr != nil {
-			w.releaseDispatchSlot(gen)
 			// AppendRows can return the attempt-context error after handing a
 			// request to the bidirectional stream. Its acknowledgement is then
-			// ambiguous, and this generation cannot safely be reused.
-			v, attemptEnded, siblingTeardown := w.classifyAndRetire(ctx, aerr, gen, req)
+			// ambiguous, and this generation cannot safely be reused. Retire
+			// the stream before releasing the dispatch slot and byte budget so
+			// teardown completes before a sibling slot can reuse those bytes.
+			v, attemptEnded, siblingTeardown := w.classifyAndRetire(ctx, aerr, slot, gen, req)
+			w.releaseDispatchSlot(slot, gen, reqBytes)
 			w.recordFailureFeedback(v, attemptEnded, siblingTeardown, w.now().Sub(dispatched))
 			fail(v, aerr)
 			continue
 		}
-		w.registerResult(gen)
+		w.registerResult(slot, gen)
 		w.observeInflight(1)
 		p := &pendingAppend{
+			slot: slot, gen: gen, reqBytes: reqBytes,
 			res: res, req: req, start: start, count: len(req.rows), dispatched: dispatched,
 			done: make(chan struct{}),
 		}
@@ -933,6 +1720,7 @@ dispatch:
 		inflight = append(inflight, p)
 	}
 
+	w.releaseRetiredSlotGens(slots, slotGens)
 	for _, p := range inflight {
 		drainOne(p)
 	}
@@ -1018,6 +1806,44 @@ func rowWireBytes(row []byte) int {
 	return 1 + protowire.SizeVarint(uint64(len(row))) + len(row)
 }
 
+// envelopeOverheadBytes returns the conservative AppendRowsRequest wire
+// framing overhead outside ProtoRows.serialized_rows, including the write
+// stream name, schema descriptor, and trace ID that managedwriter sends on the
+// wire.
+func (w *Writer) envelopeOverheadBytes() int {
+	size := requestEnvelopeOverheadBytes
+	if w.opts.Descriptor != nil {
+		size += proto.Size(w.opts.Descriptor) + 16
+	}
+	if w.opts.Table != "" {
+		size += len(w.opts.TableRef()) + len("/streams/_default") + 8
+	}
+	if w.opts.TraceID != "" {
+		size += len(w.opts.TraceID) + 8
+	}
+	return size
+}
+
+func (w *Writer) requestWireBytes(req [][]byte) int {
+	size := w.envelopeOverheadBytes()
+	for _, row := range req {
+		size += rowWireBytes(row)
+	}
+	return size
+}
+
+// boundedRequestBytes returns the full unclipped conservative wire-byte
+// reservation for req when pool-wide byte budgeting is active. Reservations
+// are never clipped to MaxInflightBytes: a single sub-request whose wire size
+// exceeds MaxInflightBytes waits until inflightBytes == 0 and then holds its
+// full byte count exclusively while in flight.
+func (w *Writer) boundedRequestBytes(req [][]byte) int {
+	if w.opts.MaxInflightBytes <= 0 {
+		return 0
+	}
+	return w.requestWireBytes(req)
+}
+
 // SplitRequests groups serialized rows into requests that stay under the size
 // threshold, accounting for per-row ProtoRows wire framing and a fixed
 // per-request envelope reserve.
@@ -1077,8 +1903,8 @@ func splitRequestSlices(rows [][]byte, maxBytes int) []requestSlice {
 	return out
 }
 
-// Close shuts the stream down. In-flight appends are drained by the caller's
-// context deadline before this is called.
+// Close shuts all stream slots down. In-flight appends are drained by the
+// caller's context deadline before this is called.
 func (w *Writer) Close() error {
 	w.mu.Lock()
 	if w.closed {
@@ -1094,27 +1920,46 @@ func (w *Writer) Close() error {
 	}
 	w.closed = true
 	w.closeDone = make(chan struct{})
-	gen := w.ms
-	w.ms = nil
-	if gen != nil {
-		w.markGenerationRetiredLocked(gen)
-		w.releaseGenerationSlotLocked(gen)
-	}
+	slots := w.ensureSlotsLocked()
 	cancel := w.ownedCancel
-	w.notifyGenerationChangeLocked()
+	if w.byteSignal != nil {
+		close(w.byteSignal)
+		w.byteSignal = nil
+	}
 	w.mu.Unlock()
+
+	var gens []*streamGeneration
+	for _, slot := range slots {
+		slot.mu.Lock()
+		slot.closed = true
+		slot.abortStreamCreationLocked(errWriterClosed)
+		if gen := slot.ms; gen != nil {
+			slot.ms = nil
+			w.startGenerationTeardownLocked(gen)
+			slot.releaseGenerationSlotLocked(gen)
+			gens = append(gens, gen)
+		}
+		slot.notifyGenerationChangeLocked()
+		slot.mu.Unlock()
+	}
+
 	if cancel != nil {
 		cancel()
 	}
-	var err error
-	if gen != nil {
-		err = gen.Close()
+	var errs []error
+	for _, gen := range gens {
+		if err := gen.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		w.completeGenerationTeardown(gen)
 	}
 	w.constructorWG.Wait()
 	// All Append calls must finish registering any asynchronous result owner
 	// before cancellation and Wait; this ordering avoids Add/Wait races.
 	w.appendWG.Wait()
 	w.drainWG.Wait()
+	w.teardownWG.Wait()
+	err := errors.Join(errs...)
 	w.mu.Lock()
 	w.closeErr = err
 	close(w.closeDone)

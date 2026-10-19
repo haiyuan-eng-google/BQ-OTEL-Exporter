@@ -38,6 +38,7 @@
 #   --set=exporters.bigquery.traces.max_staleness=15m
 #   --set=exporters.bigquery.labels.environment=production
 #   --set=exporters.bigquery.traces.partition_expiration_days=365
+#   --set=exporters.bigquery.write.stream_pool_size=4   # >1 opens N dedicated per-stream AppendRows connections
 #   The bundled config wires traces, logs, and metrics pipelines to the bigquery
 #   exporter.  Override the table names above to match your Terraform-provisioned
 #   tables when not using auto_create.
