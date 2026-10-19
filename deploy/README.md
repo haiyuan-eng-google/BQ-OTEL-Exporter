@@ -106,6 +106,15 @@ For crash-replay durability, enable the `file_storage` extension:
 
 See [docs/deployment-models.md](../docs/deployment-models.md) for more details.
 
+## Storage Write API Stream Pool
+
+Set `write.streamPoolSize` (Helm) or `exporters.bigquery.write.stream_pool_size`
+(collector config / Cloud Run `--set`) between `1` and `16` to open multiple
+default-stream `ManagedStream` slots per destination table. When
+`stream_pool_size > 1`, each table's writer pool automatically uses `N`
+dedicated per-stream `AppendRows` connections and sizes its gRPC connection pool
+to `max(connection_pool_size, stream_pool_size)`.
+
 ## Enterprise Governance
 
 When Terraform provisions the tables, Terraform governs their retention,

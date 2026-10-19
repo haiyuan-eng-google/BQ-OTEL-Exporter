@@ -81,6 +81,8 @@ redaction:
   redactLogBody: false
 
 # Storage Write API stream pool tuning.
+# When streamPoolSize > 1, each table's writer pool opens N dedicated per-stream
+# AppendRows connections and sizes its gRPC connection pool to at least N.
 write:
   streamPoolSize: 1
 

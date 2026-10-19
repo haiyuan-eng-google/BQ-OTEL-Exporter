@@ -21,6 +21,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protowire"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/descriptorpb"
 )
 
@@ -170,6 +171,7 @@ type streamGeneration struct {
 	slot        *streamSlot
 	users       int
 	pending     int
+	unresolved  int
 	dispatched  int
 	slotSignal  chan struct{}
 	retired     bool
@@ -450,6 +452,9 @@ func (w *Writer) trackResult(
 	slot *streamSlot, gen *streamGeneration, reqBytes int, res appendResult, started time.Time,
 ) {
 	w.drainWG.Add(1)
+	slot.mu.Lock()
+	gen.unresolved++
+	slot.mu.Unlock()
 	w.mu.Lock()
 	ctx := w.ownedCtx
 	w.mu.Unlock()
@@ -460,17 +465,19 @@ func (w *Writer) trackResult(
 			w.observeUnresolved(-1)
 			w.observeResultWait(started)
 			w.releaseResult(slot, gen, reqBytes)
+			slot.mu.Lock()
+			gen.unresolved--
+			slot.mu.Unlock()
 			w.drainWG.Done()
 		}()
 		_, _ = res.GetResult(ctx)
 	}()
 }
 
-// retireStream tears down gen only if it is still current on its slot. Another
-// append on this slot may already have retired gen and installed a replacement;
-// a late result from the old generation must not close that replacement, and
-// other slots in the pool are completely unaffected.
-func (w *Writer) retireStream(slot *streamSlot, gen *streamGeneration) {
+func (w *Writer) retireSlotGeneration(slot *streamSlot, gen *streamGeneration) {
+	if slot == nil || gen == nil {
+		return
+	}
 	slot.mu.Lock()
 	if slot.ms != gen {
 		slot.mu.Unlock()
@@ -484,6 +491,65 @@ func (w *Writer) retireStream(slot *streamSlot, gen *streamGeneration) {
 	_ = gen.Close()
 	if w.opts.Observer != nil {
 		w.opts.Observer.RecordStreamRetirement(context.Background())
+	}
+}
+
+func (w *Writer) generationUnresolved(slot *streamSlot, gen *streamGeneration) int {
+	if slot == nil || gen == nil {
+		return 0
+	}
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	return gen.unresolved
+}
+
+// retireStream tears down gen only if it is still current on its slot. Another
+// append on this slot may already have retired gen and installed a replacement;
+// a late result from the old generation must not close that replacement.
+//
+// When a caller constructs a managedwriter.Client with WithMultiplexing() and
+// StreamPoolSize > 1, closing one slot's ManagedStream detaches that slot from
+// multiConn without closing multiConn while sibling slots remain attached,
+// leaving any timed-out AppendResult unresolved. If gen still has tracked
+// unresolved results after closing its own stream, retireStream also retires
+// sibling slots so multiConn closes and releases the pool-wide byte budget.
+func (w *Writer) retireStream(slot *streamSlot, gen *streamGeneration) {
+	if slot == nil || gen == nil {
+		return
+	}
+	hadUnresolved := w.generationUnresolved(slot, gen) > 0
+	w.retireSlotGeneration(slot, gen)
+	if !hadUnresolved {
+		return
+	}
+	w.mu.Lock()
+	slots := w.ensureSlotsLocked()
+	w.mu.Unlock()
+	if len(slots) <= 1 {
+		return
+	}
+	for range 50 {
+		if w.generationUnresolved(slot, gen) == 0 {
+			return
+		}
+		time.Sleep(100 * time.Microsecond)
+	}
+	for _, sib := range slots {
+		if sib == slot {
+			continue
+		}
+		sib.mu.Lock()
+		sibGen := sib.ms
+		sib.mu.Unlock()
+		if sibGen != nil {
+			w.retireSlotGeneration(sib, sibGen)
+		}
+	}
+	for range 100 {
+		if w.generationUnresolved(slot, gen) == 0 {
+			return
+		}
+		time.Sleep(200 * time.Microsecond)
 	}
 }
 
@@ -547,7 +613,7 @@ func (w *Writer) tryAcquireBytes(reqBytes int) bool {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.inflightBytes+reqBytes > w.opts.MaxInflightBytes {
+	if w.inflightBytes+reqBytes > w.opts.MaxInflightBytes && w.inflightBytes != 0 {
 		return false
 	}
 	w.inflightBytes += reqBytes
@@ -568,7 +634,7 @@ func (w *Writer) waitForBytes(ctx context.Context, gen *streamGeneration, reqByt
 		default:
 		}
 		w.mu.Lock()
-		if w.inflightBytes+reqBytes <= w.opts.MaxInflightBytes {
+		if w.inflightBytes+reqBytes <= w.opts.MaxInflightBytes || w.inflightBytes == 0 {
 			w.inflightBytes += reqBytes
 			w.mu.Unlock()
 			return nil
@@ -860,9 +926,9 @@ func (w *Writer) finishResult(
 	w.releaseResult(slot, gen, reqBytes)
 }
 
-func (w *Writer) classifyAndRetire(
+func (w *Writer) classifyFailure(
 	ctx context.Context, err error, slot *streamSlot, gen *streamGeneration, req requestSlice,
-) (Verdict, bool, bool) {
+) (Verdict, bool, bool, bool) {
 	verdict, attemptEnded := w.classifyAppendFailure(ctx, err, req)
 	siblingTeardown := false
 	if !attemptEnded && verdict.Label != LabelShutdown && isTeardown(err) && w.isRetired(slot, gen) {
@@ -873,7 +939,15 @@ func (w *Writer) classifyAndRetire(
 		verdict = Verdict{Uncertain, OwnerExporterHelper, LabelUncertainAck, false}
 		siblingTeardown = true
 	}
-	if verdict.StreamRecreate || attemptEnded || verdict.Class == Uncertain {
+	shouldRetire := verdict.StreamRecreate || attemptEnded || verdict.Class == Uncertain
+	return verdict, attemptEnded, siblingTeardown, shouldRetire
+}
+
+func (w *Writer) classifyAndRetire(
+	ctx context.Context, err error, slot *streamSlot, gen *streamGeneration, req requestSlice,
+) (Verdict, bool, bool) {
+	verdict, attemptEnded, siblingTeardown, shouldRetire := w.classifyFailure(ctx, err, slot, gen, req)
+	if shouldRetire {
 		w.retireStream(slot, gen)
 	}
 	if attemptEnded {
@@ -1142,11 +1216,17 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 				out.RowErrors = append(out.RowErrors, rowErrs...)
 				return
 			}
-			v, attemptEnded, siblingTeardown := w.classifyAndRetire(ctx, rerr, p.slot, p.gen, p.req)
+			v, attemptEnded, siblingTeardown, shouldRetire := w.classifyFailure(ctx, rerr, p.slot, p.gen, p.req)
 			if attemptEnded {
 				w.trackResult(p.slot, p.gen, p.reqBytes, p.res, p.dispatched)
 			} else {
 				w.finishResult(p.slot, p.gen, p.reqBytes, p.dispatched)
+			}
+			if shouldRetire {
+				w.retireStream(p.slot, p.gen)
+			}
+			if attemptEnded {
+				w.observeTimeoutAfterDispatch()
 			}
 			w.recordFailureFeedback(v, attemptEnded, siblingTeardown, elapsed)
 			// Keep draining all other results already dispatched by this call.
@@ -1356,23 +1436,42 @@ func rowWireBytes(row []byte) int {
 	return 1 + protowire.SizeVarint(uint64(len(row))) + len(row)
 }
 
-func requestWireBytes(req [][]byte) int {
+// envelopeOverheadBytes returns the conservative AppendRowsRequest wire
+// framing overhead outside ProtoRows.serialized_rows, including the write
+// stream name, schema descriptor, and trace ID that managedwriter sends on the
+// wire.
+func (w *Writer) envelopeOverheadBytes() int {
 	size := requestEnvelopeOverheadBytes
+	if w.opts.Descriptor != nil {
+		size += proto.Size(w.opts.Descriptor) + 16
+	}
+	if w.opts.Table != "" {
+		size += len(w.opts.TableRef()) + len("/streams/_default") + 8
+	}
+	if w.opts.TraceID != "" {
+		size += len(w.opts.TraceID) + 8
+	}
+	return size
+}
+
+func (w *Writer) requestWireBytes(req [][]byte) int {
+	size := w.envelopeOverheadBytes()
 	for _, row := range req {
 		size += rowWireBytes(row)
 	}
 	return size
 }
 
+// boundedRequestBytes returns the full unclipped conservative wire-byte
+// reservation for req when pool-wide byte budgeting is active. Reservations
+// are never clipped to MaxInflightBytes: a single sub-request whose wire size
+// exceeds MaxInflightBytes waits until inflightBytes == 0 and then holds its
+// full byte count exclusively while in flight.
 func (w *Writer) boundedRequestBytes(req [][]byte) int {
 	if w.opts.MaxInflightBytes <= 0 {
 		return 0
 	}
-	n := requestWireBytes(req)
-	if n > w.opts.MaxInflightBytes {
-		return w.opts.MaxInflightBytes
-	}
-	return n
+	return w.requestWireBytes(req)
 }
 
 // SplitRequests groups serialized rows into requests that stay under the size

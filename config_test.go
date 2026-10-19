@@ -967,9 +967,9 @@ func TestStreamPoolConfigValidation(t *testing.T) {
 			c.Write.StreamPoolSize = 4
 			c.Write.ConnectionPoolSize = 4
 		},
-		"non-multiplexed with zero connection pool": func(c *Config) {
+		"non-multiplexed pool size 1 with zero connection pool": func(c *Config) {
 			c.Write.EnableMultiplexing = false
-			c.Write.StreamPoolSize = 4
+			c.Write.StreamPoolSize = 1
 			c.Write.ConnectionPoolSize = 0
 		},
 	}
@@ -1006,6 +1006,14 @@ func TestStreamPoolConfigValidation(t *testing.T) {
 				c.Write.ConnectionPoolSize = 2
 			},
 			"write.connection_pool_size (2) must be at least write.stream_pool_size (4) when write.enable_multiplexing is false",
+		},
+		"non-multiplexed stream pool with zero connection pool": {
+			func(c *Config) {
+				c.Write.EnableMultiplexing = false
+				c.Write.StreamPoolSize = 4
+				c.Write.ConnectionPoolSize = 0
+			},
+			"write.connection_pool_size (0) must be at least write.stream_pool_size (4) when write.enable_multiplexing is false",
 		},
 	}
 	for name, tc := range rejects {

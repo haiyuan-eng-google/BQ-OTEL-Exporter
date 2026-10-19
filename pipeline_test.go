@@ -254,8 +254,8 @@ func TestCollectorPipelineStreamPoolWithBQFake(t *testing.T) {
 		enableMultiplexing bool
 		wantMinStreams     int
 	}{
-		{name: "multiplexed", enableMultiplexing: true, wantMinStreams: 1},
-		{name: "simplex", enableMultiplexing: false, wantMinStreams: 2},
+		{name: "multiplexed", enableMultiplexing: true, wantMinStreams: 4},
+		{name: "simplex", enableMultiplexing: false, wantMinStreams: 4},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := bqfake.NewServer(t)
@@ -268,7 +268,7 @@ func TestCollectorPipelineStreamPoolWithBQFake(t *testing.T) {
 			cfg.Endpoint.URL = srv.Addr()
 			cfg.Endpoint.Insecure = true
 			cfg.Endpoint.WithoutAuthentication = true
-			cfg.Write.StreamPoolSize = 2
+			cfg.Write.StreamPoolSize = 4
 			cfg.Write.EnableMultiplexing = tc.enableMultiplexing
 			cfg.Write.ConnectionPoolSize = 4
 			cfg.Write.MaxRequestBytes = 512
@@ -291,7 +291,7 @@ func TestCollectorPipelineStreamPoolWithBQFake(t *testing.T) {
 			t.Cleanup(shutdown)
 
 			now := time.Date(2026, 8, 12, 16, 0, 0, 0, time.UTC)
-			const spanCount = 8
+			const spanCount = 16
 			td := ptrace.NewTraces()
 			rs := td.ResourceSpans().AppendEmpty()
 			rs.Resource().Attributes().PutStr("service.name", "stream-pool-svc")
@@ -319,8 +319,8 @@ func TestCollectorPipelineStreamPoolWithBQFake(t *testing.T) {
 			if got := srv.RowCount(cfg.Traces.Table); got != spanCount {
 				t.Fatalf("%s row count = %d, want %d", cfg.Traces.Table, got, spanCount)
 			}
-			if streams, requests, _ := srv.Counts(); streams < tc.wantMinStreams || requests < 2 {
-				t.Fatalf("bqfake streams=%d requests=%d, want streams>=%d and requests>=2",
+			if streams, requests, _ := srv.Counts(); streams < tc.wantMinStreams || requests < 4 {
+				t.Fatalf("bqfake streams=%d requests=%d, want streams>=%d and requests>=4",
 					streams, requests, tc.wantMinStreams)
 			}
 		})

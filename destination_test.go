@@ -2103,9 +2103,26 @@ func TestWriterClientOptionsMultiplexingKeepaliveAndCompression(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 1 ADC scope + 1 keepalive dial option + 1 gzip compressor dial option = 3.
-	if len(opts) != 3 {
-		t.Fatalf("writer options = %d, want 3 (ADC scope, keepalive, gzip)", len(opts))
+	// 1 ADC scope + 2 default inflight options + 1 keepalive dial option + 1 gzip compressor dial option = 5.
+	if len(opts) != 5 {
+		t.Fatalf("writer options = %d, want 5 (ADC scope, default inflight requests/bytes, keepalive, gzip)", len(opts))
+	}
+}
+
+func TestWriterClientOptionsStreamPoolUsesDedicatedConnections(t *testing.T) {
+	cfg := validConfig()
+	cfg.Write.EnableMultiplexing = true
+	cfg.Write.StreamPoolSize = 8
+	cfg.Write.ConnectionPoolSize = 4
+	e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+
+	opts, err := e.writerClientOptions(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 1 ADC scope + 2 default inflight options + 1 gRPC connection pool (max(4,8)=8) = 4 (no WithMultiplexing).
+	if len(opts) != 4 {
+		t.Fatalf("stream pool writer options = %d, want 4 (ADC scope, default inflight requests/bytes, connection pool without multiplexing)", len(opts))
 	}
 }
 

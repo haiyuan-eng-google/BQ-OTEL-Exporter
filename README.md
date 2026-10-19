@@ -241,7 +241,7 @@ as log events rather than span attributes.
 | `write.max_row_bytes`           | `1048576` (1 MiB)     | Rejects individual serialized signal rows above this size and bounds quarantine rows by truncating `raw_payload`. |
 | `write.max_inflight_requests`   | `8`                   | Bounds asynchronous in-flight appends per stream slot. |
 | `write.max_inflight_bytes`      | `67108864` (64 MiB)   | Bounds memory held by in-flight appends across the destination table's stream pool. |
-| `write.stream_pool_size`        | `1`                   | Number of default-stream `ManagedStream` slots opened per destination table (`1..16`). |
+| `write.stream_pool_size`        | `1`                   | Number of default-stream `ManagedStream` slots opened per destination table (`1..16`). When `> 1`, opens `N` dedicated per-stream `AppendRows` connections and sizes the gRPC connection pool to `max(connection_pool_size, stream_pool_size)`. |
 | `write.backpressure.enabled`    | `false`               | Enable adaptive AIMD adjustment of the effective request byte split threshold and in-flight concurrency under Storage Write API congestion. |
 | `write.backpressure.min_request_bytes` | `1048576` (1 MiB) | AIMD floor for the effective per-request byte split threshold (`<= write.max_request_bytes`). |
 | `write.backpressure.min_inflight_requests` | `1`           | AIMD floor for effective concurrent `AppendRows` sub-requests (`>= 1` and `<= write.max_inflight_requests`). |
@@ -789,10 +789,13 @@ every acknowledgement.
   same number of consumers as one slot's request window, so each can keep a
   request in flight without waiting. A batch that needs more requests than there
   are free slots drains its own earlier acknowledgements before waiting on
-  anyone else's. When `write.enable_multiplexing` is `false` and
-  `write.stream_pool_size > 1`, an explicit `write.connection_pool_size` must be
-  at least `write.stream_pool_size` so simplex `AppendRows` streams do not share
-  fewer gRPC channels than configured stream slots.
+  anyone else's. When `write.stream_pool_size > 1`, each table's writer pool
+  automatically uses `N` dedicated per-stream `AppendRows` connections and sizes
+  the gRPC connection pool to `max(write.connection_pool_size,
+  write.stream_pool_size)`. When `write.enable_multiplexing` is `false` and
+  `write.stream_pool_size > 1`, `write.connection_pool_size` must be at least
+  `write.stream_pool_size` so simplex `AppendRows` streams do not share fewer
+  gRPC channels than configured stream slots.
 - **Adaptive backpressure (`write.backpressure.enabled`).** When enabled, AIMD
   congestion control steps the per-request byte split threshold down toward
   `write.backpressure.min_request_bytes` and the concurrent dispatch window down
