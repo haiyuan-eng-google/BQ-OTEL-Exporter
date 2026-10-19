@@ -273,33 +273,114 @@ func (w *Writer) writerOptions() []managedwriter.WriterOption {
 	}
 }
 
-func slotHasOpenWindow(slot *streamSlot, effectiveInflight int) bool {
+// slotReadiness describes how soon a slot can take a dispatch.
+type slotReadiness int
+
+const (
+	// slotBlocked cannot take a dispatch now: it is closed or retiring, every
+	// generation slot is held by a stream that is still draining, or its live
+	// stream has no free dispatch window.
+	slotBlocked slotReadiness = iota
+	// slotCold has no stream and none being created, but may start one.
+	slotCold
+	// slotCreating has no stream yet; one is being created.
+	slotCreating
+	// slotLive has a live stream with a free dispatch window.
+	slotLive
+)
+
+func slotReadinessOf(slot *streamSlot, effectiveInflight int) slotReadiness {
 	slot.mu.Lock()
 	defer slot.mu.Unlock()
-	if slot.closed || slot.retiring {
-		return false
+	switch {
+	case slot.closed || slot.retiring:
+		return slotBlocked
+	case slot.ms != nil:
+		if slot.ms.retired || slot.ms.dispatched >= effectiveInflight {
+			return slotBlocked
+		}
+		return slotLive
+	case slot.activeGenerations >= maxActiveStreamGenerations:
+		return slotBlocked
+	case slot.creation != nil:
+		return slotCreating
+	default:
+		return slotCold
 	}
-	if slot.ms == nil {
-		return slot.activeGenerations < maxActiveStreamGenerations
-	}
-	return !slot.ms.retired && slot.ms.dispatched < effectiveInflight
 }
 
-func (w *Writer) selectSlot(slots []*streamSlot) *streamSlot {
+// slotHasOpenWindow reports whether slot can take a dispatch now, or can start
+// a stream that will.
+func slotHasOpenWindow(slot *streamSlot, effectiveInflight int) bool {
+	return slotReadinessOf(slot, effectiveInflight) != slotBlocked
+}
+
+// nextSlotStart returns the index at which the next sub-request begins its
+// scan for a slot. The start rotates so equally loaded slots take turns.
+func (w *Writer) nextSlotStart(slotCount int) int {
+	if slotCount <= 1 {
+		return 0
+	}
+	return int((w.nextSlot.Add(1) - 1) % uint64(slotCount))
+}
+
+// anyLiveSlot reports whether some slot has a live stream with a free
+// dispatch window.
+func anyLiveSlot(slots []*streamSlot, effectiveInflight int) bool {
+	for _, s := range slots {
+		if slotReadinessOf(s, effectiveInflight) == slotLive {
+			return true
+		}
+	}
+	return false
+}
+
+// selectSlot picks the slot for the next sub-request. Scanning from start, it
+// takes the first slot that can accept a dispatch and has nothing pending, and
+// otherwise the open slot with the fewest pending requests. Equally loaded
+// slots therefore take turns, and a pool that has just been created fills
+// evenly instead of piling onto its first stream.
+//
+// A slot whose stream is still being created counts as open only when no slot
+// has a live stream with a free window, or when it is waitOn: the slot whose
+// creation the caller itself started and may now wait for. Routing any other
+// caller into it would park that sub-request behind a stream that may not
+// exist before the attempt ends while healthy slots go unused. A slot with no
+// stream and no creation stays attractive, because selecting it is what starts
+// its creation (see acquireSlotStream).
+func (w *Writer) selectSlot(
+	slots []*streamSlot, start int, waitOn *streamSlot,
+) *streamSlot {
 	if len(slots) == 1 {
 		return slots[0]
 	}
 	effectiveInflight := w.EffectiveMaxInflightRequests()
-	start := int((w.nextSlot.Add(1) - 1) % uint64(len(slots)))
+	var liveKnown, anyLive bool
+	open := func(s *streamSlot) bool {
+		switch slotReadinessOf(s, effectiveInflight) {
+		case slotLive, slotCold:
+			return true
+		case slotCreating:
+			if s == waitOn {
+				return true
+			}
+			if !liveKnown {
+				anyLive, liveKnown = anyLiveSlot(slots, effectiveInflight), true
+			}
+			return !anyLive
+		default:
+			return false
+		}
+	}
 	best := slots[start]
-	bestOpen := slotHasOpenWindow(best, effectiveInflight)
+	bestOpen := open(best)
 	bestPending := best.pending.Load()
 	if bestOpen && bestPending == 0 {
 		return best
 	}
 	for i := 1; i < len(slots); i++ {
 		cand := slots[(start+i)%len(slots)]
-		candOpen := slotHasOpenWindow(cand, effectiveInflight)
+		candOpen := open(cand)
 		candPending := cand.pending.Load()
 		if (candOpen && !bestOpen) || (candOpen == bestOpen && candPending < bestPending) {
 			best = cand
@@ -327,10 +408,16 @@ func (w *Writer) ensureSlotStream(
 }
 
 // acquireSlotStream returns the live stream generation for slot, starting
-// creation when a generation slot is free. When waitForGenerationSlot is false
-// and all generation slots on slot are occupied by draining retired streams,
-// it returns (nil, false, nil) instead of blocking on generationSignal so a
-// caller with in-flight work can drain first.
+// creation when a generation slot is free.
+//
+// When waitForGenerationSlot is false the call never blocks. A slot without a
+// live generation starts creating one if it may, and the call returns
+// (nil, false, nil) rather than waiting on that creation or on a generation
+// slot held by a draining retired stream, so a caller with in-flight work
+// drains one result and reselects. Waiting would leave those results unread
+// past the attempt deadline, where an acknowledgement is indistinguishable
+// from a lost one. The creation belongs to the slot, not to the caller: it
+// outlives the call and is reused by whoever needs the slot next.
 func (w *Writer) acquireSlotStream(
 	ctx context.Context, slot *streamSlot, waitForGenerationSlot bool,
 ) (*streamGeneration, bool, error) {
@@ -354,6 +441,10 @@ func (w *Writer) acquireSlotStream(
 		if !slot.retiring && slot.creation == nil && slot.activeGenerations < maxActiveStreamGenerations {
 			w.startSlotStreamCreationLocked(slot)
 		}
+		if !waitForGenerationSlot {
+			slot.mu.Unlock()
+			return nil, false, nil
+		}
 		if !slot.retiring && slot.creation != nil {
 			creation := slot.creation
 			done := creation.done
@@ -373,11 +464,6 @@ func (w *Writer) acquireSlotStream(
 				}
 				continue
 			}
-		}
-
-		if !waitForGenerationSlot {
-			slot.mu.Unlock()
-			return nil, false, nil
 		}
 
 		signal := slot.generationSignalLocked()
@@ -1456,13 +1542,26 @@ func (w *Writer) Append(ctx context.Context, rows [][]byte) AppendOutcome {
 	drainOne := func(p *pendingAppend) {
 		defer p.stopWatcher()
 		pollInflightReady(inflight, w.now)
-		_, rerr := p.res.GetResult(ctx)
+		// A result that has already arrived is read under a context that
+		// cannot end. GetResult picks pseudo-randomly between a ready result
+		// and a finished context, so with the attempt context over it would
+		// report an acknowledged request as attempt-ended half the time,
+		// retire the healthy stream that served it and replay rows the
+		// service already holds. Only a result still outstanding when the
+		// attempt ends is ambiguous.
+		readCtx := ctx
+		select {
+		case <-p.res.Ready():
+			readCtx = context.Background()
+		default:
+		}
+		_, rerr := p.res.GetResult(readCtx)
 		pollInflightReady(inflight, w.now)
 		elapsed := p.ackDuration(w.now)
 		if rerr != nil {
 			// Row errors arrive alongside the error; the whole request is not
 			// appended when any row in it fails.
-			rowErrs := extractRowErrors(ctx, p.res, p.start)
+			rowErrs := extractRowErrors(readCtx, p.res, p.start)
 			if len(rowErrs) > 0 {
 				w.finishResult(p.slot, p.gen, p.reqBytes, p.dispatched)
 				out.RowErrors = append(out.RowErrors, rowErrs...)
@@ -1500,13 +1599,29 @@ dispatch:
 		var (
 			slot *streamSlot
 			gen  *streamGeneration
+			// slotStart is where this sub-request's slot scan begins. It is
+			// drawn once, so a retry after draining reconsiders the slot the
+			// first pass chose instead of advancing the rotation.
+			slotStart = -1
+			// kicked is the last slot this sub-request found without a live
+			// stream and could not wait for because results were in flight.
+			// Once those are drained the caller has nothing left to lose by
+			// waiting on it.
+			kicked *streamSlot
 		)
 		for {
 			if replayOwed() {
 				break dispatch
 			}
 			w.releaseRetiredSlotGens(slots, slotGens)
-			slot = w.selectSlot(slots)
+			if slotStart < 0 {
+				slotStart = w.nextSlotStart(len(slots))
+			}
+			var waitOn *streamSlot
+			if len(inflight) == 0 {
+				waitOn = kicked
+			}
+			slot = w.selectSlot(slots, slotStart, waitOn)
 			gen = slotGens[slot.index]
 			if gen == nil {
 				var (
@@ -1519,6 +1634,7 @@ dispatch:
 					break dispatch
 				}
 				if !ensured {
+					kicked = slot
 					w.releaseRetiredSlotGens(slots, slotGens)
 					drainOne(inflight[0])
 					inflight = inflight[1:]

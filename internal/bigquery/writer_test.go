@@ -5136,3 +5136,116 @@ func TestWriterStreamPoolMultipleRequestsOnSingleSlotDoNotBlockInManagedWriter(t
 		t.Fatalf("streamsOpened = %d, want 1 (both requests placed on slot 0)", got)
 	}
 }
+
+func TestWriterStreamPoolSlowCreationDoesNotLivelockMultiRequestBatches(t *testing.T) {
+	const poolSize = 4
+	var (
+		factoryCalls atomic.Int32
+		slowDelay    = 500 * time.Millisecond
+		attemptLimit = 200 * time.Millisecond
+	)
+
+	obs := &fakeObserver{}
+	w := &Writer{
+		opts: WriterOptions{
+			Project:             "p",
+			Dataset:             "d",
+			Table:               "t",
+			MaxRequestBytes:     100, // 2 rows of 60 bytes split into 2 sub-requests
+			MaxInflightRequests: 8,
+			MaxInflightBytes:    64 * 1024,
+			StreamPoolSize:      poolSize,
+			Observer:            obs,
+		},
+		lifetimeCtx: context.Background(),
+	}
+
+	w.factory = func(ctx context.Context, _ ...managedwriter.WriterOption) (stream, error) {
+		call := factoryCalls.Add(1)
+		// Call 5 is the replacement stream for the retired slot. Simulate slow metadata RPC.
+		if call == 5 {
+			select {
+			case <-time.After(slowDelay):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+
+		return &funcStream{
+			appendFn: func(_ context.Context, _ [][]byte) (appendResult, error) {
+				return fakeResult{}, nil
+			},
+		}, nil
+	}
+	defer func() { _ = w.Close() }()
+
+	// Step 1: Warm up all 4 slots so they each have a live stream.
+	row := make([]byte, 60)
+	twoRowBatch := [][]byte{row, row}
+
+	for i := 0; i < poolSize; i++ {
+		out := w.Append(context.Background(), twoRowBatch)
+		if out.Err != nil || out.AcknowledgedRows != 2 {
+			t.Fatalf("warmup append %d failed: %+v", i, out)
+		}
+	}
+
+	if got := factoryCalls.Load(); got != poolSize {
+		t.Fatalf("factoryCalls after warmup = %d, want %d", got, poolSize)
+	}
+
+	// Step 2: Deliberately retire slot 1 to trigger replacement creation.
+	w.mu.Lock()
+	slots := w.ensureSlotsLocked()
+	w.mu.Unlock()
+	targetSlot := slots[1]
+	targetSlot.mu.Lock()
+	targetGen := targetSlot.ms
+	targetSlot.mu.Unlock()
+	w.retireStream(targetSlot, targetGen)
+
+	obs.mu.Lock()
+	initialRetirements := obs.retirements
+	obs.mu.Unlock()
+
+	// Step 3: Run concurrent callers sending 2-subrequest batches with attemptLimit timeout.
+	const numCallers = 6
+	const batchesPerCaller = 5
+	var wg sync.WaitGroup
+	var successCount atomic.Int32
+
+	for c := 0; c < numCallers; c++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for b := 0; b < batchesPerCaller; b++ {
+				for attempt := 0; attempt < 15; attempt++ {
+					out := appendWithin(w, attemptLimit, twoRowBatch)
+					if out.Err == nil && out.AcknowledgedRows == 2 {
+						successCount.Add(1)
+						break
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := successCount.Load(); got != numCallers*batchesPerCaller {
+		t.Fatalf("successCount = %d, want %d", got, numCallers*batchesPerCaller)
+	}
+
+	// Step 4: Healthy slots must NOT have been retired during the slow recreation.
+	obs.mu.Lock()
+	extraRetirements := obs.retirements - initialRetirements
+	obs.mu.Unlock()
+	if extraRetirements != 0 {
+		t.Fatalf("observed %d extra retirements on healthy slots, want 0", extraRetirements)
+	}
+
+	// Exactly 5 factory calls (4 initial + 1 recreation for slot 1).
+	if got := factoryCalls.Load(); got != 5 {
+		t.Fatalf("factoryCalls = %d, want 5", got)
+	}
+}
