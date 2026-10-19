@@ -331,9 +331,11 @@ input, output, and reasoning token usage across the 17 emitted levels (`depth`
 `0..16`, even across tokenless intermediate spans such as `execute_tool`)
 without double-counting ancestor spans (regardless of `gen_ai_operation_name`)
 whose reported token families (`input`, `output`, `reasoning`) are covered
-across emitted trajectory descendants or non-cyclic emitted direct children
-(such as out-of-window orphan children, including when the parent is at
-`depth = 16`). When a parent is only partially covered by descendants (for
+across emitted trajectory descendants up to 32 parent hops via
+`emitted_ancestors` (including across tokenless intermediate spans and across
+parent/child links that straddle the `[-24h, +1h]` recursion window, such as
+out-of-window orphan children or children of `depth = 16` spans, with mutual
+reachability cycle breaking on `(start_time, span_id)`). When a parent is only partially covered by descendants (for
 example, a parent reports `input`, `output`, and `reasoning` while its child
 reports only `input` and `output`), `is_token_leaf` stays `TRUE` for the
 uncovered family and the covered token columns on that row are projected as

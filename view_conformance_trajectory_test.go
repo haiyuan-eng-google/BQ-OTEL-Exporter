@@ -216,7 +216,6 @@ func genAIAgentTrajectoryView(t testing.TB, spans []map[string]any) []map[string
 	}
 
 	var emitted []map[string]any
-	var allItems []trajectoryWorkItem
 	var frontier []trajectoryWorkItem
 
 	// Anchor member: true roots and orphan roots whose parent_span_id is absent
@@ -276,7 +275,6 @@ func genAIAgentTrajectoryView(t testing.TB, spans []map[string]any) []map[string
 			visited: []string{spanID},
 		}
 		emitted = append(emitted, row)
-		allItems = append(allItems, item)
 		frontier = append(frontier, item)
 	}
 
@@ -348,55 +346,110 @@ func genAIAgentTrajectoryView(t testing.TB, spans []map[string]any) []map[string
 					visited: nextVisited,
 				}
 				emitted = append(emitted, row)
-				allItems = append(allItems, item)
 				nextFrontier = append(nextFrontier, item)
 			}
 		}
 		frontier = nextFrontier
 	}
 
-	// token_parent_coverage first branch: proper ancestors along
-	// visited_span_ids of any emitted token-bearing trajectory row.
-	for _, item := range allItems {
-		if !reportsTokens(item.row) {
+	// emitted_ancestors: walk upward along parent_span_id -> span_id across all
+	// emitted rows in trajectory (up to 32 hops, cycle-guarded by path_span_ids).
+	type ancestorHop struct {
+		descendant map[string]any
+		descSpanID string
+		descStart  int64
+		ancestor   map[string]any
+		ancSpanID  string
+		ancParent  string
+		ancStart   int64
+		hop        int
+		path       []string
+	}
+	var allAncestorHops []ancestorHop
+	var ancFrontier []ancestorHop
+	reachable := make(map[string]bool)
+
+	for _, c := range emitted {
+		cParent, hasParent := colString(c, "parent_span_id")
+		if !hasParent || cParent == "" {
 			continue
 		}
-		for _, ancSpanID := range item.visited[:len(item.visited)-1] {
-			key := groupKey(item.row["trace_id"], item.row["service_name"], ancSpanID)
-			recordTokenCoverage(tokenParentCoverage, key, item.row)
+		cSpanID, _ := colString(c, "span_id")
+		cStart, _ := colInt(c, "start_time")
+		for _, p := range emitted {
+			if p["trace_id"] != c["trace_id"] || !equalNullableString(p["service_name"], c["service_name"]) {
+				continue
+			}
+			pSpanID, _ := colString(p, "span_id")
+			if pSpanID != cParent || pSpanID == cSpanID {
+				continue
+			}
+			pParent, _ := colString(p, "parent_span_id")
+			pStart, _ := colInt(p, "start_time")
+			h := ancestorHop{
+				descendant: c,
+				descSpanID: cSpanID,
+				descStart:  cStart,
+				ancestor:   p,
+				ancSpanID:  pSpanID,
+				ancParent:  pParent,
+				ancStart:   pStart,
+				hop:        1,
+				path:       []string{cSpanID, pSpanID},
+			}
+			allAncestorHops = append(allAncestorHops, h)
+			ancFrontier = append(ancFrontier, h)
+			reachable[groupKey(c["trace_id"], c["service_name"], cSpanID, pSpanID)] = true
 		}
 	}
-	// token_parent_coverage second branch: emitted trajectory parents that have
-	// a direct non-ancestor emitted child in trajectory (such as an
-	// out-of-window child emitted as an orphan root, including when the parent
-	// sits at depth = 16), ordered on (start_time, span_id) when the parent is
-	// an orphan so a broken cycle cannot suppress every node.
-	for _, pItem := range allItems {
-		pSpanID, _ := colString(pItem.row, "span_id")
-		pStart, _ := colInt(pItem.row, "start_time")
-		pOrphan, _ := pItem.row["is_orphan"].(bool)
-		for _, cItem := range allItems {
-			c := cItem.row
-			if c["trace_id"] != pItem.row["trace_id"] {
+	for len(ancFrontier) > 0 {
+		var nextAnc []ancestorHop
+		for _, ea := range ancFrontier {
+			if ea.hop >= 32 || ea.ancParent == "" {
 				continue
 			}
-			if !equalNullableString(c["service_name"], pItem.row["service_name"]) {
-				continue
-			}
-			cParent, hasParent := colString(c, "parent_span_id")
-			cSpanID, _ := colString(c, "span_id")
-			if !hasParent || cParent != pSpanID || slices.Contains(pItem.visited, cSpanID) {
-				continue
-			}
-			cStart, _ := colInt(c, "start_time")
-			if pOrphan && (cStart < pStart || (cStart == pStart && cSpanID <= pSpanID)) {
-				continue
-			}
-			if reportsTokens(c) {
-				key := groupKey(pItem.row["trace_id"], pItem.row["service_name"], pSpanID)
-				recordTokenCoverage(tokenParentCoverage, key, c)
+			for _, p := range emitted {
+				if p["trace_id"] != ea.descendant["trace_id"] || !equalNullableString(p["service_name"], ea.descendant["service_name"]) {
+					continue
+				}
+				pSpanID, _ := colString(p, "span_id")
+				if pSpanID != ea.ancParent || slices.Contains(ea.path, pSpanID) {
+					continue
+				}
+				pParent, _ := colString(p, "parent_span_id")
+				pStart, _ := colInt(p, "start_time")
+				h := ancestorHop{
+					descendant: ea.descendant,
+					descSpanID: ea.descSpanID,
+					descStart:  ea.descStart,
+					ancestor:   p,
+					ancSpanID:  pSpanID,
+					ancParent:  pParent,
+					ancStart:   pStart,
+					hop:        ea.hop + 1,
+					path:       append(slices.Clone(ea.path), pSpanID),
+				}
+				allAncestorHops = append(allAncestorHops, h)
+				nextAnc = append(nextAnc, h)
+				reachable[groupKey(ea.descendant["trace_id"], ea.descendant["service_name"], ea.descSpanID, pSpanID)] = true
 			}
 		}
+		ancFrontier = nextAnc
+	}
+
+	// token_parent_coverage: aggregate per-family descendant token coverage per
+	// ancestor, using reverse_path mutual reachability so only true cycle pairs
+	// apply the (start_time, span_id) tie-breaker.
+	for _, ea := range allAncestorHops {
+		if !reportsTokens(ea.descendant) {
+			continue
+		}
+		hasReversePath := reachable[groupKey(ea.descendant["trace_id"], ea.descendant["service_name"], ea.ancSpanID, ea.descSpanID)]
+		if hasReversePath && (ea.descStart < ea.ancStart || (ea.descStart == ea.ancStart && ea.descSpanID <= ea.ancSpanID)) {
+			continue
+		}
+		key := groupKey(ea.descendant["trace_id"], ea.descendant["service_name"], ea.ancSpanID)
+		recordTokenCoverage(tokenParentCoverage, key, ea.descendant)
 	}
 
 	// Outer SELECT: partial-overlap token family suppression, step_index,
@@ -1246,6 +1299,162 @@ func TestAgentTrajectoryViewEdgeCases(t *testing.T) {
 			t.Fatalf("time_window_broken_cycle token leaf sum = %d, want 100", sumIn)
 		}
 	})
+
+	t.Run("acyclic_earlier_child_of_orphan_parent_suppresses_parent", func(t *testing.T) {
+		// p is an orphan root at +0h (its parent "missing" is not exported), and
+		// c is an acyclic child of p whose clock was skewed to -2h (outside the
+		// [-1h, +24h] child window, so c is also emitted as an orphan root).
+		// Because there is no reverse path from p to c, c covers p even though
+		// p.is_orphan is true and c.start_time < p.start_time.
+		parent := makeSpan("t-orphan-early-child", "p", "missing", "svc", "invoke_agent", "planner", 0, 100)
+		child := makeSpan("t-orphan-early-child", "c", "p", "svc", "chat", "planner", -int64(2*time.Hour/time.Microsecond), 100)
+
+		got := genAIAgentTrajectoryView(t, []map[string]any{parent, child})
+		if len(got) != 2 {
+			t.Fatalf("acyclic_earlier_child_of_orphan_parent rows = %d, want 2", len(got))
+		}
+		requireCols(t, "orphan parent p suppressed by acyclic earlier child c", onlyRow(t, "p", got, "span_id", "p"), map[string]any{
+			"depth":         int64(0),
+			"is_orphan":     true,
+			"is_token_leaf": false,
+		})
+		requireCols(t, "earlier child c is sole token leaf", onlyRow(t, "c", got, "span_id", "c"), map[string]any{
+			"depth":         int64(0),
+			"is_orphan":     true,
+			"is_token_leaf": true,
+		})
+		var sumIn int64
+		for _, row := range got {
+			if row["is_token_leaf"] == true {
+				sumIn += intOrZero(row, "gen_ai_usage_input_tokens")
+			}
+		}
+		if sumIn != 100 {
+			t.Fatalf("acyclic_earlier_child_of_orphan_parent token leaf sum = %d, want 100", sumIn)
+		}
+	})
+
+	t.Run("orphan_rooted_depth_16_chain_with_earlier_emitted_child_suppresses_depth_16", func(t *testing.T) {
+		// 17-node orphan-rooted chain s00..s16 (s00 names "missing" as parent, so
+		// is_orphan = true is inherited by s00..s16) plus child s17 of s16 at
+		// s16.start_time - 2h (outside s16's [-1h, +24h] child window, so s17 is
+		// emitted as an orphan root at depth 0). Because there is no cycle, s17
+		// covers s16..s00 and is the sole token leaf.
+		var spans []map[string]any
+		for i := 0; i <= 16; i++ {
+			id := fmt.Sprintf("s%02d", i)
+			parent := "missing"
+			if i > 0 {
+				parent = fmt.Sprintf("s%02d", i-1)
+			}
+			spans = append(spans, makeSpan("t-orphan-deep-early-child", id, parent, "svc", "invoke_agent", id, int64(i)*1_000_000, 100))
+		}
+		s16Offset := int64(16) * 1_000_000
+		spans = append(spans, makeSpan("t-orphan-deep-early-child", "s17", "s16", "svc", "chat", "s17", s16Offset-int64(2*time.Hour/time.Microsecond), 100))
+
+		got := genAIAgentTrajectoryView(t, spans)
+		if len(got) != 18 {
+			t.Fatalf("orphan_rooted_depth_16_chain_with_earlier_emitted_child rows = %d, want 18", len(got))
+		}
+		requireCols(t, "s16 in orphan tree suppressed by earlier emitted child s17", onlyRow(t, "s16", got, "span_id", "s16"), map[string]any{
+			"depth":         int64(16),
+			"is_orphan":     true,
+			"is_token_leaf": false,
+		})
+		requireCols(t, "s17 emitted as orphan root and sole token leaf", onlyRow(t, "s17", got, "span_id", "s17"), map[string]any{
+			"depth":         int64(0),
+			"is_orphan":     true,
+			"is_token_leaf": true,
+		})
+		var sumIn int64
+		for _, row := range got {
+			if row["is_token_leaf"] == true {
+				sumIn += intOrZero(row, "gen_ai_usage_input_tokens")
+			}
+		}
+		if sumIn != 100 {
+			t.Fatalf("orphan_rooted_depth_16_chain_with_earlier_emitted_child token leaf sum = %d, want 100", sumIn)
+		}
+	})
+
+	t.Run("tokenless_intermediate_span_across_parent_to_tool_window_break_suppresses_parent", func(t *testing.T) {
+		// p (+0h, 100 tokens) -> tool (+25h, NULL tokens, outside p's +24h child
+		// window so tool is emitted as an orphan root at depth 0) -> c (+25h01m,
+		// 100 tokens, emitted at depth 1 under tool). emitted_ancestors walks
+		// c -> tool -> p across both trajectory segments so c suppresses p.
+		parent := makeSpan("t-window-break-p-tool", "p", "", "svc", "invoke_agent", "planner", 0, 100)
+		toolOffset := int64(25 * time.Hour / time.Microsecond)
+		tool := makeSpan("t-window-break-p-tool", "tool", "p", "svc", "execute_tool", "", toolOffset, 0)
+		child := makeSpan("t-window-break-p-tool", "c", "tool", "svc", "chat", "planner", toolOffset+int64(time.Minute/time.Microsecond), 100)
+
+		got := genAIAgentTrajectoryView(t, []map[string]any{parent, tool, child})
+		if len(got) != 3 {
+			t.Fatalf("tokenless_intermediate_span_across_parent_to_tool_window_break rows = %d, want 3", len(got))
+		}
+		requireCols(t, "root p suppressed across window break and tokenless tool", onlyRow(t, "p", got, "span_id", "p"), map[string]any{
+			"depth":         int64(0),
+			"is_orphan":     false,
+			"is_token_leaf": false,
+		})
+		requireCols(t, "tokenless tool orphan root", onlyRow(t, "tool", got, "span_id", "tool"), map[string]any{
+			"depth":         int64(0),
+			"is_orphan":     true,
+			"is_token_leaf": false,
+		})
+		requireCols(t, "child c is sole token leaf", onlyRow(t, "c", got, "span_id", "c"), map[string]any{
+			"depth":         int64(1),
+			"is_orphan":     true,
+			"is_token_leaf": true,
+		})
+		var sumIn int64
+		for _, row := range got {
+			if row["is_token_leaf"] == true {
+				sumIn += intOrZero(row, "gen_ai_usage_input_tokens")
+			}
+		}
+		if sumIn != 100 {
+			t.Fatalf("tokenless_intermediate_span_across_parent_to_tool_window_break token leaf sum = %d, want 100", sumIn)
+		}
+	})
+
+	t.Run("tokenless_intermediate_span_across_tool_to_child_window_break_suppresses_parent", func(t *testing.T) {
+		// p (+0h, 100 tokens) -> tool (+1m, NULL tokens, emitted at depth 1 under
+		// p) -> c (+26h, 100 tokens, outside tool's +24h child window so c is
+		// emitted as an orphan root at depth 0). emitted_ancestors walks
+		// c -> tool -> p so c suppresses p.
+		parent := makeSpan("t-window-break-tool-c", "p", "", "svc", "invoke_agent", "planner", 0, 100)
+		tool := makeSpan("t-window-break-tool-c", "tool", "p", "svc", "execute_tool", "", int64(time.Minute/time.Microsecond), 0)
+		child := makeSpan("t-window-break-tool-c", "c", "tool", "svc", "chat", "planner", int64(26*time.Hour/time.Microsecond), 100)
+
+		got := genAIAgentTrajectoryView(t, []map[string]any{parent, tool, child})
+		if len(got) != 3 {
+			t.Fatalf("tokenless_intermediate_span_across_tool_to_child_window_break rows = %d, want 3", len(got))
+		}
+		requireCols(t, "root p suppressed across tokenless tool and window break", onlyRow(t, "p", got, "span_id", "p"), map[string]any{
+			"depth":         int64(0),
+			"is_orphan":     false,
+			"is_token_leaf": false,
+		})
+		requireCols(t, "tokenless tool at depth 1", onlyRow(t, "tool", got, "span_id", "tool"), map[string]any{
+			"depth":         int64(1),
+			"is_orphan":     false,
+			"is_token_leaf": false,
+		})
+		requireCols(t, "child c orphan root is sole token leaf", onlyRow(t, "c", got, "span_id", "c"), map[string]any{
+			"depth":         int64(0),
+			"is_orphan":     true,
+			"is_token_leaf": true,
+		})
+		var sumIn int64
+		for _, row := range got {
+			if row["is_token_leaf"] == true {
+				sumIn += intOrZero(row, "gen_ai_usage_input_tokens")
+			}
+		}
+		if sumIn != 100 {
+			t.Fatalf("tokenless_intermediate_span_across_tool_to_child_window_break token leaf sum = %d, want 100", sumIn)
+		}
+	})
 }
 
 func TestTrajectoryViewModelMatchesViewSQL(t *testing.T) {
@@ -1276,8 +1485,9 @@ func TestTrajectoryViewModelMatchesViewSQL(t *testing.T) {
 			"CASE WHEN c.agent_path_name IS NOT NULL AND ( ARRAY_LENGTH(t.agent_path) = 0 OR t.agent_path[SAFE_OFFSET(ARRAY_LENGTH(t.agent_path) - 1)] != c.agent_path_name ) THEN ARRAY_CONCAT(t.agent_path, [c.agent_path_name]) ELSE t.agent_path END AS agent_path, "+
 			"t.is_orphan AS is_orphan, ARRAY_CONCAT(t.visited_span_ids, [c.span_id]) AS visited_span_ids",
 		"FROM trajectory AS t JOIN spans AS c ON c.trace_id = t.trace_id AND c.parent_span_id = t.span_id AND c.service_name IS NOT DISTINCT FROM t.service_name AND c.start_time BETWEEN TIMESTAMP_SUB(t.start_time, INTERVAL 1 HOUR) AND TIMESTAMP_ADD(t.start_time, INTERVAL 24 HOUR) WHERE t.depth < 16 AND c.span_id NOT IN UNNEST(t.visited_span_ids)",
-		// Per-family token_parent_coverage + cycle-safe emitted trajectory child fallback.
-		"token_parent_coverage AS ( SELECT trace_id, service_name, span_id, LOGICAL_OR(has_input) AS has_input, LOGICAL_OR(has_output) AS has_output, LOGICAL_OR(has_reasoning) AS has_reasoning FROM ( SELECT d.trace_id, d.service_name, anc_span_id AS span_id, d.gen_ai_usage_input_tokens IS NOT NULL AS has_input, d.gen_ai_usage_output_tokens IS NOT NULL AS has_output, d.gen_ai_usage_reasoning_tokens IS NOT NULL AS has_reasoning FROM trajectory AS d CROSS JOIN UNNEST(d.visited_span_ids) AS anc_span_id WITH OFFSET AS anc_idx WHERE anc_idx < ARRAY_LENGTH(d.visited_span_ids) - 1 AND ( d.gen_ai_usage_input_tokens IS NOT NULL OR d.gen_ai_usage_output_tokens IS NOT NULL OR d.gen_ai_usage_reasoning_tokens IS NOT NULL ) UNION ALL SELECT p.trace_id, p.service_name, p.span_id AS span_id, c.gen_ai_usage_input_tokens IS NOT NULL AS has_input, c.gen_ai_usage_output_tokens IS NOT NULL AS has_output, c.gen_ai_usage_reasoning_tokens IS NOT NULL AS has_reasoning FROM trajectory AS p JOIN trajectory AS c ON c.trace_id = p.trace_id AND c.parent_span_id = p.span_id AND c.service_name IS NOT DISTINCT FROM p.service_name WHERE c.span_id NOT IN UNNEST(p.visited_span_ids) AND ( NOT p.is_orphan OR c.start_time > p.start_time OR (c.start_time = p.start_time AND c.span_id > p.span_id) ) AND ( c.gen_ai_usage_input_tokens IS NOT NULL OR c.gen_ai_usage_output_tokens IS NOT NULL OR c.gen_ai_usage_reasoning_tokens IS NOT NULL ) ) GROUP BY trace_id, service_name, span_id )",
+		// emitted_ancestors + mutual-reachability token_parent_coverage.
+		"emitted_ancestors AS ( SELECT c.trace_id, c.service_name, c.span_id AS descendant_span_id, c.start_time AS descendant_start_time, c.gen_ai_usage_input_tokens IS NOT NULL AS has_input, c.gen_ai_usage_output_tokens IS NOT NULL AS has_output, c.gen_ai_usage_reasoning_tokens IS NOT NULL AS has_reasoning, p.span_id AS ancestor_span_id, p.parent_span_id AS ancestor_parent_span_id, p.start_time AS ancestor_start_time, 1 AS hop, [c.span_id, p.span_id] AS path_span_ids FROM trajectory AS c JOIN trajectory AS p ON p.trace_id = c.trace_id AND p.span_id = c.parent_span_id AND p.service_name IS NOT DISTINCT FROM c.service_name WHERE p.span_id != c.span_id UNION ALL SELECT ea.trace_id, ea.service_name, ea.descendant_span_id, ea.descendant_start_time, ea.has_input, ea.has_output, ea.has_reasoning, p.span_id AS ancestor_span_id, p.parent_span_id AS ancestor_parent_span_id, p.start_time AS ancestor_start_time, ea.hop + 1 AS hop, ARRAY_CONCAT(ea.path_span_ids, [p.span_id]) AS path_span_ids FROM emitted_ancestors AS ea JOIN trajectory AS p ON p.trace_id = ea.trace_id AND p.span_id = ea.ancestor_parent_span_id AND p.service_name IS NOT DISTINCT FROM ea.service_name WHERE ea.hop < 32 AND p.span_id NOT IN UNNEST(ea.path_span_ids) )",
+		"token_parent_coverage AS ( SELECT ea.trace_id, ea.service_name, ea.ancestor_span_id AS span_id, LOGICAL_OR(ea.has_input) AS has_input, LOGICAL_OR(ea.has_output) AS has_output, LOGICAL_OR(ea.has_reasoning) AS has_reasoning FROM emitted_ancestors AS ea LEFT JOIN emitted_ancestors AS reverse_path ON reverse_path.trace_id = ea.trace_id AND reverse_path.service_name IS NOT DISTINCT FROM ea.service_name AND reverse_path.descendant_span_id = ea.ancestor_span_id AND reverse_path.ancestor_span_id = ea.descendant_span_id WHERE (ea.has_input OR ea.has_output OR ea.has_reasoning) AND ( reverse_path.ancestor_span_id IS NULL OR ea.descendant_start_time > ea.ancestor_start_time OR ( ea.descendant_start_time = ea.ancestor_start_time AND ea.descendant_span_id > ea.ancestor_span_id ) ) GROUP BY ea.trace_id, ea.service_name, ea.ancestor_span_id )",
 		"IF( COALESCE(token_leaf_check.has_input, FALSE) AND ( (t.gen_ai_usage_output_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_output, FALSE)) OR (t.gen_ai_usage_reasoning_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_reasoning, FALSE)) ), CAST(NULL AS INT64), t.gen_ai_usage_input_tokens ) AS gen_ai_usage_input_tokens,",
 		"IF( COALESCE(token_leaf_check.has_output, FALSE) AND ( (t.gen_ai_usage_input_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_input, FALSE)) OR (t.gen_ai_usage_reasoning_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_reasoning, FALSE)) ), CAST(NULL AS INT64), t.gen_ai_usage_output_tokens ) AS gen_ai_usage_output_tokens,",
 		"IF( COALESCE(token_leaf_check.has_reasoning, FALSE) AND ( (t.gen_ai_usage_input_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_input, FALSE)) OR (t.gen_ai_usage_output_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_output, FALSE)) ), CAST(NULL AS INT64), t.gen_ai_usage_reasoning_tokens ) AS gen_ai_usage_reasoning_tokens,",

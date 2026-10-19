@@ -1288,20 +1288,23 @@ CREATE OR REPLACE VIEW ` + "`%[1]s.%[2]s." + GenAIAgentTrajectoryViewName + "`" 
 //
 // is_token_leaf marks spans that have at least one uncovered non-null token
 // family (input, output, or reasoning; an explicit 0 counts) after aggregating
-// per-family coverage (token_parent_coverage via LOGICAL_OR) across all
-// emitted trajectory descendants along visited_span_ids (including across
-// tokenless intermediate spans) and across non-cyclic emitted direct children
-// in trajectory (such as an out-of-window child emitted as an orphan root,
-// including when the parent sits at depth = 16). When a span is only partially
+// per-family coverage (token_parent_coverage via LOGICAL_OR over the recursive
+// emitted_ancestors CTE) across all emitted trajectory descendants up to 32
+// parent hops (including across tokenless intermediate spans and across
+// parent/child links that straddle the [-24h, +1h] recursion window, such as an
+// out-of-window child emitted as an orphan root or a child of a depth = 16
+// span). When a span is only partially
 // covered (for example, a parent reports input, output, and reasoning while its
 // child reports only input and output), is_token_leaf remains TRUE for the
 // uncovered family and the covered families on that row are projected as NULL
 // so summing gen_ai_usage_*_tokens WHERE is_token_leaf = TRUE neither
 // double-counts covered families nor drops uncovered ones; fully covered
-// rollup rows (is_token_leaf = FALSE) retain their raw token counts. When two
-// spans form a parent cycle broken by the [-24h, +1h] window, the direct-child
-// fallback excludes ancestors in p.visited_span_ids and orders cross-orphan
-// links by (start_time, span_id) so a cycle cannot suppress all token leaves.
+// rollup rows (is_token_leaf = FALSE) retain their raw token counts. When
+// spans form a parent cycle broken by the [-24h, +1h] window,
+// token_parent_coverage detects mutual reachability via a self-join on
+// emitted_ancestors (reverse_path) and breaks cycle ties on
+// (start_time, span_id) without discarding acyclic earlier children of orphan
+// trees.
 // A depth = 16 span is never suppressed by unemitted depth > 16 children so it
 // retains the leaf token totals for its truncated subtree when ancestors report
 // subtree rollups (tokens reported only on unemitted depth > 16 spans are
@@ -1499,56 +1502,74 @@ WITH RECURSIVE
     WHERE t.depth < 16
       AND c.span_id NOT IN UNNEST(t.visited_span_ids)
   ),
+  emitted_ancestors AS (
+    SELECT
+      c.trace_id,
+      c.service_name,
+      c.span_id AS descendant_span_id,
+      c.start_time AS descendant_start_time,
+      c.gen_ai_usage_input_tokens IS NOT NULL AS has_input,
+      c.gen_ai_usage_output_tokens IS NOT NULL AS has_output,
+      c.gen_ai_usage_reasoning_tokens IS NOT NULL AS has_reasoning,
+      p.span_id AS ancestor_span_id,
+      p.parent_span_id AS ancestor_parent_span_id,
+      p.start_time AS ancestor_start_time,
+      1 AS hop,
+      [c.span_id, p.span_id] AS path_span_ids
+    FROM trajectory AS c
+    JOIN trajectory AS p
+      ON p.trace_id = c.trace_id
+      AND p.span_id = c.parent_span_id
+      AND p.service_name IS NOT DISTINCT FROM c.service_name
+    WHERE p.span_id != c.span_id
+
+    UNION ALL
+
+    SELECT
+      ea.trace_id,
+      ea.service_name,
+      ea.descendant_span_id,
+      ea.descendant_start_time,
+      ea.has_input,
+      ea.has_output,
+      ea.has_reasoning,
+      p.span_id AS ancestor_span_id,
+      p.parent_span_id AS ancestor_parent_span_id,
+      p.start_time AS ancestor_start_time,
+      ea.hop + 1 AS hop,
+      ARRAY_CONCAT(ea.path_span_ids, [p.span_id]) AS path_span_ids
+    FROM emitted_ancestors AS ea
+    JOIN trajectory AS p
+      ON p.trace_id = ea.trace_id
+      AND p.span_id = ea.ancestor_parent_span_id
+      AND p.service_name IS NOT DISTINCT FROM ea.service_name
+    WHERE ea.hop < 32
+      AND p.span_id NOT IN UNNEST(ea.path_span_ids)
+  ),
   token_parent_coverage AS (
     SELECT
-      trace_id,
-      service_name,
-      span_id,
-      LOGICAL_OR(has_input) AS has_input,
-      LOGICAL_OR(has_output) AS has_output,
-      LOGICAL_OR(has_reasoning) AS has_reasoning
-    FROM (
-      SELECT
-        d.trace_id,
-        d.service_name,
-        anc_span_id AS span_id,
-        d.gen_ai_usage_input_tokens IS NOT NULL AS has_input,
-        d.gen_ai_usage_output_tokens IS NOT NULL AS has_output,
-        d.gen_ai_usage_reasoning_tokens IS NOT NULL AS has_reasoning
-      FROM trajectory AS d
-      CROSS JOIN UNNEST(d.visited_span_ids) AS anc_span_id WITH OFFSET AS anc_idx
-      WHERE anc_idx < ARRAY_LENGTH(d.visited_span_ids) - 1
-        AND (
-          d.gen_ai_usage_input_tokens IS NOT NULL
-          OR d.gen_ai_usage_output_tokens IS NOT NULL
-          OR d.gen_ai_usage_reasoning_tokens IS NOT NULL
+      ea.trace_id,
+      ea.service_name,
+      ea.ancestor_span_id AS span_id,
+      LOGICAL_OR(ea.has_input) AS has_input,
+      LOGICAL_OR(ea.has_output) AS has_output,
+      LOGICAL_OR(ea.has_reasoning) AS has_reasoning
+    FROM emitted_ancestors AS ea
+    LEFT JOIN emitted_ancestors AS reverse_path
+      ON reverse_path.trace_id = ea.trace_id
+      AND reverse_path.service_name IS NOT DISTINCT FROM ea.service_name
+      AND reverse_path.descendant_span_id = ea.ancestor_span_id
+      AND reverse_path.ancestor_span_id = ea.descendant_span_id
+    WHERE (ea.has_input OR ea.has_output OR ea.has_reasoning)
+      AND (
+        reverse_path.ancestor_span_id IS NULL
+        OR ea.descendant_start_time > ea.ancestor_start_time
+        OR (
+          ea.descendant_start_time = ea.ancestor_start_time
+          AND ea.descendant_span_id > ea.ancestor_span_id
         )
-      UNION ALL
-      SELECT
-        p.trace_id,
-        p.service_name,
-        p.span_id AS span_id,
-        c.gen_ai_usage_input_tokens IS NOT NULL AS has_input,
-        c.gen_ai_usage_output_tokens IS NOT NULL AS has_output,
-        c.gen_ai_usage_reasoning_tokens IS NOT NULL AS has_reasoning
-      FROM trajectory AS p
-      JOIN trajectory AS c
-        ON c.trace_id = p.trace_id
-        AND c.parent_span_id = p.span_id
-        AND c.service_name IS NOT DISTINCT FROM p.service_name
-      WHERE c.span_id NOT IN UNNEST(p.visited_span_ids)
-        AND (
-          NOT p.is_orphan
-          OR c.start_time > p.start_time
-          OR (c.start_time = p.start_time AND c.span_id > p.span_id)
-        )
-        AND (
-          c.gen_ai_usage_input_tokens IS NOT NULL
-          OR c.gen_ai_usage_output_tokens IS NOT NULL
-          OR c.gen_ai_usage_reasoning_tokens IS NOT NULL
-        )
-    )
-    GROUP BY trace_id, service_name, span_id
+      )
+    GROUP BY ea.trace_id, ea.service_name, ea.ancestor_span_id
   )
 SELECT
   t.start_time,
