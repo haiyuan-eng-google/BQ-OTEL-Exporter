@@ -200,11 +200,11 @@ type AutoCreateConfig struct {
 	// CompanionViews creates the companion views over the dedup views if absent
 	// and reconciles an existing view to the current definition (the query
 	// only, best effort): otel_spans_as_allspans, v_gen_ai_spans,
-	// v_gen_ai_model_costs, v_gen_ai_sessions, v_gen_ai_tool_usage, and
-	// v_gen_ai_agent_trajectory with the traces table, v_gen_ai_logs with the
-	// logs table once the traces dedup view exists, and v_gen_ai_metrics and
-	// v_gen_ai_metric_exemplars with the metrics table (the latter once the
-	// traces dedup view exists).
+	// v_gen_ai_model_costs, v_gen_ai_sessions, v_gen_ai_tool_usage,
+	// v_gen_ai_agent_trajectory, v_mcp_spans, and v_mcp_tool_usage with the
+	// traces table, v_gen_ai_logs with the logs table once the traces dedup
+	// view exists, and v_gen_ai_metrics and v_gen_ai_metric_exemplars with
+	// the metrics table (the latter once the traces dedup view exists).
 	// Requires tables.
 	CompanionViews bool `mapstructure:"companion_views"`
 	// AllowUnprunableViews creates the companion views that join spans on a

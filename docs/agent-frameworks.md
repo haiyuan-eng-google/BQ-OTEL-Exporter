@@ -349,6 +349,28 @@ view). Unlike `v_gen_ai_model_costs` and `v_gen_ai_sessions`, which check only
 direct children within an hour or UTC session date, `is_token_leaf` follows the
 emitted trajectory path.
 
+For Model Context Protocol (MCP) telemetry (OpenTelemetry MCP Semantic
+Conventions `1.40.0`, Development status), `v_mcp_spans` reads
+`otel_spans_dedup` directly (not `v_gen_ai_spans`) so non-GenAI MCP protocol
+spans such as `initialize`, `tools/list`, `resources/read`, and `prompts/get`
+are captured alongside dual-tagged `tools/call` spans. Dual-tagged spans that
+also carry GenAI attributes (for example `gen_ai.operation.name =
+'execute_tool'` or `gen_ai.provider.name`) appear in both `v_gen_ai_spans` /
+`v_gen_ai_tool_usage` and `v_mcp_spans` / `v_mcp_tool_usage`; use
+`v_mcp_spans.also_in_gen_ai_view` and
+`v_mcp_tool_usage.gen_ai_tagged_call_count` to distinguish dual-tagged calls
+from MCP-only spans without double-counting across views. `v_mcp_tool_usage`
+groups by `mcp_target_name` (`COALESCE(gen_ai_tool_name, mcp_resource_uri,
+gen_ai_prompt_name)`) alongside `gen_ai_tool_name` so `resources/read` and
+`prompts/get` spans roll up by resource URI or prompt name, and its
+`error_count` counts `status_code = 2 OR error_type IS NOT NULL` (capturing
+JSON-RPC or MCP error responses that leave `status_code` unset, whereas
+`v_gen_ai_tool_usage.error_count` counts `status_code = 2`). It aggregates at
+the per-span observation grain (`span_kind` separates `CLIENT` and `SERVER`
+spans so paired client/server traces produce separate `CLIENT` and `SERVER`
+rows, and session-only or resource-only MCP spans without `mcp.method.name`
+group under `mcp_method_name IS NULL`).
+
 ## Synthetic scenario fixtures
 
 Beyond the single-framework captures in `testdata/otlp/`, the manifest lists

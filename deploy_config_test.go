@@ -992,6 +992,7 @@ var terraformViewReplacer = strings.NewReplacer(
 	"${google_bigquery_table.otel_metrics_dedup.table_id}", "otel_metrics_dedup",
 	"${google_bigquery_table.v_gen_ai_spans.table_id}", "v_gen_ai_spans",
 	"${google_bigquery_table.v_gen_ai_metrics.table_id}", "v_gen_ai_metrics",
+	"${google_bigquery_table.v_mcp_spans.table_id}", "v_mcp_spans",
 )
 
 func normalizeCompanionViewSQL(sql string) string {
@@ -1027,6 +1028,8 @@ func TestTerraformCompanionViewsMatchExporter(t *testing.T) {
 		{schema.GenAISessionsViewName, schema.GenAISessionsViewQuery, []any{"p", "d"}},
 		{schema.GenAIToolUsageViewName, schema.GenAIToolUsageViewQuery, []any{"p", "d"}},
 		{schema.GenAIAgentTrajectoryViewName, schema.GenAIAgentTrajectoryViewQuery, []any{"p", "d"}},
+		{schema.MCPSpansViewName, schema.MCPSpansViewQuery, []any{"p", "d", "otel_spans"}},
+		{schema.MCPToolUsageViewName, schema.MCPToolUsageViewQuery, []any{"p", "d"}},
 	} {
 		t.Run(tc.resource, func(t *testing.T) {
 			block := terraformBlock(mainTF, `resource "google_bigquery_table" "`+tc.resource+`"`)

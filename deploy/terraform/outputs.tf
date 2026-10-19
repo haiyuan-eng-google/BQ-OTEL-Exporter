@@ -38,6 +38,16 @@ output "v_gen_ai_agent_trajectory_table_id" {
   value       = one(google_bigquery_table.v_gen_ai_agent_trajectory[*].id)
 }
 
+output "v_mcp_spans_table_id" {
+  description = "Fully-qualified v_mcp_spans view ID"
+  value       = google_bigquery_table.v_mcp_spans.id
+}
+
+output "v_mcp_tool_usage_table_id" {
+  description = "Fully-qualified v_mcp_tool_usage view ID"
+  value       = google_bigquery_table.v_mcp_tool_usage.id
+}
+
 output "service_account_email" {
   description = "Service account email for the collector"
   value       = google_service_account.otel_collector.email

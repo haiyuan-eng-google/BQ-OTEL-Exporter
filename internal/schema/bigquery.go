@@ -124,7 +124,8 @@ func applyGovernanceOptions(md *bq.TableMetadata, opts DestinationOptions) {
 }
 
 // SpanCompanionViewOrder lists the span companion views in dependency order so
-// v_gen_ai_spans is created before the rollup and trajectory views that query it.
+// v_gen_ai_spans and v_mcp_spans are created before the rollup and trajectory
+// views that query them.
 var SpanCompanionViewOrder = []string{
 	SpansAsAllSpansViewName,
 	GenAISpansViewName,
@@ -132,12 +133,15 @@ var SpanCompanionViewOrder = []string{
 	GenAISessionsViewName,
 	GenAIToolUsageViewName,
 	GenAIAgentTrajectoryViewName,
+	MCPSpansViewName,
+	MCPToolUsageViewName,
 }
 
 // CompanionViewsMetadata builds the optional companion views of one signal,
 // keyed by view name: otel_spans_as_allspans, v_gen_ai_spans,
-// v_gen_ai_model_costs, v_gen_ai_sessions, v_gen_ai_tool_usage, and
-// v_gen_ai_agent_trajectory for traces, and v_gen_ai_logs for logs. The views
+// v_gen_ai_model_costs, v_gen_ai_sessions, v_gen_ai_tool_usage,
+// v_gen_ai_agent_trajectory, v_mcp_spans, and v_mcp_tool_usage for traces, and
+// v_gen_ai_logs for logs. The views
 // read the dedup views, never the raw tables, and v_gen_ai_logs reads the span
 // dedup view as well as the log one, so it can only be created once the span
 // dedup view exists.
@@ -155,6 +159,8 @@ func CompanionViewsMetadata(
 			GenAISessionsViewName:        view(fmt.Sprintf(GenAISessionsViewQuery, project, dataset)),
 			GenAIToolUsageViewName:       view(fmt.Sprintf(GenAIToolUsageViewQuery, project, dataset)),
 			GenAIAgentTrajectoryViewName: view(fmt.Sprintf(GenAIAgentTrajectoryViewQuery, project, dataset)),
+			MCPSpansViewName:             view(fmt.Sprintf(MCPSpansViewQuery, project, dataset, spansTable)),
+			MCPToolUsageViewName:         view(fmt.Sprintf(MCPToolUsageViewQuery, project, dataset)),
 		}
 	}
 	return map[string]*bq.TableMetadata{

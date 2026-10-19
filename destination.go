@@ -774,7 +774,8 @@ func isRollupView(id string) bool {
 		schema.GenAISessionsViewName,
 		schema.GenAIToolUsageViewName,
 		schema.GenAIAgentTrajectoryViewName,
-		schema.GenAIMetricExemplarsViewName:
+		schema.GenAIMetricExemplarsViewName,
+		schema.MCPToolUsageViewName:
 		return true
 	default:
 		return false

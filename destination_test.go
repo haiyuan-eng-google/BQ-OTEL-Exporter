@@ -532,19 +532,25 @@ func TestPrepareDestinationCreatesSpanCompanionViews(t *testing.T) {
 		"v_gen_ai_sessions":         fmt.Sprintf(schema.GenAISessionsViewQuery, "my-project", "otel"),
 		"v_gen_ai_tool_usage":       fmt.Sprintf(schema.GenAIToolUsageViewQuery, "my-project", "otel"),
 		"v_gen_ai_agent_trajectory": fmt.Sprintf(schema.GenAIAgentTrajectoryViewQuery, "my-project", "otel"),
+		"v_mcp_spans":               fmt.Sprintf(schema.MCPSpansViewQuery, "my-project", "otel", cfg.Traces.Table),
+		"v_mcp_tool_usage":          fmt.Sprintf(schema.MCPToolUsageViewQuery, "my-project", "otel"),
 	} {
 		if md := admin.createdTables[id]; md == nil || md.ViewQuery != want {
 			t.Errorf("companion view %s = %#v, want expected view query", id, md)
 		}
 	}
-	if got := len(admin.createdTables); got != 8 {
-		t.Errorf("created %d tables and views, want the table, its dedup view and six span companion views", got)
+	if got := len(admin.createdTables); got != 10 {
+		t.Errorf("created %d tables and views, want the table, its dedup view and eight span companion views", got)
 	}
 	spansIdx := slices.Index(admin.createdTableOrder, "v_gen_ai_spans")
 	for _, rollup := range []string{"v_gen_ai_model_costs", "v_gen_ai_sessions", "v_gen_ai_tool_usage", "v_gen_ai_agent_trajectory"} {
 		if idx := slices.Index(admin.createdTableOrder, rollup); spansIdx < 0 || idx < spansIdx {
 			t.Errorf("createdTableOrder = %v, want v_gen_ai_spans before %s", admin.createdTableOrder, rollup)
 		}
+	}
+	mcpSpansIdx := slices.Index(admin.createdTableOrder, "v_mcp_spans")
+	if idx := slices.Index(admin.createdTableOrder, "v_mcp_tool_usage"); mcpSpansIdx < 0 || idx < mcpSpansIdx {
+		t.Errorf("createdTableOrder = %v, want v_mcp_spans before v_mcp_tool_usage", admin.createdTableOrder)
 	}
 	if !equalStrings(admin.tableReadIDs, []string{cfg.Traces.Table, cfg.Logs.Table + "_dedup", cfg.Metrics.Table + "_dedup"}) {
 		t.Errorf("table reads = %v, want the destination table probe, the log dedup view probe, and the metric dedup view probe", admin.tableReadIDs)
@@ -595,8 +601,8 @@ func TestPrepareDestinationCreatesLogsCompanionViewWhenTracesStartsSecond(t *tes
 	if md := admin.createdTables["v_gen_ai_logs"]; md == nil || md.ViewQuery != want {
 		t.Fatalf("v_gen_ai_logs = %#v, want traces startup to create v_gen_ai_logs when log dedup view already exists", md)
 	}
-	if got := len(admin.createdTables); got != 9 {
-		t.Errorf("created %d tables and views, want the table, its dedup view, six span companion views, and v_gen_ai_logs", got)
+	if got := len(admin.createdTables); got != 11 {
+		t.Errorf("created %d tables and views, want the table, its dedup view, eight span companion views, and v_gen_ai_logs", got)
 	}
 	if !slices.Contains(admin.tableReadIDs, cfg.Logs.Table+"_dedup") {
 		t.Errorf("table reads = %v, want a probe of the log dedup view", admin.tableReadIDs)
@@ -685,6 +691,8 @@ func TestPrepareDestinationCompanionViewCreationResults(t *testing.T) {
 				"v_gen_ai_sessions":         alreadyExists(),
 				"v_gen_ai_tool_usage":       alreadyExists(),
 				"v_gen_ai_agent_trajectory": alreadyExists(),
+				"v_mcp_spans":               alreadyExists(),
+				"v_mcp_tool_usage":          alreadyExists(),
 				"v_gen_ai_logs":             alreadyExists(),
 			},
 		},
@@ -960,6 +968,16 @@ func reconcileTargets() []reconcileTarget {
 			name: "agent trajectory companion view", table: defaultSpansTable, tableSchema: schema.SpansTableSchema(),
 			viewID: schema.GenAIAgentTrajectoryViewName,
 			query:  fmt.Sprintf(schema.GenAIAgentTrajectoryViewQuery, project, dataset),
+		},
+		{
+			name: "mcp spans companion view", table: defaultSpansTable, tableSchema: schema.SpansTableSchema(),
+			viewID: schema.MCPSpansViewName,
+			query:  fmt.Sprintf(schema.MCPSpansViewQuery, project, dataset, defaultSpansTable),
+		},
+		{
+			name: "mcp tool usage companion view", table: defaultSpansTable, tableSchema: schema.SpansTableSchema(),
+			viewID: schema.MCPToolUsageViewName,
+			query:  fmt.Sprintf(schema.MCPToolUsageViewQuery, project, dataset),
 		},
 	}
 }
@@ -1361,6 +1379,73 @@ func TestPrepareDestinationSkipsMetricExemplarsViewWhenGenAIMetricsViewPreserved
 					schema.GenAIMetricExemplarsViewName: rollupErr,
 				},
 				updateErrByID: map[string]error{schema.GenAIMetricsViewName: tc.updateErr},
+			}
+
+			err := e.prepareDestination(context.Background(), admin)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tc.wantErr)
+			}
+			skipped := logs.FilterMessage("skipping rollup view creation over preserved companion view").Len()
+			if (skipped == 1) != tc.wantSkipped || skipped > 1 {
+				t.Errorf("%d skipped-rollup warnings, want one: %v", skipped, tc.wantSkipped)
+			}
+		})
+	}
+}
+
+func TestIsRollupViewAndMCPToolUsageToleranceWhenMCPSpansPreserved(t *testing.T) {
+	if !isRollupView(schema.MCPToolUsageViewName) {
+		t.Fatal("isRollupView(v_mcp_tool_usage) = false, want true")
+	}
+	if isRollupView(schema.MCPSpansViewName) {
+		t.Fatal("isRollupView(v_mcp_spans) = true, want false")
+	}
+
+	rollupErr := status.Error(codes.InvalidArgument, "column not found in underlying v_mcp_spans view")
+	mcpSpansQuery := fmt.Sprintf(schema.MCPSpansViewQuery, "my-project", "otel", defaultSpansTable)
+	view := func(query string) fakeTableMetadataResponse {
+		return fakeTableMetadataResponse{metadata: &bq.TableMetadata{Type: bq.ViewTable, ViewQuery: query, ETag: "etag-mcp-1"}}
+	}
+	for _, tc := range []struct {
+		name        string
+		mcpView     fakeTableMetadataResponse
+		updateErr   error
+		wantErr     error
+		wantSkipped bool
+	}{
+		{
+			name:        "stale v_mcp_spans that cannot be updated preserves v_mcp_tool_usage rollup tolerance",
+			mcpView:     view("SELECT 1 AS stale_mcp_spans"),
+			updateErr:   forbidden(),
+			wantSkipped: true,
+		},
+		{
+			name:    "replaced v_mcp_spans fails startup on v_mcp_tool_usage error",
+			mcpView: view("SELECT 1 AS stale_mcp_spans"),
+			wantErr: rollupErr,
+		},
+		{
+			name:    "current v_mcp_spans fails startup on v_mcp_tool_usage error",
+			mcpView: view(mcpSpansQuery),
+			wantErr: rollupErr,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := companionViewConfig()
+			core, logs := observer.New(zap.WarnLevel)
+			e := newSignalExporter(
+				component.TelemetrySettings{Logger: zap.New(core)}, cfg, cfg.Traces.Table, schema.SpansTableSchema())
+			admin := &fakeDestinationAdmin{
+				datasetMetadata:  &bq.DatasetMetadata{},
+				tableMetadataErr: notFound(),
+				tableMetadataByID: map[string]fakeTableMetadataResponse{
+					schema.MCPSpansViewName: tc.mcpView,
+				},
+				createErrByID: map[string]error{
+					schema.MCPSpansViewName:     alreadyExists(),
+					schema.MCPToolUsageViewName: rollupErr,
+				},
+				updateErrByID: map[string]error{schema.MCPSpansViewName: tc.updateErr},
 			}
 
 			err := e.prepareDestination(context.Background(), admin)
@@ -3009,7 +3094,7 @@ func TestSignalExporterStartBoundsEachMetadataCallRatherThanWholeSequence(t *tes
 		cfg.AutoCreate.CompanionViews = true
 		cfg.AutoCreate.SearchIndexes = true
 		cfg.Quarantine.Enabled = true
-		// 18+ sequential metadata/DDL calls * 15ms > 100ms total, but each
+		// 20+ sequential metadata/DDL calls * 15ms > 100ms total, but each
 		// individual call takes 15ms < 100ms per-call timeout.
 		cfg.TimeoutSettings.Timeout = 100 * time.Millisecond
 
@@ -3017,8 +3102,10 @@ func TestSignalExporterStartBoundsEachMetadataCallRatherThanWholeSequence(t *tes
 		if err := e.start(context.Background(), nil); err != nil {
 			t.Fatalf("start() failed when cumulative cold-start duration exceeded per-call timeout: %v", err)
 		}
-		if admin.createdTables[schema.GenAIAgentTrajectoryViewName] == nil {
-			t.Fatalf("expected %s to be created during cold start", schema.GenAIAgentTrajectoryViewName)
+		for _, viewName := range []string{schema.GenAIAgentTrajectoryViewName, schema.MCPToolUsageViewName} {
+			if admin.createdTables[viewName] == nil {
+				t.Fatalf("expected %s to be created during cold start", viewName)
+			}
 		}
 		e.client = nil
 		e.quarantineClient = nil
@@ -3039,7 +3126,7 @@ func TestSignalExporterStartBoundsEachMetadataCallRatherThanWholeSequence(t *tes
 			datasetMetadataErr: notFound(),
 			tableMetadataErr:   notFound(),
 			blockCreateByID: map[string]bool{
-				schema.GenAIAgentTrajectoryViewName: true,
+				schema.MCPToolUsageViewName: true,
 			},
 		}
 		newDestinationAdmin = func(
@@ -3066,11 +3153,65 @@ func TestSignalExporterStartBoundsEachMetadataCallRatherThanWholeSequence(t *tes
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("start() error = %v, want %v", err, context.DeadlineExceeded)
 		}
-		if !strings.Contains(err.Error(), schema.GenAIAgentTrajectoryViewName) {
-			t.Fatalf("start() error = %q, want it to name %s", err, schema.GenAIAgentTrajectoryViewName)
+		if !strings.Contains(err.Error(), schema.MCPToolUsageViewName) {
+			t.Fatalf("start() error = %q, want it to name %s", err, schema.MCPToolUsageViewName)
 		}
 		if elapsed := time.Since(started); elapsed > time.Second {
 			t.Fatalf("blocking late view creation returned after %v, want < 1s", elapsed)
+		}
+	})
+
+	t.Run("canceling Start ctx cancels an in-flight blocked metadata call", func(t *testing.T) {
+		originalAdmin := newDestinationAdmin
+		originalWriter := newManagedWriterClient
+		t.Cleanup(func() {
+			newDestinationAdmin = originalAdmin
+			newManagedWriterClient = originalWriter
+		})
+
+		admin := &fakeDestinationAdmin{
+			datasetMetadataErr: notFound(),
+			tableMetadataErr:   notFound(),
+			blockCreateByID: map[string]bool{
+				schema.MCPToolUsageViewName: true,
+			},
+		}
+		newDestinationAdmin = func(
+			context.Context, string, string, ...option.ClientOption,
+		) (destinationAdmin, error) {
+			return admin, nil
+		}
+		newManagedWriterClient = func(
+			context.Context, string, ...option.ClientOption,
+		) (*managedwriter.Client, error) {
+			t.Fatal("writer construction must not run after Start ctx is canceled")
+			return nil, nil
+		}
+
+		cfg := companionViewConfig()
+		cfg.AutoCreate.Dataset = true
+		cfg.AutoCreate.Tables = true
+		cfg.AutoCreate.CompanionViews = true
+		cfg.TimeoutSettings.Timeout = 5 * time.Second
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() {
+			time.Sleep(25 * time.Millisecond)
+			cancel()
+		}()
+
+		e := newSignalExporter(componentTelemetryForTest(), cfg, cfg.Traces.Table, schema.SpansTableSchema())
+		started := time.Now()
+		err := e.start(ctx, nil)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("start() error = %v, want %v", err, context.Canceled)
+		}
+		if !strings.Contains(err.Error(), schema.MCPToolUsageViewName) {
+			t.Fatalf("start() error = %q, want it to name %s", err, schema.MCPToolUsageViewName)
+		}
+		if elapsed := time.Since(started); elapsed > time.Second {
+			t.Fatalf("canceled Start ctx returned after %v, want < 1s", elapsed)
 		}
 	})
 }
