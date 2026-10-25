@@ -35,7 +35,6 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
-	tracenoop "go.opentelemetry.io/otel/trace/noop"
 	"go.uber.org/zap"
 )
 
@@ -358,7 +357,7 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 		if err != nil {
 			return SignalResult{}, fmt.Errorf("starting bqfake server: %w", err)
 		}
-		defer fakeSrv.Close()
+		defer func() { _ = fakeSrv.Close() }()
 	}
 
 	reader := sdkmetric.NewManualReader()
@@ -422,13 +421,12 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 		return SignalResult{}, fmt.Errorf("validating exporter config: %w", err)
 	}
 
+	telSet := componenttest.NewNopTelemetrySettings()
+	telSet.Logger = zap.NewNop()
+	telSet.MeterProvider = mp
 	set := exporter.Settings{
-		ID: component.NewID(component.MustNewType("bigquery")),
-		TelemetrySettings: component.TelemetrySettings{
-			Logger:         zap.NewNop(),
-			TracerProvider: tracenoop.NewTracerProvider(),
-			MeterProvider:  mp,
-		},
+		ID:                component.NewID(component.MustNewType("bigquery")),
+		TelemetrySettings: telSet,
 	}
 
 	var (
