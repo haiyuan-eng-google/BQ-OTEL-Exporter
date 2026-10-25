@@ -12,6 +12,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"time"
 
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
@@ -958,6 +959,19 @@ func (e *signalExporter) quarantineContext(ctx context.Context) (context.Context
 	return context.WithTimeout(context.WithoutCancel(ctx), timeout)
 }
 
+// quarantineBudgetSpent reports whether the quarantine budget ctx is spent:
+// canceled, or past its deadline even though its timer has not fired yet, which
+// on a loaded machine can lag the deadline by milliseconds. The row builders
+// stop on the same test, so the rows they built as the budget ran out are
+// dropped here rather than appended.
+func quarantineBudgetSpent(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+	dl, ok := ctx.Deadline()
+	return ok && time.Until(dl) <= 0
+}
+
 func quarantineRowReason(row transform.Row) string {
 	code, _ := row["error_code"].(string)
 	switch code {
@@ -1053,7 +1067,7 @@ func (e *signalExporter) quarantineRows(ctx context.Context, rows []transform.Ro
 	if len(rows) == 0 {
 		return
 	}
-	if err := ctx.Err(); err != nil {
+	if quarantineBudgetSpent(ctx) {
 		e.quarantineRowsDropped(ctx, rows, opID)
 		return
 	}
@@ -1062,7 +1076,7 @@ func (e *signalExporter) quarantineRows(ctx context.Context, rows []transform.Ro
 	encodedReasons := make([]string, 0, len(rows))
 	var encodedRows []transform.Row
 	for i, row := range rows {
-		if err := ctx.Err(); err != nil {
+		if quarantineBudgetSpent(ctx) {
 			e.quarantineRowsDropped(ctx, append(encodedRows, rows[i:]...), opID)
 			return
 		}
@@ -1087,7 +1101,7 @@ func (e *signalExporter) quarantineRows(ctx context.Context, rows []transform.Ro
 	if len(encoded) == 0 {
 		return
 	}
-	if err := ctx.Err(); err != nil {
+	if quarantineBudgetSpent(ctx) {
 		e.quarantineRowsDropped(ctx, encodedRows, opID)
 		return
 	}

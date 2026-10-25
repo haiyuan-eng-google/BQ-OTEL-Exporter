@@ -2,6 +2,8 @@ module github.com/haiyuan-eng-google/BQ-OTEL-Exporter
 
 go 1.26.5
 
+toolchain go1.27.3
+
 require (
 	cloud.google.com/go/bigquery v1.85.0
 	github.com/googleapis/gax-go/v2 v2.27.0

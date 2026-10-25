@@ -2597,6 +2597,48 @@ func TestQuarantineBudgetExpiryCountsEveryUnwrittenRow(t *testing.T) {
 	}
 }
 
+// lateTimerContext has passed its deadline but still reports no error, as a
+// timeout context does on a loaded machine until the runtime runs its timer.
+type lateTimerContext struct {
+	context.Context
+	deadline time.Time
+}
+
+func (c lateTimerContext) Deadline() (time.Time, bool) { return c.deadline, true }
+
+// The quarantine budget is spent once its deadline passes, before the context's
+// timer fires. The row builders stop there, so the rows they built as the
+// budget ran out are counted in quarantine_failed_rows and never appended.
+// Appending them made TestPushMetricsQuarantineStopsOnceBudgetIsExhausted flaky.
+func TestQuarantineRowsPastTheDeadlineAreNotAppended(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+	e, err := newTracesExporter(component.TelemetrySettings{Logger: zap.NewNop(), MeterProvider: mp}, validConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, stream := withQuarantine(t, e.signalExporter, bqi.AppendOutcome{AcknowledgedRows: 1})
+
+	ctx := lateTimerContext{Context: context.Background(), deadline: time.Now().Add(-time.Millisecond)}
+	e.quarantineRows(ctx, []transform.Row{{
+		"ingest_time":    time.Now().UnixMicro(),
+		"signal":         schema.SignalSpans,
+		"error_code":     "MISSING_END_TIME",
+		"error_message":  "span has no end time",
+		"schema_version": schema.Version,
+	}}, "op")
+
+	if stream.appended != 0 {
+		t.Errorf("quarantine appends = %d, want 0 past the deadline", stream.appended)
+	}
+	quarantined := metricInt64SumOrZero(t, reader, "otelcol_exporter_bigquery_quarantined_rows")
+	failed := metricInt64SumOrZero(t, reader, "otelcol_exporter_bigquery_quarantine_failed_rows")
+	if quarantined != 0 || failed != 1 {
+		t.Errorf("quarantined_rows = %d, quarantine_failed_rows = %d, want 0 and 1", quarantined, failed)
+	}
+}
+
 func TestPushMetricsPreservesRetryIdentityWhenEarlierOrdinalPeerDroppedByEncodeRows(t *testing.T) {
 	// Construct 3 otherwise identical delta-sum points whose metric descriptions differ.
 	// Point 0 has a long description that makes its proto-encoded row exceed max_row_bytes.

@@ -272,6 +272,13 @@ func TestReleaseBuildUsesPinnedPatchedGoAndStampedVersion(t *testing.T) {
 			}
 		}
 	}
+	// The toolchain line in go.mod names that release too, so local builds and
+	// the workflows that set up Go from go-version-file: go.mod use it. The go
+	// line stays the minimum for modules that require this one, which ignore
+	// the toolchain line.
+	if toolchain := firstCapture(`(?m)^toolchain go(\S+)$`, readRepoText(t, "go.mod")); want == nil || toolchain != want[1] {
+		t.Errorf("go.mod toolchain = %q, example/Dockerfile builder = %v, want the same patched release", toolchain, want)
+	}
 	if strings.Contains(string(wf), "/usr/local/bin") {
 		t.Error("release.yml must not install tools into the root-owned /usr/local/bin")
 	}
