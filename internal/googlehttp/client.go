@@ -26,8 +26,14 @@ import (
 	"cloud.google.com/go/auth/credentials"
 	"cloud.google.com/go/auth/httptransport"
 	"google.golang.org/api/option"
+	"google.golang.org/api/option/internaloption"
 	htransport "google.golang.org/api/transport/http"
 )
+
+// Keep the external constructors replaceable so lifecycle tests can exercise
+// failures after a constructor has used the owned transports.
+var newAPITransport = htransport.NewTransport
+var newAPIClient = htransport.NewClient
 
 func newBase() (*http.Transport, error) {
 	base, ok := http.DefaultTransport.(*http.Transport)
@@ -253,21 +259,19 @@ func NewClient(ctx context.Context, scopes []string, opts ...option.ClientOption
 		return nil, "", nil, err
 	}
 	allOpts := append([]option.ClientOption{option.WithScopes(scopes...)}, opts...)
-	rt, err := htransport.NewTransport(ctx, base, allOpts...)
+	rt, err := newAPITransport(ctx, base, allOpts...)
 	if err != nil {
 		cleanup()
 		return nil, "", nil, err
 	}
 	client := &http.Client{Transport: rt}
-	// Resolve the endpoint without allocating another API transport. Other
-	// options already apply to rt and can conflict with WithHTTPClient.
-	endpointOpts := []option.ClientOption{option.WithHTTPClient(client)}
-	for _, opt := range opts {
-		if typ := reflect.TypeOf(opt); typ != nil && (typ.Name() == "withEndpoint" || typ.Name() == "withUniverseDomain") {
-			endpointOpts = append(endpointOpts, opt)
-		}
-	}
-	_, endpoint, err := htransport.NewClient(ctx, endpointOpts...)
+	// Resolve the endpoint using the complete, already-validated options. Only
+	// the HTTP client is replaced. Skip the second validation because adding that
+	// client conflicts with options (such as certificate sources or quota project)
+	// that already applied to rt; endpoint resolution does not allocate a pool.
+	endpointOpts := append([]option.ClientOption{}, allOpts...)
+	endpointOpts = append(endpointOpts, option.WithHTTPClient(client), internaloption.SkipDialSettingsValidation())
+	_, endpoint, err := newAPIClient(ctx, endpointOpts...)
 	if err != nil {
 		cleanup()
 		return nil, "", nil, err
