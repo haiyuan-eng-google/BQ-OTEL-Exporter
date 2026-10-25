@@ -4,6 +4,7 @@
 package bigqueryexporter
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -27,11 +28,15 @@ import (
 )
 
 type impersonationLoopbackTransport struct {
-	base     http.RoundTripper
-	endpoint *url.URL
+	base         http.RoundTripper
+	endpoint     *url.URL
+	checkRequest func(*http.Request)
 }
 
 func (r impersonationLoopbackTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if r.checkRequest != nil {
+		r.checkRequest(req)
+	}
 	copyReq := req.Clone(req.Context())
 	endpoint := *req.URL
 	endpoint.Scheme, endpoint.Host = r.endpoint.Scheme, r.endpoint.Host
@@ -39,8 +44,12 @@ func (r impersonationLoopbackTransport) RoundTrip(req *http.Request) (*http.Resp
 	return r.base.RoundTrip(copyReq)
 }
 
-func impersonationTestCredentials(t *testing.T, handler http.Handler) (*signalExporter, *auth.Credentials, *atomic.Int64) {
+func impersonationTestCredentials(t *testing.T, handler http.Handler, universe ...string) (*signalExporter, *auth.Credentials, *atomic.Int64) {
 	t.Helper()
+	domain := ""
+	if len(universe) != 0 {
+		domain = universe[0]
+	}
 	var sourceRequests atomic.Int64
 	sourceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		sourceRequests.Add(1)
@@ -50,11 +59,17 @@ func impersonationTestCredentials(t *testing.T, handler http.Handler) (*signalEx
 	t.Cleanup(sourceServer.Close)
 	subject := filepath.Join(t.TempDir(), "subject-token")
 	writePrivateFile(t, subject, []byte("subject"))
-	data := fmt.Sprintf(`{"type":"external_account","audience":"test-audience","subject_token_type":"urn:ietf:params:oauth:token-type:jwt","token_url":%q,"credential_source":{"file":%q}}`, sourceServer.URL, subject)
+	data := fmt.Sprintf(`{"type":"external_account","audience":"test-audience","subject_token_type":"urn:ietf:params:oauth:token-type:jwt","token_url":%q,"credential_source":{"file":%q},"universe_domain":%q}`, sourceServer.URL, subject, domain)
 	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", writeCredentialsFile(t, data))
 	t.Setenv("GOOGLE_API_USE_CLIENT_CERTIFICATE", "false")
+	t.Setenv("GOOGLE_CLOUD_UNIVERSE_DOMAIN", "")
+	t.Setenv("GOOGLE_API_USE_MTLS_ENDPOINT", "auto")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.Copy(io.Discard, r.Body)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
 		if r.Header.Get("Authorization") != "Bearer source-token" {
 			t.Errorf("impersonation Authorization=%q", r.Header.Get("Authorization"))
 		}
@@ -62,6 +77,7 @@ func impersonationTestCredentials(t *testing.T, handler http.Handler) (*signalEx
 			t.Errorf("impersonation path=%q", r.URL.Path)
 		}
 		handler.ServeHTTP(w, r)
+		_, _ = io.Copy(io.Discard, r.Body)
 	}))
 	t.Cleanup(server.Close)
 	endpoint, err := url.Parse(server.URL)
@@ -73,12 +89,17 @@ func impersonationTestCredentials(t *testing.T, handler http.Handler) (*signalEx
 	newBigQueryHTTPClient = func(ctx context.Context, opts ...option.ClientOption) (*http.Client, *http.Transport, error) {
 		client, base, err := original(ctx, opts...)
 		if err == nil {
-			client.Transport = impersonationLoopbackTransport{base: client.Transport, endpoint: endpoint}
+			client.Transport = impersonationLoopbackTransport{base: client.Transport, endpoint: endpoint, checkRequest: func(r *http.Request) {
+				if domain != "" && r.URL.Host != "iamcredentials."+domain {
+					t.Errorf("impersonation host=%q, want %q", r.URL.Host, "iamcredentials."+domain)
+				}
+			}}
 		}
 		return client, base, err
 	}
 	cfg := validConfig()
 	cfg.Credentials.ImpersonateServiceAccount = "target@example.com"
+	cfg.Credentials.UniverseDomain = domain
 	e := newTestSignalExporter(cfg, "traces", schema.SpansTableSchema())
 	lifetime, cancel := context.WithCancel(context.Background())
 	e.lifetimeCancel = cancel

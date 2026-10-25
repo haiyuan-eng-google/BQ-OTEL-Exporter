@@ -290,7 +290,11 @@ func (e *signalExporter) authenticationOptions(
 				return nil, err
 			}
 			e.authCleanup = append(e.authCleanup, closeAuth)
-			client, base, err := newBigQueryHTTPClient(ctx, option.WithAuthCredentials(creds))
+			sourceOpts := []option.ClientOption{option.WithAuthCredentials(creds)}
+			if e.cfg.Credentials.UniverseDomain != "" {
+				sourceOpts = append(sourceOpts, option.WithUniverseDomain(e.cfg.Credentials.UniverseDomain))
+			}
+			client, base, err := newBigQueryHTTPClient(ctx, sourceOpts...)
 			if err != nil {
 				return nil, err
 			}
