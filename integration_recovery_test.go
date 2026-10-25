@@ -28,6 +28,8 @@ import (
 	bigqueryapi "google.golang.org/api/bigquery/v2"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
+
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/googlehttp"
 )
 
 // TestRecoveryAfterAttemptTimeoutsLiveBigQuery is the live half of issue #3.
@@ -253,20 +255,20 @@ func recoveryLogs(runID uint64, seq *atomic.Uint64, n int) plog.Logs {
 
 func newLiveBigQueryAdmin(ctx context.Context, t *testing.T, project, dataset string) *bq.Client {
 	t.Helper()
-	httpClient, httpBase, err := newBigQueryHTTPClient(ctx, option.WithScopes(bigqueryapi.BigqueryScope))
+	httpClient, _, closeHTTP, err := googlehttp.NewClient(ctx, []string{bigqueryapi.BigqueryScope})
 	if err != nil {
 		t.Fatalf("create cleanup/query HTTP client: %v", err)
 	}
 	admin, err := bq.NewClient(ctx, project, option.WithHTTPClient(httpClient))
 	if err != nil {
-		httpBase.CloseIdleConnections()
+		closeHTTP()
 		t.Fatalf("create cleanup/query client: %v", err)
 	}
 	t.Cleanup(func() {
 		if err := admin.Close(); err != nil {
 			t.Errorf("close cleanup/query client: %v", err)
 		}
-		httpBase.CloseIdleConnections()
+		closeHTTP()
 	})
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)

@@ -18,8 +18,10 @@ jobs:
 
       - name: Validate Live BigQuery configuration
         id: check-config
+        env:
+          BQ_PROJECT: ${{ vars.BQ_PROJECT }}
         run: |
-          if [ -z "${{ vars.BQ_PROJECT }}" ]; then
+          if [ -z "$BQ_PROJECT" ]; then
             echo "::warning::vars.BQ_PROJECT is not configured in repository variables. Live BigQuery integration tests require BQ_PROJECT and GCP authentication. Skipping live test suite."
             echo "configured=false" >> "$GITHUB_OUTPUT"
           else

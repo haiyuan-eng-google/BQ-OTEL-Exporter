@@ -28,8 +28,8 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"google.golang.org/api/option"
-	htransport "google.golang.org/api/transport/http"
 
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/googlehttp"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
 )
@@ -121,16 +121,13 @@ type BlobStore interface {
 type GCSBlobStore struct {
 	client  *http.Client
 	baseURL string
+	cleanup func()
 }
 
 // NewGCSBlobStore creates a GCSBlobStore configured with the provided client
 // options.
 func NewGCSBlobStore(ctx context.Context, opts ...option.ClientOption) (*GCSBlobStore, error) {
-	allOpts := make([]option.ClientOption, 0, len(opts)+1)
-	allOpts = append(allOpts, option.WithScopes(gcsReadWriteScope))
-	allOpts = append(allOpts, opts...)
-
-	client, endpoint, err := htransport.NewClient(ctx, allOpts...)
+	client, endpoint, cleanup, err := googlehttp.NewClient(ctx, []string{gcsReadWriteScope}, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("creating GCS HTTP client: %w", err)
 	}
@@ -143,6 +140,7 @@ func NewGCSBlobStore(ctx context.Context, opts ...option.ClientOption) (*GCSBlob
 	return &GCSBlobStore{
 		client:  client,
 		baseURL: base,
+		cleanup: cleanup,
 	}, nil
 }
 
@@ -249,8 +247,8 @@ func (s *GCSBlobStore) fetchExistingGeneration(
 
 // Close releases idle HTTP connections held by the underlying HTTP client.
 func (s *GCSBlobStore) Close() error {
-	if s != nil && s.client != nil {
-		s.client.CloseIdleConnections()
+	if s != nil && s.cleanup != nil {
+		s.cleanup()
 	}
 	return nil
 }

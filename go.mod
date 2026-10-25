@@ -5,6 +5,7 @@ go 1.26.5
 toolchain go1.27.3
 
 require (
+	cloud.google.com/go/auth v0.24.1-0.20261001053825-dbc26066f70a
 	cloud.google.com/go/bigquery v1.85.0
 	github.com/googleapis/gax-go/v2 v2.27.0
 	go.opentelemetry.io/collector/component v1.69.0
@@ -35,7 +36,6 @@ require (
 
 require (
 	cloud.google.com/go v0.123.0 // indirect
-	cloud.google.com/go/auth v0.24.1-0.20261001053825-dbc26066f70a // indirect
 	cloud.google.com/go/auth/oauth2adapt v0.3.0 // indirect
 	cloud.google.com/go/compute/metadata v0.10.0 // indirect
 	cloud.google.com/go/iam v1.14.0 // indirect

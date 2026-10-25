@@ -27,8 +27,8 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"google.golang.org/api/option"
-	htransport "google.golang.org/api/transport/http"
 
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/googlehttp"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 )
 
@@ -604,11 +604,7 @@ func (s *MemorySink) ExportMetrics(_ context.Context, md pmetric.Metrics) error 
 // NewGCSObjectFetcher returns an ObjectFetcher that downloads `gs://bucket/object`
 // URIs over the Google Cloud Storage JSON media API, plus a cleanup function.
 func NewGCSObjectFetcher(ctx context.Context, opts ...option.ClientOption) (ObjectFetcher, func(), error) {
-	allOpts := make([]option.ClientOption, 0, len(opts)+1)
-	allOpts = append(allOpts, option.WithScopes(gcsReadOnlyScope))
-	allOpts = append(allOpts, opts...)
-
-	client, endpoint, err := htransport.NewClient(ctx, allOpts...)
+	client, endpoint, cleanup, err := googlehttp.NewClient(ctx, []string{gcsReadOnlyScope}, opts...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("creating GCS HTTP client: %w", err)
 	}
@@ -646,9 +642,6 @@ func NewGCSObjectFetcher(ctx context.Context, opts ...option.ClientOption) (Obje
 			return nil, fmt.Errorf("GCS download %q returned HTTP %d", uri, resp.StatusCode)
 		}
 		return io.ReadAll(resp.Body)
-	}
-	cleanup := func() {
-		client.CloseIdleConnections()
 	}
 	return fetcher, cleanup, nil
 }

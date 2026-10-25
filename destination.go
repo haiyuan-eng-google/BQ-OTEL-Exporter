@@ -84,6 +84,7 @@ func (a *bigQueryDestinationAdmin) RunDDL(ctx context.Context, sql string) error
 
 func (a *bigQueryDestinationAdmin) Close() error {
 	err := a.client.Close()
+	// The API client's auth middleware does not forward pool cleanup.
 	a.httpBase.CloseIdleConnections()
 	return err
 }
