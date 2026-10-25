@@ -275,11 +275,11 @@ func TestGeneratorAllSevenFrameworksAndMCP(t *testing.T) {
 	if len(seenFrameworks) != 7 {
 		t.Fatalf("seenFrameworks = %d (%v), want all 7 frameworks", len(seenFrameworks), seenFrameworks)
 	}
-	if seenOps["invoke_agent"] == 0 || seenOps["chat"] == 0 || seenOps["execute_tool"] == 0 {
-		t.Fatalf("missing expected gen_ai.operation.name values: %v", seenOps)
+	if seenOps["invoke_agent"] != 6 || seenOps["chat"] != 6 || seenOps["execute_tool"] != 12 {
+		t.Fatalf("unexpected gen_ai.operation.name counts across 6 GenAI frameworks: %v, want invoke_agent=6, chat=6, execute_tool=12", seenOps)
 	}
-	if seenOpenInferenceKinds["AGENT"] != 1 || seenOpenInferenceKinds["LLM"] != 1 || seenOpenInferenceKinds["TOOL"] != 1 {
-		t.Fatalf("unexpected CrewAI OpenInference span kinds: %v", seenOpenInferenceKinds)
+	if seenOpenInferenceKinds["AGENT"] != 1 || seenOpenInferenceKinds["LLM"] != 1 || seenOpenInferenceKinds["TOOL"] != 2 {
+		t.Fatalf("unexpected CrewAI OpenInference span kinds: %v, want AGENT=1, LLM=1, TOOL=2", seenOpenInferenceKinds)
 	}
 	for _, wantMethod := range []string{"tools/call", "resources/read", "prompts/get"} {
 		if !seenMCP[wantMethod] {
@@ -422,6 +422,138 @@ func TestGeneratorAllSevenFrameworksAndMCP(t *testing.T) {
 		}
 	}
 
+	// Evaluate transformed SpanRows, LogRows, and MetricRows against the exact SQL
+	// view filter predicates and parent-child trajectory invariants from
+	// internal/schema/schema.go (v_gen_ai_spans, v_gen_ai_agent_trajectory,
+	// v_mcp_spans, v_gen_ai_logs, v_gen_ai_metrics, v_gen_ai_metric_exemplars).
+	parseAttrs := func(raw any) map[string]any {
+		s, _ := raw.(string)
+		if s == "" {
+			return nil
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(s), &m); err != nil {
+			t.Fatalf("invalid attributes JSON %q: %v", s, err)
+		}
+		return m
+	}
+	hasNonEmptyAttr := func(attrs map[string]any, keys ...string) bool {
+		for _, k := range keys {
+			if v, ok := attrs[k]; ok && v != nil && v != "" {
+				return true
+			}
+		}
+		return false
+	}
+	matchesGenAISpansView := func(attrs map[string]any) bool {
+		return hasNonEmptyAttr(attrs,
+			"gen_ai.operation.name",
+			"gen_ai.system",
+			"gen_ai.provider.name",
+			"gcp.vertex.agent.invocation_id",
+			"gen_ai.main_agent.name",
+			"gen_ai.main_agent.id",
+		)
+	}
+	matchesMCPSpansView := func(attrs map[string]any) bool {
+		return hasNonEmptyAttr(attrs,
+			"mcp.method.name",
+			"mcp.session.id",
+			"mcp.resource.uri",
+		)
+	}
+
+	genAISpanSet := make(map[string]bool)
+	var (
+		genAISpanCount       int
+		crewAIGenAISpanCount int
+		mcpSpanCount         int
+		mcpAlsoInGenAICount  int
+		mcpCrewAIOnlyCount   int
+	)
+	for _, sr := range spanRows {
+		attrs := parseAttrs(sr["attributes"])
+		svc, _ := sr["service_name"].(string)
+		traceID, _ := sr["trace_id"].(string)
+		spanID, _ := sr["span_id"].(string)
+		inGenAI := matchesGenAISpansView(attrs)
+		if inGenAI {
+			genAISpanCount++
+			genAISpanSet[traceID+"/"+spanID+"/"+svc] = true
+			if svc == "crewai-analyst-crew" {
+				crewAIGenAISpanCount++
+			}
+		}
+		if matchesMCPSpansView(attrs) {
+			mcpSpanCount++
+			if inGenAI {
+				mcpAlsoInGenAICount++
+			} else if svc == "crewai-analyst-crew" {
+				mcpCrewAIOnlyCount++
+			}
+		}
+	}
+	if genAISpanCount != 24 || crewAIGenAISpanCount != 0 {
+		t.Fatalf("v_gen_ai_spans matched %d/28 spans (crewai=%d), want 24/28 (crewai=0)", genAISpanCount, crewAIGenAISpanCount)
+	}
+	if mcpSpanCount != 7 || mcpAlsoInGenAICount != 6 || mcpCrewAIOnlyCount != 1 {
+		t.Fatalf("v_mcp_spans matched %d/28 spans (also_in_gen_ai_view=%d, crewai_only=%d), want 7 (6 and 1)",
+			mcpSpanCount, mcpAlsoInGenAICount, mcpCrewAIOnlyCount)
+	}
+
+	// Verify v_gen_ai_agent_trajectory parent-child linkage: every non-root span
+	// in v_gen_ai_spans must have its (trace_id, parent_span_id, service_name)
+	// present in v_gen_ai_spans so is_orphan is FALSE for all 24 GenAI spans.
+	var (
+		trajectoryRoots    int
+		trajectoryChildren int
+		trajectoryOrphans  int
+	)
+	for _, sr := range spanRows {
+		attrs := parseAttrs(sr["attributes"])
+		if !matchesGenAISpansView(attrs) {
+			continue
+		}
+		svc, _ := sr["service_name"].(string)
+		traceID, _ := sr["trace_id"].(string)
+		parentSpanID, _ := sr["parent_span_id"].(string)
+		if parentSpanID == "" {
+			trajectoryRoots++
+			continue
+		}
+		if genAISpanSet[traceID+"/"+parentSpanID+"/"+svc] {
+			trajectoryChildren++
+		} else {
+			trajectoryOrphans++
+		}
+	}
+	if trajectoryRoots != 6 || trajectoryChildren != 18 || trajectoryOrphans != 0 {
+		t.Fatalf("v_gen_ai_agent_trajectory roots=%d, children=%d, orphans=%d, want 6, 18, 0",
+			trajectoryRoots, trajectoryChildren, trajectoryOrphans)
+	}
+
+	// Verify v_gen_ai_logs and v_gen_ai_metrics view predicates across all 28 rows.
+	for i, lr := range logRows {
+		attrs := parseAttrs(lr["attributes"])
+		evName, _ := lr["event_name"].(string)
+		if evName == "" {
+			if v, ok := attrs["event.name"].(string); ok {
+				evName = v
+			}
+		}
+		inGenAILogs := strings.HasPrefix(evName, "gen_ai.") ||
+			hasNonEmptyAttr(attrs, "gen_ai.system", "gen_ai.provider.name", "gcp.vertex.agent.invocation_id")
+		if !inGenAILogs {
+			t.Fatalf("logRow[%d] did not satisfy v_gen_ai_logs WHERE predicate: event_name=%q attrs=%v", i, evName, attrs)
+		}
+	}
+	for i, mr := range metricRows {
+		mName, _ := mr["metric_name"].(string)
+		if !strings.HasPrefix(mName, "gen_ai.") {
+			t.Fatalf("metricRow[%d] metric_name = %q, want prefix 'gen_ai.' for v_gen_ai_metrics", i, mName)
+		}
+	}
+
 	// Verify payloadFor produces valid JSON across all UniquePayloads x PlantSecrets
 	// combinations at 1024 B and across every small PayloadBytes value in 1..128
 	// (covering compact JSON fallbacks and exact prefix+suffix boundary sizes).
@@ -498,7 +630,7 @@ func TestGeneratorAllSevenFrameworksAndMCP(t *testing.T) {
 }
 
 func TestRunBQFakeAllSignalsAndRedaction(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
 	cfg := RunnerConfig{
@@ -564,7 +696,7 @@ func TestRunBQFakeAllSignalsAndRedaction(t *testing.T) {
 }
 
 func TestRunBQFakeBackpressureAndLocalOffload(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
 	offloadDir := t.TempDir()
@@ -654,7 +786,7 @@ func TestRunBQFakeBackpressureAndLocalOffload(t *testing.T) {
 }
 
 func TestRunPerBatchCallTimeoutDoesNotExitWorker(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancel()
 
 	// 1. Default AllowPartialFailures=false: when per-batch CallTimeout < SimulateAckDelay,
@@ -709,7 +841,7 @@ func TestRunPerBatchCallTimeoutDoesNotExitWorker(t *testing.T) {
 }
 
 func TestRunUniquePayloadsAndZeroAckErrors(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
 	// 1. UniquePayloads=true generates fresh batches beyond 8 batches with 0 dedup hits.
@@ -780,7 +912,7 @@ func TestRunUniquePayloadsAndZeroAckErrors(t *testing.T) {
 }
 
 func TestRunStreamPoolSweepAndValidation(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
 	cfg := RunnerConfig{
@@ -862,7 +994,7 @@ func TestRunStreamPoolSweepAndValidation(t *testing.T) {
 }
 
 func TestDeleteDatasetWithContentsAndDatasetExistsHTTP(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 
 	var (
@@ -1064,7 +1196,7 @@ func TestDeleteDatasetWithContentsAndDatasetExistsHTTP(t *testing.T) {
 }
 
 func TestRunPartialFailureEmptyWindowInvalidOffloadAndPanicRecovery(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
 	// 1. Empty measurement window (Duration=1ns -> 0 samples / 0 acked rows) must fail.
@@ -1190,5 +1322,56 @@ func TestRunPartialFailureEmptyWindowInvalidOffloadAndPanicRecovery(t *testing.T
 	if throttleRep.Results[0].AttemptedBytesPerAckedRow <= throttleRep.Results[0].BytesPerRow {
 		t.Fatalf("throttled AttemptedBytesPerAckedRow (%.2f) must exceed single-append BytesPerRow (%.2f)",
 			throttleRep.Results[0].AttemptedBytesPerAckedRow, throttleRep.Results[0].BytesPerRow)
+	}
+
+	// 7. Pre-append offload failures under AllowPartialFailures=true must not
+	// dilute BytesPerRow (since ConsumeTraces was not dispatched for those batches).
+	cleanOffloadDir := t.TempDir()
+	cleanOffloadRep, err := Run(ctx, RunnerConfig{
+		Mode:                  ModeBQFake,
+		Signals:               []string{"traces"},
+		Duration:              120 * time.Millisecond,
+		BatchSize:             28,
+		Workers:               1,
+		PayloadBytes:          1024,
+		UniquePayloads:        true,
+		OffloadDir:            cleanOffloadDir,
+		OffloadThresholdBytes: 512,
+	})
+	if err != nil {
+		t.Fatalf("Run(cleanOffload) error: %v", err)
+	}
+	flakyOffloadRoot := t.TempDir()
+	flakyBucketPath := filepath.Join(flakyOffloadRoot, "local-offload-bench")
+	partialOffloadRep, err := Run(ctx, RunnerConfig{
+		Mode:                  ModeBQFake,
+		Signals:               []string{"traces"},
+		Duration:              150 * time.Millisecond,
+		BatchSize:             28,
+		Workers:               1,
+		PayloadBytes:          1024,
+		UniquePayloads:        true,
+		OffloadDir:            flakyOffloadRoot,
+		OffloadThresholdBytes: 512,
+		AllowPartialFailures:  true,
+		workerHook: func(_, seq int) {
+			if seq == 1 {
+				_ = os.RemoveAll(flakyBucketPath)
+				_ = os.WriteFile(flakyBucketPath, []byte("blocker"), 0o600)
+			} else if seq == 2 {
+				_ = os.Remove(flakyBucketPath)
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run(partialOffload, AllowPartialFailures=true) error: %v", err)
+	}
+	if partialOffloadRep.Results[0].BatchesFailed <= 0 || partialOffloadRep.Results[0].BatchesSucceeded <= 0 {
+		t.Fatalf("partialOffload BatchesFailed=%d, BatchesSucceeded=%d, want both > 0",
+			partialOffloadRep.Results[0].BatchesFailed, partialOffloadRep.Results[0].BatchesSucceeded)
+	}
+	if math.Abs(partialOffloadRep.Results[0].BytesPerRow-cleanOffloadRep.Results[0].BytesPerRow) > 5.0 {
+		t.Fatalf("partialOffload BytesPerRow = %.2f vs cleanOffload %.2f, want pre-append offload failures excluded from BytesPerRow denominator",
+			partialOffloadRep.Results[0].BytesPerRow, cleanOffloadRep.Results[0].BytesPerRow)
 	}
 }

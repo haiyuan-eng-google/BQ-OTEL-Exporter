@@ -842,17 +842,18 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 	cpuBefore, _ := readProcessCPUAndRSS()
 
 	var (
-		batchesAttempted atomic.Int64
-		batchesSucceeded atomic.Int64
-		batchesFailed    atomic.Int64
-		recordsAttempted atomic.Int64
-		recordsSubmitted atomic.Int64
-		batchSeq         atomic.Int64
-		latMu            sync.Mutex
-		latenciesMs      = make([]float64, 0, 1024)
-		errMu            sync.Mutex
-		firstConsumeErr  error
-		panicErr         error
+		batchesAttempted     atomic.Int64
+		batchesSucceeded     atomic.Int64
+		batchesFailed        atomic.Int64
+		consumeBatchesFailed atomic.Int64
+		recordsAttempted     atomic.Int64
+		recordsSubmitted     atomic.Int64
+		batchSeq             atomic.Int64
+		latMu                sync.Mutex
+		latenciesMs          = make([]float64, 0, 1024)
+		errMu                sync.Mutex
+		firstConsumeErr      error
+		panicErr             error
 	)
 
 	targetTable := "otel_" + signal
@@ -930,7 +931,10 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 				idx := (workerID + seq) % prebuiltCount
 				t0 := time.Now()
 				callCtx, cancelCall := context.WithTimeout(ctx, expCfg.TimeoutSettings.Timeout)
-				var consumeErr error
+				var (
+					consumeErr        error
+					consumeDispatched bool
+				)
 				switch signal {
 				case "traces":
 					var td ptrace.Traces
@@ -956,6 +960,7 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 						td = cloned
 					}
 					if consumeErr == nil {
+						consumeDispatched = true
 						consumeErr = tracesExp.ConsumeTraces(callCtx, td)
 					}
 				case "logs":
@@ -980,6 +985,7 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 						ld = cloned
 					}
 					if consumeErr == nil {
+						consumeDispatched = true
 						consumeErr = logsExp.ConsumeLogs(callCtx, ld)
 					}
 				case "metrics":
@@ -989,6 +995,7 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 					} else {
 						md = prebuiltMetrics[idx]
 					}
+					consumeDispatched = true
 					consumeErr = metricsExp.ConsumeMetrics(callCtx, md)
 				}
 				cancelCall()
@@ -1001,6 +1008,9 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 					batchesAttempted.Add(1)
 					recordsAttempted.Add(int64(cfg.BatchSize))
 					batchesFailed.Add(1)
+					if consumeDispatched {
+						consumeBatchesFailed.Add(1)
+					}
 					errMu.Lock()
 					if firstConsumeErr == nil {
 						firstConsumeErr = consumeErr
@@ -1075,7 +1085,7 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 		attemptedBytesPerAckedRow = float64(telem.AppendBytesTotal) / float64(ackedRows)
 		bytesPerRow = attemptedBytesPerAckedRow
 		succeededBatches := batchesSucceeded.Load()
-		totalAppendAttempts := succeededBatches + telem.Retries + batchesFailed.Load()
+		totalAppendAttempts := succeededBatches + telem.Retries + consumeBatchesFailed.Load()
 		if succeededBatches > 0 && totalAppendAttempts > succeededBatches {
 			bytesPerRow = (float64(telem.AppendBytesTotal) * float64(succeededBatches) / float64(totalAppendAttempts)) / float64(ackedRows)
 		}

@@ -18,7 +18,7 @@ All unit prices below reference public list prices for the **`US` multi-region**
 
 | Service | Resource / SKU | Unit List Price (`US` / `us-central1`) | Free Tier / Notes | Reference |
 |---|---|---:|---|---|
-| **BigQuery Storage Write API** | Committed stream ingestion (`AppendRows`) | **`$0.025` / GB** (`$25.00` / TB) | First **2 TiB / month** per billing account free (`1 TB = 1,000 GB`) | [cloud.google.com/bigquery/pricing](https://cloud.google.com/bigquery/pricing) |
+| **BigQuery Storage Write API** | Committed stream ingestion (`AppendRows`) | **`$0.025` / GiB** (`$25.60` / TiB) | First **2 TiB (`2,048 GiB`) / month** per billing account free | [cloud.google.com/bigquery/pricing](https://cloud.google.com/bigquery/pricing) |
 | **BigQuery Storage (Logical)** | Active logical bytes (< 90 days unmodified) | **`$0.020` / GiB-month** | First **10 GiB / month** free | [cloud.google.com/bigquery/pricing](https://cloud.google.com/bigquery/pricing) |
 | **BigQuery Storage (Logical)** | Long-term logical bytes ($\ge$ 90 days unmodified) | **`$0.010` / GiB-month** | Automatic 50% discount after 90 days | [cloud.google.com/bigquery/pricing](https://cloud.google.com/bigquery/pricing) |
 | **BigQuery Storage (Physical)** | Active physical compressed bytes (< 90 days) | **`$0.040` / GiB-month** | First **10 GiB / month** free; includes time-travel + fail-safe bytes | [cloud.google.com/bigquery/pricing](https://cloud.google.com/bigquery/pricing) |
@@ -29,24 +29,29 @@ All unit prices below reference public list prices for the **`US` multi-region**
 | **Cloud Storage (Operations)** | Class A operations (`storage.objects.insert`) | **`$0.005` / 1,000 ops** (`$5.00` / 1M ops) | Dedup cache hits (`ifGenerationMatch=0`) eliminate redundant uploads | [cloud.google.com/storage/pricing](https://cloud.google.com/storage/pricing) |
 | **GKE Autopilot / Cloud Run** | Dedicated / always-allocated vCPU & RAM (`us-central1`) | **`~$24` / vCPU-mo**, **`~$2.65` / GiB-mo** | Subject to minimum pod/instance increments (Section 6) | [cloud.google.com/kubernetes-engine/pricing](https://cloud.google.com/kubernetes-engine/pricing), [cloud.google.com/run/pricing](https://cloud.google.com/run/pricing) |
 
+> **Unit Basis (`GiB` / `TiB`)**: All byte-to-volume conversions across Sections 2–7 use binary units ($1\text{ KiB} = 2^{10} = 1{,}024\text{ B}$, $1\text{ MiB} = 2^{20}\text{ B}$, $1\text{ GiB} = 2^{30} = 1{,}073{,}741{,}824\text{ B}$, and $1\text{ TiB} = 2^{40}\text{ B} = 1{,}024\text{ GiB}$) so Storage Write API (`2 TiB = 2,048 GiB` free tier), BigQuery Logical/Physical Storage (`GiB-month`), Cloud Storage (`GiB-month`), and On-Demand SQL scanning (`TiB`) share a single consistent denominator.
+
 ### 1.2 Measured Benchmark Inputs vs. Illustrative Engineering Assumptions
 
 To keep capacity planning transparent, this guide distinguishes between **measured benchmark values** from `cmd/bq-otel-testbench` ([`docs/benchmarks/v0.1.0-performance-envelope.md`](benchmarks/v0.1.0-performance-envelope.md)) and **illustrative workload assumptions** that vary by deployment:
 
 * **Measured Benchmark Inputs (`cmd/bq-otel-testbench`)**:
   * Exact serialized `ProtoRows` wire bytes per row across `otel_spans` (`2,895 B` at `1 KiB`, `5,966 B` at `4 KiB`, `18,255 B` at `16 KiB` inline, `1,983 B` local offload), `otel_logs` (`2,384 B` at `1 KiB`, `5,456 B` at `4 KiB`, `17,745 B` at `16 KiB` inline, `1,472 B` local offload), and `otel_metrics` (`1,252 B`).
-  * Exporter throughput (`21,248`–`29,459 rows/s` in `bqfake`; `9,185`–`10,404 rows/s` in live BigQuery), whole-process CPU (`1.89`–`3.43` cores per `10k rows/s`), and SHA-256 content-addressed offload deduplication (`99.92%` cache hit rate on a 16-entry repeated prompt corpus in Suite C).
+  * Exporter throughput (`15,876`–`29,459 rows/s` in `bqfake` across `stream_pool_size=1..16`, `23,544`–`28,983 rows/s` at `stream_pool_size=4`; `9,185`–`10,404 rows/s` in live BigQuery), whole-process CPU (`1.89`–`3.27` cores per `10k rows/s` unredacted across `stream_pool_size=1..16`, `2.25`–`2.96` at `stream_pool_size=4`, `3.05`–`3.14` with Step-0 redaction, and `1.24`–`1.66` in live BigQuery), and SHA-256 content-addressed offload deduplication (`99.92%` cache hit rate on a 16-entry repeated prompt corpus in Suite C).
 * **Illustrative Engineering Assumptions (Configure to Match Your Workload)**:
-  * **Composite Agent Turn Shape**: `1` agent turn = `4` spans (`invoke_agent`, `chat`, `execute_tool`, `mcp.client.operation`) + `2` GenAI event logs + `2` histogram metric data points (`gen_ai.client.token.usage` and `gen_ai.client.operation.duration`) = **`8` BigQuery rows/turn**.
+  * **Composite Agent Turn Shape & Fleet Tiers**: `1` agent turn = `4` spans (`invoke_agent`, `chat`, `execute_tool`, `mcp.client.operation`) + `2` GenAI event logs + `2` histogram metric data points (`gen_ai.client.token.usage` and `gen_ai.client.operation.duration`) = **`8` BigQuery rows/turn**. The three workload tiers scale by $10\times$:
+    * **Tier 1 (`100K turns/day`)**: `400K spans/day` (`4.6 spans/s` avg, `~46–100 spans/s` burst) / `800K combined rows/day` (`9.3 rows/s` avg).
+    * **Tier 2 (`1M turns/day`)**: `4M spans/day` (`46.3 spans/s` avg, `~463–2,500 spans/s` burst) / `8M combined rows/day` (`92.6 rows/s` avg).
+    * **Tier 3 (`10M turns/day`)**: `40M spans/day` (`463.0 spans/s` avg, `~4,630–25,000 spans/s` burst) / `80M combined rows/day` (`925.9 rows/s` avg).
   * **BigQuery Physical Compression Ratio**: **`6:1` baseline** (typical Capacitor + Zstandard compression range `4:1`–`8:1` on repetitive JSON telemetry; high-entropy UUIDs or base64 blobs compress closer to `2:1`–`3:1`).
   * **Production Offload Deduplication Hit Rate**: **`80%` illustrative assumption** for production fleets that repeat system instructions, tool schemas, and RAG context headers across turns (`0%` worst-case if every offloaded payload is unique; `99.9%` best-case on static templates).
-  * **Mart Scan Reduction & Continuous Query Slot Sizing**: The `99.8%` query scan reduction in Section 5.3 assumes `20` dashboard refreshes/hour over a 7-day window reading pre-aggregated `INT64`/`FLOAT64` columns instead of raw `JSON` attributes; the `50` / `75` / `250` Continuous Query slot figures in Section 5.4 are illustrative capacity-planning starting points that should be validated against your query complexity.
+  * **Mart Scan Reduction & Continuous Query Slot Sizing**: The `99.96%` query scan reduction in Section 5.3 assumes `20` dashboard refreshes/hour over a 7-day window reading pre-aggregated `INT64`/`FLOAT64` columns from incremental Dataform marts (`deploy/dataform/`) instead of scanning raw `JSON` attributes on every dashboard load; the `50` / `100` / `250` Continuous Query slot figures in Section 5.4 are illustrative capacity-planning starting points that should be validated against your query complexity.
 
 ---
 
 ## 2. BigQuery Storage Write API Ingestion Cost
 
-BigQuery bills Storage Write API ingestion (`AppendRows` on committed default/explicit streams) at **`$0.025 per GB`** (`$25.00 per TB`, where $1\text{ TB} = 1{,}000\text{ GB} = 10^{12}\text{ bytes}$), with the **first 2 TiB per month free** per billing account.
+BigQuery bills Storage Write API ingestion (`AppendRows` on committed default/explicit streams) at **`$0.025 per GiB`** (`$25.60 per TiB`, where $1\text{ GiB} = 2^{30} = 1{,}073{,}741{,}824\text{ bytes}$), with the **first 2 TiB (`2,048 GiB`) per month free** per billing account.
 
 ### 2.1 Measured Per-Row Wire Size by Signal & Payload Tier
 
@@ -63,24 +68,24 @@ Measured directly from `otelcol_exporter_bigquery_append_bytes / otelcol_exporte
 
 ### 2.2 Ingestion Cost Formula
 
-$$\text{Monthly Write Volume (GB)} = \frac{\text{Turns/Day} \times 30 \times \text{Bytes/Turn}}{10^9}$$
+$$\text{Monthly Write Volume (GiB)} = \frac{\text{Turns/Day} \times 30 \times \text{Bytes/Turn}}{2^{30}}$$
 
-$$\text{Monthly Write API Cost (\$)} = \max\!\left(0,\; \text{Monthly Write Volume (GB)} - 2{,}048\text{ GB}\right) \times \$0.025$$
+$$\text{Monthly Write API Cost (\$)} = \max\!\left(0,\; \text{Monthly Write Volume (GiB)} - 2{,}048\text{ GiB}\right) \times \$0.025$$
 
 ### 2.3 Monthly Storage Write API Cost Across Workload Tiers
 
-| Fleet Tier | Turns / Day | Turns / Month (30d) | Rows / Month (`8x`) | Avg Rows / Sec | Payload Profile | Monthly Write Volume | Billable Volume (After 2 TiB Free) | Monthly Write API Cost |
+| Fleet Tier | Turns / Day | Turns / Month (30d) | Rows / Month (`8x`) | Avg Rows / Sec (`Spans/s`) | Payload Profile | Monthly Write Volume (`GiB`) | Billable Volume (After `2,048 GiB` Free) | Monthly Write API Cost |
 |---|---:|---:|---:|---:|---|---:|---:|---:|
-| **Tier 1 — Team / Pilot** | `100,000` | `3,000,000` | `24,000,000` | `9.3 rows/s` | Typical (`1 KiB`) | `56.56 GB` | `0 GB` | **`$0.00`** |
-| **Tier 1 — Team / Pilot** | `100,000` | `3,000,000` | `24,000,000` | `9.3 rows/s` | Large Inline (`16 KiB`) | `333.04 GB` | `0 GB` | **`$0.00`** |
-| **Tier 2 — Production** | `1,000,000` | `30,000,000` | `240,000,000` | `92.6 rows/s` | Typical (`1 KiB`) | `565.56 GB` | `0 GB` | **`$0.00`** |
-| **Tier 2 — Production** | `1,000,000` | `30,000,000` | `240,000,000` | `92.6 rows/s` | Medium (`4 KiB`) | `1,118.40 GB` | `0 GB` | **`$0.00`** |
-| **Tier 2 — Production** | `1,000,000` | `30,000,000` | `240,000,000` | `92.6 rows/s` | Large Inline (`16 KiB`) | `3,330.42 GB` | `1,282.42 GB` | **`$32.06`** |
-| **Tier 2 — Production** | `1,000,000` | `30,000,000` | `240,000,000` | `92.6 rows/s` | Large Offloaded (`16 KiB`) | `445.50 GB` | `0 GB` | **`$0.00`** |
-| **Tier 3 — Enterprise Scale** | `10,000,000` | `300,000,000` | `2,400,000,000` | `925.9 rows/s` | Typical (`1 KiB`) | `5,655.60 GB` | `3,607.60 GB` | **`$90.19`** |
-| **Tier 3 — Enterprise Scale** | `10,000,000` | `300,000,000` | `2,400,000,000` | `925.9 rows/s` | Medium (`4 KiB`) | `11,184.00 GB` | `9,136.00 GB` | **`$228.40`** |
-| **Tier 3 — Enterprise Scale** | `10,000,000` | `300,000,000` | `2,400,000,000` | `925.9 rows/s` | Large Inline (`16 KiB`) | `33,304.20 GB` | `31,256.20 GB` | **`$781.41`** |
-| **Tier 3 — Enterprise Scale** | `10,000,000` | `300,000,000` | `2,400,000,000` | `925.9 rows/s` | Large Offloaded (`16 KiB`) | `4,455.00 GB` | `2,407.00 GB` | **`$60.18`** |
+| **Tier 1 — Team / Pilot** | `100,000` | `3,000,000` | `24,000,000` | `9.3 rows/s` (`4.6 spans/s`) | Typical (`1 KiB`) | `52.67 GiB` | `0 GiB` | **`$0.00`** |
+| **Tier 1 — Team / Pilot** | `100,000` | `3,000,000` | `24,000,000` | `9.3 rows/s` (`4.6 spans/s`) | Large Inline (`16 KiB`) | `310.17 GiB` | `0 GiB` | **`$0.00`** |
+| **Tier 2 — Production** | `1,000,000` | `30,000,000` | `240,000,000` | `92.6 rows/s` (`46.3 spans/s`) | Typical (`1 KiB`) | `526.72 GiB` | `0 GiB` | **`$0.00`** |
+| **Tier 2 — Production** | `1,000,000` | `30,000,000` | `240,000,000` | `92.6 rows/s` (`46.3 spans/s`) | Medium (`4 KiB`) | `1,041.59 GiB` | `0 GiB` | **`$0.00`** |
+| **Tier 2 — Production** | `1,000,000` | `30,000,000` | `240,000,000` | `92.6 rows/s` (`46.3 spans/s`) | Large Inline (`16 KiB`) | `3,101.70 GiB` | `1,053.70 GiB` | **`$26.34`** |
+| **Tier 2 — Production** | `1,000,000` | `30,000,000` | `240,000,000` | `92.6 rows/s` (`46.3 spans/s`) | Large Offloaded (`16 KiB`) | `414.90 GiB` | `0 GiB` | **`$0.00`** |
+| **Tier 3 — Enterprise Scale** | `10,000,000` | `300,000,000` | `2,400,000,000` | `925.9 rows/s` (`463.0 spans/s`) | Typical (`1 KiB`) | `5,267.19 GiB` | `3,219.19 GiB` | **`$80.48`** |
+| **Tier 3 — Enterprise Scale** | `10,000,000` | `300,000,000` | `2,400,000,000` | `925.9 rows/s` (`463.0 spans/s`) | Medium (`4 KiB`) | `10,415.91 GiB` | `8,367.91 GiB` | **`$209.20`** |
+| **Tier 3 — Enterprise Scale** | `10,000,000` | `300,000,000` | `2,400,000,000` | `925.9 rows/s` (`463.0 spans/s`) | Large Inline (`16 KiB`) | `31,016.95 GiB` | `28,968.95 GiB` | **`$724.22`** |
+| **Tier 3 — Enterprise Scale** | `10,000,000` | `300,000,000` | `2,400,000,000` | `925.9 rows/s` (`463.0 spans/s`) | Large Offloaded (`16 KiB`) | `4,149.04 GiB` | `2,101.04 GiB` | **`$52.53`** |
 
 ---
 
@@ -90,23 +95,25 @@ $$\text{Monthly Write API Cost (\$)} = \max\!\left(0,\; \text{Monthly Write Volu
 
 BigQuery datasets can be configured for **Logical Storage Billing** or **Physical (Compressed) Storage Billing** (`ALTER SCHEMA ... SET OPTIONS(storage_billing_model = 'PHYSICAL')`):
 
-* **Illustrative Compression Assumption**: Columnar Capacitor encoding + Zstandard compression on `otel_spans`, `otel_logs`, and `otel_metrics` (clustered by `(service_name, trace_id)` / `(service_name, severity_text)` / `(service_name, metric_name)`) typically achieves a **`4:1` to `8:1` compression ratio** on repetitive JSON keys, resource attributes, and histogram buckets.
-* Even at unit price `$0.040 / GiB-month` (`2x` the logical `$0.020 / GiB-month` rate) and accounting for the **7-day time-travel + 7-day fail-safe window** (`+14 days` of physical retention overhead), switching the telemetry dataset to `PHYSICAL` billing reduces net BigQuery storage spend by **55%–68%** when compression exceeds `4:1`.
-* **Partition Expiration (TTL)**: Because append-only partitions in `otel_spans`, `otel_logs`, `otel_metrics`, and `otel_quarantine` are never modified after the day closes, partitions retained beyond **90 days** automatically drop to the **Long-Term Storage** rate (`$0.010 / GiB-month` logical or `$0.020 / GiB-month` physical).
+* **Illustrative Compression Assumption**: Columnar Capacitor encoding + Zstandard compression on `otel_spans` (`CLUSTER BY service_name, trace_id, name`), `otel_logs` (`CLUSTER BY service_name, trace_id, severity_number`), `otel_metrics` (`CLUSTER BY service_name, metric_name, metric_type`), and `otel_quarantine` (`CLUSTER BY signal, error_code, service_name`) typically achieves a **`4:1` to `8:1` compression ratio** on repetitive JSON keys, resource attributes, and histogram buckets.
+* Even at unit price `$0.040 / GiB-month` (`2x` the logical `$0.020 / GiB-month` rate) and accounting for the **7-day time-travel + 7-day fail-safe window** (`+14 days` of active physical retention overhead), switching the telemetry dataset to `PHYSICAL` billing reduces net BigQuery storage spend by **55%–68%** when compression exceeds `4:1`.
+* **Partition Expiration (TTL) & Long-Term Storage Discount**: Because append-only partitions in `otel_spans` (`TIMESTAMP_TRUNC(start_time, HOUR)`), `otel_logs` (`DATE(timestamp)`), `otel_metrics` (`DATE(timestamp)`), and `otel_quarantine` (`DATE(ingest_time)`) are never modified after the partition closes, partitions retained beyond **90 days** automatically drop 50% to the **Long-Term Storage** rate (`$0.010 / GiB-month` logical or `$0.020 / GiB-month` physical). Under a 365-day physical retention window, `104` physical days (`90` active days + `14` time-travel/fail-safe days) bill at the `$0.040 / GiB-month` active rate (after the first `10 GiB` free), while `275` days (`days 91..365`) bill at the `$0.020 / GiB-month` long-term rate.
 
 ### 3.2 Steady-State Monthly BigQuery Storage Cost (`6:1` Physical Compression Assumption)
 
 $$\text{Physical GiB (Steady State)} = \frac{\text{Daily Logical GiB}}{\text{Compression Ratio }(6)} \times \left(\text{Retention Days} + 14\text{ time-travel/fail-safe days}\right)$$
 
-| Fleet Tier | Payload Profile | Daily Logical GiB | 30-Day Logical Billing (`$0.02/GiB`) | 30-Day Physical Billing (`6:1`, `$0.04/GiB` + 14d Fail-Safe) | 90-Day Physical Billing (`6:1`) | 365-Day Physical Billing (`6:1`, 90d Active + 275d Long-Term) |
+$$\text{365d Physical Cost (\$)} = \max\!\left(0,\; 104 \times D_{\text{phys}} - 10\text{ GiB}\right) \times \$0.040 + \left(275 \times D_{\text{phys}}\right) \times \$0.020$$
+
+| Fleet Tier | Payload Profile | Daily Logical GiB | 30-Day Logical Billing (`$0.02/GiB`, 10 GiB Free) | 30-Day Physical Billing (`6:1`, `$0.04/GiB` + 14d Fail-Safe) | 90-Day Physical Billing (`6:1`, `104d` Active) | 365-Day Physical Billing (`6:1`, `104d` Active @ `$0.04` + `275d` Long-Term @ `$0.02`) |
 |---|---|---:|---:|---:|---:|---:|
-| **Tier 1 (`100K/day`)** | Typical (`1 KiB`) | `1.76 GiB/day` | `$0.86 / mo` | **`$0.48 / mo`** (`22.0 GiB`, first 10 GiB free) | **`$0.81 / mo`** | **`$3.98 / mo`** |
-| **Tier 2 (`1M/day`)** | Typical (`1 KiB`) | `17.56 GiB/day` | `$10.34 / mo` | **`$4.75 / mo`** (`128.8 GiB`) | **`$11.77 / mo`** | **`$43.96 / mo`** |
-| **Tier 2 (`1M/day`)** | Large Inline (`16 KiB`) | `103.39 GiB/day` | `$61.83 / mo` | **`$29.92 / mo`** (`758.2 GiB`) | **`$71.26 / mo`** | **`$260.96 / mo`** |
-| **Tier 2 (`1M/day`)** | Large Offloaded (`16 KiB`) | `13.83 GiB/day` | `$8.10 / mo` | **`$3.66 / mo`** (`101.4 GiB`) | **`$9.18 / mo`** | **`$34.54 / mo`** |
-| **Tier 3 (`10M/day`)** | Typical (`1 KiB`) | `175.57 GiB/day` | `$105.14 / mo` | **`$51.10 / mo`** (`1,287.5 GiB`) | **`$121.31 / mo`** | **`$443.17 / mo`** |
-| **Tier 3 (`10M/day`)** | Large Inline (`16 KiB`) | `1,033.90 GiB/day` | `$620.14 / mo` | **`$302.88 / mo`** (`7,581.9 GiB`) | **`$716.32 / mo`** | **`$2,613.38 / mo`** |
-| **Tier 3 (`10M/day`)** | Large Offloaded (`16 KiB`) | `138.30 GiB/day` | `$82.78 / mo` | **`$40.17 / mo`** (`1,014.2 GiB`) | **`$95.44 / mo`** | **`$348.92 / mo`** |
+| **Tier 1 (`100K/day`)** | Typical (`1 KiB`) | `1.76 GiB/day` | `$0.85 / mo` (`52.7 GiB`) | **`$0.12 / mo`** (`12.9 GiB`, first 10 GiB free) | **`$0.82 / mo`** (`30.4 GiB`) | **`$2.43 / mo`** (`110.9 GiB`) |
+| **Tier 2 (`1M/day`)** | Typical (`1 KiB`) | `17.56 GiB/day` | `$10.33 / mo` (`526.7 GiB`) | **`$4.75 / mo`** (`128.8 GiB`) | **`$11.77 / mo`** (`304.3 GiB`) | **`$27.87 / mo`** (`1,109.0 GiB`) |
+| **Tier 2 (`1M/day`)** | Large Inline (`16 KiB`) | `103.39 GiB/day` | `$61.83 / mo` (`3,101.7 GiB`) | **`$29.93 / mo`** (`758.2 GiB`) | **`$71.28 / mo`** (`1,792.1 GiB`) | **`$166.06 / mo`** (`6,530.8 GiB`) |
+| **Tier 2 (`1M/day`)** | Large Offloaded (`16 KiB`) | `13.83 GiB/day` | `$8.10 / mo` (`414.9 GiB`) | **`$3.66 / mo`** (`101.4 GiB`) | **`$9.19 / mo`** (`239.7 GiB`) | **`$21.87 / mo`** (`873.6 GiB`) |
+| **Tier 3 (`10M/day`)** | Typical (`1 KiB`) | `175.57 GiB/day` | `$105.14 / mo` (`5,267.2 GiB`) | **`$51.10 / mo`** (`1,287.5 GiB`) | **`$121.33 / mo`** (`3,043.3 GiB`) | **`$282.27 / mo`** (`11,090.4 GiB`) |
+| **Tier 3 (`10M/day`)** | Large Inline (`16 KiB`) | `1,033.90 GiB/day` | `$620.14 / mo` (`31,017.0 GiB`) | **`$302.88 / mo`** (`7,581.9 GiB`) | **`$716.44 / mo`** (`17,920.9 GiB`) | **`$1,664.18 / mo`** (`65,307.9 GiB`) |
+| **Tier 3 (`10M/day`)** | Large Offloaded (`16 KiB`) | `138.30 GiB/day` | `$82.78 / mo` (`4,149.0 GiB`) | **`$40.17 / mo`** (`1,014.2 GiB`) | **`$95.49 / mo`** (`2,397.2 GiB`) | **`$222.27 / mo`** (`8,736.0 GiB`) |
 
 ---
 
@@ -138,27 +145,32 @@ Each `16 KiB` agent turn contains `6` eligible large payloads (`4` spans + `2` l
 
 ### 5.1 Partition & Cluster Pruning Rules
 
-All four tables (`otel_spans`, `otel_logs`, `otel_metrics`, `otel_quarantine`) are partitioned by `DATE(...)` and clustered on `service_name` plus signal-specific high-cardinality keys:
+The four tables in `internal/schema/schema.go` use signal-specific partitioning and clustering:
 
-1. **Always filter on the partition timestamp (`start_timestamp` or `timestamp`)**: Omitting a `WHERE start_timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL ...)` predicate causes a full-table scan across all retained days.
-2. **Always include `service_name` in dashboard filters**: Clustering on `(service_name, trace_id)` allows BigQuery to prune blocks that do not contain the target agent service.
+* **`otel_spans`**: `PARTITION BY TIMESTAMP_TRUNC(start_time, HOUR) CLUSTER BY service_name, trace_id, name` (hourly partitioning).
+* **`otel_logs`**: `PARTITION BY DATE(timestamp) CLUSTER BY service_name, trace_id, severity_number` (daily partitioning).
+* **`otel_metrics`**: `PARTITION BY DATE(timestamp) CLUSTER BY service_name, metric_name, metric_type` (daily partitioning).
+* **`otel_quarantine`**: `PARTITION BY DATE(ingest_time) CLUSTER BY signal, error_code, service_name` (daily partitioning).
+
+1. **Always filter on the table's partition column (`start_time`, `timestamp`, or `ingest_time`)**: Omitting a `WHERE start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL ...)` predicate on `otel_spans` / `v_gen_ai_spans` (or `WHERE timestamp >= ...` on `otel_logs` / `otel_metrics`) causes a full-table scan across all retained partitions.
+2. **Always include `service_name` in dashboard filters**: Leading-column clustering on `service_name` across `otel_spans`, `otel_logs`, and `otel_metrics` allows BigQuery to prune storage blocks that do not contain the target agent service.
 
 ### 5.2 Column Projection Discipline (Avoid `SELECT *` on Semantic Views)
 
 In `v_gen_ai_spans` and `v_gen_ai_logs`, `JSON_VALUE(attributes, ...)` expressions read the underlying `attributes JSON` column (`~1.8 KiB`–`16 KiB` per row):
 
-* **Lightweight Metadata Query** (`SELECT trace_id, span_id, service_name, name, duration_nano, status_code FROM otel_spans WHERE start_timestamp >= ...`): scans only **`~140 B / row`** (`~6.7%` of a `2,895 B` span row).
-* **Full Semantic View Query** (`SELECT * FROM v_gen_ai_spans WHERE start_timestamp >= ...`): scans `attributes`, `resource.attributes`, and `instrumentation_scope` (**`~2,450 B / row`** on `1 KiB` inline spans, or **`~720 B / row`** when large payloads are offloaded to GCS).
+* **Lightweight Metadata Query** (`SELECT trace_id, span_id, service_name, name, duration_nano, status.code FROM otel_spans WHERE start_time >= ...`): scans only **`~140 B / row`** (`~4.8%` of a `2,895 B` span row).
+* **Full Semantic View Query** (`SELECT * FROM v_gen_ai_spans WHERE start_time >= ...`): scans `attributes`, `resource.attributes`, and `instrumentation_scope` (**`~2,450 B / row`** on `1 KiB` inline spans, or **`~720 B / row`** when large payloads are offloaded to GCS).
 
-### 5.3 Pre-Aggregated Hourly Mart Pattern (Illustrative `99.8%` Scan Reduction)
+### 5.3 Pre-Aggregated Hourly Mart Pattern (`deploy/dataform/`, Illustrative `99.96%` Scan Reduction)
 
-For high-frequency operational dashboards (e.g., `20` panel refreshes/hour across a 7-day lookback window = `14,400` queries/month):
+Logical companion views such as `v_gen_ai_agent_trajectory`, `v_gen_ai_model_costs`, and `v_gen_ai_sessions` are unmaterialized SQL views over `v_gen_ai_spans` (`otel_spans_dedup`). For high-frequency operational dashboards (e.g., `20` panel refreshes/hour across a 7-day lookback window = `14,400` queries/month), use the incremental Dataform marts in `deploy/dataform/` (`mart_gen_ai_cost_hourly.sqlx`, `mart_agent_loop_summary.sqlx`, `mart_tool_reliability.sqlx`):
 
 * **Querying raw `v_gen_ai_spans` directly** (Tier 2: `4M spans/day` $\times 7\text{ days} \times 2{,}450\text{ B/span} \approx 63.9\text{ GiB/query}$):
   $$14{,}400\text{ queries/mo} \times 63.9\text{ GiB} = 898.6\text{ TiB/mo} \implies \mathbf{\$5{,}610/\text{mo}}\text{ (On-Demand)}$$
-* **Querying a scheduled hourly summary table (`mart_gen_ai_hourly`)** grouped by `(hour_bucket, service_name, gen_ai_framework, gen_ai_request_model, gen_ai_operation_name)` (`~5,000 rows/day` $\times 120\text{ B/row} \approx 4.2\text{ MiB}$ for 7 days):
-  * 720 hourly incremental rollup runs/month scanning only the latest 1 hour of `v_gen_ai_spans`: `720` $\times$ `0.38 GiB` = `0.27 TiB/mo`
-  * 14,400 dashboard queries/month scanning `4.2 MiB`: `0.06 TiB/mo`
+* **Querying an incremental hourly summary mart (`mart_gen_ai_cost_hourly` / `mart_gen_ai_hourly`)** partitioned by `DATE(usage_hour)` and grouped by `(TIMESTAMP_TRUNC(start_time, HOUR) AS usage_hour, service_name, gen_ai_system, gen_ai_request_model, gen_ai_operation_name)` (`~5,000 rows/day` $\times 120\text{ B/row} \approx 4.2\text{ MiB}$ for 7 days):
+  * 720 hourly incremental rollup runs/month scanning only the latest 1-hour partition of `v_gen_ai_spans` (`WHERE start_time >= TIMESTAMP_SUB(...)`): `720` $\times$ `0.38 GiB` = `0.27 TiB/mo`
+  * 14,400 dashboard queries/month scanning `4.2 MiB` from the pre-aggregated mart: `0.06 TiB/mo`
   * **Total monthly bytes scanned**: **`0.33 TiB/mo`** (within the **1 TiB/month free tier** $\rightarrow$ **`$0.00/mo`**, an illustrative **`99.96%` reduction** in scanned bytes).
 
 ### 5.4 Continuous Queries & Edition Slot Sizing (Illustrative Capacity Model)
@@ -201,10 +213,10 @@ The table below combines all five cost components for a **30-day BigQuery Physic
 
 | Cost Component | Tier 1 (`100K turns/day`, `1 KiB` Inline) | Tier 2 (`1M turns/day`, `1 KiB` Inline) | Tier 2 (`1M turns/day`, `16 KiB` Inline) | Tier 2 (`1M turns/day`, `16 KiB` Offloaded, `80%` Dedup) | Tier 3 (`10M turns/day`, `1 KiB` Inline) | Tier 3 (`10M turns/day`, `16 KiB` Inline) | Tier 3 (`10M turns/day`, `16 KiB` Offloaded, `80%` Dedup) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| **1. BigQuery Storage Write API** (`$0.025/GB` after 2 TiB free) | `$0.00` (`56.6 GB`) | `$0.00` (`565.6 GB`) | `$32.06` (`3,330.4 GB`) | `$0.00` (`445.5 GB`) | `$90.19` (`5,655.6 GB`) | `$781.41` (`33,304.2 GB`) | `$60.18` (`4,455.0 GB`) |
-| **2. BigQuery Physical Storage** (`30d` + `14d` fail-safe, `6:1` compressed) | `$0.48` (`22.0 GiB`) | `$4.75` (`128.8 GiB`) | `$29.92` (`758.2 GiB`) | `$3.66` (`101.4 GiB`) | `$51.10` (`1,287.5 GiB`) | `$302.88` (`7,581.9 GiB`) | `$40.17` (`1,014.2 GiB`) |
+| **1. BigQuery Storage Write API** (`$0.025/GiB` after `2,048 GiB` free) | `$0.00` (`52.7 GiB`) | `$0.00` (`526.7 GiB`) | `$26.34` (`3,101.7 GiB`) | `$0.00` (`414.9 GiB`) | `$80.48` (`5,267.2 GiB`) | `$724.22` (`31,017.0 GiB`) | `$52.53` (`4,149.0 GiB`) |
+| **2. BigQuery Physical Storage** (`30d` + `14d` fail-safe, `6:1` compressed) | `$0.12` (`12.9 GiB`) | `$4.75` (`128.8 GiB`) | `$29.93` (`758.2 GiB`) | `$3.66` (`101.4 GiB`) | `$51.10` (`1,287.5 GiB`) | `$302.88` (`7,581.9 GiB`) | `$40.17` (`1,014.2 GiB`) |
 | **3. GCS Payload Offload** (Standard `30d` + Class A ops at `80%` dedup) | `$0.00` | `$0.00` | `$0.00` | `$194.28` (`$14.28` storage + `$180.00` ops) | `$0.00` | `$0.00` | `$1,942.82` (`$142.82` storage + `$1,800.00` ops) |
 | **4. BigQuery Queries** (Hourly Mart Rollup + 14.4k Dashboard Queries, On-Demand) | `$0.00` (`< 1 TiB` free tier) | `$0.00` (`0.33 TiB` < `1 TiB` free tier) | `$5.13` (`1.82 TiB` scanned) | `$0.00` (`0.24 TiB` < `1 TiB` free tier) | `$10.50` (`2.68 TiB` scanned) | `$107.50` (`18.20 TiB` scanned) | `$8.75` (`2.40 TiB` scanned) |
 | **5. Collector Compute** (GKE Autopilot / Cloud Run HA Replicas) | `$14.65` (`2x 0.25 vCPU`) | `$58.60` (`2x 1 vCPU`) | `$58.60` (`2x 1 vCPU`) | `$58.60` (`2x 1 vCPU`) | `$234.40` (`4x 2 vCPU`) | `$234.40` (`4x 2 vCPU`) | `$234.40` (`4x 2 vCPU`) |
-| **Total Monthly TCO** | **`$15.13 / mo`** | **`$63.35 / mo`** | **`$125.71 / mo`** | **`$256.54 / mo`** *(or **`$66.52 / mo`** if `min_bytes: 65536`)* | **`$386.19 / mo`** | **`$1,426.19 / mo`** | **`$2,286.32 / mo`** *(or **`$483.17 / mo`** if `min_bytes: 65536`)* |
-| **Unit Cost per `1,000` Agent Turns** | **`$0.0050`** | **`$0.0021`** | **`$0.0042`** | **`$0.0086`** | **`$0.0013`** | **`$0.0048`** | **`$0.0076`** |
+| **Total Monthly TCO** | **`$14.77 / mo`** | **`$63.35 / mo`** | **`$120.00 / mo`** | **`$256.54 / mo`** *(or **`$120.00 / mo`** inline when `min_bytes: 65536`)* | **`$376.48 / mo`** | **`$1,369.00 / mo`** | **`$2,278.67 / mo`** *(or **`$1,369.00 / mo`** inline when `min_bytes: 65536`)* |
+| **Unit Cost per `1,000` Agent Turns** | **`$0.0049`** | **`$0.0021`** | **`$0.0040`** | **`$0.0086`** | **`$0.0013`** | **`$0.0046`** | **`$0.0076`** |

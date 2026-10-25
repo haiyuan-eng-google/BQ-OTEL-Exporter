@@ -165,8 +165,8 @@ fuzz:
 # BENCH_DATASET is intentionally separate from BQ_DATASET so an ambient
 # BQ_DATASET is never passed to -ephemeral-dataset teardown.
 BENCH_MODE     ?= bqfake
-BENCH_DURATION ?= 1s
-BENCH_WORKERS  ?= 8
+BENCH_DURATION ?= 2s
+BENCH_WORKERS  ?= 4
 BENCH_DATASET  ?=
 .PHONY: bench-envelope
 bench-envelope:

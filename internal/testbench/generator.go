@@ -36,8 +36,10 @@ type FrameworkSpec struct {
 }
 
 // DefaultFrameworks returns the 7 canonical GenAI agent frameworks generated
-// across synthetic trace, log, and metric batches, aligned with
-// testdata/otlp/manifest.yaml and internal/schema view predicates.
+// across synthetic trace, log, and metric batches. Six frameworks emit standard
+// gen_ai.* span attributes selected by v_gen_ai_spans, while crewai emits
+// OpenInference span attributes that intentionally remain in otel_spans and
+// otel_spans_dedup outside v_gen_ai_spans (testdata/otlp/manifest.yaml).
 func DefaultFrameworks() []FrameworkSpec {
 	return []FrameworkSpec{
 		{
@@ -338,10 +340,14 @@ func (g *Generator) TracesBatch(spanCount int) ptrace.Traces {
 		attrs.PutStr("gen_ai.conversation.id", fmt.Sprintf("conv-%08x", treeID%100000))
 		attrs.PutStr("session.id", fmt.Sprintf("sess-%08x", treeID%100000))
 
-		if fw.Framework == "crewai" && stepInTree < 3 {
-			// CrewAI uses OpenInference span attributes rather than standard gen_ai.*
-			// span attributes (testdata/otlp/manifest.yaml), exercising the
-			// openinference.span.kind / crew_tasks / llm.* SQL branches in v_gen_ai_spans.
+		if fw.Framework == "crewai" {
+			// CrewAI uses OpenInference span attributes (openinference.span.kind,
+			// crew_tasks, llm.*, tool.name) without gen_ai.operation.name,
+			// gen_ai.system, or gen_ai.provider.name (testdata/otlp/manifest.yaml:
+			// spans_outside_gen_ai_view: true). All 4 spans in a CrewAI tree
+			// intentionally land in otel_spans and otel_spans_dedup outside
+			// v_gen_ai_spans and v_gen_ai_agent_trajectory, while step 3 (the MCP
+			// child span) is selected by v_mcp_spans with also_in_gen_ai_view = FALSE.
 			switch stepInTree {
 			case 0:
 				sp.SetName("Crew.kickoff")
@@ -365,6 +371,13 @@ func (g *Generator) TracesBatch(spanCount int) ptrace.Traces {
 				attrs.PutStr("openinference.span.kind", "TOOL")
 				attrs.PutStr("tool.name", fw.ToolName)
 				attrs.PutStr("output.value", g.payloadFor(seq))
+			case 3:
+				attrs.PutStr("openinference.span.kind", "TOOL")
+				attrs.PutStr("llm.model_name", fw.Model)
+				attrs.PutStr("crew_tasks", "Analyze quarterly market trends")
+				attrs.PutStr("crew.agent.name", fw.AgentName)
+				attrs.PutStr("crew.agent.id", "agent-crew-01-mcp-01")
+				populateMCPSpan(sp, attrs, treeID, seq, g.payloadFor(seq))
 			}
 		} else {
 			if fw.Provider != "" {
@@ -425,31 +438,8 @@ func (g *Generator) TracesBatch(spanCount int) ptrace.Traces {
 				attrs.PutStr("gen_ai.tool.call.result", g.payloadFor(seq))
 			case 3:
 				// Child MCP client span (tools/call, resources/read, or prompts/get).
-				mcp := mcpMethods[treeID%uint64(len(mcpMethods))]
-				sp.SetParentSpanID(spanIDFromPair(treeID, 2))
-				sp.SetName(fmt.Sprintf("mcp %s %s", mcp.Method, mcp.ToolOrURI))
-				sp.SetKind(ptrace.SpanKindClient)
 				attrs.PutStr("gen_ai.operation.name", "execute_tool")
-				attrs.PutStr("mcp.method.name", mcp.Method)
-				attrs.PutStr("mcp.server.name", mcp.ServerName)
-				attrs.PutStr("server.address", mcp.ServerName)
-				attrs.PutStr("mcp.session.id", fmt.Sprintf("mcp-sess-%08x", treeID%10000))
-				attrs.PutStr("mcp.protocol.version", "2025-06-18")
-				attrs.PutStr("rpc.system", "jsonrpc")
-				attrs.PutStr("rpc.jsonrpc.version", "2.0")
-				reqID := fmt.Sprintf("req-%d", seq)
-				attrs.PutStr("rpc.jsonrpc.request_id", reqID)
-				attrs.PutStr("jsonrpc.request.id", reqID)
-				switch mcp.Method {
-				case "resources/read":
-					attrs.PutStr("mcp.resource.uri", mcp.ToolOrURI)
-				case "prompts/get":
-					attrs.PutStr("gen_ai.prompt.name", mcp.ToolOrURI)
-				default:
-					attrs.PutStr("gen_ai.tool.name", mcp.ToolOrURI)
-					attrs.PutStr("gen_ai.tool.call.id", fmt.Sprintf("call-mcp-%012x", seq))
-				}
-				attrs.PutStr("mcp.payload.content", g.payloadFor(seq))
+				populateMCPSpan(sp, attrs, treeID, seq, g.payloadFor(seq))
 			}
 		}
 
@@ -468,7 +458,12 @@ func (g *Generator) TracesBatch(spanCount int) ptrace.Traces {
 
 // LogsBatch generates a plog.Logs batch with exactly logCount GenAI event log
 // records distributed across the 7 GenAI frameworks, correlated 1-to-1 with
-// the 4-span agent execution trees emitted by TracesBatch.
+// the 4-span agent execution trees emitted by TracesBatch. Unlike raw fixture
+// captures in testdata/otlp/manifest.yaml (where crewai and aws_bedrock omit
+// log files and anthropic_agent_sdk emits non-gen_ai.* claude_code.api_request
+// logs), LogsBatch attaches synthetic gen_ai.* bridge attributes across all 7
+// framework resources so every framework participates uniformly in v_gen_ai_logs
+// cross-signal join and throughput benchmarking.
 func (g *Generator) LogsBatch(logCount int) plog.Logs {
 	if logCount <= 0 {
 		logCount = 1
@@ -566,7 +561,11 @@ func (g *Generator) LogsBatch(logCount int) plog.Logs {
 // MetricsBatch generates a pmetric.Metrics batch with exactly pointCount
 // Histogram data points (gen_ai.client.token.usage and
 // gen_ai.client.operation.duration with trace exemplars) distributed across
-// the 7 GenAI frameworks and correlated 1-to-1 with TracesBatch.
+// the 7 GenAI frameworks and correlated 1-to-1 with TracesBatch. For frameworks
+// whose golden fixtures in testdata/otlp/manifest.yaml are trace-only (crewai,
+// aws_bedrock), MetricsBatch synthesizes standard gen_ai.client.* histograms
+// with trace exemplars so all 7 framework resources exercise v_gen_ai_metrics
+// and v_gen_ai_metric_exemplars uniformly.
 func (g *Generator) MetricsBatch(pointCount int) pmetric.Metrics {
 	if pointCount <= 0 {
 		pointCount = 1
@@ -693,6 +692,33 @@ func (g *Generator) MetricsBatch(pointCount int) pmetric.Metrics {
 		ex.FilteredAttributes().PutStr("gen_ai.agent.name", fw.AgentName)
 	}
 	return md
+}
+
+func populateMCPSpan(sp ptrace.Span, attrs pcommon.Map, treeID, seq uint64, payload string) {
+	mcp := mcpMethods[treeID%uint64(len(mcpMethods))]
+	sp.SetParentSpanID(spanIDFromPair(treeID, 2))
+	sp.SetName(fmt.Sprintf("mcp %s %s", mcp.Method, mcp.ToolOrURI))
+	sp.SetKind(ptrace.SpanKindClient)
+	attrs.PutStr("mcp.method.name", mcp.Method)
+	attrs.PutStr("mcp.server.name", mcp.ServerName)
+	attrs.PutStr("server.address", mcp.ServerName)
+	attrs.PutStr("mcp.session.id", fmt.Sprintf("mcp-sess-%08x", treeID%10000))
+	attrs.PutStr("mcp.protocol.version", "2025-06-18")
+	attrs.PutStr("rpc.system", "jsonrpc")
+	attrs.PutStr("rpc.jsonrpc.version", "2.0")
+	reqID := fmt.Sprintf("req-%d", seq)
+	attrs.PutStr("rpc.jsonrpc.request_id", reqID)
+	attrs.PutStr("jsonrpc.request.id", reqID)
+	switch mcp.Method {
+	case "resources/read":
+		attrs.PutStr("mcp.resource.uri", mcp.ToolOrURI)
+	case "prompts/get":
+		attrs.PutStr("gen_ai.prompt.name", mcp.ToolOrURI)
+	default:
+		attrs.PutStr("gen_ai.tool.name", mcp.ToolOrURI)
+		attrs.PutStr("gen_ai.tool.call.id", fmt.Sprintf("call-mcp-%012x", seq))
+	}
+	attrs.PutStr("mcp.payload.content", payload)
 }
 
 func plantSecretKeyAttribute(attrs pcommon.Map, seq uint64) {

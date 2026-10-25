@@ -17,7 +17,7 @@ import (
 )
 
 func TestCLIRunBQFakeAndJSONOut(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
 	jsonPath := filepath.Join(t.TempDir(), "report.json")
@@ -76,7 +76,7 @@ func TestCLIRunBQFakeAndJSONOut(t *testing.T) {
 }
 
 func TestCLISweepAndFlagValidation(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
 	var stdout, stderr bytes.Buffer
