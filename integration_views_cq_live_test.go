@@ -25,7 +25,7 @@ import (
 // TestLiveContinuousQueriesDryRun validates all three Continuous Query SQL
 // templates in deploy/continuous-queries/ against a live BigQuery dataset where
 // otel_spans enforces require_partition_filter = true and otel_alerts is
-// provisioned with the Terraform 10-column alert sink schema.
+// provisioned with the Terraform 7-column alert sink schema.
 func TestLiveContinuousQueriesDryRun(t *testing.T) {
 	project := os.Getenv("BQ_PROJECT")
 	if project == "" {
@@ -125,6 +125,7 @@ func TestLiveContinuousQueriesDryRun(t *testing.T) {
 	}
 	for _, name := range templates {
 		t.Run(name, func(t *testing.T) {
+			subCtx := t.Context()
 			raw, err := os.ReadFile(filepath.Join("deploy", "continuous-queries", name))
 			if err != nil {
 				t.Fatalf("read %s: %v", name, err)
@@ -136,7 +137,7 @@ func TestLiveContinuousQueriesDryRun(t *testing.T) {
 			// (validates partition filter satisfaction on otel_spans and output JSON shape).
 			qSelect := admin.Query(innerSelect)
 			qSelect.DryRun = true
-			selectJob, err := qSelect.Run(ctx)
+			selectJob, err := qSelect.Run(subCtx)
 			if err != nil {
 				t.Fatalf("%s inner SELECT dry-run failed: %v\nSQL:\n%s", name, err, innerSelect)
 			}
@@ -156,22 +157,28 @@ func TestLiveContinuousQueriesDryRun(t *testing.T) {
 					},
 				},
 			}
-			if _, err := rawSvc.Jobs.Insert(project, exportJob).Context(ctx).Do(); err != nil {
-				// Projects without an Enterprise Plus CONTINUOUS reservation still
-				// parse and type-check the SQL or report a continuous-query feature
-				// / PubSub URI error rather than a SQL syntax or column error.
+			if _, err := rawSvc.Jobs.Insert(project, exportJob).Context(subCtx).Do(); err != nil {
+				// On on-demand projects without an Enterprise Plus CONTINUOUS
+				// reservation or Pub/Sub export topic, BigQuery only returns a
+				// continuous-query reservation/feature or Pub/Sub permission error
+				// after parsing the query; any other error must fail the test.
 				msg := strings.ToLower(err.Error())
-				if strings.Contains(msg, "syntax error") || strings.Contains(msg, "unrecognized name") || strings.Contains(msg, "column") {
-					t.Fatalf("%s EXPORT DATA continuous dry-run failed with SQL schema/syntax error: %v", name, err)
+				allowed := strings.Contains(msg, "continuous") ||
+					strings.Contains(msg, "reservation") ||
+					strings.Contains(msg, "enterprise") ||
+					strings.Contains(msg, "pubsub") ||
+					strings.Contains(msg, "permission")
+				if !allowed {
+					t.Fatalf("%s EXPORT DATA continuous dry-run failed with unexpected error: %v", name, err)
 				}
 				t.Logf("%s EXPORT DATA continuous dry-run note: %v", name, err)
 			}
 
 			// 3. Dry-run the INSERT INTO `<project>.<dataset>.otel_alerts` table-sink
-			// query against the provisioned 10-column otel_alerts table.
+			// query against the provisioned 7-column otel_alerts table.
 			qInsert := admin.Query(insertSQL)
 			qInsert.DryRun = true
-			insertJob, err := qInsert.Run(ctx)
+			insertJob, err := qInsert.Run(subCtx)
 			if err != nil {
 				t.Fatalf("%s INSERT INTO otel_alerts dry-run failed: %v\nSQL:\n%s", name, err, insertSQL)
 			}

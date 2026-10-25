@@ -3249,3 +3249,174 @@ func TestTerraformBoundedWindowTVFsMatchSchemaContract(t *testing.T) {
 		}
 	}
 }
+
+func genAILogsTVF(t testing.TB, rawLogs, rawSpans []map[string]any, startTS, endTS int64) []map[string]any {
+	t.Helper()
+	var windowSpans []map[string]any
+	for _, s := range rawSpans {
+		st, _ := colInt(s, "start_time")
+		if st >= startTS-logJoinBefore.Microseconds() && st <= endTS+logJoinAfter.Microseconds() {
+			windowSpans = append(windowSpans, s)
+		}
+	}
+	var windowLogs []map[string]any
+	for _, l := range logsDedup.apply(rawLogs) {
+		ts, _ := colInt(l, "timestamp")
+		if ts >= startTS && ts < endTS {
+			windowLogs = append(windowLogs, l)
+		}
+	}
+	return genAILogsView(t, windowLogs, windowSpans)
+}
+
+func genAIMetricExemplarsTVF(t testing.TB, rawMetrics, rawSpans []map[string]any, startTS, endTS int64) []map[string]any {
+	t.Helper()
+	var windowSpans []map[string]any
+	for _, s := range rawSpans {
+		st, _ := colInt(s, "start_time")
+		if st >= startTS-exemplarJoinBefore.Microseconds() && st <= endTS+exemplarJoinAfter.Microseconds() {
+			windowSpans = append(windowSpans, s)
+		}
+	}
+	var windowMetrics []map[string]any
+	for _, m := range metricsDedup.apply(rawMetrics) {
+		ts, _ := colInt(m, "timestamp")
+		if ts >= startTS && ts < endTS {
+			windowMetrics = append(windowMetrics, m)
+		}
+	}
+	return genAIMetricExemplarsView(t, windowMetrics, windowSpans)
+}
+
+func TestLogsAndMetricExemplarsTVFTiledWindowSemantics(t *testing.T) {
+	rig := newConformanceRig(t)
+	t0 := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	t1 := t0.Add(time.Hour)
+	t2 := t1.Add(time.Hour)
+	valD := func(v float64) *float64 { return &v }
+
+	// Span 1 starts 2 hours before t0 (inside [t0 - 24h, t1 + 1h]) and correlates
+	// with a log at t0 + 10m and a boundary metric exemplar at exactly t1.
+	rig.pushTraces(t, buildTraces(t, "tvf-agent",
+		specSpan{
+			trace: traceHex(11), id: spanHex(11), name: "chat cross_window",
+			start: t0.Add(-2 * time.Hour), end: t0.Add(-2*time.Hour + time.Second),
+			attrs: map[string]any{
+				"gen_ai.operation.name":  "chat",
+				"gen_ai.agent.name":      "cross_bot",
+				"gen_ai.conversation.id": "conv-tvf-11",
+			},
+		},
+	))
+
+	// Log 1 in [t0, t1), Log 2 on boundary t1 (emitted only in [t1, t2)).
+	ld := plog.NewLogs()
+	rl := ld.ResourceLogs().AppendEmpty()
+	rl.Resource().Attributes().PutStr("service.name", "tvf-agent")
+	sl := rl.ScopeLogs().AppendEmpty()
+
+	rec1 := sl.LogRecords().AppendEmpty()
+	rec1.SetTimestamp(pcommon.NewTimestampFromTime(t0.Add(10 * time.Minute)))
+	rec1.SetEventName("gen_ai.choice")
+	rec1.SetTraceID(mustTraceID(t, traceHex(11)))
+	rec1.SetSpanID(mustSpanID(t, spanHex(11)))
+	rec1.Body().SetStr("in-first-window")
+
+	rec2 := sl.LogRecords().AppendEmpty()
+	rec2.SetTimestamp(pcommon.NewTimestampFromTime(t1))
+	rec2.SetEventName("gen_ai.choice")
+	rec2.SetTraceID(mustTraceID(t, traceHex(11)))
+	rec2.SetSpanID(mustSpanID(t, spanHex(11)))
+	rec2.Body().SetStr("on-boundary-t1")
+	rig.pushLogs(t, ld)
+
+	// Metric 1 in [t0, t1), Metric 2 on boundary t1 (emitted only in [t1, t2)).
+	rig.pushMetrics(t, buildExemplarMetrics(t, "tvf-agent",
+		specMetricPoint{
+			name: "gen_ai.client.operation.duration", unit: "s", at: t0.Add(10 * time.Minute), valDouble: valD(0.5),
+			attrs: map[string]any{"gen_ai.operation.name": "chat"},
+			exemplars: []specExemplar{
+				{trace: traceHex(11), span: spanHex(11), at: t0.Add(10 * time.Minute), valDouble: valD(0.5)},
+			},
+		},
+		specMetricPoint{
+			name: "gen_ai.client.operation.duration", unit: "s", at: t1, valDouble: valD(0.75),
+			attrs: map[string]any{"gen_ai.operation.name": "chat"},
+			exemplars: []specExemplar{
+				{trace: traceHex(11), span: spanHex(11), at: t1, valDouble: valD(0.75)},
+			},
+		},
+	))
+
+	rawLogs := rig.srv.Rows(confLogs)
+	rawMetrics := rig.srv.Rows(confMetrics)
+	rawSpans := rig.srv.Rows(confSpans)
+
+	logsW1 := genAILogsTVF(t, rawLogs, rawSpans, t0.UnixMicro(), t1.UnixMicro())
+	logsW2 := genAILogsTVF(t, rawLogs, rawSpans, t1.UnixMicro(), t2.UnixMicro())
+	if len(logsW1) != 1 || len(logsW2) != 1 {
+		t.Fatalf("tvf_gen_ai_logs tiled windows rows = (%d, %d), want (1, 1)", len(logsW1), len(logsW2))
+	}
+	requireCols(t, "log in [t0, t1) enriched by earlier span", logsW1[0], map[string]any{
+		"timestamp":         t0.Add(10 * time.Minute).UnixMicro(),
+		"gen_ai_agent_name": "cross_bot",
+		"adk_session_id":    "conv-tvf-11",
+	})
+	requireCols(t, "boundary log at t1 in [t1, t2)", logsW2[0], map[string]any{
+		"timestamp":         t1.UnixMicro(),
+		"gen_ai_agent_name": "cross_bot",
+		"adk_session_id":    "conv-tvf-11",
+	})
+
+	exW1 := genAIMetricExemplarsTVF(t, rawMetrics, rawSpans, t0.UnixMicro(), t1.UnixMicro())
+	exW2 := genAIMetricExemplarsTVF(t, rawMetrics, rawSpans, t1.UnixMicro(), t2.UnixMicro())
+	if len(exW1) != 1 || len(exW2) != 1 {
+		t.Fatalf("tvf_gen_ai_metric_exemplars tiled windows rows = (%d, %d), want (1, 1)", len(exW1), len(exW2))
+	}
+	requireCols(t, "exemplar in [t0, t1) enriched by earlier span", exW1[0], map[string]any{
+		"metric_timestamp":       t0.Add(10 * time.Minute).UnixMicro(),
+		"span_name":              "chat cross_window",
+		"span_gen_ai_agent_name": "cross_bot",
+		"adk_session_id":         "conv-tvf-11",
+	})
+	requireCols(t, "boundary exemplar at t1 in [t1, t2)", exW2[0], map[string]any{
+		"metric_timestamp":       t1.UnixMicro(),
+		"span_name":              "chat cross_window",
+		"span_gen_ai_agent_name": "cross_bot",
+		"adk_session_id":         "conv-tvf-11",
+	})
+}
+
+func TestTerraformOtelAlertsSchemaMatchesDDL(t *testing.T) {
+	raw, err := os.ReadFile("deploy/terraform/main.tf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	re := regexp.MustCompile(`(?s)resource "google_bigquery_table" "otel_alerts" \{.*?schema\s*=\s*jsonencode\(\[(.*?)\]\)`)
+	m := re.FindStringSubmatch(string(raw))
+	if m == nil {
+		t.Fatal("deploy/terraform/main.tf missing google_bigquery_table.otel_alerts schema")
+	}
+	fieldRe := regexp.MustCompile(`\{\s*name\s*=\s*"([^"]+)",\s*type\s*=\s*"([^"]+)",\s*mode\s*=\s*"([^"]+)"\s*\}`)
+	matches := fieldRe.FindAllStringSubmatch(m[1], -1)
+
+	type colSpec struct{ name, typ, mode string }
+	want := []colSpec{
+		{"alert_id", "STRING", "REQUIRED"},
+		{"alert_kind", "STRING", "REQUIRED"},
+		{"event_time", "TIMESTAMP", "REQUIRED"},
+		{"service_name", "STRING", "NULLABLE"},
+		{"trace_id", "STRING", "REQUIRED"},
+		{"span_id", "STRING", "REQUIRED"},
+		{"payload", "JSON", "NULLABLE"},
+	}
+	if len(matches) != len(want) {
+		t.Fatalf("otel_alerts schema has %d columns, want %d: %v", len(matches), len(want), matches)
+	}
+	for i, w := range want {
+		got := colSpec{matches[i][1], matches[i][2], matches[i][3]}
+		if got != w {
+			t.Errorf("otel_alerts column[%d] = %+v, want %+v", i, got, w)
+		}
+	}
+}

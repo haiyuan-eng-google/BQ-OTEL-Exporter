@@ -530,23 +530,23 @@ func (e *signalExporter) start(ctx context.Context, host component.Host) (err er
 			e.authCleanup = e.authCleanup[:cleanupMark]
 			return fmt.Errorf("creating BigQuery metadata client: %w", adminErr)
 		}
-		defer func() {
-			closeErr := admin.Close()
-			for i := len(e.authCleanup) - 1; i >= cleanupMark; i-- {
-				e.authCleanup[i]()
-			}
-			e.authCleanup = e.authCleanup[:cleanupMark]
-			if closeErr == nil {
-				return
-			}
+		prepareErr := e.prepareDestination(ctx, withPerCallTimeout(admin, e.cfg.TimeoutSettings.Timeout))
+		closeErr := admin.Close()
+		for i := len(e.authCleanup) - 1; i >= cleanupMark; i-- {
+			e.authCleanup[i]()
+		}
+		e.authCleanup = e.authCleanup[:cleanupMark]
+		if closeErr != nil {
 			closeErr = fmt.Errorf("closing BigQuery metadata client: %w", closeErr)
-			if err != nil {
-				err = errors.Join(err, closeErr)
-				return
-			}
-			e.logger.Warn("closing BigQuery metadata client failed", zap.Error(closeErr))
-		}()
-		if prepareErr := e.prepareDestination(ctx, withPerCallTimeout(admin, e.cfg.TimeoutSettings.Timeout)); prepareErr != nil {
+			defer func() {
+				if err != nil {
+					err = errors.Join(err, closeErr)
+					return
+				}
+				e.logger.Warn("closing BigQuery metadata client failed", zap.Error(closeErr))
+			}()
+		}
+		if prepareErr != nil {
 			return prepareErr
 		}
 	}

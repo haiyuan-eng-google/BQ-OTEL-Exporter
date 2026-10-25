@@ -268,14 +268,18 @@ three views when `otel_spans` requires a partition filter.
 
 For deployments that enforce `require_partition_filter = true`, three
 bounded-window Table-Valued Functions (TVFs) provide identical output schemas
-with explicit `(start_ts TIMESTAMP, end_ts TIMESTAMP)` bounds pushed directly
-into the base deduplication views:
+with explicit half-open `[start_ts, end_ts)` (`>= start_ts AND < end_ts`) output
+windows and `[-24h, +1h]` cross-window span correlation bounds pushed directly
+into the base deduplication views (because BigQuery `CREATE TABLE FUNCTION`
+forbids `WITH RECURSIVE`, `tvf_gen_ai_agent_trajectory` evaluates the 16-hop
+parent chain and 32-hop multi-segment token-coverage walk via 5-step
+binary-lifting pointer jumping):
 
-| Unprunable View | Partition-Prunable TVF (`(start_ts TIMESTAMP, end_ts TIMESTAMP)`) | Pushed Partition Bounds |
+| Unprunable View | Partition-Prunable TVF (`(start_ts TIMESTAMP, end_ts TIMESTAMP)`) | Pushed Partition & Output Bounds |
 | --- | --- | --- |
-| `v_gen_ai_logs` | `tvf_gen_ai_logs(start_ts, end_ts)` | `otel_logs_dedup.timestamp BETWEEN start_ts AND end_ts` and `otel_spans_dedup.start_time BETWEEN start_ts - 24h AND end_ts + 1h` |
-| `v_gen_ai_metric_exemplars` | `tvf_gen_ai_metric_exemplars(start_ts, end_ts)` | `v_gen_ai_metrics.timestamp BETWEEN start_ts AND end_ts` and `otel_spans_dedup.start_time BETWEEN start_ts - 24h AND end_ts + 1h` |
-| `v_gen_ai_agent_trajectory` | `tvf_gen_ai_agent_trajectory(start_ts, end_ts)` | `v_gen_ai_spans.start_time BETWEEN start_ts AND end_ts` inside the anchor `spans` CTE |
+| `v_gen_ai_logs` | `tvf_gen_ai_logs(start_ts, end_ts)` | `otel_logs_dedup.timestamp >= start_ts AND < end_ts` and `otel_spans_dedup.start_time >= start_ts - 24h AND <= end_ts + 1h` |
+| `v_gen_ai_metric_exemplars` | `tvf_gen_ai_metric_exemplars(start_ts, end_ts)` | `v_gen_ai_metrics.timestamp >= start_ts AND < end_ts` and `otel_spans_dedup.start_time >= start_ts - 24h AND <= end_ts + 1h` |
+| `v_gen_ai_agent_trajectory` | `tvf_gen_ai_agent_trajectory(start_ts, end_ts)` | `v_gen_ai_spans.start_time >= start_ts - 24h AND <= end_ts + 1h` in the `spans` CTE, and `t.start_time >= start_ts AND < end_ts` on the outer `SELECT` |
 
 Example query on a partition-filter-enforced dataset:
 

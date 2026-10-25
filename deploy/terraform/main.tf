@@ -1676,19 +1676,19 @@ resource "google_bigquery_routine" "tvf_gen_ai_logs" {
       l.resource,
       l.instrumentation_scope,
       JSON_VALUE(l.attributes, '$."error.type"') AS error_type
-    FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.otel_logs_dedup.table_id}` l
+    FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.otel_logs_dedup.table_id}` AS l
     LEFT JOIN (
       SELECT *
       FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.otel_spans_dedup.table_id}`
       WHERE start_time >= TIMESTAMP_SUB(start_ts, INTERVAL 24 HOUR)
         AND start_time <= TIMESTAMP_ADD(end_ts, INTERVAL 1 HOUR)
-    ) s
+    ) AS s
       ON l.trace_id = s.trace_id
       AND l.span_id = s.span_id
       AND l.service_name IS NOT DISTINCT FROM s.service_name
       AND s.start_time BETWEEN TIMESTAMP_SUB(l.timestamp, INTERVAL 24 HOUR) AND TIMESTAMP_ADD(l.timestamp, INTERVAL 1 HOUR)
     WHERE l.timestamp >= start_ts
-      AND l.timestamp <= end_ts
+      AND l.timestamp < end_ts
       AND (
         COALESCE(NULLIF(l.event_name, ''), JSON_VALUE(l.attributes, '$."event.name"')) LIKE 'gen_ai.%'
         OR JSON_VALUE(l.attributes, '$."gen_ai.system"') IS NOT NULL
@@ -1757,20 +1757,21 @@ resource "google_bigquery_routine" "tvf_gen_ai_metric_exemplars" {
         JSON_VALUE(s.attributes, '$."gen_ai.conversation.id"')
       ) AS adk_session_id,
       JSON_VALUE(s.attributes, '$."error.type"') AS span_error_type
-    FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.v_gen_ai_metrics.table_id}` m,
-    UNNEST(m.exemplars) AS ex WITH OFFSET AS exemplar_ordinal
+    FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.v_gen_ai_metrics.table_id}` AS m
+    INNER JOIN UNNEST(m.exemplars) AS ex
+      WITH OFFSET AS exemplar_ordinal
     LEFT JOIN (
       SELECT *
       FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.otel_spans_dedup.table_id}`
       WHERE start_time >= TIMESTAMP_SUB(start_ts, INTERVAL 24 HOUR)
         AND start_time <= TIMESTAMP_ADD(end_ts, INTERVAL 1 HOUR)
-    ) s
+    ) AS s
       ON s.trace_id = ex.trace_id
       AND s.span_id = ex.span_id
       AND s.service_name IS NOT DISTINCT FROM m.service_name
       AND s.start_time BETWEEN TIMESTAMP_SUB(m.timestamp, INTERVAL 24 HOUR) AND TIMESTAMP_ADD(m.timestamp, INTERVAL 1 HOUR)
     WHERE m.timestamp >= start_ts
-      AND m.timestamp <= end_ts
+      AND m.timestamp < end_ts
       AND ex.trace_id IS NOT NULL
       AND ex.span_id IS NOT NULL
       AND ex.trace_id != ''
@@ -1845,8 +1846,8 @@ resource "google_bigquery_routine" "tvf_gen_ai_agent_trajectory" {
             IF(gen_ai_operation_name IN ('invoke_agent', 'create_agent'), gen_ai_agent_name, NULL)
           ) AS agent_path_name
         FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.v_gen_ai_spans.table_id}`
-        WHERE start_time >= start_ts
-          AND start_time <= end_ts
+        WHERE start_time >= TIMESTAMP_SUB(start_ts, INTERVAL 24 HOUR)
+          AND start_time <= TIMESTAMP_ADD(end_ts, INTERVAL 1 HOUR)
         QUALIFY ROW_NUMBER() OVER (
           PARTITION BY trace_id, service_name, span_id
           ORDER BY start_time ASC, end_time DESC, span_name ASC, duration_nano DESC
@@ -1867,15 +1868,21 @@ resource "google_bigquery_routine" "tvf_gen_ai_agent_trajectory" {
           IF(
             s.parent_span_id IS NOT NULL
               AND s.parent_span_id != ''
-              AND p.span_id IS NOT NULL
-              AND p.span_id != s.span_id,
+              AND p.span_id IS NOT NULL,
             p.span_id,
             CAST(NULL AS STRING)
           ) AS top_parent_id,
           [
             STRUCT(
               s.span_id AS span_id,
+              s.start_time AS start_time,
               (s.parent_span_id IS NOT NULL AND s.parent_span_id != '') AS is_orphan,
+              (
+                s.parent_span_id IS NOT NULL
+                AND s.parent_span_id != ''
+                AND p.span_id IS NOT NULL
+                AND p.start_time BETWEEN TIMESTAMP_SUB(s.start_time, INTERVAL 24 HOUR) AND TIMESTAMP_ADD(s.start_time, INTERVAL 1 HOUR)
+              ) AS in_tree_window,
               (s.gen_ai_operation_name IN ('invoke_agent', 'create_agent')) AS is_agent_op,
               (s.declared_agent_name IS NOT NULL) AS has_declared_agent,
               COALESCE(s.declared_agent_name, s.gen_ai_agent_name) AS resolved_agent_name,
@@ -1884,10 +1891,9 @@ resource "google_bigquery_routine" "tvf_gen_ai_agent_trajectory" {
           ] AS chain
         FROM spans AS s
         LEFT JOIN spans AS p
-          ON s.trace_id = p.trace_id
-          AND s.parent_span_id = p.span_id
-          AND s.service_name IS NOT DISTINCT FROM p.service_name
-          AND p.start_time BETWEEN TIMESTAMP_SUB(s.start_time, INTERVAL 24 HOUR) AND TIMESTAMP_ADD(s.start_time, INTERVAL 1 HOUR)
+          ON p.trace_id = s.trace_id
+          AND p.span_id = s.parent_span_id
+          AND p.service_name IS NOT DISTINCT FROM s.service_name
       ),
       hop1 AS (
         SELECT
@@ -1949,6 +1955,17 @@ resource "google_bigquery_routine" "tvf_gen_ai_agent_trajectory" {
           AND anc.service_name IS NOT DISTINCT FROM h.service_name
           AND anc.span_id = h.top_parent_id
       ),
+      rooted_chains AS (
+        SELECT
+          h.*,
+          (
+            SELECT MAX(idx)
+            FROM UNNEST(h.chain) AS n
+              WITH OFFSET AS idx
+            WHERE NOT n.in_tree_window
+          ) AS tree_start_idx
+        FROM hop16 AS h
+      ),
       trajectory AS (
         SELECT
           h.start_time,
@@ -1982,20 +1999,24 @@ resource "google_bigquery_routine" "tvf_gen_ai_agent_trajectory" {
           h.adk_invocation_id,
           h.adk_user_id,
           h.error_type,
-          ARRAY_LENGTH(h.chain) - 1 AS depth,
-          h.chain[OFFSET(0)].span_id AS root_span_id,
+          (ARRAY_LENGTH(h.chain) - 1 - h.tree_start_idx) AS depth,
+          h.chain[OFFSET(h.tree_start_idx)].span_id AS root_span_id,
           COALESCE(
             (
               SELECT n.span_id
-              FROM UNNEST(h.chain) AS n WITH OFFSET AS idx
-              WHERE n.is_agent_op
+              FROM UNNEST(h.chain) AS n
+                WITH OFFSET AS idx
+              WHERE idx >= h.tree_start_idx
+                AND n.is_agent_op
               ORDER BY idx DESC
               LIMIT 1
             ),
             (
               SELECT n.span_id
-              FROM UNNEST(h.chain) AS n WITH OFFSET AS idx
-              WHERE n.has_declared_agent
+              FROM UNNEST(h.chain) AS n
+                WITH OFFSET AS idx
+              WHERE idx >= h.tree_start_idx
+                AND n.has_declared_agent
               ORDER BY idx ASC
               LIMIT 1
             )
@@ -2003,29 +2024,37 @@ resource "google_bigquery_routine" "tvf_gen_ai_agent_trajectory" {
           COALESCE(
             (
               SELECT n.resolved_agent_name
-              FROM UNNEST(h.chain) AS n WITH OFFSET AS idx
-              WHERE n.is_agent_op
+              FROM UNNEST(h.chain) AS n
+                WITH OFFSET AS idx
+              WHERE idx >= h.tree_start_idx
+                AND n.is_agent_op
               ORDER BY idx DESC
               LIMIT 1
             ),
             (
               SELECT n.resolved_agent_name
-              FROM UNNEST(h.chain) AS n WITH OFFSET AS idx
-              WHERE n.has_declared_agent
+              FROM UNNEST(h.chain) AS n
+                WITH OFFSET AS idx
+              WHERE idx >= h.tree_start_idx
+                AND n.has_declared_agent
               ORDER BY idx ASC
               LIMIT 1
             )
           ) AS nearest_agent_name,
           ARRAY(
             SELECT n.agent_path_name
-            FROM UNNEST(h.chain) AS n WITH OFFSET AS idx
-            WHERE n.agent_path_name IS NOT NULL
+            FROM UNNEST(h.chain) AS n
+              WITH OFFSET AS idx
+            WHERE idx >= h.tree_start_idx
+              AND n.agent_path_name IS NOT NULL
               AND (
-                idx = 0
+                idx = h.tree_start_idx
                 OR n.agent_path_name IS DISTINCT FROM (
                   SELECT prev.agent_path_name
-                  FROM UNNEST(h.chain) AS prev WITH OFFSET AS p_idx
-                  WHERE p_idx < idx
+                  FROM UNNEST(h.chain) AS prev
+                    WITH OFFSET AS p_idx
+                  WHERE p_idx >= h.tree_start_idx
+                    AND p_idx < idx
                     AND prev.agent_path_name IS NOT NULL
                   ORDER BY p_idx DESC
                   LIMIT 1
@@ -2033,29 +2062,68 @@ resource "google_bigquery_routine" "tvf_gen_ai_agent_trajectory" {
               )
             ORDER BY idx ASC
           ) AS agent_path,
-          h.chain[OFFSET(0)].is_orphan AS is_orphan,
+          h.chain[OFFSET(h.tree_start_idx)].is_orphan AS is_orphan,
+          h.tree_start_idx AS tree_start_idx,
           h.chain AS chain
-        FROM hop16 AS h
-        WHERE h.top_parent_id IS NULL
-          AND ARRAY_LENGTH(h.chain) <= 17
+        FROM rooted_chains AS h
+        WHERE h.tree_start_idx IS NOT NULL
+          AND (ARRAY_LENGTH(h.chain) - 1 - h.tree_start_idx) <= 16
+      ),
+      emitted_ancestors AS (
+        SELECT
+          t.trace_id,
+          t.service_name,
+          t.span_id AS descendant_span_id,
+          t.start_time AS descendant_start_time,
+          t.gen_ai_usage_input_tokens IS NOT NULL AS has_input,
+          t.gen_ai_usage_output_tokens IS NOT NULL AS has_output,
+          t.gen_ai_usage_reasoning_tokens IS NOT NULL AS has_reasoning,
+          anc.span_id AS ancestor_span_id,
+          anc.start_time AS ancestor_start_time,
+          EXISTS (
+            SELECT 1
+            FROM UNNEST(t.chain) AS x
+              WITH OFFSET AS x_idx
+            WHERE x_idx < a_idx
+              AND x.span_id = t.span_id
+          ) AS has_reverse_path
+        FROM trajectory AS t
+        INNER JOIN UNNEST(t.chain) AS anc
+          WITH OFFSET AS a_idx
+        WHERE a_idx < ARRAY_LENGTH(t.chain) - 1
+          AND anc.span_id != t.span_id
+          AND (
+            a_idx >= t.tree_start_idx
+            OR (
+              a_idx - (
+                SELECT MAX(i2)
+                FROM UNNEST(t.chain) AS n2
+                  WITH OFFSET AS i2
+                WHERE i2 <= a_idx
+                  AND NOT n2.in_tree_window
+              )
+            ) <= 16
+          )
       ),
       token_parent_coverage AS (
         SELECT
-          c.trace_id,
-          c.service_name,
-          anc.span_id AS span_id,
-          LOGICAL_OR(c.gen_ai_usage_input_tokens IS NOT NULL) AS has_input,
-          LOGICAL_OR(c.gen_ai_usage_output_tokens IS NOT NULL) AS has_output,
-          LOGICAL_OR(c.gen_ai_usage_reasoning_tokens IS NOT NULL) AS has_reasoning
-        FROM trajectory AS c,
-        UNNEST(c.chain) AS anc WITH OFFSET AS anc_idx
-        WHERE anc_idx < ARRAY_LENGTH(c.chain) - 1
+          ea.trace_id,
+          ea.service_name,
+          ea.ancestor_span_id AS span_id,
+          LOGICAL_OR(ea.has_input) AS has_input,
+          LOGICAL_OR(ea.has_output) AS has_output,
+          LOGICAL_OR(ea.has_reasoning) AS has_reasoning
+        FROM emitted_ancestors AS ea
+        WHERE (ea.has_input OR ea.has_output OR ea.has_reasoning)
           AND (
-            c.gen_ai_usage_input_tokens IS NOT NULL
-            OR c.gen_ai_usage_output_tokens IS NOT NULL
-            OR c.gen_ai_usage_reasoning_tokens IS NOT NULL
+            NOT ea.has_reverse_path
+            OR ea.descendant_start_time > ea.ancestor_start_time
+            OR (
+              ea.descendant_start_time = ea.ancestor_start_time
+              AND ea.descendant_span_id > ea.ancestor_span_id
+            )
           )
-        GROUP BY c.trace_id, c.service_name, anc.span_id
+        GROUP BY ea.trace_id, ea.service_name, ea.ancestor_span_id
       )
     SELECT
       t.start_time,
@@ -2138,6 +2206,8 @@ resource "google_bigquery_routine" "tvf_gen_ai_agent_trajectory" {
       ON t.trace_id = token_leaf_check.trace_id
       AND t.span_id = token_leaf_check.span_id
       AND t.service_name IS NOT DISTINCT FROM token_leaf_check.service_name
+    WHERE t.start_time >= start_ts
+      AND t.start_time < end_ts
   EOT
 }
 

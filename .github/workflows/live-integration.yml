@@ -13,7 +13,7 @@ jobs:
   live-integration:
     name: Live BigQuery Integration Suite
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - name: Validate Live BigQuery configuration
         id: check-config
@@ -49,8 +49,9 @@ jobs:
         if: steps.check-config.outputs.configured == 'true'
         env:
           REQUIRE_LIVE_BQ: "1"
+          REQUIRE_LIVE_GCS: ${{ vars.BQ_OFFLOAD_TEST_BUCKET != '' && '1' || '' }}
           BQ_PROJECT: ${{ vars.BQ_PROJECT }}
           BQ_LOCATION: ${{ vars.BQ_LOCATION || 'US' }}
-          BQ_OFFLOAD_BUCKET: ${{ vars.BQ_OFFLOAD_BUCKET }}
+          BQ_OFFLOAD_TEST_BUCKET: ${{ vars.BQ_OFFLOAD_TEST_BUCKET }}
         run: |
-          go test -v -race -tags=integration -count=1 -timeout=10m ./...
+          go test -v -race -tags=integration -count=1 -timeout=20m ./...

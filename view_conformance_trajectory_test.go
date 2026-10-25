@@ -6,6 +6,7 @@ package bigqueryexporter
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -504,6 +505,380 @@ func genAIAgentTrajectoryView(t testing.TB, spans []map[string]any) []map[string
 	return out
 }
 
+// genAIAgentTrajectoryTVF evaluates tvf_gen_ai_agent_trajectory(start_ts, end_ts)
+// over the rows of v_gen_ai_spans using the TVF's non-recursive 5-step
+// binary-lifting pointer-jumping algorithm for both hop0..hop16 (parent chain
+// reconstruction) and anc_hop0..anc_hop16 (multi-segment emitted_ancestors
+// token coverage), plus the outer half-open [startTS, endTS) window filter.
+func genAIAgentTrajectoryTVF(t testing.TB, rawViewSpans []map[string]any, startTS, endTS int64) []map[string]any {
+	t.Helper()
+	var windowSpans []map[string]any
+	for _, s := range rawViewSpans {
+		st, _ := colInt(s, "start_time")
+		if st >= startTS-trajectoryLookbackMicros && st <= endTS+trajectorySkewMicros {
+			windowSpans = append(windowSpans, s)
+		}
+	}
+	spans := canonicalizeTrajectorySpans(windowSpans)
+
+	parentIDs := make(map[string]bool)
+	for _, s := range spans {
+		parent, hasParent := colString(s, "parent_span_id")
+		if !hasParent || parent == "" {
+			continue
+		}
+		parentIDs[groupKey(s["trace_id"], s["service_name"], parent)] = true
+	}
+
+	type hopRow struct {
+		span        map[string]any
+		topParentID string
+		chain       []map[string]any
+	}
+
+	// hop0: 1-hop parent lookup within [-24h, +1h] (including self-loops p.span_id == s.span_id).
+	hops := make([]hopRow, 0, len(spans))
+	for _, s := range spans {
+		parent, hasParent := colString(s, "parent_span_id")
+		sStart, _ := colInt(s, "start_time")
+		var matchedP map[string]any
+		if hasParent && parent != "" {
+			for _, p := range spans {
+				if p["trace_id"] != s["trace_id"] || !equalNullableString(s["service_name"], p["service_name"]) {
+					continue
+				}
+				pSpanID, _ := colString(p, "span_id")
+				if pSpanID != parent {
+					continue
+				}
+				pStart, _ := colInt(p, "start_time")
+				if pStart >= sStart-trajectoryLookbackMicros && pStart <= sStart+trajectorySkewMicros {
+					matchedP = p
+					break
+				}
+			}
+		}
+		if matchedP != nil {
+			pSpanID, _ := colString(matchedP, "span_id")
+			hops = append(hops, hopRow{
+				span:        s,
+				topParentID: pSpanID,
+				chain:       []map[string]any{matchedP, s},
+			})
+		} else {
+			hops = append(hops, hopRow{
+				span:        s,
+				topParentID: "",
+				chain:       []map[string]any{s},
+			})
+		}
+	}
+
+	// hop1, hop2, hop4, hop8, hop16: 5 doubling steps (up to 32 hops).
+	for _, maxJump := range []int{2, 3, 5, 9, 17} {
+		nextHops := make([]hopRow, len(hops))
+		for i, h := range hops {
+			if h.topParentID == "" || len(h.chain) > maxJump {
+				nextHops[i] = h
+				continue
+			}
+			var matchedU *hopRow
+			for j := range hops {
+				u := &hops[j]
+				uSpanID, _ := colString(u.span, "span_id")
+				if u.span["trace_id"] != h.span["trace_id"] || !equalNullableString(u.span["service_name"], h.span["service_name"]) || uSpanID != h.topParentID {
+					continue
+				}
+				cycleOverlap := false
+				for idx, x := range u.chain {
+					if idx >= len(u.chain)-1 {
+						break
+					}
+					xID, _ := colString(x, "span_id")
+					for _, y := range h.chain {
+						yID, _ := colString(y, "span_id")
+						if xID == yID {
+							cycleOverlap = true
+							break
+						}
+					}
+					if cycleOverlap {
+						break
+					}
+				}
+				if !cycleOverlap {
+					matchedU = u
+					break
+				}
+			}
+			if matchedU != nil {
+				merged := make([]map[string]any, 0, len(matchedU.chain)-1+len(h.chain))
+				merged = append(merged, matchedU.chain[:len(matchedU.chain)-1]...)
+				merged = append(merged, h.chain...)
+				nextHops[i] = hopRow{
+					span:        h.span,
+					topParentID: matchedU.topParentID,
+					chain:       merged,
+				}
+			} else {
+				nextHops[i] = h
+			}
+		}
+		hops = nextHops
+	}
+
+	// trajectory CTE: keep rooted chains (top_parent_id IS NULL AND ARRAY_LENGTH(chain) <= 17).
+	var emitted []map[string]any
+	for _, h := range hops {
+		if h.topParentID != "" || len(h.chain) > 17 {
+			continue
+		}
+		row := copyTrajectoryBaseCols(h.span)
+		row["depth"] = int64(len(h.chain) - 1)
+		rootSpanID, _ := colString(h.chain[0], "span_id")
+		row["root_span_id"] = rootSpanID
+
+		lastAgentOpIdx := -1
+		firstDeclaredIdx := -1
+		var firstDeclaredName string
+		for idx, node := range h.chain {
+			if op, _ := colString(node, "gen_ai_operation_name"); isAgentOperation(op) {
+				lastAgentOpIdx = idx
+			}
+			if firstDeclaredIdx < 0 {
+				if dec, ok := declaredAgentName(t, node); ok {
+					firstDeclaredIdx = idx
+					firstDeclaredName = dec
+				}
+			}
+		}
+		if lastAgentOpIdx >= 0 {
+			agNode := h.chain[lastAgentOpIdx]
+			agSpanID, _ := colString(agNode, "span_id")
+			row["nearest_agent_span_id"] = agSpanID
+			if dec, ok := declaredAgentName(t, agNode); ok {
+				row["nearest_agent_name"] = dec
+			} else if name, ok := colString(agNode, "gen_ai_agent_name"); ok {
+				row["nearest_agent_name"] = name
+			}
+		} else if firstDeclaredIdx >= 0 {
+			decNode := h.chain[firstDeclaredIdx]
+			decSpanID, _ := colString(decNode, "span_id")
+			row["nearest_agent_span_id"] = decSpanID
+			row["nearest_agent_name"] = firstDeclaredName
+		}
+
+		agentPath := []string{}
+		for pos, node := range h.chain {
+			name, ok := agentPathName(t, node)
+			if !ok {
+				continue
+			}
+			dupPrev := false
+			for prevPos := 0; prevPos < pos; prevPos++ {
+				prevName, prevOK := agentPathName(t, h.chain[prevPos])
+				if !prevOK {
+					continue
+				}
+				hasMid := false
+				for midPos := prevPos + 1; midPos < pos; midPos++ {
+					if _, midOK := agentPathName(t, h.chain[midPos]); midOK {
+						hasMid = true
+						break
+					}
+				}
+				if !hasMid && prevName == name {
+					dupPrev = true
+					break
+				}
+			}
+			if !dupPrev {
+				agentPath = append(agentPath, name)
+			}
+		}
+		row["agent_path"] = agentPath
+
+		rootParent, hasRootParent := colString(h.chain[0], "parent_span_id")
+		row["is_orphan"] = hasRootParent && rootParent != ""
+		emitted = append(emitted, row)
+	}
+
+	// anc_hop0..anc_hop16: 5-step binary lifting over trajectory rows along parent_span_id -> span_id.
+	type ancHopRow struct {
+		desc         map[string]any
+		nextParentID string
+		ancChain     []map[string]any
+	}
+	ancHops := make([]ancHopRow, 0, len(emitted))
+	for _, c := range emitted {
+		cSpanID, _ := colString(c, "span_id")
+		cParent, hasParent := colString(c, "parent_span_id")
+		var matchedP map[string]any
+		if hasParent && cParent != "" && cParent != cSpanID {
+			for _, p := range emitted {
+				if p["trace_id"] != c["trace_id"] || !equalNullableString(p["service_name"], c["service_name"]) {
+					continue
+				}
+				pSpanID, _ := colString(p, "span_id")
+				if pSpanID == cParent && pSpanID != cSpanID {
+					matchedP = p
+					break
+				}
+			}
+		}
+		if matchedP != nil {
+			pSpanID, _ := colString(matchedP, "span_id")
+			ancHops = append(ancHops, ancHopRow{
+				desc:         c,
+				nextParentID: pSpanID,
+				ancChain:     []map[string]any{matchedP},
+			})
+		} else {
+			ancHops = append(ancHops, ancHopRow{
+				desc:         c,
+				nextParentID: "",
+				ancChain:     nil,
+			})
+		}
+	}
+
+	for range 5 {
+		nextAnc := make([]ancHopRow, len(ancHops))
+		for i, h := range ancHops {
+			if h.nextParentID == "" {
+				nextAnc[i] = h
+				continue
+			}
+			var matchedA *ancHopRow
+			for j := range ancHops {
+				a := &ancHops[j]
+				aSpanID, _ := colString(a.desc, "span_id")
+				if a.desc["trace_id"] == h.desc["trace_id"] && equalNullableString(a.desc["service_name"], h.desc["service_name"]) && aSpanID == h.nextParentID {
+					matchedA = a
+					break
+				}
+			}
+			if matchedA != nil {
+				merged := make([]map[string]any, 0, len(h.ancChain)+len(matchedA.ancChain))
+				merged = append(merged, h.ancChain...)
+				merged = append(merged, matchedA.ancChain...)
+				nextAnc[i] = ancHopRow{
+					desc:         h.desc,
+					nextParentID: matchedA.nextParentID,
+					ancChain:     merged,
+				}
+			} else {
+				nextAnc[i] = ancHopRow{
+					desc:         h.desc,
+					nextParentID: "",
+					ancChain:     h.ancChain,
+				}
+			}
+		}
+		ancHops = nextAnc
+	}
+
+	// emitted_ancestors + token_parent_coverage with mutual-reachability cycle tie-breaking.
+	type emittedAncPair struct {
+		desc      map[string]any
+		descID    string
+		descStart int64
+		ancID     string
+		ancStart  int64
+	}
+	var pairs []emittedAncPair
+	reachable := make(map[string]bool)
+	for _, h := range ancHops {
+		descID, _ := colString(h.desc, "span_id")
+		descStart, _ := colInt(h.desc, "start_time")
+		seenAnc := make(map[string]bool)
+		for _, anc := range h.ancChain {
+			ancID, _ := colString(anc, "span_id")
+			if ancID == descID || seenAnc[ancID] {
+				continue
+			}
+			seenAnc[ancID] = true
+			ancStart, _ := colInt(anc, "start_time")
+			pairs = append(pairs, emittedAncPair{
+				desc:      h.desc,
+				descID:    descID,
+				descStart: descStart,
+				ancID:     ancID,
+				ancStart:  ancStart,
+			})
+			reachable[groupKey(h.desc["trace_id"], h.desc["service_name"], descID, ancID)] = true
+		}
+	}
+
+	tokenParentCoverage := make(map[string]tokenCoverage)
+	for _, ea := range pairs {
+		if !reportsTokens(ea.desc) {
+			continue
+		}
+		hasReversePath := reachable[groupKey(ea.desc["trace_id"], ea.desc["service_name"], ea.ancID, ea.descID)]
+		if hasReversePath && (ea.descStart < ea.ancStart || (ea.descStart == ea.ancStart && ea.descID <= ea.ancID)) {
+			continue
+		}
+		key := groupKey(ea.desc["trace_id"], ea.desc["service_name"], ea.ancID)
+		recordTokenCoverage(tokenParentCoverage, key, ea.desc)
+	}
+
+	// Outer SELECT: filter by WHERE t.start_time >= startTS AND t.start_time < endTS,
+	// then compute step_index, is_leaf, partial-overlap token suppression, and is_token_leaf.
+	partitions := make(map[string][]map[string]any)
+	var partitionOrder []string
+	for _, row := range emitted {
+		st, _ := colInt(row, "start_time")
+		if st < startTS || st >= endTS {
+			continue
+		}
+		pk := groupKey(row["trace_id"], row["service_name"])
+		if _, ok := partitions[pk]; !ok {
+			partitionOrder = append(partitionOrder, pk)
+		}
+		partitions[pk] = append(partitions[pk], row)
+	}
+
+	var out []map[string]any
+	for _, pk := range partitionOrder {
+		part := partitions[pk]
+		sort.SliceStable(part, func(i, j int) bool {
+			si, _ := colInt(part[i], "start_time")
+			sj, _ := colInt(part[j], "start_time")
+			if si != sj {
+				return si < sj
+			}
+			idi, _ := colString(part[i], "span_id")
+			idj, _ := colString(part[j], "span_id")
+			return idi < idj
+		})
+		for idx, row := range part {
+			row["step_index"] = int64(idx + 1)
+			lk := groupKey(row["trace_id"], row["service_name"], row["span_id"])
+			row["is_leaf"] = !parentIDs[lk]
+			cov := tokenParentCoverage[lk]
+			_, hasIn := colInt(row, "gen_ai_usage_input_tokens")
+			_, hasOut := colInt(row, "gen_ai_usage_output_tokens")
+			_, hasReas := colInt(row, "gen_ai_usage_reasoning_tokens")
+			uncovIn := hasIn && !cov.hasInput
+			uncovOut := hasOut && !cov.hasOutput
+			uncovReas := hasReas && !cov.hasReasoning
+			if cov.hasInput && (uncovOut || uncovReas) {
+				delete(row, "gen_ai_usage_input_tokens")
+			}
+			if cov.hasOutput && (uncovIn || uncovReas) {
+				delete(row, "gen_ai_usage_output_tokens")
+			}
+			if cov.hasReasoning && (uncovIn || uncovOut) {
+				delete(row, "gen_ai_usage_reasoning_tokens")
+			}
+			row["is_token_leaf"] = uncovIn || uncovOut || uncovReas
+			out = append(out, row)
+		}
+	}
+	return out
+}
+
 func TestScenarioMultiAgentTrajectoryView(t *testing.T) {
 	rig := newConformanceRig(t)
 	rig.pushTraces(t, loadTraces(t, "multi_agent/traces.json"))
@@ -511,6 +886,10 @@ func TestScenarioMultiAgentTrajectoryView(t *testing.T) {
 	rawSpans := rig.srv.Rows("otel_spans")
 	spans := trajectorySpans(t, rawSpans)
 	traj := genAIAgentTrajectoryView(t, spans)
+	tvfTraj := genAIAgentTrajectoryTVF(t, spans, 0, int64(1)<<60)
+	if !reflect.DeepEqual(tvfTraj, traj) {
+		t.Fatalf("tvf_gen_ai_agent_trajectory rows differed from v_gen_ai_agent_trajectory:\ngot:  %#v\nwant: %#v", tvfTraj, traj)
+	}
 
 	if len(traj) != 8 {
 		t.Fatalf("v_gen_ai_agent_trajectory rows = %d, want 8", len(traj))
@@ -708,6 +1087,30 @@ func TestAgentTrajectoryViewEdgeCases(t *testing.T) {
 		}
 		return row
 	}
+	evalView := genAIAgentTrajectoryView
+	genAIAgentTrajectoryView := func(t *testing.T, spans []map[string]any) []map[string]any {
+		t.Helper()
+		gotView := evalView(t, spans)
+		gotTVF := genAIAgentTrajectoryTVF(t, spans,
+			baseTime-48*int64(time.Hour/time.Microsecond),
+			baseTime+48*int64(time.Hour/time.Microsecond),
+		)
+		if !reflect.DeepEqual(gotTVF, gotView) {
+			t.Fatalf("tvf_gen_ai_agent_trajectory differed from v_gen_ai_agent_trajectory:\ngot TVF:  %#v\nwant view: %#v", gotTVF, gotView)
+		}
+		return gotView
+	}
+
+	t.Run("self_parented_span_and_descendant_excluded", func(t *testing.T) {
+		spans := []map[string]any{
+			makeSpan("t-self-loop", "s1", "s1", "svc", "invoke_agent", "agent-a", 0, 10),
+			makeSpan("t-self-loop", "s2", "s1", "svc", "chat", "agent-a", 10, 10),
+		}
+		got := genAIAgentTrajectoryView(t, spans)
+		if len(got) != 0 {
+			t.Fatalf("self-parented cycle rows = %d, want 0", len(got))
+		}
+	})
 
 	t.Run("two_node_cycle_disconnected", func(t *testing.T) {
 		spans := []map[string]any{
@@ -1457,6 +1860,119 @@ func TestAgentTrajectoryViewEdgeCases(t *testing.T) {
 	})
 }
 
+func TestAgentTrajectoryTVFTiledWindowSemantics(t *testing.T) {
+	t0 := time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC).UnixMicro()
+	t1 := t0 + int64(time.Hour/time.Microsecond)
+	t2 := t1 + int64(time.Hour/time.Microsecond)
+
+	attrsJSON := func(agent string) string {
+		raw, err := json.Marshal(map[string]string{"gen_ai.agent.name": agent})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(raw)
+	}
+	makeSpanAt := func(traceID, spanID, parentID, op, agent string, startMicros, inTokens int64) map[string]any {
+		row := map[string]any{
+			"start_time":            startMicros,
+			"end_time":              startMicros + 1000,
+			"duration_nano":         int64(1_000_000),
+			"duration_ms":           float64(1.0),
+			"trace_id":              traceID,
+			"span_id":               spanID,
+			"span_name":             op + " " + spanID,
+			"span_kind":             int64(1),
+			"status_code":           int64(1),
+			"service_name":          "tiled-svc",
+			"gen_ai_operation_name": op,
+			"gen_ai_agent_name":     agent,
+			"attributes":            attrsJSON(agent),
+		}
+		if parentID != "" {
+			row["parent_span_id"] = parentID
+		}
+		if inTokens > 0 {
+			row["gen_ai_usage_input_tokens"] = inTokens
+		}
+		return row
+	}
+
+	// 1. Boundary span at start_time == t1 is emitted only in [t1, t2), never in [t0, t1).
+	// 2. Cross-window trace: root parent at t1 - 1s (in [t0, t1), 250 tokens) ->
+	//    tokenless tool at t1 - 500ms (in [t0, t1)) ->
+	//    worker child at t1 + 1s (in [t1, t2), 250 tokens).
+	//    Because tvf_gen_ai_agent_trajectory scans spans in [start_ts - 24h, end_ts + 1h]
+	//    before applying the outer WHERE t.start_time >= start_ts AND t.start_time < end_ts:
+	//    - In [t0, t1): parent sees child at t1 + 1s, so parent has is_leaf = false
+	//      and is_token_leaf = false.
+	//    - In [t1, t2): child sees parent and tool in [start_ts - 24h, end_ts + 1h],
+	//      so child has depth = 2, root_span_id = "cross-parent", is_orphan = false,
+	//      agent_path = ["planner", "worker"], is_leaf = true, is_token_leaf = true.
+	//    - Across tiled windows [t0, t1) U [t1, t2), every span is emitted exactly
+	//      once and summing tokens where is_token_leaf = true equals 250 + 40 = 290
+	//      with zero double-counting.
+	spans := []map[string]any{
+		makeSpanAt("t-boundary", "boundary-span", "", "chat", "planner", t1, 40),
+		makeSpanAt("t-cross", "cross-parent", "", "invoke_agent", "planner", t1-int64(time.Second/time.Microsecond), 250),
+		makeSpanAt("t-cross", "cross-tool", "cross-parent", "execute_tool", "planner", t1-int64(500*time.Millisecond/time.Microsecond), 0),
+		makeSpanAt("t-cross", "cross-child", "cross-tool", "invoke_agent", "worker", t1+int64(time.Second/time.Microsecond), 250),
+	}
+
+	win1 := genAIAgentTrajectoryTVF(t, spans, t0, t1)
+	win2 := genAIAgentTrajectoryTVF(t, spans, t1, t2)
+
+	if len(win1) != 2 {
+		t.Fatalf("[t0, t1) rows = %d, want 2 (cross-parent and cross-tool); got %#v", len(win1), win1)
+	}
+	if len(win2) != 2 {
+		t.Fatalf("[t1, t2) rows = %d, want 2 (boundary-span and cross-child); got %#v", len(win2), win2)
+	}
+
+	requireCols(t, "cross-parent in [t0, t1)", onlyRow(t, "cross-parent", win1, "span_id", "cross-parent"), map[string]any{
+		"depth":         int64(0),
+		"root_span_id":  "cross-parent",
+		"is_orphan":     false,
+		"is_leaf":       false,
+		"is_token_leaf": false,
+		"agent_path":    []string{"planner"},
+	})
+	requireCols(t, "cross-tool in [t0, t1)", onlyRow(t, "cross-tool", win1, "span_id", "cross-tool"), map[string]any{
+		"depth":         int64(1),
+		"root_span_id":  "cross-parent",
+		"is_orphan":     false,
+		"is_leaf":       false,
+		"is_token_leaf": false,
+		"agent_path":    []string{"planner"},
+	})
+	requireCols(t, "boundary-span in [t1, t2)", onlyRow(t, "boundary-span", win2, "span_id", "boundary-span"), map[string]any{
+		"start_time":    t1,
+		"depth":         int64(0),
+		"is_orphan":     false,
+		"is_leaf":       true,
+		"is_token_leaf": true,
+	})
+	requireCols(t, "cross-child in [t1, t2)", onlyRow(t, "cross-child", win2, "span_id", "cross-child"), map[string]any{
+		"depth":                 int64(2),
+		"root_span_id":          "cross-parent",
+		"nearest_agent_span_id": "cross-child",
+		"nearest_agent_name":    "worker",
+		"is_orphan":             false,
+		"is_leaf":               true,
+		"is_token_leaf":         true,
+		"agent_path":            []string{"planner", "worker"},
+	})
+
+	var tiledTokenSum int64
+	for _, r := range append(slices.Clone(win1), win2...) {
+		if r["is_token_leaf"] == true {
+			tiledTokenSum += intOrZero(r, "gen_ai_usage_input_tokens")
+		}
+	}
+	if tiledTokenSum != 290 {
+		t.Fatalf("tiled [t0, t1) U [t1, t2) token leaf sum = %d, want 290 (250 + 40)", tiledTokenSum)
+	}
+}
+
 func TestTrajectoryViewModelMatchesViewSQL(t *testing.T) {
 	sql := fmt.Sprintf(schema.GenAIAgentTrajectoryViewQuery, confProject, confDataset)
 	if strings.Contains(sql, "[OFFSET(ARRAY_LENGTH(t.agent_path)") {
@@ -1495,5 +2011,17 @@ func TestTrajectoryViewModelMatchesViewSQL(t *testing.T) {
 		"(leaf_check.span_id IS NULL) AS is_leaf,",
 		"( (t.gen_ai_usage_input_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_input, FALSE)) OR (t.gen_ai_usage_output_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_output, FALSE)) OR (t.gen_ai_usage_reasoning_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_reasoning, FALSE)) ) AS is_token_leaf",
 		"FROM trajectory AS t LEFT JOIN parent_ids AS leaf_check ON t.trace_id = leaf_check.trace_id AND t.span_id = leaf_check.span_id AND t.service_name IS NOT DISTINCT FROM leaf_check.service_name LEFT JOIN token_parent_coverage AS token_leaf_check ON t.trace_id = token_leaf_check.trace_id AND t.span_id = token_leaf_check.span_id AND t.service_name IS NOT DISTINCT FROM token_leaf_check.service_name",
+	)
+
+	tvfSQL := fmt.Sprintf(schema.GenAIAgentTrajectoryTVFDDL, confProject, confDataset)
+	requireSQL(t, "tvf_gen_ai_agent_trajectory", tvfSQL,
+		"WHERE start_time >= TIMESTAMP_SUB(start_ts, INTERVAL 24 HOUR) AND start_time <= TIMESTAMP_ADD(end_ts, INTERVAL 1 HOUR)",
+		"AND p.start_time BETWEEN TIMESTAMP_SUB(s.start_time, INTERVAL 24 HOUR) AND TIMESTAMP_ADD(s.start_time, INTERVAL 1 HOUR) ) AS in_tree_window,",
+		"rooted_chains AS (",
+		"WHERE h.tree_start_idx IS NOT NULL AND (ARRAY_LENGTH(h.chain) - 1 - h.tree_start_idx) <= 16",
+		"emitted_ancestors AS (",
+		") AS has_reverse_path",
+		"NOT ea.has_reverse_path",
+		"WHERE t.start_time >= start_ts AND t.start_time < end_ts",
 	)
 }

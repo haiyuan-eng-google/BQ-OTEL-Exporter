@@ -89,7 +89,6 @@ func TestRecoveryAfterAttemptTimeoutsLiveBigQuery(t *testing.T) {
 	if err := traces.start(ctx, nil); err != nil {
 		t.Fatalf("trace startup: %v", err)
 	}
-	retainExporterAuthCleanup(traces.signalExporter)
 	logs, err := newLogsExporter(settings, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -98,7 +97,6 @@ func TestRecoveryAfterAttemptTimeoutsLiveBigQuery(t *testing.T) {
 		_ = traces.shutdown(context.Background())
 		t.Fatalf("log startup: %v", err)
 	}
-	retainExporterAuthCleanup(logs.signalExporter)
 	metrics, err := newMetricsExporter(settings, cfg)
 	if err != nil {
 		_ = traces.shutdown(context.Background())
@@ -110,7 +108,6 @@ func TestRecoveryAfterAttemptTimeoutsLiveBigQuery(t *testing.T) {
 		_ = logs.shutdown(context.Background())
 		t.Fatalf("metric startup: %v", err)
 	}
-	retainExporterAuthCleanup(metrics.signalExporter)
 	shutDown := false
 	defer func() {
 		if !shutDown {

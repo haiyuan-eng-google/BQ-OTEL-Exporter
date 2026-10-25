@@ -15,6 +15,56 @@ variable "github_repository" {
   }
 }
 
+variable "github_repository_id" {
+  description = "Immutable numeric GitHub repository_id claim required when enable_github_wif is true."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.github_repository_id == "" || can(regex("^[1-9][0-9]*$", var.github_repository_id))
+    error_message = "github_repository_id must be a positive numeric GitHub repository ID."
+  }
+}
+
+variable "github_repository_owner_id" {
+  description = "Immutable numeric GitHub repository_owner_id claim required when enable_github_wif is true."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.github_repository_owner_id == "" || can(regex("^[1-9][0-9]*$", var.github_repository_owner_id))
+    error_message = "github_repository_owner_id must be a positive numeric GitHub owner ID."
+  }
+}
+
+variable "github_workflow_ref" {
+  description = "Relative workflow path within github_repository permitted to exchange OIDC tokens on refs/heads/main."
+  type        = string
+  default     = ".github/workflows/live-integration.yml"
+
+  validation {
+    condition     = can(regex("^\\.github/workflows/[A-Za-z0-9_.-]+\\.ya?ml$", var.github_workflow_ref))
+    error_message = "github_workflow_ref must be a .github/workflows/<name>.yml path."
+  }
+}
+
+variable "github_allowed_events" {
+  description = "GitHub Actions event_name values permitted to exchange OIDC tokens for live integration CI."
+  type        = list(string)
+  default     = ["schedule", "workflow_dispatch"]
+
+  validation {
+    condition     = length(var.github_allowed_events) > 0 && alltrue([for e in var.github_allowed_events : can(regex("^[a-z_]+$", e))])
+    error_message = "github_allowed_events must be a non-empty list of GitHub event names."
+  }
+}
+
+variable "ci_offload_bucket" {
+  description = "Dedicated GCS bucket for live CI payload-offload integration tests (separate from production offload_bucket)."
+  type        = string
+  default     = ""
+}
+
 variable "ci_workload_identity_pool_id" {
   description = "Workload Identity Pool ID for GitHub Actions live integration CI."
   type        = string
@@ -47,21 +97,39 @@ resource "google_iam_workload_identity_pool_provider" "github_ci" {
   workload_identity_pool_id          = google_iam_workload_identity_pool.github_ci[0].workload_identity_pool_id
   workload_identity_pool_provider_id = var.ci_workload_identity_provider_id
   display_name                       = "GitHub Actions OIDC"
-  description                        = "OIDC provider restricted to ${var.github_repository} on refs/heads/main"
+  description                        = "OIDC provider restricted to ${var.github_repository} (${var.github_workflow_ref}) on refs/heads/main"
 
   attribute_mapping = {
-    "google.subject"       = "assertion.sub"
-    "attribute.actor"      = "assertion.actor"
-    "attribute.repository" = "assertion.repository"
-    "attribute.ref"        = "assertion.ref"
+    "google.subject"                = "assertion.sub"
+    "attribute.actor"               = "assertion.actor"
+    "attribute.repository"          = "assertion.repository"
+    "attribute.repository_id"       = "assertion.repository_id"
+    "attribute.repository_owner_id" = "assertion.repository_owner_id"
+    "attribute.ref"                 = "assertion.ref"
+    "attribute.workflow_ref"        = "assertion.job_workflow_ref"
+    "attribute.event_name"          = "assertion.event_name"
   }
 
-  # Restrict token exchange to the configured repository and main branch so
-  # fork pull requests and non-main branches cannot mint credentials.
-  attribute_condition = "assertion.repository == \"${var.github_repository}\" && assertion.ref == \"refs/heads/main\""
+  # Restrict token exchange to immutable numeric owner/repo IDs, the configured
+  # workflow file on refs/heads/main, and the allowed trigger events.
+  attribute_condition = join(" && ", [
+    "attribute.repository_owner_id == \"${var.github_repository_owner_id}\"",
+    "attribute.repository_id == \"${var.github_repository_id}\"",
+    "attribute.repository == \"${var.github_repository}\"",
+    "attribute.ref == \"refs/heads/main\"",
+    "attribute.workflow_ref == \"${var.github_repository}/${var.github_workflow_ref}@refs/heads/main\"",
+    "attribute.event_name in [${join(", ", formatlist("%q", var.github_allowed_events))}]",
+  ])
 
   oidc {
     issuer_uri = "https://token.actions.githubusercontent.com"
+  }
+
+  lifecycle {
+    precondition {
+      condition     = can(regex("^[1-9][0-9]*$", var.github_repository_id)) && can(regex("^[1-9][0-9]*$", var.github_repository_owner_id))
+      error_message = "github_repository_id and github_repository_owner_id must be set to positive numeric GitHub IDs when enable_github_wif is true."
+    }
   }
 }
 
@@ -77,12 +145,13 @@ resource "google_service_account_iam_member" "github_ci_wif_user" {
   count              = var.enable_github_wif ? 1 : 0
   service_account_id = google_service_account.github_ci[0].name
   role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github_ci[0].name}/attribute.repository/${var.github_repository}"
+  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github_ci[0].name}/attribute.repository_id/${var.github_repository_id}"
 }
 
-# The live integration suite creates and deletes ephemeral datasets
-# (otel_it_*, otel_ac_*, otel_rec_*, otel_cq_*, otel_offload_*), runs query and
-# DDL jobs, and streams rows via the BigQuery Storage Write API.
+# roles/bigquery.user permits creating new ephemeral datasets (for which the
+# creator automatically receives bigquery.datasets.delete and table/routine/row
+# admin rights) and running query/dry-run jobs without granting write access to
+# pre-existing datasets in the project.
 resource "google_project_iam_member" "github_ci_bigquery_user" {
   count   = var.enable_github_wif ? 1 : 0
   project = var.project_id
@@ -90,33 +159,17 @@ resource "google_project_iam_member" "github_ci_bigquery_user" {
   member  = "serviceAccount:${google_service_account.github_ci[0].email}"
 }
 
-resource "google_project_iam_member" "github_ci_bigquery_job_user" {
-  count   = var.enable_github_wif ? 1 : 0
-  project = var.project_id
-  role    = "roles/bigquery.jobUser"
-  member  = "serviceAccount:${google_service_account.github_ci[0].email}"
-}
-
-resource "google_project_iam_member" "github_ci_bigquery_data_editor" {
-  count   = var.enable_github_wif ? 1 : 0
-  project = var.project_id
-  role    = "roles/bigquery.dataEditor"
-  member  = "serviceAccount:${google_service_account.github_ci[0].email}"
-}
-
-resource "google_bigquery_dataset_iam_member" "github_ci_telemetry_data_editor" {
-  count      = var.enable_github_wif ? 1 : 0
-  project    = var.project_id
-  dataset_id = google_bigquery_dataset.otel.dataset_id
-  role       = "roles/bigquery.dataEditor"
-  member     = "serviceAccount:${google_service_account.github_ci[0].email}"
-}
-
-resource "google_storage_bucket_iam_member" "github_ci_offload_object_admin" {
-  count  = var.enable_github_wif && var.offload_bucket != "" ? 1 : 0
-  bucket = var.offload_bucket
-  role   = "roles/storage.objectAdmin"
+resource "google_storage_bucket_iam_member" "github_ci_offload_object_user" {
+  count  = var.enable_github_wif && var.ci_offload_bucket != "" ? 1 : 0
+  bucket = var.ci_offload_bucket
+  role   = "roles/storage.objectUser"
   member = "serviceAccount:${google_service_account.github_ci[0].email}"
+
+  condition {
+    title       = "ci_offload_it_prefix_only"
+    description = "Restrict CI test object access to objects under the it-offload- prefix."
+    expression  = "resource.name.startsWith(\"projects/_/buckets/${var.ci_offload_bucket}/objects/it-offload-\")"
+  }
 }
 
 output "ci_workload_identity_provider" {
