@@ -1,0 +1,26 @@
+# Copyright 2026 Google LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# Dataform workflow settings for the incremental BigQuery marts that sit on top
+# of the exporter's companion views. See README.md in this directory.
+#
+# Replace the YOUR_PROJECT_ID / YOUR_DATASET_ID placeholders before the first
+# run. Everything else can stay as is.
+
+# Pins the Dataform core release the definitions are compiled with. The
+# Dataform CLI and the managed Dataform service install exactly this version.
+dataformCoreVersion: 3.1.2
+
+# Project, location and datasets the marts are WRITTEN to. The location must
+# match the location of the exporter dataset: a query cannot join across
+# locations.
+defaultProject: YOUR_PROJECT_ID
+defaultLocation: US
+defaultDataset: otel_marts
+defaultAssertionDataset: otel_marts_assertions
+
+vars:
+  # Project and dataset that hold the exporter tables and companion views
+  # (the project_id / dataset_id of deploy/terraform). They are only READ.
+  source_project: YOUR_PROJECT_ID
+  source_dataset: YOUR_DATASET_ID

@@ -1,0 +1,655 @@
+# Copyright 2026 Google LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# Looker Studio report specification for the GenAI observability template.
+#
+# A Looker Studio report cannot be created from a file, so this is the build
+# sheet for the template report (see README.md in this directory) and the
+# contract that the conformance tests hold the queries to: every field a page
+# uses is a column of its data source query or a calculated field declared
+# here. Formulas write fields in lower case and functions in upper case.
+#
+# aggregation is the aggregation of a chart metric. NONE is for a calculated
+# field whose formula already aggregates (it contains SUM, COUNT_DISTINCT and
+# so on); every other metric names the aggregation to apply to a column.
+#
+# terraform_binding says when the looker_studio_create_url Terraform output
+# points a data source at the module's dataset:
+#   always                     the module always creates the view or views
+#   partition_filter_off       the view is queryable only while the
+#                              require_partition_filter variable is false; with
+#                              it set, the module creates the view only with
+#                              allow_unprunable_views and BigQuery rejects
+#                              every query over it
+#   enable_continuous_queries  the otel_alerts table exists with the variable
+# A data source that is not bound keeps the template's own query, which names
+# the sandbox project and dataset that the template was built against.
+spec_version: 1
+
+report:
+  name: GenAI observability
+  page_count: 6
+
+# The queries in this directory name the project and dataset with these
+# literals. Looker Studio validates a custom query when it is saved, so the
+# template's data sources are built from the same queries with the literals
+# replaced by a sandbox project and dataset (README.md, "Build the template").
+# The Terraform output looker_studio_create_url then rewrites the sandbox names
+# with sqlReplace, using the variables looker_studio_template_project_id and
+# looker_studio_template_dataset_id.
+placeholders:
+  project: YOUR_PROJECT_ID
+  dataset: YOUR_DATASET_ID
+
+# Every query filters on its date field with the two date range parameters.
+# Enable "Enable date range parameters" on each data source, and add one report
+# date range control (all pages) so that the parameters get a value.
+date_range:
+  start_parameter: DS_START_DATE
+  end_parameter: DS_END_DATE
+  format: YYYYMMDD
+  inclusive: true
+  default: Last 7 days
+
+# Report parameters (Resource > Manage report-level parameters). The template
+# ships no prices: a deployment sets the unit prices of its own models.
+report_parameters:
+  - name: input_price_per_million_tokens
+    type: NUMBER
+    default: 0
+    description: Price of one million input tokens, in the report currency.
+  - name: output_price_per_million_tokens
+    type: NUMBER
+    default: 0
+    description: Price of one million output tokens, in the report currency.
+
+data_sources:
+  ds0:
+    name: GenAI model costs
+    query: queries/executive_summary.sql
+    views: [v_gen_ai_model_costs]
+    marts:
+      v_gen_ai_model_costs: m_gen_ai_model_costs_hourly
+    terraform_binding: always
+    date_field: usage_hour
+    field_types:
+      error_rate: PERCENT
+    calculated_fields:
+      - name: error_rate
+        formula: SUM(error_count) / SUM(call_count)
+        type: PERCENT
+        uses: [error_count, call_count]
+      - name: estimated_cost
+        formula: (SUM(total_input_tokens) * input_price_per_million_tokens + SUM(total_output_tokens) * output_price_per_million_tokens) / 1000000
+        type: NUMBER
+        uses: [total_input_tokens, total_output_tokens]
+        parameters: [input_price_per_million_tokens, output_price_per_million_tokens]
+
+  ds1:
+    name: Agent sessions
+    query: queries/agent_sessions.sql
+    views: [v_gen_ai_sessions]
+    marts:
+      v_gen_ai_sessions: m_gen_ai_sessions_daily
+    terraform_binding: always
+    date_field: session_start_date
+    calculated_fields:
+      - name: total_tokens
+        formula: total_input_tokens + total_output_tokens
+        type: NUMBER
+        uses: [total_input_tokens, total_output_tokens]
+      - name: turn_count_bucket
+        formula: CASE WHEN turn_count <= 1 THEN "01" WHEN turn_count <= 3 THEN "02-03" WHEN turn_count <= 6 THEN "04-06" WHEN turn_count <= 10 THEN "07-10" ELSE "11+" END
+        type: TEXT
+        uses: [turn_count]
+      - name: sessions_with_errors
+        formula: COUNT_DISTINCT(CASE WHEN error_count > 0 THEN session_id END)
+        type: NUMBER
+        uses: [error_count, session_id]
+
+  ds2:
+    name: Tool and MCP usage
+    query: queries/mcp_tool_usage.sql
+    views: [v_mcp_tool_usage, v_gen_ai_tool_usage]
+    marts:
+      v_mcp_tool_usage: m_mcp_tool_usage_hourly
+    terraform_binding: always
+    date_field: usage_hour
+    field_types:
+      error_rate: PERCENT
+    calculated_fields:
+      - name: error_rate
+        formula: SUM(error_count) / SUM(call_count)
+        type: PERCENT
+        uses: [error_count, call_count]
+      - name: dual_tagged_share
+        formula: SUM(gen_ai_tagged_call_count) / SUM(call_count)
+        type: PERCENT
+        uses: [gen_ai_tagged_call_count, call_count]
+
+  ds3:
+    name: Agent trajectory
+    query: queries/agent_trajectory.sql
+    views: [v_gen_ai_agent_trajectory]
+    marts:
+      v_gen_ai_agent_trajectory: m_gen_ai_agent_trajectory
+    terraform_binding: partition_filter_off
+    date_field: start_time
+    field_types:
+      trace_url: URL
+    calculated_fields:
+      - name: trace_link
+        formula: HYPERLINK(trace_url, trace_id)
+        type: TEXT
+        uses: [trace_url, trace_id]
+      - name: orphan_roots
+        formula: COUNT_DISTINCT(CASE WHEN is_orphan AND depth = 0 THEN span_id END)
+        type: NUMBER
+        uses: [is_orphan, depth, span_id]
+
+  ds4:
+    name: Security and SLA alerts
+    query: queries/security_sla_alerts.sql
+    views: [otel_alerts]
+    marts: {}
+    terraform_binding: enable_continuous_queries
+    date_field: event_time
+    field_types:
+      trace_url: URL
+    calculated_fields:
+      - name: trace_link
+        formula: HYPERLINK(trace_url, trace_id)
+        type: TEXT
+        uses: [trace_url, trace_id]
+
+  ds5:
+    name: Metric exemplars
+    query: queries/metric_exemplars.sql
+    views: [v_gen_ai_metric_exemplars]
+    marts: {}
+    terraform_binding: partition_filter_off
+    date_field: metric_timestamp
+    field_types:
+      trace_url: URL
+    calculated_fields:
+      - name: trace_link
+        formula: HYPERLINK(trace_url, trace_id)
+        type: TEXT
+        uses: [trace_url, trace_id]
+
+pages:
+  # --- Page 1 -------------------------------------------------------------
+  - id: executive_genai_finops
+    title: Executive GenAI Overview and FinOps Cost Control
+    data_source: ds0
+    controls:
+      - {id: p1_date_range, type: date_range}
+      - {id: p1_service, type: dropdown, field: service_name}
+      - {id: p1_provider, type: dropdown, field: provider}
+      - {id: p1_model, type: dropdown, field: model}
+      - {id: p1_agent, type: dropdown, field: gen_ai_agent_name}
+    components:
+      - id: p1_llm_calls
+        type: scorecard
+        title: LLM calls
+        metrics: [{field: call_count, aggregation: SUM}]
+      - id: p1_input_tokens
+        type: scorecard
+        title: Input tokens
+        metrics: [{field: total_input_tokens, aggregation: SUM}]
+      - id: p1_output_tokens
+        type: scorecard
+        title: Output tokens
+        metrics: [{field: total_output_tokens, aggregation: SUM}]
+      - id: p1_reasoning_tokens
+        type: scorecard
+        title: Reasoning tokens
+        metrics: [{field: total_reasoning_tokens, aggregation: SUM}]
+      - id: p1_cache_read_tokens
+        type: scorecard
+        title: Cache read input tokens
+        metrics: [{field: total_cache_read_input_tokens, aggregation: SUM}]
+      - id: p1_cache_creation_tokens
+        type: scorecard
+        title: Cache creation input tokens
+        metrics: [{field: total_cache_creation_input_tokens, aggregation: SUM}]
+      - id: p1_error_rate
+        type: scorecard
+        title: Error rate
+        metrics: [{field: error_rate, aggregation: NONE}]
+      - id: p1_estimated_cost
+        type: scorecard
+        title: Estimated cost
+        metrics: [{field: estimated_cost, aggregation: NONE}]
+      - id: p1_token_burn
+        type: time_series
+        title: Token burn by hour
+        dimensions: [usage_hour]
+        metrics:
+          - {field: total_input_tokens, aggregation: SUM}
+          - {field: total_output_tokens, aggregation: SUM}
+          - {field: total_reasoning_tokens, aggregation: SUM}
+          - {field: total_cache_read_input_tokens, aggregation: SUM}
+          - {field: total_cache_creation_input_tokens, aggregation: SUM}
+      - id: p1_calls_and_errors
+        type: time_series
+        title: LLM calls and errors by hour
+        dimensions: [usage_hour]
+        metrics:
+          - {field: call_count, aggregation: SUM}
+          - {field: error_count, aggregation: SUM}
+      - id: p1_error_rate_by_hour
+        type: time_series
+        title: Error rate by hour
+        dimensions: [usage_hour]
+        metrics: [{field: error_rate, aggregation: NONE}]
+      - id: p1_tokens_by_model
+        type: bar_chart
+        title: Tokens by model
+        dimensions: [model]
+        metrics:
+          - {field: total_input_tokens, aggregation: SUM}
+          - {field: total_output_tokens, aggregation: SUM}
+        sort: {field: total_input_tokens, direction: DESC}
+        limit: 15
+      - id: p1_calls_by_provider
+        type: bar_chart
+        title: LLM calls by provider
+        dimensions: [provider]
+        metrics: [{field: call_count, aggregation: SUM}]
+        sort: {field: call_count, direction: DESC}
+      - id: p1_latency_by_model
+        type: bar_chart
+        title: Worst-hour latency by model
+        note: Percentiles are per hour and cannot be averaged; the chart takes the maximum over the range.
+        dimensions: [model]
+        metrics:
+          - {field: p50_duration_ms, aggregation: MAX}
+          - {field: p95_duration_ms, aggregation: MAX}
+          - {field: p99_duration_ms, aggregation: MAX}
+        limit: 15
+      - id: p1_model_ledger
+        type: table
+        title: Model ledger
+        dimensions: [provider, model]
+        metrics:
+          - {field: call_count, aggregation: SUM}
+          - {field: error_count, aggregation: SUM}
+          - {field: error_rate, aggregation: NONE}
+          - {field: total_input_tokens, aggregation: SUM}
+          - {field: total_output_tokens, aggregation: SUM}
+          - {field: total_reasoning_tokens, aggregation: SUM}
+          - {field: p50_duration_ms, aggregation: MAX}
+          - {field: p95_duration_ms, aggregation: MAX}
+          - {field: p99_duration_ms, aggregation: MAX}
+          - {field: estimated_cost, aggregation: NONE}
+        sort: {field: call_count, direction: DESC}
+        limit: 50
+      - id: p1_error_types
+        type: table
+        title: Top error types by hour
+        dimensions: [usage_hour, model, top_error_types]
+        metrics: [{field: error_count, aggregation: SUM}]
+        filters: [{field: error_count, operator: GREATER_THAN, value: 0}]
+        sort: {field: usage_hour, direction: DESC}
+        limit: 25
+
+  # --- Page 2 -------------------------------------------------------------
+  - id: agent_sessions
+    title: Agent Sessions and Multi-Turn Engagement
+    data_source: ds1
+    controls:
+      - {id: p2_date_range, type: date_range}
+      - {id: p2_service, type: dropdown, field: service_name}
+      - {id: p2_agent, type: dropdown, field: agent_name}
+      - {id: p2_user, type: dropdown, field: user_id}
+    components:
+      - id: p2_sessions
+        type: scorecard
+        title: Sessions
+        metrics: [{field: session_id, aggregation: COUNT_DISTINCT}]
+      - id: p2_active_users
+        type: scorecard
+        title: Active users
+        metrics: [{field: user_id, aggregation: COUNT_DISTINCT}]
+      - id: p2_avg_turns
+        type: scorecard
+        title: Turns per session
+        metrics: [{field: turn_count, aggregation: AVG}]
+      - id: p2_avg_duration
+        type: scorecard
+        title: Average session duration (ms)
+        metrics: [{field: session_duration_ms, aggregation: AVG}]
+      - id: p2_sessions_with_errors
+        type: scorecard
+        title: Sessions with errors
+        metrics: [{field: sessions_with_errors, aggregation: NONE}]
+      - id: p2_session_tokens
+        type: scorecard
+        title: Input and output tokens
+        metrics: [{field: total_tokens, aggregation: SUM}]
+      - id: p2_sessions_by_day
+        type: time_series
+        title: Sessions and active users by day
+        dimensions: [session_start_date]
+        metrics:
+          - {field: session_id, aggregation: COUNT_DISTINCT}
+          - {field: user_id, aggregation: COUNT_DISTINCT}
+      - id: p2_turn_distribution
+        type: bar_chart
+        title: Turns per session distribution
+        dimensions: [turn_count_bucket]
+        metrics: [{field: session_id, aggregation: COUNT_DISTINCT}]
+        sort: {field: turn_count_bucket, direction: ASC}
+      - id: p2_duration_vs_tokens
+        type: scatter_chart
+        title: Session duration vs tokens
+        dimensions: [session_id]
+        metrics:
+          - {field: session_duration_ms, aggregation: SUM, role: x}
+          - {field: total_tokens, aggregation: SUM, role: y}
+          - {field: tool_call_count, aggregation: SUM, role: size}
+        limit: 500
+      - id: p2_error_ledger
+        type: table
+        title: Session error ledger
+        dimensions: [session_start_time, session_id, user_id, service_name, agent_name, top_error_types]
+        metrics:
+          - {field: error_count, aggregation: SUM}
+          - {field: typed_error_count, aggregation: SUM}
+          - {field: turn_count, aggregation: SUM}
+          - {field: llm_call_count, aggregation: SUM}
+          - {field: tool_call_count, aggregation: SUM}
+          - {field: session_duration_ms, aggregation: SUM}
+        filters: [{field: error_count, operator: GREATER_THAN, value: 0}]
+        sort: {field: error_count, direction: DESC}
+        limit: 100
+
+  # --- Page 3 -------------------------------------------------------------
+  - id: tool_and_mcp
+    title: Tool and MCP Server Observability
+    data_source: ds2
+    controls:
+      - {id: p3_date_range, type: date_range}
+      - {id: p3_service, type: dropdown, field: service_name}
+      - {id: p3_method, type: dropdown, field: mcp_method_name}
+      - {id: p3_server, type: dropdown, field: server_address}
+    components:
+      - id: p3_mcp_calls
+        type: scorecard
+        title: MCP calls
+        metrics: [{field: call_count, aggregation: SUM}]
+        filters: [{field: source, operator: EQUALS, value: mcp}]
+      - id: p3_mcp_error_rate
+        type: scorecard
+        title: MCP error rate
+        metrics: [{field: error_rate, aggregation: NONE}]
+        filters: [{field: source, operator: EQUALS, value: mcp}]
+      - id: p3_dual_tagged_calls
+        type: scorecard
+        title: MCP calls also in the GenAI tool view
+        metrics: [{field: gen_ai_tagged_call_count, aggregation: SUM}]
+        filters: [{field: source, operator: EQUALS, value: mcp}]
+      - id: p3_mcp_only_calls
+        type: scorecard
+        title: MCP-only calls
+        metrics: [{field: mcp_only_call_count, aggregation: SUM}]
+        filters: [{field: source, operator: EQUALS, value: mcp}]
+      - id: p3_gen_ai_tool_calls
+        type: scorecard
+        title: GenAI tool calls
+        metrics: [{field: call_count, aggregation: SUM}]
+        filters: [{field: source, operator: EQUALS, value: gen_ai}]
+      - id: p3_calls_by_method
+        type: bar_chart
+        title: MCP calls by JSON-RPC method
+        note: Methods include tools/call, resources/read, prompts/get and initialize.
+        dimensions: [mcp_method_name]
+        metrics: [{field: call_count, aggregation: SUM}]
+        filters: [{field: source, operator: EQUALS, value: mcp}]
+        sort: {field: call_count, direction: DESC}
+      - id: p3_dual_tagged_overlap
+        type: stacked_bar_chart
+        title: Dual-tagged overlap by method
+        dimensions: [mcp_method_name]
+        metrics:
+          - {field: gen_ai_tagged_call_count, aggregation: SUM}
+          - {field: mcp_only_call_count, aggregation: SUM}
+        filters: [{field: source, operator: EQUALS, value: mcp}]
+      - id: p3_server_latency
+        type: time_series
+        title: Worst p95 latency by server and hour
+        dimensions: [usage_hour, server_address]
+        metrics: [{field: p95_duration_ms, aggregation: MAX}]
+        filters: [{field: source, operator: EQUALS, value: mcp}]
+      - id: p3_server_table
+        type: table
+        title: MCP server latency and errors
+        dimensions: [server_address, mcp_method_name, mcp_target_name]
+        metrics:
+          - {field: call_count, aggregation: SUM}
+          - {field: error_rate, aggregation: NONE}
+          - {field: dual_tagged_share, aggregation: NONE}
+          - {field: avg_duration_ms, aggregation: AVG}
+          - {field: p50_duration_ms, aggregation: MAX}
+          - {field: p95_duration_ms, aggregation: MAX}
+          - {field: p99_duration_ms, aggregation: MAX}
+        filters: [{field: source, operator: EQUALS, value: mcp}]
+        sort: {field: call_count, direction: DESC}
+        limit: 50
+      - id: p3_top_error_types
+        type: table
+        title: Top error types
+        dimensions: [mcp_method_name, mcp_target_name, top_error_types]
+        metrics:
+          - {field: error_count, aggregation: SUM}
+          - {field: typed_error_count, aggregation: SUM}
+        filters:
+          - {field: source, operator: EQUALS, value: mcp}
+          - {field: error_count, operator: GREATER_THAN, value: 0}
+        sort: {field: error_count, direction: DESC}
+        limit: 25
+      - id: p3_gen_ai_tools
+        type: table
+        title: GenAI tool usage
+        dimensions: [gen_ai_tool_name, gen_ai_agent_name, gen_ai_tool_type]
+        metrics:
+          - {field: call_count, aggregation: SUM}
+          - {field: error_count, aggregation: SUM}
+          - {field: error_rate, aggregation: NONE}
+          - {field: p50_duration_ms, aggregation: MAX}
+          - {field: p95_duration_ms, aggregation: MAX}
+        filters: [{field: source, operator: EQUALS, value: gen_ai}]
+        sort: {field: call_count, direction: DESC}
+        limit: 50
+
+  # --- Page 4 -------------------------------------------------------------
+  - id: trajectory
+    title: Multi-Agent Trajectory and Execution DAG
+    data_source: ds3
+    controls:
+      - {id: p4_date_range, type: date_range}
+      - {id: p4_service, type: dropdown, field: service_name}
+      - {id: p4_main_agent, type: dropdown, field: gen_ai_main_agent_name}
+      - {id: p4_trace, type: input_box, field: trace_id}
+      - {id: p4_session, type: input_box, field: adk_session_id}
+    components:
+      - id: p4_traces
+        type: scorecard
+        title: Traces
+        metrics: [{field: trace_id, aggregation: COUNT_DISTINCT}]
+      - id: p4_spans
+        type: scorecard
+        title: Spans
+        metrics: [{field: span_id, aggregation: COUNT}]
+      - id: p4_max_depth
+        type: scorecard
+        title: Deepest call (0 to 16)
+        metrics: [{field: depth, aggregation: MAX}]
+      - id: p4_orphan_roots
+        type: scorecard
+        title: Orphan roots
+        metrics: [{field: orphan_roots, aggregation: NONE}]
+      - id: p4_leaf_input_tokens
+        type: scorecard
+        title: Input tokens, counted once
+        metrics: [{field: leaf_input_tokens, aggregation: SUM}]
+      - id: p4_leaf_output_tokens
+        type: scorecard
+        title: Output tokens, counted once
+        metrics: [{field: leaf_output_tokens, aggregation: SUM}]
+      - id: p4_spans_by_depth
+        type: bar_chart
+        title: Spans by call depth
+        dimensions: [depth]
+        metrics: [{field: span_id, aggregation: COUNT}]
+        sort: {field: depth, direction: ASC}
+      - id: p4_agent_paths
+        type: table
+        title: Agent path flows
+        dimensions: [agent_path, agent_path_length]
+        metrics:
+          - {field: trace_id, aggregation: COUNT_DISTINCT}
+          - {field: span_id, aggregation: COUNT}
+          - {field: leaf_input_tokens, aggregation: SUM}
+          - {field: leaf_output_tokens, aggregation: SUM}
+        filters: [{field: agent_path_length, operator: GREATER_THAN, value: 0}]
+        sort: {field: trace_id, direction: DESC}
+        limit: 50
+      - id: p4_orphan_split
+        type: pie_chart
+        title: Spans below a missing parent
+        dimensions: [is_orphan]
+        metrics: [{field: span_id, aggregation: COUNT}]
+      - id: p4_orphan_boundaries
+        type: table
+        title: Orphan boundary diagnostics
+        dimensions: [start_time, trace_link, span_id, parent_span_id, service_name, span_name, nearest_agent_name]
+        metrics: [{field: duration_ms, aggregation: SUM}]
+        filters:
+          - {field: is_orphan, operator: IS_TRUE}
+          - {field: depth, operator: EQUALS, value: 0}
+        sort: {field: start_time, direction: DESC}
+        limit: 100
+      - id: p4_token_integrity
+        type: bar_chart
+        title: Token integrity by day
+        note: The first metric adds every reported count, so a parent that reports the sum of its children counts them twice; the second adds the counts of token leaves only.
+        dimensions: [start_date]
+        metrics:
+          - {field: gen_ai_usage_input_tokens, aggregation: SUM, role: all_reported}
+          - {field: leaf_input_tokens, aggregation: SUM, role: counted_once}
+      - id: p4_trace_steps
+        type: table
+        title: Trace steps
+        dimensions: [step_index, depth, span_name, nearest_agent_name, gen_ai_tool_name, gen_ai_request_model, status_code, error_type, is_token_leaf]
+        metrics: [{field: duration_ms, aggregation: SUM}]
+        sort: {field: step_index, direction: ASC}
+        limit: 200
+
+  # --- Page 5 -------------------------------------------------------------
+  - id: security_sla_alerts
+    title: Real-Time Security and SLA Alerting
+    data_source: ds4
+    controls:
+      - {id: p5_date_range, type: date_range}
+      - {id: p5_kind, type: dropdown, field: alert_kind}
+      - {id: p5_service, type: dropdown, field: service_name}
+      - {id: p5_agent, type: dropdown, field: agent_name}
+    components:
+      - id: p5_alerts
+        type: scorecard
+        title: Alerts
+        metrics: [{field: alert_id, aggregation: COUNT_DISTINCT}]
+      - id: p5_tool_error
+        type: scorecard
+        title: TOOL_ERROR alerts
+        metrics: [{field: alert_id, aggregation: COUNT_DISTINCT}]
+        filters: [{field: alert_kind, operator: EQUALS, value: TOOL_ERROR}]
+      - id: p5_token_budget_burn
+        type: scorecard
+        title: TOKEN_BUDGET_BURN alerts
+        metrics: [{field: alert_id, aggregation: COUNT_DISTINCT}]
+        filters: [{field: alert_kind, operator: EQUALS, value: TOKEN_BUDGET_BURN}]
+      - id: p5_agent_latency_high
+        type: scorecard
+        title: AGENT_LATENCY_HIGH alerts
+        metrics: [{field: alert_id, aggregation: COUNT_DISTINCT}]
+        filters: [{field: alert_kind, operator: EQUALS, value: AGENT_LATENCY_HIGH}]
+      - id: p5_alerts_by_hour
+        type: time_series
+        title: Alert volume by hour
+        dimensions: [event_time]
+        metrics: [{field: alert_id, aggregation: COUNT_DISTINCT}]
+        breakdown: alert_kind
+      - id: p5_alerts_by_service
+        type: stacked_bar_chart
+        title: Alerts by service
+        dimensions: [service_name]
+        metrics: [{field: alert_id, aggregation: COUNT_DISTINCT}]
+        breakdown: alert_kind
+      - id: p5_tool_errors_by_type
+        type: bar_chart
+        title: Tool error alerts by error type
+        dimensions: [error_type]
+        metrics: [{field: alert_id, aggregation: COUNT_DISTINCT}]
+        filters: [{field: alert_kind, operator: EQUALS, value: TOOL_ERROR}]
+        sort: {field: alert_id, direction: DESC}
+        limit: 15
+      - id: p5_alert_log
+        type: table
+        title: Live alert log
+        dimensions: [event_time, alert_kind, service_name, agent_name, tool_name, error_type, session_id, trace_link]
+        metrics:
+          - {field: duration_ms, aggregation: MAX}
+          - {field: input_tokens, aggregation: SUM}
+          - {field: output_tokens, aggregation: SUM}
+          - {field: error_spans, aggregation: SUM}
+        sort: {field: event_time, direction: DESC}
+        limit: 100
+
+  # --- Page 6 -------------------------------------------------------------
+  - id: metric_exemplars
+    title: Metric Exemplar and Trace Deep-Dive
+    data_source: ds5
+    controls:
+      - {id: p6_date_range, type: date_range}
+      - {id: p6_service, type: dropdown, field: service_name}
+      - {id: p6_metric, type: dropdown, field: metric_name}
+      - {id: p6_model, type: dropdown, field: gen_ai_request_model}
+      - {id: p6_agent, type: dropdown, field: gen_ai_agent_name}
+    components:
+      - id: p6_exemplar_traces
+        type: scorecard
+        title: Traces with exemplars
+        metrics: [{field: trace_id, aggregation: COUNT_DISTINCT}]
+      - id: p6_exemplar_values
+        type: time_series
+        title: Exemplar value by metric point
+        note: Spikes in the series are the points to open in the deep-dive table.
+        dimensions: [metric_timestamp]
+        metrics: [{field: exemplar_value, aggregation: MAX}]
+        breakdown: metric_name
+      - id: p6_exemplars_by_metric
+        type: bar_chart
+        title: Exemplars by metric
+        dimensions: [metric_name]
+        metrics: [{field: span_id, aggregation: COUNT_DISTINCT}]
+        sort: {field: span_id, direction: DESC}
+      - id: p6_value_vs_duration
+        type: scatter_chart
+        title: Exemplar value vs span duration
+        dimensions: [span_id]
+        metrics:
+          - {field: exemplar_value, aggregation: MAX, role: x}
+          - {field: span_duration_ms, aggregation: MAX, role: y}
+        limit: 500
+      - id: p6_deep_dive
+        type: table
+        title: Exemplar trace deep-dive
+        dimensions: [metric_timestamp, metric_name, gen_ai_request_model, trace_link, span_id, span_name, span_status_code, span_gen_ai_agent_name, span_gen_ai_tool_name, span_error_type]
+        metrics:
+          - {field: exemplar_value, aggregation: MAX}
+          - {field: span_duration_ms, aggregation: MAX}
+        sort: {field: exemplar_value, direction: DESC}
+        limit: 100

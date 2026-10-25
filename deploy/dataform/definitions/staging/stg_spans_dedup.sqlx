@@ -1,0 +1,97 @@
+/*
+ * Copyright 2026 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Staging table: one canonical row per GenAI span, derived from
+ * v_gen_ai_spans. m_gen_ai_agent_trajectory reads it instead of re-reading the
+ * raw spans through the view chain on every run.
+ *
+ * The row set and the canonicalization are the spans CTE of
+ * v_gen_ai_agent_trajectory: one row per (trace_id, service_name, span_id),
+ * ordered by (start_time ASC, end_time DESC, span_name ASC, duration_nano DESC),
+ * plus the two agent-name columns that CTE derives from the span attributes.
+ * Only these typed columns are staged, never the attribute, event or link
+ * bags, and not status_message: with enable_column_level_security the span
+ * column it comes from sits behind a policy tag, and a table created by
+ * Dataform carries no policy tags, so staging it would hand its text to every
+ * reader of this dataset.
+ *
+ * Refresh: an incremental run deletes the rows whose start_time is at or after
+ * window_start (the hour-aligned start of the last 3 hours) and inserts the
+ * recomputed ones in one transaction, so a rerun is idempotent and a failed run
+ * leaves the table unchanged. A first or full-refresh run uses the Unix epoch as
+ * window_start and therefore rebuilds the table from the whole view.
+ *
+ * The time predicate sits in the same SELECT as the ROW_NUMBER window and
+ * before it, so the time filter reaches the partitioned base table (including a
+ * table that requires a partition filter) and cannot be crossed by the dedup
+ * window. A span is assumed to keep the same start_time across redeliveries.
+ */
+config {
+  type: "incremental",
+  tags: ["otel_marts"],
+  description: "Canonical GenAI spans staged for the incremental trajectory mart.",
+  bigquery: {
+    partitionBy: "DATE(start_time)",
+    clusterBy: ["service_name", "trace_id"]
+  }
+}
+
+pre_operations {
+  DECLARE window_start TIMESTAMP DEFAULT ${when(incremental(), `TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 HOUR), HOUR)`, `TIMESTAMP('1970-01-01 00:00:00+00')`)}
+  ---
+  ${when(incremental(), `BEGIN TRANSACTION`)}
+  ---
+  ${when(incremental(), `DELETE FROM ${self()} WHERE start_time >= window_start`)}
+}
+
+SELECT
+  start_time,
+  end_time,
+  duration_nano,
+  duration_ms,
+  trace_id,
+  span_id,
+  parent_span_id,
+  service_name,
+  span_name,
+  span_kind,
+  status_code,
+  gen_ai_operation_name,
+  gen_ai_system,
+  gen_ai_provider_name,
+  gen_ai_request_model,
+  gen_ai_response_model,
+  gen_ai_agent_id,
+  gen_ai_agent_name,
+  gen_ai_agent_version,
+  gen_ai_main_agent_id,
+  gen_ai_main_agent_name,
+  gen_ai_tool_name,
+  gen_ai_tool_call_id,
+  gen_ai_usage_input_tokens,
+  gen_ai_usage_output_tokens,
+  gen_ai_usage_reasoning_tokens,
+  adk_session_id,
+  adk_invocation_id,
+  adk_user_id,
+  error_type,
+  COALESCE(
+    JSON_VALUE(attributes, '$."gen_ai.agent.name"'),
+    JSON_VALUE(attributes, '$."gcp.vertex.agent.name"')
+  ) AS declared_agent_name,
+  COALESCE(
+    JSON_VALUE(attributes, '$."gen_ai.agent.name"'),
+    JSON_VALUE(attributes, '$."gcp.vertex.agent.name"'),
+    IF(gen_ai_operation_name IN ('invoke_agent', 'create_agent'), gen_ai_agent_name, NULL)
+  ) AS agent_path_name
+FROM ${ref("v_gen_ai_spans")}
+WHERE start_time >= window_start
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY trace_id, service_name, span_id
+  ORDER BY start_time ASC, end_time DESC, span_name ASC, duration_nano DESC
+) = 1
+
+post_operations {
+  ${when(incremental(), `COMMIT TRANSACTION`)}
+}

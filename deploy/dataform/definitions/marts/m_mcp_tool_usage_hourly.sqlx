@@ -1,0 +1,65 @@
+/*
+ * Copyright 2026 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Hourly MCP tool usage mart: v_mcp_tool_usage materialized into a table that
+ * is partitioned by day, clustered by service_name and mcp_method_name, and
+ * refreshed incrementally. Same columns as the view, so a dashboard query can
+ * read either.
+ *
+ * Refresh: the view aggregates every row of an hour from the MCP spans of that
+ * hour alone, so an incremental run deletes the rows whose usage_hour is at or
+ * after window_start (the hour-aligned start of the last 3 hours) and inserts
+ * the recomputed hours in one transaction. A rerun is idempotent and a failed
+ * run leaves the table unchanged. A first or full-refresh run uses the Unix
+ * epoch as window_start and therefore rebuilds every hour.
+ *
+ * Spans that arrive more than 3 hours after the end of their hour are not
+ * picked up until a full refresh. Percentiles and the average are per hour and
+ * grouping key; they cannot be combined across rows. call_count and
+ * gen_ai_tagged_call_count are not additive with the GenAI tool usage view:
+ * a call that carries both MCP and GenAI attributes is in both.
+ */
+config {
+  type: "incremental",
+  tags: ["otel_marts"],
+  description: "Hourly MCP method, tool and server call aggregates, refreshed incrementally.",
+  bigquery: {
+    partitionBy: "DATE(usage_hour)",
+    clusterBy: ["service_name", "mcp_method_name"]
+  }
+}
+
+pre_operations {
+  DECLARE window_start TIMESTAMP DEFAULT ${when(incremental(), `TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 HOUR), HOUR)`, `TIMESTAMP('1970-01-01 00:00:00+00')`)}
+  ---
+  ${when(incremental(), `BEGIN TRANSACTION`)}
+  ---
+  ${when(incremental(), `DELETE FROM ${self()} WHERE usage_hour >= window_start`)}
+}
+
+SELECT
+  usage_hour,
+  service_name,
+  mcp_method_name,
+  mcp_protocol_version,
+  gen_ai_tool_name,
+  mcp_target_name,
+  span_kind,
+  server_address,
+  call_count,
+  gen_ai_tagged_call_count,
+  error_count,
+  typed_error_count,
+  top_error_types,
+  error_rate,
+  avg_duration_ms,
+  p50_duration_ms,
+  p95_duration_ms,
+  p99_duration_ms
+FROM ${ref("v_mcp_tool_usage")}
+WHERE usage_hour >= window_start
+
+post_operations {
+  ${when(incremental(), `COMMIT TRANSACTION`)}
+}

@@ -1,0 +1,22 @@
+/*
+ * Copyright 2026 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Declares the exporter's typed GenAI span view as a Dataform source. The view
+ * is created by deploy/terraform (or by the collector's auto_create option) in
+ * the project and dataset named by the source_project and source_dataset
+ * variables of workflow_settings.yaml; Dataform only reads it.
+ *
+ * Dataform allows one action per .sqlx file, so the three aggregate views the
+ * marts read are declared next to this file: v_gen_ai_model_costs.sqlx,
+ * v_gen_ai_sessions.sqlx and v_mcp_tool_usage.sqlx. Every mart and the staging
+ * table reference these sources through ref(), which keeps the dependency
+ * graph and the lineage explicit.
+ */
+config {
+  type: "declaration",
+  database: dataform.projectConfig.vars.source_project,
+  schema: dataform.projectConfig.vars.source_dataset,
+  name: "v_gen_ai_spans",
+  description: "Typed GenAI spans (v_gen_ai_spans), deduplicated by otel_spans_dedup."
+}

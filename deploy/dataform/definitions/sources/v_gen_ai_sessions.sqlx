@@ -1,0 +1,14 @@
+/*
+ * Copyright 2026 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Declares the per-session GenAI view as a Dataform source. It is read by
+ * m_gen_ai_sessions_daily. See otel_sources.sqlx.
+ */
+config {
+  type: "declaration",
+  database: dataform.projectConfig.vars.source_project,
+  schema: dataform.projectConfig.vars.source_dataset,
+  name: "v_gen_ai_sessions",
+  description: "Per-session GenAI turn, tool, error and token aggregates per UTC day (v_gen_ai_sessions)."
+}

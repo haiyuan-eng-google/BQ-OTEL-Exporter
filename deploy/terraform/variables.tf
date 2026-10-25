@@ -300,3 +300,47 @@ variable "alerts_partition_expiration_days" {
     error_message = "alerts_partition_expiration_days must be a whole number of days, 0 or more."
   }
 }
+
+# --- Looker Studio dashboard template ---
+#
+# Off by default. When looker_studio_template_report_id is set, outputs.tf
+# renders looker_studio_create_url: a Looker Studio Linking API URL that copies
+# the published template report and rewrites the project and dataset names in
+# its six custom-query data sources to this module's project and dataset. The
+# template's queries were built against a sandbox project and dataset, because
+# Looker Studio validates a custom query when it is saved; the two
+# looker_studio_template_* name variables record those sandbox names so the
+# rewrite can find them. See dashboards/looker_studio/README.md.
+
+variable "looker_studio_template_report_id" {
+  description = "ID of the published Looker Studio template report that the looker_studio_create_url output copies: the value after /reporting/ in the template report's URL. Leave empty (the default) to skip the output. See dashboards/looker_studio/README.md for how to publish the template."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_-]*$", var.looker_studio_template_report_id))
+    error_message = "looker_studio_template_report_id must be empty or contain only letters, digits, underscores, and hyphens: the ID from the template report's URL, not the whole URL."
+  }
+}
+
+variable "looker_studio_template_project_id" {
+  description = "Project ID that the published Looker Studio template report's custom queries name: the sandbox project the template was built against. The looker_studio_create_url output replaces it with project_id. Required when looker_studio_template_report_id is set. See dashboards/looker_studio/README.md."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_.:-]*$", var.looker_studio_template_project_id))
+    error_message = "looker_studio_template_project_id may contain only letters, digits, underscores, periods, colons, and hyphens."
+  }
+}
+
+variable "looker_studio_template_dataset_id" {
+  description = "Dataset ID that the published Looker Studio template report's custom queries name: the sandbox dataset the template was built against. The looker_studio_create_url output replaces it with the module's dataset. Required when looker_studio_template_report_id is set. See dashboards/looker_studio/README.md."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_]*$", var.looker_studio_template_dataset_id))
+    error_message = "looker_studio_template_dataset_id may contain only letters, digits, and underscores."
+  }
+}

@@ -1,0 +1,62 @@
+/*
+ * Copyright 2026 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Hourly model cost mart: v_gen_ai_model_costs materialized into a table that
+ * is partitioned by day, clustered by service_name and model, and refreshed
+ * incrementally. Same columns as the view, so a dashboard query can read either.
+ *
+ * Refresh: the view computes every row of an hour from the spans of that hour
+ * alone (the token-parent window is partitioned by usage_hour), so an
+ * incremental run deletes the rows whose usage_hour is at or after window_start
+ * (the hour-aligned start of the last 3 hours) and inserts the recomputed hours
+ * in one transaction. A rerun is idempotent and a failed run leaves the table
+ * unchanged. A first or full-refresh run uses the Unix epoch as window_start and
+ * therefore rebuilds every hour.
+ *
+ * Spans that arrive more than 3 hours after the end of their hour are not
+ * picked up until a full refresh. Percentiles are per hour, model and agent;
+ * they cannot be combined across rows.
+ */
+config {
+  type: "incremental",
+  tags: ["otel_marts"],
+  description: "Hourly GenAI call, token and latency aggregates per model, refreshed incrementally.",
+  bigquery: {
+    partitionBy: "DATE(usage_hour)",
+    clusterBy: ["service_name", "model"]
+  }
+}
+
+pre_operations {
+  DECLARE window_start TIMESTAMP DEFAULT ${when(incremental(), `TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 HOUR), HOUR)`, `TIMESTAMP('1970-01-01 00:00:00+00')`)}
+  ---
+  ${when(incremental(), `BEGIN TRANSACTION`)}
+  ---
+  ${when(incremental(), `DELETE FROM ${self()} WHERE usage_hour >= window_start`)}
+}
+
+SELECT
+  usage_hour,
+  service_name,
+  gen_ai_agent_name,
+  provider,
+  model,
+  call_count,
+  error_count,
+  total_input_tokens,
+  total_output_tokens,
+  total_cache_read_input_tokens,
+  total_cache_creation_input_tokens,
+  total_reasoning_tokens,
+  p50_duration_ms,
+  p95_duration_ms,
+  p99_duration_ms,
+  typed_error_count,
+  top_error_types
+FROM ${ref("v_gen_ai_model_costs")}
+WHERE usage_hour >= window_start
+
+post_operations {
+  ${when(incremental(), `COMMIT TRANSACTION`)}
+}
