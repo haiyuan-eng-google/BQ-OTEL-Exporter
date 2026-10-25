@@ -134,7 +134,7 @@
           "editorMode": "code",
           "format": 1,
           "rawQuery": true,
-          "rawSql": "SELECT SUM(call_count) AS llm_calls\nFROM `${project}.${dataset}.v_gen_ai_model_costs`\nWHERE $__timeFilter(usage_hour)\n  AND COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>[${service:singlequote}])",
+          "rawSql": "SELECT SUM(call_count) AS llm_calls\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_model_costs`\nWHERE $__timeFilter(usage_hour)\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))",
           "refId": "A"
         }
       ],
@@ -195,7 +195,7 @@
           "editorMode": "code",
           "format": 1,
           "rawQuery": true,
-          "rawSql": "SELECT SAFE_DIVIDE(SUM(error_count), SUM(call_count)) AS error_rate\nFROM `${project}.${dataset}.v_gen_ai_model_costs`\nWHERE $__timeFilter(usage_hour)\n  AND COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>[${service:singlequote}])",
+          "rawSql": "SELECT SAFE_DIVIDE(SUM(error_count), SUM(call_count)) AS error_rate\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_model_costs`\nWHERE $__timeFilter(usage_hour)\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))",
           "refId": "A"
         }
       ],
@@ -256,7 +256,7 @@
           "editorMode": "code",
           "format": 1,
           "rawQuery": true,
-          "rawSql": "SELECT\n  SUM(total_input_tokens) AS input,\n  SUM(total_output_tokens) AS output,\n  SUM(total_reasoning_tokens) AS reasoning,\n  SUM(total_cache_read_input_tokens) AS cache_read,\n  SUM(total_cache_creation_input_tokens) AS cache_creation\nFROM `${project}.${dataset}.v_gen_ai_model_costs`\nWHERE $__timeFilter(usage_hour)\n  AND COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>[${service:singlequote}])",
+          "rawSql": "SELECT\n  SUM(total_input_tokens) AS input,\n  SUM(total_output_tokens) AS output,\n  SUM(total_reasoning_tokens) AS reasoning,\n  SUM(total_cache_read_input_tokens) AS cache_read,\n  SUM(total_cache_creation_input_tokens) AS cache_creation\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_model_costs`\nWHERE $__timeFilter(usage_hour)\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))",
           "refId": "A"
         }
       ],
@@ -319,7 +319,7 @@
           "editorMode": "code",
           "format": 0,
           "rawQuery": true,
-          "rawSql": "SELECT\n  usage_hour AS time,\n  SUM(total_input_tokens) AS input,\n  SUM(total_output_tokens) AS output,\n  SUM(total_reasoning_tokens) AS reasoning,\n  SUM(total_cache_read_input_tokens) AS cache_read,\n  SUM(total_cache_creation_input_tokens) AS cache_creation\nFROM `${project}.${dataset}.v_gen_ai_model_costs`\nWHERE $__timeFilter(usage_hour)\n  AND COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>[${service:singlequote}])\nGROUP BY usage_hour\nORDER BY usage_hour",
+          "rawSql": "SELECT\n  usage_hour AS time,\n  SUM(total_input_tokens) AS input,\n  SUM(total_output_tokens) AS output,\n  SUM(total_reasoning_tokens) AS reasoning,\n  SUM(total_cache_read_input_tokens) AS cache_read,\n  SUM(total_cache_creation_input_tokens) AS cache_creation\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_model_costs`\nWHERE $__timeFilter(usage_hour)\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))\nGROUP BY usage_hour\nORDER BY usage_hour",
           "refId": "A"
         }
       ],
@@ -381,7 +381,7 @@
           "editorMode": "code",
           "format": 0,
           "rawQuery": true,
-          "rawSql": "SELECT\n  usage_hour AS time,\n  SUM(call_count) AS calls,\n  SUM(error_count) AS errors\nFROM `${project}.${dataset}.v_gen_ai_model_costs`\nWHERE $__timeFilter(usage_hour)\n  AND COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>[${service:singlequote}])\nGROUP BY usage_hour\nORDER BY usage_hour",
+          "rawSql": "SELECT\n  usage_hour AS time,\n  SUM(call_count) AS calls,\n  SUM(error_count) AS errors\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_model_costs`\nWHERE $__timeFilter(usage_hour)\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))\nGROUP BY usage_hour\nORDER BY usage_hour",
           "refId": "A"
         }
       ],
@@ -444,7 +444,7 @@
           "editorMode": "code",
           "format": 0,
           "rawQuery": true,
-          "rawSql": "SELECT\n  usage_hour AS time,\n  SAFE_DIVIDE(SUM(error_count), SUM(call_count)) AS error_rate\nFROM `${project}.${dataset}.v_gen_ai_model_costs`\nWHERE $__timeFilter(usage_hour)\n  AND COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>[${service:singlequote}])\nGROUP BY usage_hour\nORDER BY usage_hour",
+          "rawSql": "SELECT\n  usage_hour AS time,\n  SAFE_DIVIDE(SUM(error_count), SUM(call_count)) AS error_rate\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_model_costs`\nWHERE $__timeFilter(usage_hour)\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))\nGROUP BY usage_hour\nORDER BY usage_hour",
           "refId": "A"
         }
       ],
@@ -506,7 +506,7 @@
           "editorMode": "code",
           "format": 0,
           "rawQuery": true,
-          "rawSql": "SELECT\n  usage_hour AS time,\n  COALESCE(model, '(unknown)') AS model,\n  MAX(p95_duration_ms) AS p95_ms\nFROM `${project}.${dataset}.v_gen_ai_model_costs`\nWHERE $__timeFilter(usage_hour)\n  AND COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>[${service:singlequote}])\nGROUP BY usage_hour, model\nORDER BY usage_hour",
+          "rawSql": "SELECT\n  usage_hour AS time,\n  COALESCE(model, '(unknown)') AS model,\n  MAX(p95_duration_ms) AS p95_ms\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_model_costs`\nWHERE $__timeFilter(usage_hour)\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))\nGROUP BY usage_hour, model\nORDER BY usage_hour",
           "refId": "A"
         }
       ],
@@ -564,7 +564,7 @@
           "editorMode": "code",
           "format": 1,
           "rawQuery": true,
-          "rawSql": "SELECT\n  COALESCE(model, '(unknown)') AS model,\n  SUM(total_input_tokens) AS input,\n  SUM(total_output_tokens) AS output\nFROM `${project}.${dataset}.v_gen_ai_model_costs`\nWHERE $__timeFilter(usage_hour)\n  AND COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>[${service:singlequote}])\nGROUP BY model\nORDER BY input DESC\nLIMIT 15",
+          "rawSql": "SELECT\n  COALESCE(model, '(unknown)') AS model,\n  SUM(total_input_tokens) AS input,\n  SUM(total_output_tokens) AS output\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_model_costs`\nWHERE $__timeFilter(usage_hour)\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))\nGROUP BY model\nORDER BY input DESC\nLIMIT 15",
           "refId": "A"
         }
       ],
@@ -616,7 +616,7 @@
           "editorMode": "code",
           "format": 1,
           "rawQuery": true,
-          "rawSql": "SELECT\n  COALESCE(e.value, '(none)') AS error_type,\n  SUM(e.count) AS errors\nFROM `${project}.${dataset}.v_gen_ai_model_costs`, UNNEST(top_error_types) AS e\nWHERE $__timeFilter(usage_hour)\n  AND COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>[${service:singlequote}])\nGROUP BY error_type\nORDER BY errors DESC\nLIMIT 20",
+          "rawSql": "SELECT\n  COALESCE(e.value, '(none)') AS error_type,\n  SUM(e.count) AS errors\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_model_costs`, UNNEST(top_error_types) AS e\nWHERE $__timeFilter(usage_hour)\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))\nGROUP BY error_type\nORDER BY errors DESC\nLIMIT 20",
           "refId": "A"
         }
       ],
@@ -717,7 +717,7 @@
           "editorMode": "code",
           "format": 1,
           "rawQuery": true,
-          "rawSql": "SELECT\n  provider,\n  model,\n  SUM(call_count) AS calls,\n  SUM(error_count) AS errors,\n  SAFE_DIVIDE(SUM(error_count), SUM(call_count)) AS error_rate,\n  SUM(total_input_tokens) AS input_tokens,\n  SUM(total_output_tokens) AS output_tokens,\n  SUM(total_reasoning_tokens) AS reasoning_tokens,\n  SUM(total_cache_read_input_tokens) AS cache_read_tokens,\n  SUM(total_cache_creation_input_tokens) AS cache_creation_tokens,\n  MAX(p50_duration_ms) AS worst_p50_ms,\n  MAX(p95_duration_ms) AS worst_p95_ms,\n  MAX(p99_duration_ms) AS worst_p99_ms\nFROM `${project}.${dataset}.v_gen_ai_model_costs`\nWHERE $__timeFilter(usage_hour)\n  AND COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>[${service:singlequote}])\nGROUP BY provider, model\nORDER BY calls DESC\nLIMIT 50",
+          "rawSql": "SELECT\n  provider,\n  model,\n  SUM(call_count) AS calls,\n  SUM(error_count) AS errors,\n  SAFE_DIVIDE(SUM(error_count), SUM(call_count)) AS error_rate,\n  SUM(total_input_tokens) AS input_tokens,\n  SUM(total_output_tokens) AS output_tokens,\n  SUM(total_reasoning_tokens) AS reasoning_tokens,\n  SUM(total_cache_read_input_tokens) AS cache_read_tokens,\n  SUM(total_cache_creation_input_tokens) AS cache_creation_tokens,\n  MAX(p50_duration_ms) AS worst_p50_ms,\n  MAX(p95_duration_ms) AS worst_p95_ms,\n  MAX(p99_duration_ms) AS worst_p99_ms\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_model_costs`\nWHERE $__timeFilter(usage_hour)\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))\nGROUP BY provider, model\nORDER BY calls DESC\nLIMIT 50",
           "refId": "A"
         }
       ],
@@ -791,7 +791,7 @@
           "editorMode": "code",
           "format": 1,
           "rawQuery": true,
-          "rawSql": "SELECT\n  COUNT(DISTINCT session_id) AS sessions,\n  COUNT(DISTINCT user_id) AS active_users\nFROM `${project}.${dataset}.v_gen_ai_sessions`\nWHERE session_start_date >= DATE(TIMESTAMP_MILLIS(${__from}))\n  AND session_start_date <= DATE(TIMESTAMP_MILLIS(${__to}))\n  AND COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>[${service:singlequote}])",
+          "rawSql": "SELECT\n  COUNT(DISTINCT session_id) AS sessions,\n  COUNT(DISTINCT user_id) AS active_users\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_sessions`\nWHERE session_start_date >= DATE(TIMESTAMP_MILLIS(${__from}))\n  AND session_start_date <= DATE(TIMESTAMP_MILLIS(${__to}))\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))",
           "refId": "A"
         }
       ],
@@ -877,7 +877,7 @@
           "editorMode": "code",
           "format": 1,
           "rawQuery": true,
-          "rawSql": "SELECT\n  AVG(turn_count) AS avg_turns,\n  AVG(session_duration_ms) AS avg_duration_ms\nFROM `${project}.${dataset}.v_gen_ai_sessions`\nWHERE session_start_date >= DATE(TIMESTAMP_MILLIS(${__from}))\n  AND session_start_date <= DATE(TIMESTAMP_MILLIS(${__to}))\n  AND COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>[${service:singlequote}])",
+          "rawSql": "SELECT\n  AVG(turn_count) AS avg_turns,\n  AVG(session_duration_ms) AS avg_duration_ms\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_sessions`\nWHERE session_start_date >= DATE(TIMESTAMP_MILLIS(${__from}))\n  AND session_start_date <= DATE(TIMESTAMP_MILLIS(${__to}))\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))",
           "refId": "A"
         }
       ],
@@ -939,7 +939,7 @@
           "editorMode": "code",
           "format": 0,
           "rawQuery": true,
-          "rawSql": "SELECT\n  TIMESTAMP(session_start_date) AS time,\n  COUNT(DISTINCT session_id) AS sessions,\n  COUNT(DISTINCT user_id) AS active_users\nFROM `${project}.${dataset}.v_gen_ai_sessions`\nWHERE session_start_date >= DATE(TIMESTAMP_MILLIS(${__from}))\n  AND session_start_date <= DATE(TIMESTAMP_MILLIS(${__to}))\n  AND COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>[${service:singlequote}])\nGROUP BY session_start_date\nORDER BY session_start_date",
+          "rawSql": "SELECT\n  TIMESTAMP(session_start_date) AS time,\n  COUNT(DISTINCT session_id) AS sessions,\n  COUNT(DISTINCT user_id) AS active_users\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_sessions`\nWHERE session_start_date >= DATE(TIMESTAMP_MILLIS(${__from}))\n  AND session_start_date <= DATE(TIMESTAMP_MILLIS(${__to}))\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))\nGROUP BY session_start_date\nORDER BY session_start_date",
           "refId": "A"
         }
       ],
@@ -996,7 +996,7 @@
           "editorMode": "code",
           "format": 1,
           "rawQuery": true,
-          "rawSql": "SELECT\n  CASE\n    WHEN turn_count <= 1 THEN '01'\n    WHEN turn_count <= 3 THEN '02-03'\n    WHEN turn_count <= 6 THEN '04-06'\n    WHEN turn_count <= 10 THEN '07-10'\n    ELSE '11+'\n  END AS turns,\n  COUNT(DISTINCT session_id) AS sessions\nFROM `${project}.${dataset}.v_gen_ai_sessions`\nWHERE session_start_date >= DATE(TIMESTAMP_MILLIS(${__from}))\n  AND session_start_date <= DATE(TIMESTAMP_MILLIS(${__to}))\n  AND COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>[${service:singlequote}])\nGROUP BY turns\nORDER BY turns",
+          "rawSql": "SELECT\n  CASE\n    WHEN turn_count <= 1 THEN '01'\n    WHEN turn_count <= 3 THEN '02-03'\n    WHEN turn_count <= 6 THEN '04-06'\n    WHEN turn_count <= 10 THEN '07-10'\n    ELSE '11+'\n  END AS turns,\n  COUNT(DISTINCT session_id) AS sessions\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_sessions`\nWHERE session_start_date >= DATE(TIMESTAMP_MILLIS(${__from}))\n  AND session_start_date <= DATE(TIMESTAMP_MILLIS(${__to}))\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))\nGROUP BY turns\nORDER BY turns",
           "refId": "A"
         }
       ],
@@ -1059,7 +1059,7 @@
           "editorMode": "code",
           "format": 0,
           "rawQuery": true,
-          "rawSql": "SELECT\n  TIMESTAMP(session_start_date) AS time,\n  AVG(invocation_count) AS invocations,\n  AVG(agent_invocation_count) AS agent_invocations,\n  AVG(llm_call_count) AS llm_calls,\n  AVG(tool_call_count) AS tool_calls\nFROM `${project}.${dataset}.v_gen_ai_sessions`\nWHERE session_start_date >= DATE(TIMESTAMP_MILLIS(${__from}))\n  AND session_start_date <= DATE(TIMESTAMP_MILLIS(${__to}))\n  AND COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>[${service:singlequote}])\nGROUP BY session_start_date\nORDER BY session_start_date",
+          "rawSql": "SELECT\n  TIMESTAMP(session_start_date) AS time,\n  AVG(invocation_count) AS invocations,\n  AVG(agent_invocation_count) AS agent_invocations,\n  AVG(llm_call_count) AS llm_calls,\n  AVG(tool_call_count) AS tool_calls\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_sessions`\nWHERE session_start_date >= DATE(TIMESTAMP_MILLIS(${__from}))\n  AND session_start_date <= DATE(TIMESTAMP_MILLIS(${__to}))\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))\nGROUP BY session_start_date\nORDER BY session_start_date",
           "refId": "A"
         }
       ],
@@ -1124,7 +1124,7 @@
           "editorMode": "code",
           "format": 1,
           "rawQuery": true,
-          "rawSql": "SELECT\n  session_start_time AS time,\n  session_id,\n  user_id,\n  service_name,\n  agent_name,\n  error_count,\n  typed_error_count,\n  turn_count,\n  llm_call_count,\n  tool_call_count,\n  session_duration_ms,\n  NULLIF(\n    ARRAY_TO_STRING(\n      ARRAY(\n        SELECT CONCAT(COALESCE(e.value, ''), ' (', CAST(e.count AS STRING), ')')\n        FROM UNNEST(top_error_types) AS e\n      ),\n      ', '\n    ),\n    ''\n  ) AS top_error_types\nFROM `${project}.${dataset}.v_gen_ai_sessions`\nWHERE session_start_date >= DATE(TIMESTAMP_MILLIS(${__from}))\n  AND session_start_date <= DATE(TIMESTAMP_MILLIS(${__to}))\n  AND COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>[${service:singlequote}])\n  AND error_count > 0\nORDER BY error_count DESC\nLIMIT 100",
+          "rawSql": "SELECT\n  session_start_time AS time,\n  session_id,\n  user_id,\n  service_name,\n  agent_name,\n  error_count,\n  typed_error_count,\n  turn_count,\n  llm_call_count,\n  tool_call_count,\n  session_duration_ms,\n  NULLIF(\n    ARRAY_TO_STRING(\n      ARRAY(\n        SELECT CONCAT(COALESCE(e.value, ''), ' (', CAST(e.count AS STRING), ')')\n        FROM UNNEST(top_error_types) AS e\n      ),\n      ', '\n    ),\n    ''\n  ) AS top_error_types\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_sessions`\nWHERE session_start_date >= DATE(TIMESTAMP_MILLIS(${__from}))\n  AND session_start_date <= DATE(TIMESTAMP_MILLIS(${__to}))\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))\n  AND error_count > 0\nORDER BY error_count DESC\nLIMIT 100",
           "refId": "A"
         }
       ],
@@ -1223,7 +1223,7 @@
           "editorMode": "code",
           "format": 1,
           "rawQuery": true,
-          "rawSql": "SELECT\n  SUM(call_count) AS mcp_calls,\n  SAFE_DIVIDE(SUM(error_count), SUM(call_count)) AS error_rate,\n  SAFE_DIVIDE(SUM(gen_ai_tagged_call_count), SUM(call_count)) AS also_genai_tagged\nFROM `${project}.${dataset}.v_mcp_tool_usage`\nWHERE $__timeFilter(usage_hour)\n  AND COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>[${service:singlequote}])",
+          "rawSql": "SELECT\n  SUM(call_count) AS mcp_calls,\n  SAFE_DIVIDE(SUM(error_count), SUM(call_count)) AS error_rate,\n  SAFE_DIVIDE(SUM(gen_ai_tagged_call_count), SUM(call_count)) AS also_genai_tagged\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_mcp_tool_usage`\nWHERE $__timeFilter(usage_hour)\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))",
           "refId": "A"
         }
       ],
@@ -1281,7 +1281,7 @@
           "editorMode": "code",
           "format": 1,
           "rawQuery": true,
-          "rawSql": "SELECT\n  COALESCE(mcp_method_name, '(none)') AS method,\n  SUM(call_count) AS calls\nFROM `${project}.${dataset}.v_mcp_tool_usage`\nWHERE $__timeFilter(usage_hour)\n  AND COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>[${service:singlequote}])\nGROUP BY method\nORDER BY calls DESC\nLIMIT 15",
+          "rawSql": "SELECT\n  COALESCE(mcp_method_name, '(none)') AS method,\n  SUM(call_count) AS calls\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_mcp_tool_usage`\nWHERE $__timeFilter(usage_hour)\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))\nGROUP BY method\nORDER BY calls DESC\nLIMIT 15",
           "refId": "A"
         }
       ],
@@ -1344,7 +1344,7 @@
           "editorMode": "code",
           "format": 0,
           "rawQuery": true,
-          "rawSql": "SELECT\n  usage_hour AS time,\n  COALESCE(server_address, '(unknown)') AS server,\n  MAX(p95_duration_ms) AS p95_ms\nFROM `${project}.${dataset}.v_mcp_tool_usage`\nWHERE $__timeFilter(usage_hour)\n  AND COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>[${service:singlequote}])\nGROUP BY usage_hour, server\nORDER BY usage_hour",
+          "rawSql": "SELECT\n  usage_hour AS time,\n  COALESCE(server_address, '(unknown)') AS server,\n  MAX(p95_duration_ms) AS p95_ms\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_mcp_tool_usage`\nWHERE $__timeFilter(usage_hour)\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))\nGROUP BY usage_hour, server\nORDER BY usage_hour",
           "refId": "A"
         }
       ],
@@ -1444,7 +1444,7 @@
           "editorMode": "code",
           "format": 1,
           "rawQuery": true,
-          "rawSql": "SELECT\n  server_address,\n  mcp_method_name,\n  mcp_target_name,\n  SUM(call_count) AS calls,\n  SUM(gen_ai_tagged_call_count) AS also_genai_tagged_calls,\n  SUM(error_count) AS errors,\n  SAFE_DIVIDE(SUM(error_count), SUM(call_count)) AS error_rate,\n  MAX(p50_duration_ms) AS worst_p50_ms,\n  MAX(p95_duration_ms) AS worst_p95_ms,\n  MAX(p99_duration_ms) AS worst_p99_ms\nFROM `${project}.${dataset}.v_mcp_tool_usage`\nWHERE $__timeFilter(usage_hour)\n  AND COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>[${service:singlequote}])\nGROUP BY server_address, mcp_method_name, mcp_target_name\nORDER BY calls DESC\nLIMIT 50",
+          "rawSql": "SELECT\n  server_address,\n  mcp_method_name,\n  mcp_target_name,\n  SUM(call_count) AS calls,\n  SUM(gen_ai_tagged_call_count) AS also_genai_tagged_calls,\n  SUM(error_count) AS errors,\n  SAFE_DIVIDE(SUM(error_count), SUM(call_count)) AS error_rate,\n  MAX(p50_duration_ms) AS worst_p50_ms,\n  MAX(p95_duration_ms) AS worst_p95_ms,\n  MAX(p99_duration_ms) AS worst_p99_ms\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_mcp_tool_usage`\nWHERE $__timeFilter(usage_hour)\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))\nGROUP BY server_address, mcp_method_name, mcp_target_name\nORDER BY calls DESC\nLIMIT 50",
           "refId": "A"
         }
       ],
@@ -1496,7 +1496,7 @@
           "editorMode": "code",
           "format": 1,
           "rawQuery": true,
-          "rawSql": "SELECT\n  COALESCE(e.value, '(none)') AS error_type,\n  SUM(e.count) AS errors\nFROM `${project}.${dataset}.v_mcp_tool_usage`, UNNEST(top_error_types) AS e\nWHERE $__timeFilter(usage_hour)\n  AND COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>[${service:singlequote}])\nGROUP BY error_type\nORDER BY errors DESC\nLIMIT 20",
+          "rawSql": "SELECT\n  COALESCE(e.value, '(none)') AS error_type,\n  SUM(e.count) AS errors\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_mcp_tool_usage`, UNNEST(top_error_types) AS e\nWHERE $__timeFilter(usage_hour)\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))\nGROUP BY error_type\nORDER BY errors DESC\nLIMIT 20",
           "refId": "A"
         }
       ],
@@ -1570,7 +1570,7 @@
           "editorMode": "code",
           "format": 1,
           "rawQuery": true,
-          "rawSql": "SELECT COUNT(DISTINCT alert_id) AS alerts\nFROM `${project}.${dataset}.otel_alerts`\nWHERE $__timeFilter(event_time)\n  AND COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>[${service:singlequote}])",
+          "rawSql": "SELECT COUNT(DISTINCT alert_id) AS alerts\nFROM `${VAR_PROJECT}.${VAR_DATASET}.otel_alerts`\nWHERE $__timeFilter(event_time)\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))",
           "refId": "A"
         }
       ],
@@ -1633,7 +1633,7 @@
           "editorMode": "code",
           "format": 0,
           "rawQuery": true,
-          "rawSql": "SELECT\n  TIMESTAMP_TRUNC(event_time, HOUR) AS time,\n  alert_kind,\n  COUNT(DISTINCT alert_id) AS alerts\nFROM `${project}.${dataset}.otel_alerts`\nWHERE $__timeFilter(event_time)\n  AND COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>[${service:singlequote}])\nGROUP BY time, alert_kind\nORDER BY time",
+          "rawSql": "SELECT\n  TIMESTAMP_TRUNC(event_time, HOUR) AS time,\n  alert_kind,\n  COUNT(DISTINCT alert_id) AS alerts\nFROM `${VAR_PROJECT}.${VAR_DATASET}.otel_alerts`\nWHERE $__timeFilter(event_time)\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))\nGROUP BY time, alert_kind\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -1675,7 +1675,7 @@
                 "value": [
                   {
                     "title": "Open trace in Cloud Trace",
-                    "url": "https://console.cloud.google.com/traces/explorer;traceId=${__value.raw}?project=${project}",
+                    "url": "https://console.cloud.google.com/traces/explorer;traceId=${__value.raw}?project=${VAR_PROJECT}",
                     "targetBlank": true
                   }
                 ]
@@ -1704,7 +1704,7 @@
           "editorMode": "code",
           "format": 1,
           "rawQuery": true,
-          "rawSql": "SELECT\n  event_time AS time,\n  alert_kind,\n  service_name,\n  NULLIF(trace_id, '') AS trace_id,\n  JSON_VALUE(payload, '$.agent_name') AS agent_name,\n  JSON_VALUE(payload, '$.tool_name') AS tool_name,\n  JSON_VALUE(payload, '$.error_type') AS error_type\nFROM `${project}.${dataset}.otel_alerts`\nWHERE $__timeFilter(event_time)\n  AND COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>[${service:singlequote}])\nQUALIFY ROW_NUMBER() OVER (PARTITION BY alert_id ORDER BY event_time ASC) = 1\nORDER BY event_time DESC\nLIMIT 100",
+          "rawSql": "SELECT\n  event_time AS time,\n  alert_kind,\n  service_name,\n  NULLIF(trace_id, '') AS trace_id,\n  JSON_VALUE(payload, '$.agent_name') AS agent_name,\n  JSON_VALUE(payload, '$.tool_name') AS tool_name,\n  JSON_VALUE(payload, '$.error_type') AS error_type\nFROM `${VAR_PROJECT}.${VAR_DATASET}.otel_alerts`\nWHERE $__timeFilter(event_time)\n  AND ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR COALESCE(service_name, '(none)') IN UNNEST(ARRAY<STRING>${service:json}))\nQUALIFY ROW_NUMBER() OVER (PARTITION BY alert_id ORDER BY event_time ASC) = 1\nORDER BY event_time DESC\nLIMIT 100",
           "refId": "A"
         }
       ],
@@ -1729,46 +1729,6 @@
   "templating": {
     "list": [
       {
-        "type": "constant",
-        "name": "project",
-        "label": "project",
-        "hide": 2,
-        "skipUrlSync": false,
-        "query": "${VAR_PROJECT}",
-        "current": {
-          "selected": false,
-          "text": "${VAR_PROJECT}",
-          "value": "${VAR_PROJECT}"
-        },
-        "options": [
-          {
-            "selected": true,
-            "text": "${VAR_PROJECT}",
-            "value": "${VAR_PROJECT}"
-          }
-        ]
-      },
-      {
-        "type": "constant",
-        "name": "dataset",
-        "label": "dataset",
-        "hide": 2,
-        "skipUrlSync": false,
-        "query": "${VAR_DATASET}",
-        "current": {
-          "selected": false,
-          "text": "${VAR_DATASET}",
-          "value": "${VAR_DATASET}"
-        },
-        "options": [
-          {
-            "selected": true,
-            "text": "${VAR_DATASET}",
-            "value": "${VAR_DATASET}"
-          }
-        ]
-      },
-      {
         "type": "query",
         "name": "service",
         "label": "Service",
@@ -1776,18 +1736,19 @@
           "type": "grafana-bigquery-datasource",
           "uid": "${DS_BIGQUERY}"
         },
-        "definition": "SELECT COALESCE(service_name, '(none)') AS service_name\nFROM `${project}.${dataset}.v_gen_ai_model_costs`\nWHERE $__timeFilter(usage_hour)\n  AND NOT REGEXP_CONTAINS(COALESCE(service_name, ''), r'[\\x00-\\x1f\\'\"\\\\`]')\nUNION DISTINCT\nSELECT COALESCE(service_name, '(none)')\nFROM `${project}.${dataset}.v_mcp_tool_usage`\nWHERE $__timeFilter(usage_hour)\n  AND NOT REGEXP_CONTAINS(COALESCE(service_name, ''), r'[\\x00-\\x1f\\'\"\\\\`]')\nUNION DISTINCT\nSELECT COALESCE(service_name, '(none)')\nFROM `${project}.${dataset}.v_gen_ai_sessions`\nWHERE session_start_date >= DATE(TIMESTAMP_MILLIS(${__from}))\n  AND session_start_date <= DATE(TIMESTAMP_MILLIS(${__to}))\n  AND NOT REGEXP_CONTAINS(COALESCE(service_name, ''), r'[\\x00-\\x1f\\'\"\\\\`]')\nORDER BY service_name",
+        "definition": "SELECT COALESCE(service_name, '(none)') AS service_name\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_model_costs`\nWHERE $__timeFilter(usage_hour)\n  AND NOT REGEXP_CONTAINS(COALESCE(service_name, ''), r'[\\x00-\\x1f\\'\"\\\\`]')\nUNION DISTINCT\nSELECT COALESCE(service_name, '(none)')\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_mcp_tool_usage`\nWHERE $__timeFilter(usage_hour)\n  AND NOT REGEXP_CONTAINS(COALESCE(service_name, ''), r'[\\x00-\\x1f\\'\"\\\\`]')\nUNION DISTINCT\nSELECT COALESCE(service_name, '(none)')\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_sessions`\nWHERE session_start_date >= DATE(TIMESTAMP_MILLIS(${__from}))\n  AND session_start_date <= DATE(TIMESTAMP_MILLIS(${__to}))\n  AND NOT REGEXP_CONTAINS(COALESCE(service_name, ''), r'[\\x00-\\x1f\\'\"\\\\`]')\nORDER BY service_name",
         "query": {
           "editorMode": "code",
           "format": 1,
           "rawQuery": true,
-          "rawSql": "SELECT COALESCE(service_name, '(none)') AS service_name\nFROM `${project}.${dataset}.v_gen_ai_model_costs`\nWHERE $__timeFilter(usage_hour)\n  AND NOT REGEXP_CONTAINS(COALESCE(service_name, ''), r'[\\x00-\\x1f\\'\"\\\\`]')\nUNION DISTINCT\nSELECT COALESCE(service_name, '(none)')\nFROM `${project}.${dataset}.v_mcp_tool_usage`\nWHERE $__timeFilter(usage_hour)\n  AND NOT REGEXP_CONTAINS(COALESCE(service_name, ''), r'[\\x00-\\x1f\\'\"\\\\`]')\nUNION DISTINCT\nSELECT COALESCE(service_name, '(none)')\nFROM `${project}.${dataset}.v_gen_ai_sessions`\nWHERE session_start_date >= DATE(TIMESTAMP_MILLIS(${__from}))\n  AND session_start_date <= DATE(TIMESTAMP_MILLIS(${__to}))\n  AND NOT REGEXP_CONTAINS(COALESCE(service_name, ''), r'[\\x00-\\x1f\\'\"\\\\`]')\nORDER BY service_name",
+          "rawSql": "SELECT COALESCE(service_name, '(none)') AS service_name\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_model_costs`\nWHERE $__timeFilter(usage_hour)\n  AND NOT REGEXP_CONTAINS(COALESCE(service_name, ''), r'[\\x00-\\x1f\\'\"\\\\`]')\nUNION DISTINCT\nSELECT COALESCE(service_name, '(none)')\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_mcp_tool_usage`\nWHERE $__timeFilter(usage_hour)\n  AND NOT REGEXP_CONTAINS(COALESCE(service_name, ''), r'[\\x00-\\x1f\\'\"\\\\`]')\nUNION DISTINCT\nSELECT COALESCE(service_name, '(none)')\nFROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_sessions`\nWHERE session_start_date >= DATE(TIMESTAMP_MILLIS(${__from}))\n  AND session_start_date <= DATE(TIMESTAMP_MILLIS(${__to}))\n  AND NOT REGEXP_CONTAINS(COALESCE(service_name, ''), r'[\\x00-\\x1f\\'\"\\\\`]')\nORDER BY service_name",
           "refId": "tempvar"
         },
         "refresh": 2,
         "sort": 1,
         "multi": true,
         "includeAll": true,
+        "allValue": "__all",
         "allowCustomValue": false,
         "hide": 0,
         "skipUrlSync": false,
@@ -1801,7 +1762,7 @@
           ]
         },
         "options": [],
-        "description": "Services with GenAI or MCP activity in the time range. Every panel filters on it; All selects every listed service. A name that contains a quote, a backslash, a backtick or a control character is not listed."
+        "description": "Services with GenAI or MCP activity in the time range. All sets the __all sentinel so every panel (including otel_alerts for alert-only services) remains unfiltered by the option list."
       }
     ]
   },

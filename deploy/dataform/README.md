@@ -21,13 +21,14 @@ All actions except the declarations carry the tag `otel_marts`.
 | Action | Type | Reads | Partition by | Cluster by |
 |:---|:---|:---|:---|:---|
 | `v_gen_ai_spans`, `v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_mcp_tool_usage` | declaration | the exporter views (not written) | | |
-| `stg_spans_dedup` | incremental | `v_gen_ai_spans` | `DATE(start_time)` | `service_name`, `trace_id` |
-| `m_gen_ai_model_costs_hourly` | incremental | `v_gen_ai_model_costs` | `DATE(usage_hour)` | `service_name`, `model` |
-| `m_mcp_tool_usage_hourly` | incremental | `v_mcp_tool_usage` | `DATE(usage_hour)` | `service_name`, `mcp_method_name` |
-| `m_gen_ai_sessions_daily` | incremental | `v_gen_ai_sessions` | `session_start_date` | `service_name`, `agent_name` |
-| `m_gen_ai_agent_trajectory` | incremental | `stg_spans_dedup` | `DATE(start_time)` | `service_name`, `trace_id` |
-| `assert_no_orphan_tokens` | assertion | `stg_spans_dedup`, `m_gen_ai_agent_trajectory` | | |
-| `assert_no_unhandled_cycles` | assertion | `stg_spans_dedup`, `m_gen_ai_agent_trajectory` | | |
+| `stg_run_window` | table | | | |
+| `stg_spans_dedup` | incremental | `stg_run_window`, `v_gen_ai_spans` | `DATE(start_time)` | `service_name`, `trace_id` |
+| `m_gen_ai_model_costs_hourly` | incremental | `stg_run_window`, `v_gen_ai_model_costs` | `DATE(usage_hour)` | `service_name`, `model` |
+| `m_mcp_tool_usage_hourly` | incremental | `stg_run_window`, `v_mcp_tool_usage` | `DATE(usage_hour)` | `service_name`, `mcp_method_name` |
+| `m_gen_ai_sessions_daily` | incremental | `stg_run_window`, `v_gen_ai_sessions` | `session_start_date` | `service_name`, `agent_name` |
+| `m_gen_ai_agent_trajectory` | incremental | `stg_run_window`, `stg_spans_dedup` | `DATE(start_time)` | `service_name`, `trace_id` |
+| `assert_no_orphan_tokens` | assertion | `stg_run_window`, `stg_spans_dedup`, `m_gen_ai_agent_trajectory` | | |
+| `assert_no_unhandled_cycles` | assertion | `stg_run_window`, `stg_spans_dedup`, `m_gen_ai_agent_trajectory` | | |
 
 Every mart has the columns of its view, in the view's order, so a dashboard
 query can read either. The one exception is `status_message` of the trajectory
@@ -53,9 +54,28 @@ instead of re-reading the raw spans through the view chain on every run.
    | `defaultLocation` | Location of the marts datasets. It must equal the location of the exporter dataset: a query cannot read across locations |
    | `defaultDataset`, `defaultAssertionDataset` | Datasets for the marts and the assertion views. Dataform creates them when they do not exist |
    | `vars.source_project`, `vars.source_dataset` | `project_id` and `dataset_id` of the exporter. Only read |
+   | `vars.run_timestamp` | Optional ISO-8601 UTC timestamp override for `stg_run_window` (empty uses the run-start `CURRENT_TIMESTAMP()`) |
 
-   You can also leave the file as is and pass the two variables on the command
-   line: `dataform run --vars=source_project=my-project,source_dataset=otel`.
+   Always set `defaultProject` and `defaultLocation` in
+   [`workflow_settings.yaml`](workflow_settings.yaml) before running (`--vars`
+   only overrides entries under `vars:`, so leaving `defaultProject` at
+   `YOUR_PROJECT_ID` would still target `YOUR_PROJECT_ID` for the destination
+   tables and assertion views). Once `defaultProject` and `defaultLocation` are
+   set, you can either edit `vars.source_project` and `vars.source_dataset` in
+   the file or pass them on the command line:
+   `dataform run --vars=source_project=my-project,source_dataset=otel`.
+
+   ```yaml
+   defaultProject: my-project
+   defaultLocation: US
+   defaultDataset: otel_marts
+   defaultAssertionDataset: otel_marts_assertions
+
+   vars:
+     source_project: my-project
+     source_dataset: otel
+     run_timestamp: ""
+   ```
 4. Create `.df-credentials.json` with `dataform init-creds bigquery` and keep it
    out of version control (`.gitignore` in this directory lists it).
 5. Grant the identity that runs Dataform (the CLI user, or the service account of
@@ -98,10 +118,17 @@ a run. Then
 window_start = TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 HOUR), HOUR)
 ```
 
-so `T - 4h < window_start <= T - 3h`: the lookback `L` is 3 to 4 hours. A first
+so `T - 4h < window_start <= T - 3h`: the lookback `L` is 3 to 4 hours.
+`stg_run_window` captures `T` and `window_start` once at the start of the
+invocation (or from `vars.run_timestamp` when set), and every incremental
+action and assertion reads `stg_run_window.window_start` so the whole DAG
+shares a single cutoff even if execution crosses an hour boundary. A first
 run or a full refresh uses the Unix epoch as `window_start` and rebuilds
-everything. A rerun gives the same rows, and a run that fails leaves the tables
-as they were, because the delete and the insert commit together.
+everything. A rerun gives the same rows, and each individual table action is
+atomic (`BEGIN TRANSACTION` ... `DELETE` ... `INSERT` ... `COMMIT TRANSACTION`):
+if a table action fails, its own transaction rolls back and leaves that table
+as it was, while upstream table actions that already committed keep their
+refreshed rows until the next run.
 
 | Mart | What one run recomputes | Row is exact when |
 |:---|:---|:---|
@@ -125,15 +152,17 @@ Hour `H` is rewritten by every run with `T < H + 4h`, that is, until 3 hours
 after the hour ends. With runs every `g` hours, a span is reflected in its hour
 whenever it is ingested less than `3h - g` after the end of its hour: 2 hours
 for hourly runs. A span ingested later is not reflected until the next full
-refresh. Choose `g` and the lookback so that the ingestion delay of your
-deployment plus `g` stays below 3 hours. To widen the lookback, change
-`INTERVAL 3 HOUR` consistently in `stg_spans_dedup`, the four marts and the two
-assertions; a conformance test fails when they differ.
+refresh. Choose `g` and the lookback so that the ingestion delay of your deployment
+plus `g` stays below 3 hours. To widen the lookback, change `INTERVAL 3 HOUR`
+in `stg_run_window` (which `stg_spans_dedup`, the four marts and the two
+assertions read); a conformance test fails when they differ.
 
 Run at least every 3 hours: the hours between the window of one run and the
 window of the next run are not recomputed, so a gap longer than the lookback
-leaves them with rows computed before the gap. Run an hourly schedule, or a
-full refresh, to repair a gap.
+leaves them with rows computed before the gap. Running on an hourly schedule
+prevents future lookback gaps; to repair an already-expired gap longer than the
+lookback window, run a targeted backfill (`--vars=run_timestamp=...` or a
+temporarily widened lookback) or `dataform run --tags otel_marts --full-refresh`.
 
 ### Lookback completeness bound
 
@@ -204,7 +233,7 @@ check the run that just finished.
 
 | Assertion | A row is returned when |
 |:---|:---|
-| `assert_no_orphan_tokens` | a span of the trajectory mart breaks a token invariant. The `violation` column names the rule: `projected_token_differs_from_raw` (a token count is neither `NULL` nor the staged count), `rollup_token_changed` (a span that is not a token leaf lost or changed a count), `token_leaf_without_tokens` (a token leaf with no count left), `token_double_counted_with_child` (a token leaf keeps a count that a later direct child also reports) or `span_missing_from_trajectory` (a staged span that reports tokens is not in the mart) |
+| `assert_no_orphan_tokens` | a span of the trajectory mart breaks a token invariant. The `violation` column names the rule: `projected_token_differs_from_raw` (a token count is neither `NULL` nor the staged count), `rollup_token_changed` (a span that is not a token leaf has an uncovered count or lost/changed a count, or a partial leaf nulled an uncovered count), `token_leaf_without_tokens` (a token leaf with no count left), `token_double_counted_with_child` (a token leaf whose counts are all covered by emitted descendants up to 32 hops, or a partial leaf that keeps a count an emitted descendant already covers) or `span_missing_from_trajectory` (a staged span that reports tokens is not in the mart) |
 | `assert_no_unhandled_cycles` | a staged span appears in the trajectory mart zero times (`span_missing_from_trajectory`: it is in a parent cycle or deeper than 16 levels, which the trajectory does not emit) or more than once (`span_in_trajectory_more_than_once`) |
 
 They check the invariants that make a sum of `gen_ai_usage_*_tokens` over the
@@ -286,7 +315,7 @@ also needs a full refresh, because an incremental run only inserts rows.
 ## Dataform core versions
 
 `workflow_settings.yaml` pins `dataformCoreVersion: 3.1.2`, and the package has
-been run with that version only. Dataform core 3 rejects a project that has both
+been compiled and graph-validated with that version. Dataform core 3 rejects a project that has both
 `workflow_settings.yaml` and `dataform.json`, so this directory has no
 `dataform.json`. A project that must stay on Dataform core 2.x needs a
 `dataform.json` with the same settings in place of `workflow_settings.yaml`

@@ -24,3 +24,6 @@ vars:
   # (the project_id / dataset_id of deploy/terraform). They are only READ.
   source_project: YOUR_PROJECT_ID
   source_dataset: YOUR_DATASET_ID
+  # Optional ISO-8601 UTC timestamp override for stg_run_window; empty uses
+  # CURRENT_TIMESTAMP() captured once when stg_run_window runs.
+  run_timestamp: ""

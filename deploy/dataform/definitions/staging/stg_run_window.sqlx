@@ -1,0 +1,31 @@
+/*
+ * Copyright 2026 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+config {
+  type: "table",
+  tags: ["otel_marts"],
+  description: "Single run-start timestamp and 3-hour lookback boundary shared by every staging table, mart and assertion in one Dataform invocation."
+}
+
+-- Capture the invocation timestamp once when the DAG begins, or use the
+-- explicit ISO-8601 UTC vars.run_timestamp override when supplied, so every
+-- downstream staging table, mart and assertion evaluates the exact same
+-- window_start even if execution crosses an hour boundary.
+
+SELECT
+  COALESCE(
+    SAFE_CAST(NULLIF('${dataform.projectConfig.vars.run_timestamp}', '') AS TIMESTAMP),
+    CURRENT_TIMESTAMP()
+  ) AS run_ts,
+  TIMESTAMP_TRUNC(
+    TIMESTAMP_SUB(
+      COALESCE(
+        SAFE_CAST(NULLIF('${dataform.projectConfig.vars.run_timestamp}', '') AS TIMESTAMP),
+        CURRENT_TIMESTAMP()
+      ),
+      INTERVAL 3 HOUR
+    ),
+    HOUR
+  ) AS window_start

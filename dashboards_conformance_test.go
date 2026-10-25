@@ -598,6 +598,23 @@ var dashSQLKeywords = func() map[string]bool {
 	return m
 }()
 
+// dashAllowedSQLFuncs are the GoogleSQL functions the dashboards, views and
+// Dataform package may call. Any unknown function call is rejected.
+var dashAllowedSQLFuncs = func() map[string]bool {
+	m := map[string]bool{}
+	for _, fn := range strings.Fields(`
+		SUM AVG MIN MAX COUNT ANY_VALUE LOGICAL_OR ARRAY_AGG STRING_AGG APPROX_QUANTILES ROW_NUMBER
+		COALESCE IF IFNULL NULLIF CAST SAFE_CAST SAFE_DIVIDE ROUND
+		DATE TIMESTAMP TIMESTAMP_TRUNC TIMESTAMP_SUB TIMESTAMP_ADD TIMESTAMP_DIFF TIMESTAMP_MILLIS UNIX_MICROS
+		PARSE_DATE DATE_ADD DATE_SUB CURRENT_TIMESTAMP
+		CONCAT LOWER UPPER TRIM SUBSTR LENGTH TO_JSON_STRING JSON_VALUE JSON_QUERY JSON_EXTRACT_SCALAR
+		REGEXP_CONTAINS REGEXP_EXTRACT
+		ARRAY STRUCT UNNEST ARRAY_LENGTH ARRAY_TO_STRING ARRAY_CONCAT GENERATE_ARRAY SAFE_OFFSET SAFE_ORDINAL`) {
+		m[fn] = true
+	}
+	return m
+}()
+
 // dashSource says what the identifiers of one SELECT may name.
 type dashSource struct {
 	// cols are the unqualified names the sources of the FROM clause provide,
@@ -652,7 +669,10 @@ func dashCheckBranch(b *dashBranch, src dashSource) []string {
 				continue
 			}
 			if i+1 < len(toks) && toks[i+1].is("(") {
-				continue // a function call
+				if !dashAllowedSQLFuncs[t.up] {
+					problems = append(problems, fmt.Sprintf("%s: unknown function %s", where, t.text))
+				}
+				continue
 			}
 			if i > 0 && toks[i-1].up == "AS" {
 				continue // an alias or a type name
@@ -936,7 +956,7 @@ func dashDecodeSpec(files dashFileSet) (*dashSpec, error) {
 }
 
 // dashAlertColumnPattern matches one column of the otel_alerts schema in main.tf.
-var dashAlertColumnPattern = regexp.MustCompile(`\{ name = "([a-z_]+)", type = "[A-Z]+", mode = "[A-Z]+" \}`)
+var dashAlertColumnPattern = regexp.MustCompile(`\{ name = "([a-z_]+)", type = "([A-Z0-9]+)", mode = "[A-Z]+" \}`)
 
 // dashAlertColumns returns the columns main.tf gives the otel_alerts table.
 func dashAlertColumns(files dashFileSet) []string {
@@ -954,6 +974,214 @@ func dashAlertColumns(files dashFileSet) []string {
 		cols = append(cols, m[1])
 	}
 	return cols
+}
+
+// dashSourceColumnTypes returns the GoogleSQL column types of a companion view
+// or of otel_alerts so Looker Studio select items and metric aggregations can
+// be type-checked.
+func dashSourceColumnTypes(files dashFileSet, view string) map[string]string {
+	types := map[string]string{
+		// Timestamps and dates
+		"usage_hour":         "TIMESTAMP",
+		"session_start_date": "DATE",
+		"first_turn_time":    "TIMESTAMP",
+		"last_turn_time":     "TIMESTAMP",
+		"start_time":         "TIMESTAMP",
+		"end_time":           "TIMESTAMP",
+		"root_start_time":    "TIMESTAMP",
+		"metric_time":        "TIMESTAMP",
+		"span_start_time":    "TIMESTAMP",
+		"span_end_time":      "TIMESTAMP",
+		"event_time":         "TIMESTAMP",
+		"publish_time":       "TIMESTAMP",
+		// Strings
+		"service_name":           "STRING",
+		"service_version":        "STRING",
+		"deployment_environment": "STRING",
+		"provider":               "STRING",
+		"operation_name":         "STRING",
+		"request_model":          "STRING",
+		"response_model":         "STRING",
+		"model":                  "STRING",
+		"agent_name":             "STRING",
+		"agent_id":               "STRING",
+		"session_id":             "STRING",
+		"user_id":                "STRING",
+		"first_trace_id":         "STRING",
+		"last_trace_id":          "STRING",
+		"mcp_method_name":        "STRING",
+		"tool_name":              "STRING",
+		"tool_type":              "STRING",
+		"server_address":         "STRING",
+		"network_transport":      "STRING",
+		"mcp_protocol_version":   "STRING",
+		"trace_id":               "STRING",
+		"span_id":                "STRING",
+		"parent_span_id":         "STRING",
+		"root_span_id":           "STRING",
+		"span_name":              "STRING",
+		"step_kind":              "STRING",
+		"status_message":         "STRING",
+		"error_type":             "STRING",
+		"gen_ai_system":          "STRING",
+		"gen_ai_operation_name":  "STRING",
+		"gen_ai_request_model":   "STRING",
+		"gen_ai_response_model":  "STRING",
+		"gen_ai_agent_id":        "STRING",
+		"gen_ai_agent_name":      "STRING",
+		"gen_ai_conversation_id": "STRING",
+		"gen_ai_tool_name":       "STRING",
+		"gen_ai_tool_type":       "STRING",
+		"gen_ai_tool_call_id":    "STRING",
+		"gen_ai_user_id":         "STRING",
+		"gen_ai_Workflow_name":   "STRING",
+		"gen_ai_output_type":     "STRING",
+		"gen_ai_data_source_id":  "STRING",
+		"agent_path":             "STRING",
+		"span_path":              "STRING",
+		"metric_name":            "STRING",
+		"metric_unit":            "STRING",
+		"metric_type":            "STRING",
+		"span_status_message":    "STRING",
+		"span_error_type":        "STRING",
+		"alert_id":               "STRING",
+		"subscription_name":      "STRING",
+		"source":                 "STRING",
+		"trace_url":              "STRING",
+		"alert_kind":             "STRING",
+		"window_start":           "STRING",
+		"window_end":             "STRING",
+		"last_error_type":        "STRING",
+		// Booleans
+		"is_orphan":     "BOOL",
+		"is_leaf":       "BOOL",
+		"is_token_leaf": "BOOL",
+		// Integers
+		"span_kind":                         "INT64",
+		"status_code":                       "INT64",
+		"span_status_code":                  "INT64",
+		"call_count":                        "INT64",
+		"error_count":                       "INT64",
+		"total_input_tokens":                "INT64",
+		"total_output_tokens":               "INT64",
+		"total_reasoning_tokens":            "INT64",
+		"total_cache_read_input_tokens":     "INT64",
+		"total_cache_creation_input_tokens": "INT64",
+		"total_tokens":                      "INT64",
+		"turn_count":                        "INT64",
+		"llm_call_count":                    "INT64",
+		"tool_call_count":                   "INT64",
+		"agent_Error_count":                 "INT64",
+		"distinct_models_used":              "INT64",
+		"distinct_tools_used":               "INT64",
+		"gen_ai_tagged_call_count":          "INT64",
+		"mcp_only_call_count":               "INT64",
+		"server_port":                       "INT64",
+		"depth":                             "INT64",
+		"gen_ai_usage_input_tokens":         "INT64",
+		"gen_ai_usage_output_tokens":        "INT64",
+		"gen_ai_usage_reasoning_tokens":     "INT64",
+		"gen_ai_usage_cache_read_tokens":    "INT64",
+		"gen_ai_usage_cache_create_tokens":  "INT64",
+		"leaf_input_tokens":                 "INT64",
+		"leaf_output_tokens":                "INT64",
+		"leaf_reasoning_tokens":             "INT64",
+		// Floats
+		"avg_duration_ms":       "FLOAT64",
+		"p50_duration_ms":       "FLOAT64",
+		"p95_duration_ms":       "FLOAT64",
+		"p99_duration_ms":       "FLOAT64",
+		"max_duration_ms":       "FLOAT64",
+		"session_duration_ms":   "FLOAT64",
+		"total_llm_duration_ms": "FLOAT64",
+		"duration_ms":           "FLOAT64",
+		"exemplar_value":        "FLOAT64",
+		"span_duration_ms":      "FLOAT64",
+		"error_rate":            "FLOAT64",
+		"p95_s":                 "FLOAT64",
+	}
+	if view == "otel_alerts" {
+		text := files["deploy/terraform/main.tf"]
+		if start := strings.Index(text, "resource \"google_bigquery_table\" \"otel_alerts\" {\n"); start >= 0 {
+			block := text[start:]
+			if end := strings.Index(block, "\n}\n"); end >= 0 {
+				block = block[:end]
+			}
+			for _, m := range dashAlertColumnPattern.FindAllStringSubmatch(block, -1) {
+				types[m[1]] = m[2]
+			}
+		}
+	}
+	return types
+}
+
+// dashInferExprType infers the GoogleSQL scalar type of a SELECT item body.
+func dashInferExprType(toks []dashTok, colTypes map[string]string) string {
+	if len(toks) == 0 {
+		return ""
+	}
+	if len(toks) == 1 {
+		t := toks[0]
+		switch {
+		case t.kind == dashString:
+			return "STRING"
+		case t.kind == dashNumber:
+			if strings.Contains(t.text, ".") {
+				return "FLOAT64"
+			}
+			return "INT64"
+		case t.up == "TRUE" || t.up == "FALSE":
+			return "BOOL"
+		case t.kind == dashWord:
+			return colTypes[strings.ToLower(t.text)]
+		}
+	}
+	if (toks[0].up == "CAST" || toks[0].up == "SAFE_CAST") && len(toks) >= 5 && toks[1].is("(") && toks[len(toks)-1].is(")") {
+		innerDepth := toks[1].depth + 1
+		for i := len(toks) - 2; i >= 2; i-- {
+			if toks[i].depth == innerDepth && toks[i-1].depth == innerDepth && toks[i-1].up == "AS" {
+				return toks[i].up
+			}
+		}
+	}
+	if (toks[0].up == "COALESCE" || toks[0].up == "IFNULL" || toks[0].up == "NULLIF") && len(toks) >= 4 && toks[1].is("(") {
+		innerDepth := toks[1].depth + 1
+		start := 2
+		for i := 2; i < len(toks); i++ {
+			if (toks[i].depth == innerDepth && toks[i].is(",")) || i == len(toks)-1 {
+				if typ := dashInferExprType(toks[start:i], colTypes); typ != "" {
+					return typ
+				}
+				start = i + 1
+			}
+		}
+	}
+	if toks[0].up == "IF" && len(toks) >= 6 && toks[1].is("(") {
+		innerDepth := toks[1].depth + 1
+		var commas []int
+		for i := 2; i < len(toks)-1; i++ {
+			if toks[i].depth == innerDepth && toks[i].is(",") {
+				commas = append(commas, i)
+			}
+		}
+		if len(commas) == 2 {
+			if typ := dashInferExprType(toks[commas[0]+1:commas[1]], colTypes); typ != "" {
+				return typ
+			}
+			return dashInferExprType(toks[commas[1]+1:len(toks)-1], colTypes)
+		}
+	}
+	switch toks[0].up {
+	case "CONCAT", "JSON_VALUE", "JSON_EXTRACT_SCALAR", "TO_JSON_STRING", "LOWER", "UPPER", "TRIM", "ARRAY_TO_STRING":
+		return "STRING"
+	case "COUNT", "ARRAY_LENGTH":
+		return "INT64"
+	case "AVG", "SAFE_DIVIDE", "ROUND":
+		return "FLOAT64"
+	case "LOGICAL_OR", "REGEXP_CONTAINS":
+		return "BOOL"
+	}
+	return ""
 }
 
 var dashPlaceholderPattern = regexp.MustCompile(`\$\{[a-z_]+\}`)
@@ -1241,6 +1469,17 @@ func (l *dashLooker) checkQueries() {
 			}
 			for _, msg := range dashCheckBranch(b, dashSource{cols: dashSet(viewCols)}) {
 				l.probs.addf("%s: %s", label, msg)
+			}
+			colTypes := dashSourceColumnTypes(l.files, view)
+			for _, it := range b.items {
+				if it.name == "" {
+					continue
+				}
+				gotType := dashInferExprType(it.body, colTypes)
+				wantType := colTypes[it.name]
+				if gotType != "" && wantType != "" && gotType != wantType {
+					l.probs.addf("%s: select item %s has type %s, want %s", label, it.name, gotType, wantType)
+				}
 			}
 			if mart, ok := src.Marts[view]; ok {
 				martCols, err := dfxMartColumns(l.files, mart)
@@ -2005,9 +2244,9 @@ const (
 
 var (
 	dashGrafanaMacros = strings.NewReplacer(
-		"${project}", "p",
-		"${dataset}", "d",
-		"${service:singlequote}", "'svc-a','svc-b'",
+		"${VAR_PROJECT}", "p",
+		"${VAR_DATASET}", "d",
+		"${service:json}", `["svc-a","svc-b"]`,
 		"${__from}", dashGrafanaFrom,
 		"${__to}", dashGrafanaTo,
 	)
@@ -2058,7 +2297,7 @@ func dashGrafanaTimePredicate(source string) string {
 }
 
 const (
-	dashServicePredicate = "COALESCE ( SERVICE_NAME , '(none)' ) IN UNNEST ( ARRAY < STRING > [ 'svc-a' , 'svc-b' ] )"
+	dashServicePredicate = "( '__all' IN UNNEST ( ARRAY < STRING > [ \"svc-a\" , \"svc-b\" ] ) OR COALESCE ( SERVICE_NAME , '(none)' ) IN UNNEST ( ARRAY < STRING > [ \"svc-a\" , \"svc-b\" ] ) )"
 	dashAlertDedup       = "ROW_NUMBER ( ) OVER ( PARTITION BY ALERT_ID ORDER BY EVENT_TIME ASC ) = 1"
 )
 
@@ -2140,14 +2379,8 @@ func dashValidateGrafanaBQ(files dashFileSet) []string {
 	for _, v := range g.Templating.List {
 		vars[v.Name] = v
 	}
-	if got := dashSortedKeys(vars); !slices.Equal(got, []string{"dataset", "project", "service"}) {
-		p.addf("%s: the variables are %v, want dataset, project and service", dashGrafanaBQ, got)
-	}
-	for name, input := range map[string]string{"project": "VAR_PROJECT", "dataset": "VAR_DATASET"} {
-		v := vars[name]
-		if v.Type != "constant" || v.Hide != 2 || string(v.Query) != `"${`+input+`}"` {
-			p.addf("%s: variable %s has to be a hidden constant that holds ${%s}", dashGrafanaBQ, name, input)
-		}
+	if got := dashSortedKeys(vars); !slices.Equal(got, []string{"service"}) {
+		p.addf("%s: the variables are %v, want only service (project and dataset are __inputs constants so ?var-project= and ?var-dataset= URL parameters cannot override them)", dashGrafanaBQ, got)
 	}
 	p = append(p, dashCheckServiceVar(files, vars["service"])...)
 
@@ -2224,7 +2457,7 @@ func dashValidateGrafanaBQ(files dashFileSet) []string {
 // dashCheckTraceLink checks that the trace_id column of a table opens Cloud
 // Trace Explorer in the project of the dashboard.
 func dashCheckTraceLink(label string, pn dashGrafanaPanel) []string {
-	const want = "https://console.cloud.google.com/traces/explorer;traceId=${__value.raw}?project=${project}"
+	const want = "https://console.cloud.google.com/traces/explorer;traceId=${__value.raw}?project=${VAR_PROJECT}"
 	for _, o := range pn.FieldConfig.Overrides {
 		if o.Matcher.ID != "byName" || o.Matcher.Options != "trace_id" {
 			continue
@@ -2245,8 +2478,8 @@ func dashCheckTraceLink(label string, pn dashGrafanaPanel) []string {
 func dashCheckServiceVar(files dashFileSet, v dashGrafanaVar) []string {
 	const label = dashGrafanaBQ + ": variable service"
 	var p dashProblems
-	if v.Type != "query" || !v.Multi || !v.IncludeAll || v.AllowCustomValue == nil || *v.AllowCustomValue {
-		p.addf("%s has to be a multi-value query variable with All and without custom values", label)
+	if v.Type != "query" || !v.Multi || !v.IncludeAll || v.AllValue != "__all" || v.AllowCustomValue == nil || *v.AllowCustomValue {
+		p.addf("%s has to be a multi-value query variable with All (allValue __all) and without custom values", label)
 	}
 	if v.Datasource == nil || *v.Datasource != (dashGrafanaDS{Type: "grafana-bigquery-datasource", UID: "${DS_BIGQUERY}"}) {
 		p.addf("%s has the data source %+v", label, v.Datasource)
@@ -2591,6 +2824,11 @@ func dashValidateGrafanaProm(files dashFileSet) []string {
 	for _, name := range dashPromRequired {
 		if len(reads[dashPromPrefix+name]) == 0 {
 			p.addf("%s: no panel reads %s, which the acceptance criteria name", dashGrafanaProm, name)
+		}
+	}
+	for _, fullName := range dashSortedKeys(md.Telemetry.Metrics) {
+		if len(reads[fullName]) == 0 {
+			p.addf("%s: no panel reads %s, which metadata.yaml declares", dashGrafanaProm, strings.TrimPrefix(fullName, dashPromPrefix))
 		}
 	}
 	if !slices.ContainsFunc(reads[dashPromPrefix+"backpressure_events"], func(by []string) bool { return slices.Contains(by, "trigger") }) {
@@ -3160,6 +3398,10 @@ var dashMutations = []dashMutation{
 	// --- Looker Studio: queries, specification and Terraform ----------------
 	{"looker_studio", "a query reads a column that the view lacks", dashLookerDir + "queries/executive_summary.sql",
 		dashReplaceFirst("  total_input_tokens,\n", "  total_input_tokenz,\n"), "unknown identifier total_input_tokenz"},
+	{"looker_studio", "a query calls an unknown function", dashLookerDir + "queries/executive_summary.sql",
+		dashReplaceFirst("  total_input_tokens,\n", "  DOES_NOT_EXIST(total_input_tokens) AS total_input_tokens,\n"), "unknown function DOES_NOT_EXIST"},
+	{"looker_studio", "a query casts a numeric metric column to STRING", dashLookerDir + "queries/executive_summary.sql",
+		dashReplaceFirst("  total_input_tokens,\n", "  CAST(total_input_tokens AS STRING) AS total_input_tokens,\n"), "select item total_input_tokens has type STRING, want INT64"},
 	{"looker_studio", "a query reads the free text of a span status", dashLookerDir + "queries/executive_summary.sql",
 		dashReplaceFirst("  call_count,\n", "  call_count,\n  status_message,\n"), "the free text of a span status"},
 	{"looker_studio", "the range end drops the last day", dashLookerDir + "queries/executive_summary.sql",
@@ -3412,7 +3654,26 @@ var dashMutations = []dashMutation{
 	{"grafana_bigquery", "a panel reads another view", dashGrafanaBQ,
 		dashEditTarget("LLM calls", "rawSql", "v_gen_ai_model_costs", "v_mcp_tool_usage"), "want only `p.d.v_gen_ai_model_costs`"},
 	{"grafana_bigquery", "a panel uses a variable that is not defined", dashGrafanaBQ,
-		dashEditTarget("LLM calls", "rawSql", "${project}", "${projekt}"), "which the dashboard does not define"},
+		dashEditTarget("LLM calls", "rawSql", "${VAR_PROJECT}", "${VAR_PROJEKT}"), "which the dashboard does not define"},
+	{"grafana_bigquery", "the dashboard exposes project as a template variable", dashGrafanaBQ,
+		dashEditJSON(func(doc map[string]any) error {
+			templating, _ := doc["templating"].(map[string]any)
+			list, _ := templating["list"].([]any)
+			templating["list"] = append(list, map[string]any{"name": "project", "type": "constant", "hide": 2, "query": "${VAR_PROJECT}"})
+			return nil
+		}), "want only service"},
+	{"grafana_bigquery", "the service variable loses its __all sentinel", dashGrafanaBQ,
+		dashEditJSON(func(doc map[string]any) error {
+			templating, _ := doc["templating"].(map[string]any)
+			list, _ := templating["list"].([]any)
+			for _, item := range list {
+				if v, _ := item.(map[string]any); v != nil && v["name"] == "service" {
+					v["allValue"] = ""
+					return nil
+				}
+			}
+			return errors.New("no service variable")
+		}), "allValue __all"},
 	{"grafana_bigquery", "a panel holds a character that is not ASCII", dashGrafanaBQ,
 		dashEditTarget("LLM calls", "rawSql", "SELECT ", "SELECT /* \u00e9 */ "), "is not ASCII"},
 	{"grafana_bigquery", "a time series names its first column something else", dashGrafanaBQ,
@@ -3504,6 +3765,21 @@ var dashMutations = []dashMutation{
 			doc["panels"] = kept
 			return nil
 		}), "no panel reads backpressure_level"},
+	{"grafana_prometheus", "a declared metric outside the headline nine is dropped from the dashboard", dashGrafanaProm,
+		dashEditJSON(func(doc map[string]any) error {
+			panels, _ := doc["panels"].([]any)
+			var kept []any
+			for _, p := range panels {
+				if panel, _ := p.(map[string]any); panel == nil || panel["title"] != "Offload errors per second by class" {
+					kept = append(kept, p)
+				}
+			}
+			if len(kept) == len(panels) {
+				return errors.New("the dashboard has no Offload errors per second by class panel")
+			}
+			doc["panels"] = kept
+			return nil
+		}), "no panel reads offload_errors, which metadata.yaml declares"},
 	{"grafana_prometheus", "a panel has a data source that is not the input", dashGrafanaProm,
 		dashEditPanel("Acknowledged rows/s", func(panel map[string]any) error {
 			panel["datasource"] = map[string]any{"type": "prometheus", "uid": "prom-prod"}
@@ -3729,4 +4005,112 @@ func mustParse(t *testing.T, sql string) *dashQuery {
 		t.Fatalf("parsing %q: %v", sql, err)
 	}
 	return q
+}
+
+// TestGrafanaBQVariableExpansionAndAlertOnlyServices verifies:
+//  1. ?var-project= and ?var-dataset= URL parameters cannot override the table
+//     reference because project and dataset are not template variables in
+//     templating.list (panels use import-time __inputs constants ${VAR_PROJECT}
+//     and ${VAR_DATASET});
+//  2. Adversarial ?var-service= payloads expanded via ${service:json}
+//     (json.Marshal) inside ARRAY<STRING>${service:json} always produce a
+//     single inert GoogleSQL string literal inside the array and cannot inject
+//     SQL tokens or break out of UNNEST;
+//  3. Selecting "All" (allValue: "__all" -> ["__all"]) leaves every panel
+//     unfiltered via ('__all' IN UNNEST(ARRAY<STRING>${service:json}) OR ...),
+//     so alert-only services in otel_alerts (such as an AGENT_LATENCY_HIGH
+//     alert from a service with zero LLM/MCP/session rows in the three views
+//     that populate the service dropdown) are shown under "All".
+func TestGrafanaBQVariableExpansionAndAlertOnlyServices(t *testing.T) {
+	files := dashLoadFileSet(t)
+	g, probs := dashDecodeGrafana(files, dashGrafanaBQ)
+	if g == nil || len(probs) != 0 {
+		t.Fatalf("dashDecodeGrafana: %v", probs)
+	}
+
+	// 1. Verify templating.list contains only "service", so ?var-project= and
+	// ?var-dataset= have no template variable to bind to.
+	for _, v := range g.Templating.List {
+		if v.Name != "service" {
+			t.Fatalf("unexpected template variable %q in %s", v.Name, dashGrafanaBQ)
+		}
+		if v.AllValue != "__all" {
+			t.Fatalf("service.allValue = %q, want \"__all\"", v.AllValue)
+		}
+	}
+
+	// 2. Simulate Grafana's ${service:json} interpolation for adversarial
+	// ?var-service= URL values and verify every panel's expanded SQL tokenizes
+	// and parses with zero extra clauses and a single string literal in UNNEST.
+	adversarialServices := []string{
+		`x\']) OR TRUE -- `,
+		`svc' OR 1=1 --`,
+		`svc" ) UNION ALL SELECT 1 --`,
+		"svc\n--",
+		"svc`",
+		`svc\"`,
+	}
+	for _, adv := range adversarialServices {
+		jsonBytes, err := json.Marshal([]string{adv})
+		if err != nil {
+			t.Fatalf("json.Marshal(%q): %v", adv, err)
+		}
+		repl := strings.NewReplacer(
+			"${VAR_PROJECT}", "my-proj",
+			"${VAR_DATASET}", "my_ds",
+			"${service:json}", string(jsonBytes),
+			"${__from}", dashGrafanaFrom,
+			"${__to}", dashGrafanaTo,
+		)
+		for _, pn := range g.Panels {
+			if pn.Type == "row" || len(pn.Targets) == 0 {
+				continue
+			}
+			expanded := repl.Replace(pn.Targets[0].RawSQL)
+			expanded = dashTimeFilter.ReplaceAllString(expanded, "$1 BETWEEN TIMESTAMP_MILLIS("+dashGrafanaFrom+") AND TIMESTAMP_MILLIS("+dashGrafanaTo+")")
+			q, err := dashParseSQL(expanded)
+			if err != nil {
+				t.Fatalf("panel %q failed to parse with adversarial service %q: %v", pn.Title, adv, err)
+			}
+			if len(q.branches) == 0 {
+				t.Fatalf("panel %q has 0 branches", pn.Title)
+			}
+			// Verify the WHERE clause still has exactly 2 top-level AND conjuncts
+			// (time filter + parenthesized service filter), proving no SQL
+			// operator was injected at the WHERE level.
+			b := q.branches[0]
+			where := b.clauses["WHERE"]
+			base := b.toks[0].depth
+			topAnds := 0
+			for _, tok := range where {
+				if tok.depth == base && tok.up == "AND" {
+					topAnds++
+				}
+			}
+			if topAnds < 1 {
+				t.Fatalf("panel %q WHERE lost its top-level AND structure for %q", pn.Title, adv)
+			}
+		}
+	}
+
+	// 3. Simulate selecting "All" (["__all"]) vs selecting specific dropdown
+	// options when an alert-only service ("alert-only-agent") exists in
+	// otel_alerts but has 0 rows in v_gen_ai_model_costs, v_mcp_tool_usage, and
+	// v_gen_ai_sessions.
+	evalServiceFilter := func(selected []string, rowService string) bool {
+		if rowService == "" {
+			rowService = "(none)"
+		}
+		return slices.Contains(selected, "__all") || slices.Contains(selected, rowService)
+	}
+	dropdownOptions := []string{"chat-svc", "mcp-svc"} // alert-only-agent is absent from the 3 views
+	if !evalServiceFilter([]string{"__all"}, "alert-only-agent") {
+		t.Errorf("selecting All ([\"__all\"]) filtered out alert-only-agent")
+	}
+	if !evalServiceFilter([]string{"__all"}, "") {
+		t.Errorf("selecting All ([\"__all\"]) filtered out NULL service_name")
+	}
+	if evalServiceFilter(dropdownOptions, "alert-only-agent") {
+		t.Errorf("expanding All to dropdown options %v unexpectedly matched alert-only-agent", dropdownOptions)
+	}
 }

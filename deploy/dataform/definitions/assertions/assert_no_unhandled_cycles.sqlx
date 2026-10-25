@@ -12,14 +12,15 @@
  * It also catches a span emitted more than once, which would double count it.
  *
  * Spans are compared by (trace_id, service_name, span_id), the identity the
- * trajectory canonicalizes on. The window is the one the incremental run
- * recomputes: the hour-aligned start of the last 3 hours (INTERVAL 3 HOUR, as in
- * the marts). The mart is read from 24 hours earlier, because a span can be
- * emitted with an earlier start_time than a redelivered copy of it.
+ * trajectory canonicalizes on. The window is read from stg_run_window so every
+ * action in one Dataform invocation shares the same 3-hour cutoff. The mart is
+ * read from 24 hours earlier, because a span can be emitted with an earlier
+ * start_time than a redelivered copy of it.
  */
 config {
   type: "assertion",
   tags: ["otel_marts"],
+  dependencies: ["stg_run_window"],
   description: "Fails when a span staged in the last 3 hours is missing from, or repeated in, the trajectory mart."
 }
 
@@ -29,7 +30,7 @@ WITH staged AS (
     service_name,
     span_id
   FROM ${ref("stg_spans_dedup")}
-  WHERE start_time >= TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 HOUR), HOUR)
+  WHERE start_time >= (SELECT rw.window_start FROM ${ref("stg_run_window")} AS rw)
 ),
 emitted AS (
   SELECT
@@ -38,7 +39,10 @@ emitted AS (
     span_id,
     COUNT(*) AS emitted_rows
   FROM ${ref("m_gen_ai_agent_trajectory")}
-  WHERE start_time >= TIMESTAMP_SUB(TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 HOUR), HOUR), INTERVAL 24 HOUR)
+  WHERE start_time >= TIMESTAMP_SUB(
+    (SELECT rw.window_start FROM ${ref("stg_run_window")} AS rw),
+    INTERVAL 24 HOUR
+  )
   GROUP BY trace_id, service_name, span_id
 )
 SELECT

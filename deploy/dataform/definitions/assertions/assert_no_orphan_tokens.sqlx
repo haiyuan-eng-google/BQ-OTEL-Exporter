@@ -7,134 +7,253 @@
  * this query returns a row; violation names the broken rule.
  *
  * is_token_leaf marks the spans whose token usage is not already reported by an
- * emitted descendant, so that summing gen_ai_usage_*_tokens where is_token_leaf
- * is true counts every token once. The view projects a token family as NULL on a
- * row when a descendant already covers it and another family is still
- * uncovered, and keeps the raw count otherwise. Therefore, per span:
+ * emitted descendant up to 32 parent hops (including across tokenless
+ * intermediate spans), so that summing gen_ai_usage_*_tokens where
+ * is_token_leaf is true counts every token once. The view projects a token
+ * family as NULL on a row when a descendant already covers it and another
+ * family is still uncovered, and keeps the raw count otherwise. Therefore, per
+ * span:
  *
  * - span_missing_from_trajectory: a staged span that reports tokens must be in
  *   the mart (a span in a parent cycle or below depth 16 is not, and its tokens
  *   would be lost from every sum).
  * - projected_token_differs_from_raw: a projected token count is NULL or the
  *   raw staged count, never another value.
- * - rollup_token_changed: a row that is not a token leaf keeps all its raw
- *   counts (it is fully covered, so it is a rollup).
+ * - rollup_token_changed: a row that is not a token leaf either has an
+ *   uncovered token family (so it should have been a token leaf) or altered one
+ *   of its raw counts, or a partial leaf nulled out an uncovered token family.
  * - token_leaf_without_tokens: a token leaf keeps at least one count.
- * - token_double_counted_with_child: a token leaf never keeps a family that an
- *   emitted direct child (started later) also reports; that would be summed
- *   twice.
+ * - token_double_counted_with_child: a row is marked is_token_leaf when all of
+ *   its token families are covered by emitted descendants up to 32 hops, or a
+ *   partial leaf keeps a family that an emitted descendant already covers.
  *
- * Spans are paired with their staged row by (trace_id, service_name, span_id,
- * start_time). The window is the one the incremental run recomputes: the
- * hour-aligned start of the last 3 hours (INTERVAL 3 HOUR, as in the marts).
+ * Spans are paired with their staged row by (trace_id, service_name, span_id).
+ * The window is read from stg_run_window so every action in one Dataform
+ * invocation shares the same 3-hour cutoff.
  */
 config {
   type: "assertion",
   tags: ["otel_marts"],
+  dependencies: ["stg_run_window"],
   description: "Fails when the token columns of the trajectory mart break the is_token_leaf sum invariants."
 }
 
-WITH staged AS (
-  SELECT
-    trace_id,
-    service_name,
-    span_id,
-    start_time,
-    gen_ai_usage_input_tokens AS raw_input_tokens,
-    gen_ai_usage_output_tokens AS raw_output_tokens,
-    gen_ai_usage_reasoning_tokens AS raw_reasoning_tokens
-  FROM ${ref("stg_spans_dedup")}
-  WHERE start_time >= TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 HOUR), HOUR)
-),
-emitted AS (
-  SELECT
-    m.trace_id,
-    m.service_name,
-    m.span_id,
-    m.parent_span_id,
-    m.start_time,
-    m.is_token_leaf,
-    m.gen_ai_usage_input_tokens AS input_tokens,
-    m.gen_ai_usage_output_tokens AS output_tokens,
-    m.gen_ai_usage_reasoning_tokens AS reasoning_tokens,
-    s.raw_input_tokens,
-    s.raw_output_tokens,
-    s.raw_reasoning_tokens
-  FROM ${ref("m_gen_ai_agent_trajectory")} AS m
-  JOIN staged AS s
-    ON m.trace_id = s.trace_id
-    AND m.service_name IS NOT DISTINCT FROM s.service_name
-    AND m.span_id = s.span_id
-    AND m.start_time = s.start_time
-  WHERE m.start_time >= TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 HOUR), HOUR)
-),
-row_violations AS (
-  SELECT
-    e.trace_id,
-    e.service_name,
-    e.span_id,
-    CASE
-      WHEN (e.input_tokens IS NOT NULL AND e.input_tokens IS DISTINCT FROM e.raw_input_tokens)
-        OR (e.output_tokens IS NOT NULL AND e.output_tokens IS DISTINCT FROM e.raw_output_tokens)
-        OR (e.reasoning_tokens IS NOT NULL AND e.reasoning_tokens IS DISTINCT FROM e.raw_reasoning_tokens)
-        THEN 'projected_token_differs_from_raw'
-      WHEN NOT e.is_token_leaf
-        AND (
-          e.input_tokens IS DISTINCT FROM e.raw_input_tokens
-          OR e.output_tokens IS DISTINCT FROM e.raw_output_tokens
-          OR e.reasoning_tokens IS DISTINCT FROM e.raw_reasoning_tokens
+WITH RECURSIVE
+  staged AS (
+    SELECT
+      trace_id,
+      service_name,
+      span_id,
+      start_time,
+      gen_ai_usage_input_tokens AS raw_input_tokens,
+      gen_ai_usage_output_tokens AS raw_output_tokens,
+      gen_ai_usage_reasoning_tokens AS raw_reasoning_tokens
+    FROM ${ref("stg_spans_dedup")}
+    WHERE start_time >= (SELECT rw.window_start FROM ${ref("stg_run_window")} AS rw)
+  ),
+  trajectory_context AS (
+    SELECT
+      m.trace_id,
+      m.service_name,
+      m.span_id,
+      m.parent_span_id,
+      m.start_time,
+      m.is_token_leaf,
+      m.gen_ai_usage_input_tokens AS input_tokens,
+      m.gen_ai_usage_output_tokens AS output_tokens,
+      m.gen_ai_usage_reasoning_tokens AS reasoning_tokens,
+      s.gen_ai_usage_input_tokens AS raw_input_tokens,
+      s.gen_ai_usage_output_tokens AS raw_output_tokens,
+      s.gen_ai_usage_reasoning_tokens AS raw_reasoning_tokens
+    FROM ${ref("m_gen_ai_agent_trajectory")} AS m
+    JOIN ${ref("stg_spans_dedup")} AS s
+      ON m.trace_id = s.trace_id
+      AND m.service_name IS NOT DISTINCT FROM s.service_name
+      AND m.span_id = s.span_id
+    WHERE m.start_time >= TIMESTAMP_SUB(
+        (SELECT rw.window_start FROM ${ref("stg_run_window")} AS rw),
+        INTERVAL 24 HOUR
+      )
+      AND s.start_time >= TIMESTAMP_SUB(
+        (SELECT rw.window_start FROM ${ref("stg_run_window")} AS rw),
+        INTERVAL 24 HOUR
+      )
+  ),
+  emitted_ancestors AS (
+    SELECT
+      c.trace_id,
+      c.service_name,
+      c.span_id AS descendant_span_id,
+      c.start_time AS descendant_start_time,
+      c.raw_input_tokens IS NOT NULL AS has_input,
+      c.raw_output_tokens IS NOT NULL AS has_output,
+      c.raw_reasoning_tokens IS NOT NULL AS has_reasoning,
+      p.span_id AS ancestor_span_id,
+      p.parent_span_id AS ancestor_parent_span_id,
+      p.start_time AS ancestor_start_time,
+      1 AS hop,
+      [c.span_id, p.span_id] AS path_span_ids
+    FROM trajectory_context AS c
+    JOIN trajectory_context AS p
+      ON p.trace_id = c.trace_id
+      AND p.span_id = c.parent_span_id
+      AND p.service_name IS NOT DISTINCT FROM c.service_name
+    WHERE p.span_id != c.span_id
+
+    UNION ALL
+
+    SELECT
+      ea.trace_id,
+      ea.service_name,
+      ea.descendant_span_id,
+      ea.descendant_start_time,
+      ea.has_input,
+      ea.has_output,
+      ea.has_reasoning,
+      p.span_id AS ancestor_span_id,
+      p.parent_span_id AS ancestor_parent_span_id,
+      p.start_time AS ancestor_start_time,
+      ea.hop + 1 AS hop,
+      ARRAY_CONCAT(ea.path_span_ids, [p.span_id]) AS path_span_ids
+    FROM emitted_ancestors AS ea
+    JOIN trajectory_context AS p
+      ON p.trace_id = ea.trace_id
+      AND p.span_id = ea.ancestor_parent_span_id
+      AND p.service_name IS NOT DISTINCT FROM ea.service_name
+    WHERE ea.hop < 32
+      AND p.span_id NOT IN UNNEST(ea.path_span_ids)
+  ),
+  token_parent_coverage AS (
+    SELECT
+      ea.trace_id,
+      ea.service_name,
+      ea.ancestor_span_id AS span_id,
+      LOGICAL_OR(ea.has_input) AS has_input,
+      LOGICAL_OR(ea.has_output) AS has_output,
+      LOGICAL_OR(ea.has_reasoning) AS has_reasoning
+    FROM emitted_ancestors AS ea
+    LEFT JOIN emitted_ancestors AS reverse_path
+      ON reverse_path.trace_id = ea.trace_id
+      AND reverse_path.service_name IS NOT DISTINCT FROM ea.service_name
+      AND reverse_path.descendant_span_id = ea.ancestor_span_id
+      AND reverse_path.ancestor_span_id = ea.descendant_span_id
+    WHERE (ea.has_input OR ea.has_output OR ea.has_reasoning)
+      AND (
+        reverse_path.ancestor_span_id IS NULL
+        OR ea.descendant_start_time > ea.ancestor_start_time
+        OR (
+          ea.descendant_start_time = ea.ancestor_start_time
+          AND ea.descendant_span_id > ea.ancestor_span_id
         )
+      )
+    GROUP BY ea.trace_id, ea.service_name, ea.ancestor_span_id
+  ),
+  emitted AS (
+    SELECT
+      m.trace_id,
+      m.service_name,
+      m.span_id,
+      m.parent_span_id,
+      m.start_time,
+      m.is_token_leaf,
+      m.input_tokens,
+      m.output_tokens,
+      m.reasoning_tokens,
+      m.raw_input_tokens,
+      m.raw_output_tokens,
+      m.raw_reasoning_tokens,
+      COALESCE(cov.has_input, FALSE) AS cov_input,
+      COALESCE(cov.has_output, FALSE) AS cov_output,
+      COALESCE(cov.has_reasoning, FALSE) AS cov_reasoning,
+      (
+        (m.raw_input_tokens IS NOT NULL AND NOT COALESCE(cov.has_input, FALSE))
+        OR (m.raw_output_tokens IS NOT NULL AND NOT COALESCE(cov.has_output, FALSE))
+        OR (m.raw_reasoning_tokens IS NOT NULL AND NOT COALESCE(cov.has_reasoning, FALSE))
+      ) AS expected_is_token_leaf
+    FROM trajectory_context AS m
+    LEFT JOIN token_parent_coverage AS cov
+      ON m.trace_id = cov.trace_id
+      AND m.span_id = cov.span_id
+      AND m.service_name IS NOT DISTINCT FROM cov.service_name
+    WHERE m.start_time >= (SELECT rw.window_start FROM ${ref("stg_run_window")} AS rw)
+  ),
+  row_violations AS (
+    SELECT
+      e.trace_id,
+      e.service_name,
+      e.span_id,
+      CASE
+        WHEN (e.input_tokens IS NOT NULL AND e.input_tokens IS DISTINCT FROM e.raw_input_tokens)
+          OR (e.output_tokens IS NOT NULL AND e.output_tokens IS DISTINCT FROM e.raw_output_tokens)
+          OR (e.reasoning_tokens IS NOT NULL AND e.reasoning_tokens IS DISTINCT FROM e.raw_reasoning_tokens)
+        THEN 'projected_token_differs_from_raw'
+        WHEN NOT e.is_token_leaf
+          AND (
+            e.expected_is_token_leaf
+            OR e.input_tokens IS DISTINCT FROM e.raw_input_tokens
+            OR e.output_tokens IS DISTINCT FROM e.raw_output_tokens
+            OR e.reasoning_tokens IS DISTINCT FROM e.raw_reasoning_tokens
+          )
         THEN 'rollup_token_changed'
-      WHEN e.is_token_leaf
-        AND e.input_tokens IS NULL
-        AND e.output_tokens IS NULL
-        AND e.reasoning_tokens IS NULL
+        WHEN e.is_token_leaf
+          AND (
+            (NOT e.cov_input AND e.input_tokens IS DISTINCT FROM e.raw_input_tokens)
+            OR (NOT e.cov_output AND e.output_tokens IS DISTINCT FROM e.raw_output_tokens)
+            OR (NOT e.cov_reasoning AND e.reasoning_tokens IS DISTINCT FROM e.raw_reasoning_tokens)
+          )
+        THEN 'rollup_token_changed'
+        WHEN e.is_token_leaf
+          AND COALESCE(e.input_tokens, e.output_tokens, e.reasoning_tokens) IS NULL
         THEN 'token_leaf_without_tokens'
-    END AS violation
-  FROM emitted AS e
-),
-double_counted AS (
-  SELECT DISTINCT
-    p.trace_id,
-    p.service_name,
-    p.span_id,
-    'token_double_counted_with_child' AS violation
-  FROM emitted AS p
-  JOIN emitted AS c
-    ON c.trace_id = p.trace_id
-    AND c.service_name IS NOT DISTINCT FROM p.service_name
-    AND c.parent_span_id = p.span_id
-    AND (c.start_time > p.start_time OR (c.start_time = p.start_time AND c.span_id > p.span_id))
-  WHERE p.is_token_leaf
-    AND (
-      (p.input_tokens IS NOT NULL AND c.raw_input_tokens IS NOT NULL)
-      OR (p.output_tokens IS NOT NULL AND c.raw_output_tokens IS NOT NULL)
-      OR (p.reasoning_tokens IS NOT NULL AND c.raw_reasoning_tokens IS NOT NULL)
-    )
-),
-missing AS (
-  SELECT DISTINCT
-    s.trace_id,
-    s.service_name,
-    s.span_id,
-    'span_missing_from_trajectory' AS violation
-  FROM staged AS s
-  WHERE (
-      s.raw_input_tokens IS NOT NULL
-      OR s.raw_output_tokens IS NOT NULL
-      OR s.raw_reasoning_tokens IS NOT NULL
-    )
-    AND NOT EXISTS (
-      SELECT 1
-      FROM ${ref("m_gen_ai_agent_trajectory")} AS m
-      WHERE m.start_time >= TIMESTAMP_SUB(TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 HOUR), HOUR), INTERVAL 24 HOUR)
-        AND m.trace_id = s.trace_id
-        AND m.service_name IS NOT DISTINCT FROM s.service_name
-        AND m.span_id = s.span_id
-    )
-)
-SELECT trace_id, service_name, span_id, violation FROM row_violations WHERE violation IS NOT NULL
+        ELSE NULL
+      END AS violation
+    FROM emitted AS e
+  ),
+  double_counted AS (
+    SELECT DISTINCT
+      e.trace_id,
+      e.service_name,
+      e.span_id,
+      'token_double_counted_with_child' AS violation
+    FROM emitted AS e
+    WHERE (e.cov_input OR e.cov_output OR e.cov_reasoning)
+      AND (
+        (e.is_token_leaf AND NOT e.expected_is_token_leaf)
+        OR (e.is_token_leaf AND e.cov_input AND e.input_tokens IS NOT NULL)
+        OR (e.is_token_leaf AND e.cov_output AND e.output_tokens IS NOT NULL)
+        OR (e.is_token_leaf AND e.cov_reasoning AND e.reasoning_tokens IS NOT NULL)
+      )
+  ),
+  missing AS (
+    SELECT
+      s.trace_id,
+      s.service_name,
+      s.span_id,
+      'span_missing_from_trajectory' AS violation
+    FROM staged AS s
+    WHERE (
+        s.raw_input_tokens IS NOT NULL
+        OR s.raw_output_tokens IS NOT NULL
+        OR s.raw_reasoning_tokens IS NOT NULL
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM ${ref("m_gen_ai_agent_trajectory")} AS m
+        WHERE m.start_time >= TIMESTAMP_SUB(
+            (SELECT rw.window_start FROM ${ref("stg_run_window")} AS rw),
+            INTERVAL 24 HOUR
+          )
+          AND m.trace_id = s.trace_id
+          AND m.service_name IS NOT DISTINCT FROM s.service_name
+          AND m.span_id = s.span_id
+      )
+  )
+SELECT trace_id, service_name, span_id, violation
+FROM row_violations
+WHERE violation IS NOT NULL
 UNION ALL
-SELECT trace_id, service_name, span_id, violation FROM double_counted
+SELECT trace_id, service_name, span_id, violation
+FROM double_counted
 UNION ALL
-SELECT trace_id, service_name, span_id, violation FROM missing
+SELECT trace_id, service_name, span_id, violation
+FROM missing

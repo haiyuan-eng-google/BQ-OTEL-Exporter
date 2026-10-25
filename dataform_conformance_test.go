@@ -36,6 +36,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -45,10 +46,15 @@ const (
 	dfxDefs = dfxDir + "definitions/"
 
 	dfxTag       = "otel_marts"
+	dfxRunWindow = "stg_run_window"
 	dfxStaging   = "stg_spans_dedup"
 	dfxTraj      = "m_gen_ai_agent_trajectory"
 	dfxTrajView  = "v_gen_ai_agent_trajectory"
 	dfxSpansView = "v_gen_ai_spans"
+
+	// dfxSharedWindowExpr is the incremental window_start expression that every
+	// staging table, mart and assertion reads from stg_run_window.
+	dfxSharedWindowExpr = "( SELECT RW . WINDOW_START FROM ref." + dfxRunWindow + " AS RW )"
 
 	dfxProjectPlaceholder = "YOUR_PROJECT_ID"
 	dfxDatasetPlaceholder = "YOUR_DATASET_ID"
@@ -74,11 +80,11 @@ var (
 	dfxCoreVersion = regexp.MustCompile(`^3\.\d+\.\d+$`)
 	dfxDatasetName = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
 
-	// dfxWindowRE matches the incremental window_start, as dashJoin writes it.
-	dfxWindowRE = regexp.MustCompile(`^TIMESTAMP_TRUNC \( TIMESTAMP_SUB \( CURRENT_TIMESTAMP \( \) , INTERVAL (\d+) HOUR \) , HOUR \)$`)
+	// dfxWindowRE matches the incremental window_start item of stg_run_window, as dashJoin writes it.
+	dfxWindowRE = regexp.MustCompile(`^TIMESTAMP_TRUNC \( TIMESTAMP_SUB \( COALESCE \( SAFE_CAST \( NULLIF \( '' , '' \) AS TIMESTAMP \) , CURRENT_TIMESTAMP \( \) \) , INTERVAL (\d+) HOUR \) , HOUR \) AS WINDOW_START$`)
 
-	// dfxIntervalRE finds the window that every action takes from the clock.
-	dfxIntervalRE = regexp.MustCompile(`CURRENT_TIMESTAMP \( \) , INTERVAL (\d+) (\w+) \)`)
+	// dfxIntervalRE finds the window that an action takes from the clock.
+	dfxIntervalRE = regexp.MustCompile(`CURRENT_TIMESTAMP \( \)(?: \))? , INTERVAL (\d+) (\w+) \)`)
 
 	// dfxHoursRE finds the hours of an interval of the trajectory view.
 	dfxHoursRE = regexp.MustCompile(`INTERVAL (\d+) HOUR`)
@@ -111,32 +117,43 @@ var dfxPlan = []dfxActionPlan{
 	{file: "sources/v_gen_ai_model_costs.sqlx", name: "v_gen_ai_model_costs", typ: "declaration"},
 	{file: "sources/v_gen_ai_sessions.sqlx", name: "v_gen_ai_sessions", typ: "declaration"},
 	{file: "sources/v_mcp_tool_usage.sqlx", name: "v_mcp_tool_usage", typ: "declaration"},
+	{file: "staging/stg_run_window.sqlx", name: dfxRunWindow, typ: "table"},
 	{
-		file: "staging/stg_spans_dedup.sqlx", name: dfxStaging, typ: "incremental", reads: []string{dfxSpansView},
+		file: "staging/stg_spans_dedup.sqlx", name: dfxStaging, typ: "incremental",
+		reads: []string{dfxRunWindow, dfxSpansView}, deps: []string{dfxRunWindow},
 		partitionBy: "DATE(start_time)", clusterBy: []string{"service_name", "trace_id"}, prune: "START_TIME >= WINDOW_START",
 	},
 	{
 		file: "marts/m_gen_ai_model_costs_hourly.sqlx", name: "m_gen_ai_model_costs_hourly", typ: "incremental",
-		reads: []string{"v_gen_ai_model_costs"}, partitionBy: "DATE(usage_hour)", clusterBy: []string{"service_name", "model"},
+		reads: []string{dfxRunWindow, "v_gen_ai_model_costs"}, deps: []string{dfxRunWindow},
+		partitionBy: "DATE(usage_hour)", clusterBy: []string{"service_name", "model"},
 		view: "v_gen_ai_model_costs", prune: "USAGE_HOUR >= WINDOW_START",
 	},
 	{
 		file: "marts/m_mcp_tool_usage_hourly.sqlx", name: "m_mcp_tool_usage_hourly", typ: "incremental",
-		reads: []string{"v_mcp_tool_usage"}, partitionBy: "DATE(usage_hour)", clusterBy: []string{"service_name", "mcp_method_name"},
+		reads: []string{dfxRunWindow, "v_mcp_tool_usage"}, deps: []string{dfxRunWindow},
+		partitionBy: "DATE(usage_hour)", clusterBy: []string{"service_name", "mcp_method_name"},
 		view: "v_mcp_tool_usage", prune: "USAGE_HOUR >= WINDOW_START",
 	},
 	{
 		file: "marts/m_gen_ai_sessions_daily.sqlx", name: "m_gen_ai_sessions_daily", typ: "incremental",
-		reads: []string{"v_gen_ai_sessions"}, partitionBy: "session_start_date", clusterBy: []string{"service_name", "agent_name"},
+		reads: []string{dfxRunWindow, "v_gen_ai_sessions"}, deps: []string{dfxRunWindow},
+		partitionBy: "session_start_date", clusterBy: []string{"service_name", "agent_name"},
 		view: "v_gen_ai_sessions", prune: "SESSION_START_DATE >= DATE ( WINDOW_START )",
 	},
 	{
 		file: "marts/m_gen_ai_agent_trajectory.sqlx", name: dfxTraj, typ: "incremental",
-		reads: []string{dfxStaging}, deps: []string{dfxStaging}, partitionBy: "DATE(start_time)",
-		clusterBy: []string{"service_name", "trace_id"}, view: dfxTrajView,
+		reads: []string{dfxRunWindow, dfxStaging}, deps: []string{dfxRunWindow, dfxStaging},
+		partitionBy: "DATE(start_time)", clusterBy: []string{"service_name", "trace_id"}, view: dfxTrajView,
 	},
-	{file: "assertions/assert_no_orphan_tokens.sqlx", name: "assert_no_orphan_tokens", typ: "assertion", reads: []string{dfxStaging, dfxTraj}},
-	{file: "assertions/assert_no_unhandled_cycles.sqlx", name: "assert_no_unhandled_cycles", typ: "assertion", reads: []string{dfxStaging, dfxTraj}},
+	{
+		file: "assertions/assert_no_orphan_tokens.sqlx", name: "assert_no_orphan_tokens", typ: "assertion",
+		reads: []string{dfxRunWindow, dfxStaging, dfxTraj}, deps: []string{dfxRunWindow},
+	},
+	{
+		file: "assertions/assert_no_unhandled_cycles.sqlx", name: "assert_no_unhandled_cycles", typ: "assertion",
+		reads: []string{dfxRunWindow, dfxStaging, dfxTraj}, deps: []string{dfxRunWindow},
+	},
 }
 
 func dfxPlanFor(name string) (dfxActionPlan, bool) {
@@ -275,6 +292,7 @@ func dfxValidateSettings(files dashFileSet) []string {
 		{"defaultProject", s.DefaultProject, dfxProjectPlaceholder},
 		{"vars.source_project", s.Vars["source_project"], dfxProjectPlaceholder},
 		{"vars.source_dataset", s.Vars["source_dataset"], dfxDatasetPlaceholder},
+		{"vars.run_timestamp", s.Vars["run_timestamp"], ""},
 	} {
 		if f.got != f.want {
 			p.addf("workflow_settings.yaml: %s is %q, want the placeholder %s", f.name, f.got, f.want)
@@ -597,10 +615,12 @@ func dfxEval(expr string, incremental bool) (string, error) {
 	switch {
 	case expr == "self()":
 		return "SELF", nil
+	case expr == dfxVarExpr+"run_timestamp":
+		return "", nil
 	case strings.HasPrefix(expr, "when(") && strings.HasSuffix(expr, ")"):
 		return dfxWhen(expr[len("when("):len(expr)-1], incremental)
 	}
-	return "", fmt.Errorf("the expression ${%s} is not one the package uses (self(), ref(\"name\") and when(incremental(), ...))", dfxSnippet(expr))
+	return "", fmt.Errorf("the expression ${%s} is not one the package uses (self(), ref(\"name\"), %srun_timestamp and when(incremental(), ...))", dfxSnippet(expr), dfxVarExpr)
 }
 
 // dfxWhen evaluates the arguments of when(incremental(), `a`[, `b`]): a for an
@@ -735,6 +755,7 @@ type dfxConfig struct {
 // README do not describe.
 var dfxConfigKeys = map[string][]string{
 	"declaration": {"type", "database", "schema", "name", "description"},
+	"table":       {"type", "tags", "description"},
 	"incremental": {"type", "tags", "dependencies", "description", "bigquery"},
 	"assertion":   {"type", "tags", "dependencies", "description"},
 }
@@ -1152,24 +1173,28 @@ func dfxReachHours() (int, error) {
 	return reach, nil
 }
 
-// dfxLookback returns the number of hours of the window of the staging table:
+// dfxLookback returns the number of hours of the window of stg_run_window:
 // the number every other action has to share.
 func dfxLookback(pkg *dfxPackage) (int, error) {
-	a := pkg.byName[dfxStaging]
+	a := pkg.byName[dfxRunWindow]
 	if a == nil {
-		return 0, fmt.Errorf("the package has no action %s", dfxStaging)
+		return 0, fmt.Errorf("the package has no action %s", dfxRunWindow)
 	}
 	run, err := dfxRender(a, true)
 	if err != nil {
-		return 0, fmt.Errorf("%s: %w", dfxStaging, err)
+		return 0, fmt.Errorf("%s: %w", dfxRunWindow, err)
 	}
-	st := run.find("declare window_start")
-	if st == nil {
-		return 0, fmt.Errorf("%s declares no window_start", dfxStaging)
+	q, err := dashParseSQL(run.body)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", dfxRunWindow, err)
 	}
-	m := dfxWindowRE.FindStringSubmatch(dfxWindowExpr(st))
+	if len(q.branches) != 1 || len(q.branches[0].items) != 2 {
+		return 0, fmt.Errorf("%s: expected 1 SELECT with 2 items (run_ts, window_start)", dfxRunWindow)
+	}
+	expr := dashJoin(q.branches[0].items[1].toks)
+	m := dfxWindowRE.FindStringSubmatch(expr)
 	if m == nil {
-		return 0, fmt.Errorf("%s: window_start is %q, want TIMESTAMP_TRUNC ( TIMESTAMP_SUB ( CURRENT_TIMESTAMP ( ) , INTERVAL n HOUR ) , HOUR )", dfxStaging, dfxWindowExpr(st))
+		return 0, fmt.Errorf("%s: window_start item is %q, want TIMESTAMP_TRUNC ( TIMESTAMP_SUB ( COALESCE ( SAFE_CAST ( NULLIF ( '' , '' ) AS TIMESTAMP ) , CURRENT_TIMESTAMP ( ) ) , INTERVAL n HOUR ) , HOUR ) AS WINDOW_START", dfxRunWindow, expr)
 	}
 	return strconv.Atoi(m[1])
 }
@@ -1531,7 +1556,7 @@ func dfxCheckDelete(a *dfxAction, e dfxActionPlan, st *dfxStmt) []string {
 // dfxCheckRun checks the operations of an action for an incremental run or for
 // a full refresh: which statements run, in which order, and the window they
 // share.
-func dfxCheckRun(a *dfxAction, e dfxActionPlan, run *dfxRun, incremental bool, lookback, reach int) []string {
+func dfxCheckRun(a *dfxAction, e dfxActionPlan, run *dfxRun, incremental bool, reach int) []string {
 	var p dashProblems
 	mode := "a full refresh"
 	wantPre := []string{"declare window_start"}
@@ -1555,8 +1580,8 @@ func dfxCheckRun(a *dfxAction, e dfxActionPlan, run *dfxRun, incremental bool, l
 		switch {
 		case !incremental && got != dfxEpochWindow:
 			p.addf("%s: in %s, window_start is %s, want the Unix epoch %s", a.name, mode, got, dfxEpochWindow)
-		case incremental && lookback > 0 && got != dfxWindowText(lookback):
-			p.addf("%s: in %s, window_start is %s, want %s: every action shares one window", a.name, mode, got, dfxWindowText(lookback))
+		case incremental && got != dfxSharedWindowExpr:
+			p.addf("%s: in %s, window_start is %s, want %s: every action shares one window from %s", a.name, mode, got, dfxSharedWindowExpr, dfxRunWindow)
 		}
 	}
 	if st := run.find("declare context_start"); st != nil && reach > 0 {
@@ -1570,8 +1595,9 @@ func dfxCheckRun(a *dfxAction, e dfxActionPlan, run *dfxRun, incremental bool, l
 	return p
 }
 
-// dfxCheckClock checks that every interval an action takes from the clock is
-// the shared lookback in hours.
+// dfxCheckClock checks that stg_run_window takes the shared lookback in hours
+// from the clock and that no downstream action bypasses stg_run_window by
+// calling CURRENT_TIMESTAMP() directly.
 func dfxCheckClock(a *dfxAction, run *dfxRun, lookback int) []string {
 	var p dashProblems
 	var parts []string
@@ -1583,14 +1609,24 @@ func dfxCheckClock(a *dfxAction, run *dfxRun, lookback int) []string {
 		return []string{fmt.Sprintf("%s: the query: %v", a.name, err)}
 	}
 	parts = append(parts, dashJoin(toks))
-	matches := dfxIntervalRE.FindAllStringSubmatch(strings.Join(parts, " ; "), -1)
-	if len(matches) == 0 {
-		p.addf("%s: never takes an interval from the clock, so it has no INTERVAL %d HOUR window", a.name, lookback)
+	joined := strings.Join(parts, " ; ")
+	matches := dfxIntervalRE.FindAllStringSubmatch(joined, -1)
+	wantHours := lookback
+	if wantHours == 0 {
+		wantHours = 3
+	}
+	if a.name == dfxRunWindow && len(matches) == 0 {
+		p.addf("%s: never takes an interval from the clock, so it has no INTERVAL %d HOUR window", a.name, wantHours)
 	}
 	for _, m := range matches {
-		if m[2] != "HOUR" || m[1] != strconv.Itoa(lookback) {
-			p.addf("%s: takes INTERVAL %s %s from the clock, want INTERVAL %d HOUR in every action", a.name, m[1], m[2], lookback)
+		if m[2] != "HOUR" || m[1] != strconv.Itoa(wantHours) {
+			p.addf("%s: takes INTERVAL %s %s from the clock, want INTERVAL %d HOUR in every action", a.name, m[1], m[2], wantHours)
+		} else if a.name != dfxRunWindow {
+			p.addf("%s: calls CURRENT_TIMESTAMP() directly instead of reading %s", a.name, dfxRunWindow)
 		}
+	}
+	if a.name != dfxRunWindow && !strings.Contains(joined, "ref."+dfxRunWindow) {
+		p.addf("%s: does not read window_start from %s", a.name, dfxRunWindow)
 	}
 	return p
 }
@@ -1618,19 +1654,17 @@ func dfxValidateRefresh(files dashFileSet) []string {
 			p.addf("%s: an incremental run: %v", a.name, err)
 			continue
 		}
-		if lookback > 0 {
-			p = append(p, dfxCheckClock(a, inc, lookback)...)
-		}
+		p = append(p, dfxCheckClock(a, inc, lookback)...)
 		if e.typ != "incremental" {
 			continue
 		}
-		p = append(p, dfxCheckRun(a, e, inc, true, lookback, reach)...)
+		p = append(p, dfxCheckRun(a, e, inc, true, reach)...)
 		full, err := dfxRender(a, false)
 		if err != nil {
 			p.addf("%s: a full refresh: %v", a.name, err)
 			continue
 		}
-		p = append(p, dfxCheckRun(a, e, full, false, lookback, reach)...)
+		p = append(p, dfxCheckRun(a, e, full, false, reach)...)
 	}
 	return p
 }
@@ -1987,20 +2021,23 @@ func dfxValidateMarts(files dashFileSet) []string {
 // clause has to contain. %W stands for the window of the run and %R for the
 // window moved back by the reach of the trajectory view.
 type dfxAssertionRule struct {
-	ctes  []string
-	cols  []string
-	where map[string]string
+	ctes     []string
+	cols     []string
+	where    map[string]string
+	wantRefs int
 }
 
 var dfxAssertionRules = map[string]dfxAssertionRule{
 	"assert_no_orphan_tokens": {
-		ctes: []string{"staged", "emitted", "row_violations", "double_counted", "missing"},
+		ctes: []string{"staged", "trajectory_context", "emitted_ancestors", "token_parent_coverage", "emitted", "row_violations", "double_counted", "missing"},
 		cols: []string{"trace_id", "service_name", "span_id", "violation"},
 		where: map[string]string{
-			"staged":  "START_TIME >= %W",
-			"emitted": "M . START_TIME >= %W",
-			"missing": "M . START_TIME >= %R",
+			"staged":             "START_TIME >= %W",
+			"trajectory_context": "M . START_TIME >= %R AND S . START_TIME >= %R",
+			"emitted":            "M . START_TIME >= %W",
+			"missing":            "M . START_TIME >= %R",
 		},
+		wantRefs: 4,
 	},
 	"assert_no_unhandled_cycles": {
 		ctes: []string{"staged", "emitted"},
@@ -2009,6 +2046,7 @@ var dfxAssertionRules = map[string]dfxAssertionRule{
 			"staged":  "START_TIME >= %W",
 			"emitted": "START_TIME >= %R",
 		},
+		wantRefs: 2,
 	},
 }
 
@@ -2027,11 +2065,11 @@ func dfxViolations(toks []dashTok) []string {
 	return dashSortedKeys(seen)
 }
 
-// dfxCountRefs counts the reads of the actions of the package in a query.
+// dfxCountRefs counts the reads of the staging table and trajectory mart in a query.
 func dfxCountRefs(toks []dashTok) int {
 	n := 0
 	for _, t := range toks {
-		if t.kind == dashIdent && strings.HasPrefix(t.text, "ref.") {
+		if t.kind == dashIdent && strings.HasPrefix(t.text, "ref.") && t.text != "ref."+dfxRunWindow {
 			n++
 		}
 	}
@@ -2067,7 +2105,7 @@ func dfxCheckAssertion(a *dfxAction, rule dfxAssertionRule, run *dfxRun, tables 
 	if lookback <= 0 || reach <= 0 {
 		return p
 	}
-	window := dfxWindowText(lookback)
+	window := dfxSharedWindowExpr
 	repl := strings.NewReplacer("%W", window, "%R", fmt.Sprintf("TIMESTAMP_SUB ( %s , INTERVAL %d HOUR )", window, reach))
 	for _, name := range dashSortedKeys(rule.where) {
 		cte := dfxCTE(q, name)
@@ -2079,8 +2117,8 @@ func dfxCheckAssertion(a *dfxAction, rule dfxAssertionRule, run *dfxRun, tables 
 			p.addf("%s: the WHERE of the WITH table %s is %q, want it to contain %q", a.name, name, got, want)
 		}
 	}
-	if n := dfxCountRefs(toks); n != len(rule.where) {
-		p.addf("%s: reads the staging table and the trajectory mart %d times, want %d, each read with its own window predicate", a.name, n, len(rule.where))
+	if n := dfxCountRefs(toks); n != rule.wantRefs {
+		p.addf("%s: reads the staging table and the trajectory mart %d times, want %d, each read with its own window predicate", a.name, n, rule.wantRefs)
 	}
 	return p
 }
@@ -2098,7 +2136,9 @@ func dfxValidateAssertions(files dashFileSet) []string {
 	if err != nil {
 		p.addf("%v", err)
 	}
-	tables := map[string][]string{}
+	tables := map[string][]string{
+		"ref." + dfxRunWindow: {"run_ts", "window_start"},
+	}
 	for _, name := range []string{dfxStaging, dfxTraj} {
 		cols, err := dfxMartColumns(files, name)
 		if err != nil {
@@ -2393,7 +2433,7 @@ func dfxLookbackNeedles(pkg *dfxPackage, lookback, reach int) []string {
 		}
 	}
 	return []string{
-		fmt.Sprintf("`INTERVAL %d HOUR` consistently in `%s`, the %s marts and the %s assertions", lookback, dfxStaging, dfxWord(marts), dfxWord(assertions)),
+		fmt.Sprintf("`INTERVAL %d HOUR` in `%s` (which `%s`, the %s marts and the %s assertions read)", lookback, dfxRunWindow, dfxStaging, dfxWord(marts), dfxWord(assertions)),
 		fmt.Sprintf("so `T - %dh < window_start <= T - %dh`: the lookback `L` is %d to %d hours", lookback+1, lookback, lookback, lookback+1),
 		fmt.Sprintf("Do not read the latest %d to %d hours as final", lookback, lookback+1),
 		fmt.Sprintf("with `T < H + %dh`, that is, until %d hours after the hour ends", lookback+1, lookback),
@@ -2588,17 +2628,18 @@ const dfxFixedWindow = "TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTER
 
 // The files that the defects change.
 const (
-	dfxFSettings = dfxDir + "workflow_settings.yaml"
-	dfxFIgnore   = dfxDir + ".gitignore"
-	dfxFSources  = dfxDefs + "sources/otel_sources.sqlx"
-	dfxFStaging  = dfxDefs + "staging/stg_spans_dedup.sqlx"
-	dfxFCosts    = dfxDefs + "marts/m_gen_ai_model_costs_hourly.sqlx"
-	dfxFTools    = dfxDefs + "marts/m_mcp_tool_usage_hourly.sqlx"
-	dfxFSessions = dfxDefs + "marts/m_gen_ai_sessions_daily.sqlx"
-	dfxFTraj     = dfxDefs + "marts/m_gen_ai_agent_trajectory.sqlx"
-	dfxFOrphans  = dfxDefs + "assertions/assert_no_orphan_tokens.sqlx"
-	dfxFCycles   = dfxDefs + "assertions/assert_no_unhandled_cycles.sqlx"
-	dfxFTerra    = dfxVariables
+	dfxFSettings  = dfxDir + "workflow_settings.yaml"
+	dfxFIgnore    = dfxDir + ".gitignore"
+	dfxFSources   = dfxDefs + "sources/otel_sources.sqlx"
+	dfxFRunWindow = dfxDefs + "staging/stg_run_window.sqlx"
+	dfxFStaging   = dfxDefs + "staging/stg_spans_dedup.sqlx"
+	dfxFCosts     = dfxDefs + "marts/m_gen_ai_model_costs_hourly.sqlx"
+	dfxFTools     = dfxDefs + "marts/m_mcp_tool_usage_hourly.sqlx"
+	dfxFSessions  = dfxDefs + "marts/m_gen_ai_sessions_daily.sqlx"
+	dfxFTraj      = dfxDefs + "marts/m_gen_ai_agent_trajectory.sqlx"
+	dfxFOrphans   = dfxDefs + "assertions/assert_no_orphan_tokens.sqlx"
+	dfxFCycles    = dfxDefs + "assertions/assert_no_unhandled_cycles.sqlx"
+	dfxFTerra     = dfxVariables
 )
 
 // dfxMutations are the defects that the rules have to catch. The text each one
@@ -2655,7 +2696,7 @@ var dfxMutations = []dfxMutation{
 	{area: "actions", name: "unknown_config_key", file: dfxFCosts,
 		edit: dashReplaceFirst("type: \"incremental\",", "type: \"incremental\",\n  uniqueKey: [\"usage_hour\"],"), want: "config key uniqueKey is not one the package sets on a incremental action"},
 	{area: "actions", name: "unknown_config_type", file: dfxFCosts,
-		edit: dashReplaceFirst("type: \"incremental\"", "type: \"table\""), want: `the config type "table" is not one the package uses`},
+		edit: dashReplaceFirst("type: \"incremental\"", "type: \"view\""), want: `the config type "view" is not one the package uses`},
 	{area: "actions", name: "description_missing", file: dfxFCosts,
 		edit: dfxDropLine("description: \"Hourly GenAI call"), want: "m_gen_ai_model_costs_hourly: the config has no description"},
 	{area: "actions", name: "config_block_missing", file: dfxFStaging,
@@ -2667,9 +2708,9 @@ var dfxMutations = []dfxMutation{
 	{area: "actions", name: "ref_misspelled", file: dfxFTraj,
 		edit: dashReplaceFirst("FROM ${ref(\"stg_spans_dedup\")} AS s", "FROM ${ref(\"stg_spans_dedupe\")} AS s"), want: `ref("stg_spans_dedupe") names no action of the package`},
 	{area: "actions", name: "trajectory_reads_the_view", file: dfxFTraj,
-		edit: dashReplaceAll("${ref(\"stg_spans_dedup\")}", "${ref(\"v_gen_ai_spans\")}"), want: "m_gen_ai_agent_trajectory: reads [v_gen_ai_spans] through ref(), want [stg_spans_dedup]"},
+		edit: dashReplaceAll("${ref(\"stg_spans_dedup\")}", "${ref(\"v_gen_ai_spans\")}"), want: "m_gen_ai_agent_trajectory: reads [stg_run_window v_gen_ai_spans] through ref(), want [stg_run_window stg_spans_dedup]"},
 	{area: "actions", name: "trajectory_loses_its_dependency", file: dfxFTraj,
-		edit: dashReplaceFirst("  dependencies: [\"stg_spans_dedup\"],\n", ""), want: "m_gen_ai_agent_trajectory: dependencies are [], want [stg_spans_dedup]"},
+		edit: dashReplaceFirst("  dependencies: [\"stg_run_window\", \"stg_spans_dedup\"],\n", ""), want: "m_gen_ai_agent_trajectory: dependencies are [], want [stg_run_window stg_spans_dedup]"},
 	{area: "actions", name: "staging_reads_the_trajectory", file: dfxFStaging,
 		edit: dashReplaceFirst("${ref(\"v_gen_ai_spans\")}", "${ref(\"m_gen_ai_agent_trajectory\")}"), want: "dependency cycle: m_gen_ai_agent_trajectory -> stg_spans_dedup -> m_gen_ai_agent_trajectory"},
 	{area: "actions", name: "assertion_read_by_assertion", file: dfxFCycles,
@@ -2679,15 +2720,17 @@ var dfxMutations = []dfxMutation{
 
 	// The refresh model: one window, one transaction, an epoch for a full refresh.
 	{area: "refresh", name: "window_of_one_mart_shorter", file: dfxFCosts,
-		edit: dashReplaceAll("INTERVAL 3 HOUR", "INTERVAL 2 HOUR"), want: "m_gen_ai_model_costs_hourly: in an incremental run, window_start is"},
+		edit: dashReplaceFirst("(SELECT rw.window_start FROM ${ref(\"stg_run_window\")} AS rw)", "TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 2 HOUR), HOUR)"), want: "m_gen_ai_model_costs_hourly: in an incremental run, window_start is"},
 	{area: "refresh", name: "window_of_the_trajectory_longer", file: dfxFTraj,
-		edit: dashReplaceFirst("INTERVAL 3 HOUR", "INTERVAL 6 HOUR"), want: "m_gen_ai_agent_trajectory: in an incremental run, window_start is"},
+		edit: dashReplaceFirst("(SELECT rw.window_start FROM ${ref(\"stg_run_window\")} AS rw)", "TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 6 HOUR), HOUR)"), want: "m_gen_ai_agent_trajectory: in an incremental run, window_start is"},
 	{area: "refresh", name: "window_of_the_staging_table_longer", file: dfxFStaging,
-		edit: dashReplaceFirst("INTERVAL 3 HOUR", "INTERVAL 4 HOUR"), want: "takes INTERVAL 3 HOUR from the clock, want INTERVAL 4 HOUR in every action"},
-	{area: "refresh", name: "window_in_days", file: dfxFSessions,
+		edit: dashReplaceFirst("(SELECT rw.window_start FROM ${ref(\"stg_run_window\")} AS rw)", "TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 4 HOUR), HOUR)"), want: "stg_spans_dedup: takes INTERVAL 4 HOUR from the clock, want INTERVAL 3 HOUR in every action"},
+	{area: "refresh", name: "window_in_days", file: dfxFRunWindow,
 		edit: dashReplaceAll("INTERVAL 3 HOUR", "INTERVAL 3 DAY"), want: "takes INTERVAL 3 DAY from the clock, want INTERVAL 3 HOUR in every action"},
 	{area: "refresh", name: "assertion_window_longer", file: dfxFOrphans,
-		edit: dashReplaceFirst("INTERVAL 3 HOUR), HOUR)\n),\nemitted AS (", "INTERVAL 4 HOUR), HOUR)\n),\nemitted AS ("), want: "assert_no_orphan_tokens: takes INTERVAL 4 HOUR from the clock, want INTERVAL 3 HOUR in every action"},
+		edit: dashReplaceFirst("(SELECT rw.window_start FROM ${ref(\"stg_run_window\")} AS rw)", "TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 4 HOUR), HOUR)"), want: "assert_no_orphan_tokens: takes INTERVAL 4 HOUR from the clock, want INTERVAL 3 HOUR in every action"},
+	{area: "refresh", name: "mart_calls_clock_directly", file: dfxFSessions,
+		edit: dashReplaceFirst("(SELECT rw.window_start FROM ${ref(\"stg_run_window\")} AS rw)", "TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 HOUR), HOUR)"), want: "m_gen_ai_sessions_daily: calls CURRENT_TIMESTAMP() directly instead of reading stg_run_window"},
 	{area: "refresh", name: "full_refresh_starts_late", file: dfxFStaging,
 		edit: dashReplaceFirst("TIMESTAMP('1970-01-01 00:00:00+00')", "TIMESTAMP('2020-01-01 00:00:00+00')"), want: "in a full refresh, window_start is"},
 	{area: "refresh", name: "commit_missing", file: dfxFTools,
@@ -2769,25 +2812,25 @@ var dfxMutations = []dfxMutation{
 
 	// The assertions.
 	{area: "assertions", name: "orphans_staged_window_longer", file: dfxFOrphans,
-		edit: dashReplaceFirst("INTERVAL 3 HOUR), HOUR)\n),\nemitted AS (", "INTERVAL 4 HOUR), HOUR)\n),\nemitted AS ("), want: "assert_no_orphan_tokens: the WHERE of the WITH table staged is"},
+		edit: dashReplaceFirst("WHERE start_time >= (SELECT rw.window_start FROM ${ref(\"stg_run_window\")} AS rw)", "WHERE start_time >= TIMESTAMP_SUB((SELECT rw.window_start FROM ${ref(\"stg_run_window\")} AS rw), INTERVAL 1 HOUR)"), want: "assert_no_orphan_tokens: the WHERE of the WITH table staged is"},
 	{area: "assertions", name: "orphans_staged_window_removed", file: dfxFOrphans,
-		edit: dashReplaceFirst("  WHERE start_time >= TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 HOUR), HOUR)\n", ""), want: "assert_no_orphan_tokens: the WHERE of the WITH table staged is"},
+		edit: dashReplaceFirst("    WHERE start_time >= (SELECT rw.window_start FROM ${ref(\"stg_run_window\")} AS rw)\n", ""), want: "assert_no_orphan_tokens: the WHERE of the WITH table staged is"},
 	{area: "assertions", name: "orphans_reach_shorter", file: dfxFOrphans,
-		edit: dashReplaceFirst("INTERVAL 24 HOUR", "INTERVAL 12 HOUR"), want: "assert_no_orphan_tokens: the WHERE of the WITH table missing is"},
+		edit: dashReplaceAll("INTERVAL 24 HOUR", "INTERVAL 12 HOUR"), want: "assert_no_orphan_tokens: the WHERE of the WITH table missing is"},
 	{area: "assertions", name: "orphans_reads_a_column_the_mart_lacks", file: dfxFOrphans,
-		edit: dashReplaceFirst("    m.is_token_leaf,\n", "    m.is_token_leafs,\n"), want: "is_token_leafs"},
+		edit: dashReplaceFirst("      m.is_token_leaf,\n", "      m.is_token_leafs,\n"), want: "is_token_leafs"},
 	{area: "assertions", name: "orphans_violation_renamed", file: dfxFOrphans,
-		edit: dashReplaceFirst("SELECT trace_id, service_name, span_id, violation FROM row_violations", "SELECT trace_id, service_name, span_id, violation AS rule FROM row_violations"), want: "branch 1 of the final SELECT outputs"},
+		edit: dashReplaceFirst("SELECT trace_id, service_name, span_id, violation\nFROM row_violations", "SELECT trace_id, service_name, span_id, violation AS rule\nFROM row_violations"), want: "branch 1 of the final SELECT outputs"},
 	{area: "assertions", name: "orphans_with_table_renamed", file: dfxFOrphans,
-		edit: dashReplaceFirst("double_counted AS (", "doubled AS ("), want: "assert_no_orphan_tokens: the WITH tables are [staged emitted row_violations doubled missing]"},
+		edit: dashReplaceFirst("  double_counted AS (", "  doubled AS ("), want: "assert_no_orphan_tokens: the WITH tables are [staged trajectory_context emitted_ancestors token_parent_coverage emitted row_violations doubled missing]"},
 	{area: "assertions", name: "orphans_reads_the_staging_table_again", file: dfxFOrphans,
-		edit: dashReplaceFirst("INTERVAL 3 HOUR), HOUR)\n),\nemitted AS (", "INTERVAL 3 HOUR), HOUR)\n    AND span_id IN (SELECT span_id FROM ${ref(\"stg_spans_dedup\")})\n),\nemitted AS ("), want: "reads the staging table and the trajectory mart 4 times, want 3"},
+		edit: dashReplaceFirst("    WHERE start_time >= (SELECT rw.window_start FROM ${ref(\"stg_run_window\")} AS rw)\n", "    WHERE start_time >= (SELECT rw.window_start FROM ${ref(\"stg_run_window\")} AS rw)\n      AND span_id IN (SELECT span_id FROM ${ref(\"stg_spans_dedup\")})\n"), want: "reads the staging table and the trajectory mart 5 times, want 4"},
 	{area: "assertions", name: "cycles_loses_a_column", file: dfxFCycles,
 		edit: dashReplaceFirst("  COALESCE(emitted.emitted_rows, 0) AS emitted_rows,\n", ""), want: "branch 1 of the final SELECT outputs [trace_id service_name span_id violation], want [trace_id service_name span_id emitted_rows violation]"},
 	{area: "assertions", name: "cycles_reach_shorter", file: dfxFCycles,
 		edit: dashReplaceFirst("INTERVAL 24 HOUR", "INTERVAL 12 HOUR"), want: "assert_no_unhandled_cycles: the WHERE of the WITH table emitted is"},
 	{area: "assertions", name: "cycles_staged_window_longer", file: dfxFCycles,
-		edit: dashReplaceFirst("INTERVAL 3 HOUR), HOUR)\n),\nemitted AS (", "INTERVAL 6 HOUR), HOUR)\n),\nemitted AS ("), want: "assert_no_unhandled_cycles: the WHERE of the WITH table staged is"},
+		edit: dashReplaceFirst("WHERE start_time >= (SELECT rw.window_start FROM ${ref(\"stg_run_window\")} AS rw)", "WHERE start_time >= TIMESTAMP_SUB((SELECT rw.window_start FROM ${ref(\"stg_run_window\")} AS rw), INTERVAL 3 HOUR)"), want: "assert_no_unhandled_cycles: the WHERE of the WITH table staged is"},
 
 	// The README.
 	{area: "docs", name: "partition_column_documented_wrongly", file: dfxDoc,
@@ -2795,7 +2838,7 @@ var dfxMutations = []dfxMutation{
 	{area: "docs", name: "cluster_order_documented_wrongly", file: dfxDoc,
 		edit: dashEditLine("| `stg_spans_dedup` | incremental", "`service_name`, `trace_id`", "`trace_id`, `service_name`"), want: "the action table clusters stg_spans_dedup by [trace_id service_name], want [service_name trace_id]"},
 	{area: "docs", name: "read_documented_wrongly", file: dfxDoc,
-		edit: dashEditLine("| `m_gen_ai_agent_trajectory` | incremental", "`stg_spans_dedup`", "`v_gen_ai_spans`"), want: "the action table says m_gen_ai_agent_trajectory reads [v_gen_ai_spans], want [stg_spans_dedup]"},
+		edit: dashEditLine("| `m_gen_ai_agent_trajectory` | incremental", "`stg_spans_dedup`", "`v_gen_ai_spans`"), want: "the action table says m_gen_ai_agent_trajectory reads [stg_run_window v_gen_ai_spans], want [stg_run_window stg_spans_dedup]"},
 	{area: "docs", name: "mart_row_missing", file: dfxDoc,
 		edit: dfxDropLine("| `m_mcp_tool_usage_hourly` | incremental"), want: "the action table has no row for m_mcp_tool_usage_hourly"},
 	{area: "docs", name: "type_documented_wrongly", file: dfxDoc,
@@ -2807,7 +2850,7 @@ var dfxMutations = []dfxMutation{
 	{area: "docs", name: "view_mapped_to_another_mart", file: dfxDoc,
 		edit: dashEditLine("| `v_gen_ai_sessions` | `m_gen_ai_sessions_daily` |", "`m_gen_ai_sessions_daily`", "`m_mcp_tool_usage_hourly`"), want: `the table of views and marts maps v_gen_ai_sessions to "m_mcp_tool_usage_hourly", want m_gen_ai_sessions_daily`},
 	{area: "docs", name: "violation_not_documented", file: dfxDoc,
-		edit: dashReplaceFirst("`rollup_token_changed` (a span that is not a token leaf lost or changed a count), ", ""), want: "the table of assertions says assert_no_orphan_tokens returns the rules"},
+		edit: dashReplaceFirst("`rollup_token_changed` (a span that is not a token leaf has an uncovered count or lost/changed a count, or a partial leaf nulled an uncovered count), ", ""), want: "the table of assertions says assert_no_orphan_tokens returns the rules"},
 	{area: "docs", name: "assertion_row_missing", file: dfxDoc,
 		edit: dfxDropLine("| `assert_no_unhandled_cycles` | a staged span appears"), want: "the table of assertions has no row for assert_no_unhandled_cycles"},
 	{area: "docs", name: "window_snippet_changed", file: dfxDoc,
@@ -2821,7 +2864,7 @@ var dfxMutations = []dfxMutation{
 	{area: "docs", name: "depth_limit_documented_wrongly", file: dfxDoc,
 		edit: dashReplaceFirst("deeper than 16 levels", "deeper than 12 levels"), want: "deeper than 16 levels"},
 	{area: "docs", name: "mart_count_documented_wrongly", file: dfxDoc,
-		edit: dashReplaceFirst("the four marts and the two\nassertions", "the five marts and the two\nassertions"), want: "the four marts and the two assertions"},
+		edit: dashReplaceFirst("the four marts and the two\nassertions read)", "the five marts and the two\nassertions read)"), want: "the four marts and the two assertions read)"},
 	{area: "docs", name: "core_version_documented_wrongly", file: dfxDoc,
 		edit: dashReplaceFirst("pins `dataformCoreVersion: 3.1.2`", "pins `dataformCoreVersion: 3.0.0`"), want: "pins `dataformCoreVersion: 3.1.2`"},
 	{area: "docs", name: "heading_renamed", file: dfxDoc,
@@ -3030,7 +3073,7 @@ func TestDfxReaders(t *testing.T) {
 			{"a pre_operations block that is not closed", "config {\n  type: \"assertion\"\n}\npre_operations {\n  SELECT 1\n", "the pre_operations block is not closed"},
 			{"a config block that cannot be read", "config {\n  type: \"assertion\" tags: []\n}\nSELECT 1\n", "the config block: expected ',' after key type"},
 			{"a config without a type", "config {\n  description: \"d\"\n}\nSELECT 1\n", "the config block has no type"},
-			{"a type the package does not use", "config {\n  type: \"table\"\n}\nSELECT 1\n", `the config type "table" is not one the package uses`},
+			{"a type the package does not use", "config {\n  type: \"view\"\n}\nSELECT 1\n", `the config type "view" is not one the package uses`},
 			{"a key the type does not take", "config {\n  type: \"assertion\",\n  partitionBy: \"x\"\n}\nSELECT 1\n", "config key partitionBy is not one the package sets on a assertion action"},
 			{"a tag that is not a list", "config {\n  type: \"assertion\",\n  tags: \"otel_marts\"\n}\nSELECT 1\n", "config key tags is not a list of strings"},
 			{"a description that is not a string", "config {\n  type: \"assertion\",\n  description: [\"x\"]\n}\nSELECT 1\n", "config key description is not a string"},
@@ -3164,5 +3207,472 @@ func TestDfxPlanAgreesWithTheDashboards(t *testing.T) {
 	}
 	if marts != len(dashMartForView) {
 		t.Errorf("the plan keeps the columns of %d views, the dashboards name %d marts", marts, len(dashMartForView))
+	}
+}
+
+// TestDataformSharedRunWindowAcrossHourBoundary verifies that because
+// stg_run_window captures window_start once at the beginning of a Dataform
+// invocation (or from vars.run_timestamp), a run that starts at 12:59:58Z and
+// crosses 13:00:00Z before m_gen_ai_agent_trajectory and the assertions execute
+// uses the exact same 09:00:00Z cutoff in every action instead of drifting to
+// 10:00:00Z and leaving spans in [09:00:00Z, 10:00:00Z) unmaterialized in the
+// trajectory mart.
+func TestDataformSharedRunWindowAcrossHourBoundary(t *testing.T) {
+	files := dashLoadFileSet(t)
+	pkg := dfxLoad(files)
+	lookback, err := dfxLookback(pkg)
+	if err != nil {
+		t.Fatalf("dfxLookback: %v", err)
+	}
+	if lookback != 3 {
+		t.Fatalf("lookback = %d, want 3", lookback)
+	}
+
+	// Simulate DAG start just before an hour boundary (12:59:58Z) and downstream
+	// execution after the hour boundary (13:01:05Z), with a staged span at
+	// 09:30:00Z.
+	dagStart := time.Date(2026, 10, 25, 12, 59, 58, 0, time.UTC)
+	downstreamStart := time.Date(2026, 10, 25, 13, 1, 5, 0, time.UTC)
+	spanStart := time.Date(2026, 10, 25, 9, 30, 0, 0, time.UTC)
+
+	sharedWindowStart := dagStart.Add(-time.Duration(lookback) * time.Hour).Truncate(time.Hour)
+	driftedWindowStart := downstreamStart.Add(-time.Duration(lookback) * time.Hour).Truncate(time.Hour)
+
+	if want := time.Date(2026, 10, 25, 9, 0, 0, 0, time.UTC); !sharedWindowStart.Equal(want) {
+		t.Fatalf("sharedWindowStart = %v, want %v", sharedWindowStart, want)
+	}
+	if want := time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC); !driftedWindowStart.Equal(want) {
+		t.Fatalf("driftedWindowStart = %v, want %v", driftedWindowStart, want)
+	}
+
+	// Under the old per-action CURRENT_TIMESTAMP() design, stg_spans_dedup staged
+	// the 09:30:00Z span (>= 09:00:00Z) while m_gen_ai_agent_trajectory's
+	// touched_traces scanned >= 10:00:00Z and missed it.
+	if spanStart.Compare(sharedWindowStart) < 0 || spanStart.Compare(driftedWindowStart) >= 0 {
+		t.Fatalf("spanStart %v must fall in [sharedWindowStart %v, driftedWindowStart %v)", spanStart, sharedWindowStart, driftedWindowStart)
+	}
+
+	// Verify that every incremental action and assertion in the package depends
+	// on stg_run_window and reads its window_start rather than calling
+	// CURRENT_TIMESTAMP().
+	for _, e := range dfxPlan {
+		if e.typ != "incremental" && e.typ != "assertion" {
+			continue
+		}
+		a := pkg.byName[e.name]
+		if a == nil {
+			t.Fatalf("missing action %s", e.name)
+		}
+		if !slices.Contains(a.cfg.deps, dfxRunWindow) {
+			t.Errorf("%s: dependencies %v do not include %s", e.name, a.cfg.deps, dfxRunWindow)
+		}
+		if !slices.Contains(dfxRefs(a), dfxRunWindow) {
+			t.Errorf("%s: refs %v do not include %s", e.name, dfxRefs(a), dfxRunWindow)
+		}
+		inc, err := dfxRender(a, true)
+		if err != nil {
+			t.Fatalf("%s: %v", e.name, err)
+		}
+		for _, st := range slices.Concat(inc.pre, inc.post) {
+			if strings.Contains(dashJoin(st.toks), "CURRENT_TIMESTAMP") {
+				t.Errorf("%s: operation %q calls CURRENT_TIMESTAMP() directly", e.name, st.kind)
+			}
+		}
+		if strings.Contains(strings.ToUpper(inc.body), "CURRENT_TIMESTAMP") {
+			t.Errorf("%s: body calls CURRENT_TIMESTAMP() directly", e.name)
+		}
+	}
+}
+
+// dfxSpanRow models a staged/emitted trajectory span row for testing the
+// relational semantics of assert_no_orphan_tokens.sqlx.
+type dfxSpanRow struct {
+	traceID         string
+	serviceName     string
+	spanID          string
+	parentSpanID    string
+	startTime       time.Time
+	inMart          bool
+	isTokenLeaf     bool
+	inputTokens     *int64
+	outputTokens    *int64
+	reasoningTokens *int64
+	rawInput        *int64
+	rawOutput       *int64
+	rawReasoning    *int64
+}
+
+func dfxInt64(v int64) *int64 { return &v }
+
+func dfxSameIntPtr(a, b *int64) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+// dfxEvalOrphanTokensAssertion evaluates the exact 32-hop recursive
+// emitted_ancestors -> token_parent_coverage -> emitted ->
+// (row_violations UNION ALL double_counted UNION ALL missing) logic of
+// assert_no_orphan_tokens.sqlx on a set of spans.
+func dfxEvalOrphanTokensAssertion(rows []dfxSpanRow, windowStart time.Time) map[string][]string {
+	contextStart := windowStart.Add(-24 * time.Hour)
+
+	// 1. staged: spans in stg_spans_dedup with start_time >= window_start.
+	var staged []dfxSpanRow
+	for _, r := range rows {
+		if !r.startTime.Before(windowStart) {
+			staged = append(staged, r)
+		}
+	}
+
+	// 2. trajectory_context: emitted rows joined with staged rows in the 24h context window.
+	var context []dfxSpanRow
+	byKey := map[string]dfxSpanRow{}
+	for _, r := range rows {
+		if r.inMart && !r.startTime.Before(contextStart) {
+			context = append(context, r)
+			byKey[r.traceID+"|"+r.serviceName+"|"+r.spanID] = r
+		}
+	}
+
+	// 3. emitted_ancestors: up to 32 hops from descendant c to ancestor p across
+	// trajectory_context, including through tokenless intermediate spans.
+	type ancEdge struct {
+		traceID             string
+		serviceName         string
+		descendantSpanID    string
+		descendantStartTime time.Time
+		hasInput            bool
+		hasOutput           bool
+		hasReasoning        bool
+		ancestorSpanID      string
+		ancestorStartTime   time.Time
+	}
+	var edges []ancEdge
+	for _, c := range context {
+		curParent := c.parentSpanID
+		visited := map[string]bool{c.spanID: true}
+		for hop := 1; hop <= 32 && curParent != ""; hop++ {
+			if visited[curParent] {
+				break
+			}
+			p, ok := byKey[c.traceID+"|"+c.serviceName+"|"+curParent]
+			if !ok {
+				break
+			}
+			visited[p.spanID] = true
+			edges = append(edges, ancEdge{
+				traceID:             c.traceID,
+				serviceName:         c.serviceName,
+				descendantSpanID:    c.spanID,
+				descendantStartTime: c.startTime,
+				hasInput:            c.rawInput != nil,
+				hasOutput:           c.rawOutput != nil,
+				hasReasoning:        c.rawReasoning != nil,
+				ancestorSpanID:      p.spanID,
+				ancestorStartTime:   p.startTime,
+			})
+			curParent = p.parentSpanID
+		}
+	}
+
+	// 4. token_parent_coverage with reverse_path cycle tie-breaker.
+	type covFlags struct {
+		hasInput, hasOutput, hasReasoning bool
+	}
+	coverage := map[string]covFlags{}
+	for _, ea := range edges {
+		if !ea.hasInput && !ea.hasOutput && !ea.hasReasoning {
+			continue
+		}
+		hasReverse := false
+		for _, rev := range edges {
+			if rev.traceID == ea.traceID &&
+				rev.serviceName == ea.serviceName &&
+				rev.descendantSpanID == ea.ancestorSpanID &&
+				rev.ancestorSpanID == ea.descendantSpanID {
+				hasReverse = true
+				break
+			}
+		}
+		if hasReverse {
+			later := ea.descendantStartTime.After(ea.ancestorStartTime) ||
+				(ea.descendantStartTime.Equal(ea.ancestorStartTime) && ea.descendantSpanID > ea.ancestorSpanID)
+			if !later {
+				continue
+			}
+		}
+		k := ea.traceID + "|" + ea.serviceName + "|" + ea.ancestorSpanID
+		cf := coverage[k]
+		cf.hasInput = cf.hasInput || ea.hasInput
+		cf.hasOutput = cf.hasOutput || ea.hasOutput
+		cf.hasReasoning = cf.hasReasoning || ea.hasReasoning
+		coverage[k] = cf
+	}
+
+	violations := map[string][]string{}
+	addViolation := func(spanID, v string) {
+		if !slices.Contains(violations[spanID], v) {
+			violations[spanID] = append(violations[spanID], v)
+		}
+	}
+
+	// 5. emitted (start_time >= window_start) -> row_violations and double_counted.
+	for _, m := range context {
+		if m.startTime.Before(windowStart) {
+			continue
+		}
+		cov := coverage[m.traceID+"|"+m.serviceName+"|"+m.spanID]
+		expectedLeaf := (m.rawInput != nil && !cov.hasInput) ||
+			(m.rawOutput != nil && !cov.hasOutput) ||
+			(m.rawReasoning != nil && !cov.hasReasoning)
+
+		// row_violations CASE order
+		switch {
+		case (m.inputTokens != nil && !dfxSameIntPtr(m.inputTokens, m.rawInput)) ||
+			(m.outputTokens != nil && !dfxSameIntPtr(m.outputTokens, m.rawOutput)) ||
+			(m.reasoningTokens != nil && !dfxSameIntPtr(m.reasoningTokens, m.rawReasoning)):
+			addViolation(m.spanID, "projected_token_differs_from_raw")
+		case !m.isTokenLeaf && (expectedLeaf ||
+			!dfxSameIntPtr(m.inputTokens, m.rawInput) ||
+			!dfxSameIntPtr(m.outputTokens, m.rawOutput) ||
+			!dfxSameIntPtr(m.reasoningTokens, m.rawReasoning)):
+			addViolation(m.spanID, "rollup_token_changed")
+		case m.isTokenLeaf && ((!cov.hasInput && !dfxSameIntPtr(m.inputTokens, m.rawInput)) ||
+			(!cov.hasOutput && !dfxSameIntPtr(m.outputTokens, m.rawOutput)) ||
+			(!cov.hasReasoning && !dfxSameIntPtr(m.reasoningTokens, m.rawReasoning))):
+			addViolation(m.spanID, "rollup_token_changed")
+		case m.isTokenLeaf && m.inputTokens == nil && m.outputTokens == nil && m.reasoningTokens == nil:
+			addViolation(m.spanID, "token_leaf_without_tokens")
+		}
+
+		// double_counted
+		if (cov.hasInput || cov.hasOutput || cov.hasReasoning) &&
+			((m.isTokenLeaf && !expectedLeaf) ||
+				(m.isTokenLeaf && cov.hasInput && m.inputTokens != nil) ||
+				(m.isTokenLeaf && cov.hasOutput && m.outputTokens != nil) ||
+				(m.isTokenLeaf && cov.hasReasoning && m.reasoningTokens != nil)) {
+			addViolation(m.spanID, "token_double_counted_with_child")
+		}
+	}
+
+	// 6. missing
+	for _, s := range staged {
+		if s.rawInput == nil && s.rawOutput == nil && s.rawReasoning == nil {
+			continue
+		}
+		if _, ok := byKey[s.traceID+"|"+s.serviceName+"|"+s.spanID]; !ok {
+			addViolation(s.spanID, "span_missing_from_trajectory")
+		}
+	}
+	return violations
+}
+
+// TestDataformOrphanTokensAssertionSemantics verifies that
+// assert_no_orphan_tokens.sqlx uses a 32-hop WITH RECURSIVE ancestor walk and
+// catches both silent token drops (a token-bearing span with no covering
+// descendants marked is_token_leaf = false) and multi-hop double-counting
+// across tokenless intermediate spans.
+func TestDataformOrphanTokensAssertionSemantics(t *testing.T) {
+	files := dashLoadFileSet(t)
+	pkg := dfxLoad(files)
+	a := pkg.byName["assert_no_orphan_tokens"]
+	if a == nil {
+		t.Fatal("missing assert_no_orphan_tokens")
+	}
+	run, err := dfxRender(a, true)
+	if err != nil {
+		t.Fatalf("dfxRender: %v", err)
+	}
+	upper := strings.ToUpper(run.body)
+	for _, required := range []string{
+		"WITH RECURSIVE",
+		"EMITTED_ANCESTORS AS",
+		"TOKEN_PARENT_COVERAGE AS",
+		"EA.HOP < 32",
+		"EXPECTED_IS_TOKEN_LEAF",
+	} {
+		if !strings.Contains(upper, required) {
+			t.Errorf("assert_no_orphan_tokens.sqlx missing %q", required)
+		}
+	}
+
+	windowStart := time.Date(2026, 10, 25, 9, 0, 0, 0, time.UTC)
+	ts := windowStart.Add(30 * time.Minute)
+
+	t.Run("valid rollup and multi-hop leaf tree produces zero violations", func(t *testing.T) {
+		rows := []dfxSpanRow{
+			{
+				traceID: "t1", serviceName: "svc", spanID: "root", parentSpanID: "",
+				startTime: ts, inMart: true, isTokenLeaf: false,
+				inputTokens: dfxInt64(10), rawInput: dfxInt64(10),
+			},
+			{
+				traceID: "t1", serviceName: "svc", spanID: "mid", parentSpanID: "root",
+				startTime: ts, inMart: true, isTokenLeaf: false,
+			},
+			{
+				traceID: "t1", serviceName: "svc", spanID: "leaf", parentSpanID: "mid",
+				startTime: ts, inMart: true, isTokenLeaf: true,
+				inputTokens: dfxInt64(10), rawInput: dfxInt64(10),
+			},
+		}
+		if got := dfxEvalOrphanTokensAssertion(rows, windowStart); len(got) != 0 {
+			t.Errorf("unexpected violations on valid tree: %v", got)
+		}
+	})
+
+	t.Run("root span with tokens and no descendants marked is_token_leaf=false triggers rollup_token_changed", func(t *testing.T) {
+		rows := []dfxSpanRow{
+			{
+				traceID: "t2", serviceName: "svc", spanID: "root_dropped", parentSpanID: "",
+				startTime: ts, inMart: true, isTokenLeaf: false,
+				inputTokens: dfxInt64(10), rawInput: dfxInt64(10),
+			},
+		}
+		got := dfxEvalOrphanTokensAssertion(rows, windowStart)
+		if !slices.Equal(got["root_dropped"], []string{"rollup_token_changed"}) {
+			t.Errorf("got violations %v, want map[root_dropped:[rollup_token_changed]]", got)
+		}
+	})
+
+	t.Run("multi-hop root -> tokenless intermediate -> token-bearing grandchild both is_token_leaf=true triggers token_double_counted_with_child", func(t *testing.T) {
+		rows := []dfxSpanRow{
+			{
+				traceID: "t3", serviceName: "svc", spanID: "root_double", parentSpanID: "",
+				startTime: ts, inMart: true, isTokenLeaf: true,
+				inputTokens: dfxInt64(10), rawInput: dfxInt64(10),
+			},
+			{
+				traceID: "t3", serviceName: "svc", spanID: "tokenless_mid", parentSpanID: "root_double",
+				startTime: ts, inMart: true, isTokenLeaf: false,
+			},
+			{
+				traceID: "t3", serviceName: "svc", spanID: "grandchild", parentSpanID: "tokenless_mid",
+				startTime: ts, inMart: true, isTokenLeaf: true,
+				inputTokens: dfxInt64(5), rawInput: dfxInt64(5),
+			},
+		}
+		got := dfxEvalOrphanTokensAssertion(rows, windowStart)
+		if !slices.Equal(got["root_double"], []string{"token_double_counted_with_child"}) {
+			t.Errorf("got violations %v, want map[root_double:[token_double_counted_with_child]]", got)
+		}
+	})
+
+	t.Run("partial leaf that keeps a covered token family triggers token_double_counted_with_child", func(t *testing.T) {
+		rows := []dfxSpanRow{
+			{
+				traceID: "t4", serviceName: "svc", spanID: "partial_parent", parentSpanID: "",
+				startTime: ts, inMart: true, isTokenLeaf: true,
+				inputTokens: dfxInt64(10), reasoningTokens: dfxInt64(3),
+				rawInput: dfxInt64(10), rawReasoning: dfxInt64(3),
+			},
+			{
+				traceID: "t4", serviceName: "svc", spanID: "input_child", parentSpanID: "partial_parent",
+				startTime: ts, inMart: true, isTokenLeaf: true,
+				inputTokens: dfxInt64(5), rawInput: dfxInt64(5),
+			},
+		}
+		got := dfxEvalOrphanTokensAssertion(rows, windowStart)
+		if !slices.Equal(got["partial_parent"], []string{"token_double_counted_with_child"}) {
+			t.Errorf("got violations %v, want map[partial_parent:[token_double_counted_with_child]]", got)
+		}
+	})
+
+	t.Run("staged token span absent from trajectory triggers span_missing_from_trajectory", func(t *testing.T) {
+		rows := []dfxSpanRow{
+			{
+				traceID: "t5", serviceName: "svc", spanID: "orphan_cycle_span", parentSpanID: "other",
+				startTime: ts, inMart: false, rawInput: dfxInt64(7),
+			},
+		}
+		got := dfxEvalOrphanTokensAssertion(rows, windowStart)
+		if !slices.Equal(got["orphan_cycle_span"], []string{"span_missing_from_trajectory"}) {
+			t.Errorf("got violations %v, want map[orphan_cycle_span:[span_missing_from_trajectory]]", got)
+		}
+	})
+}
+
+// TestDataformTargetResolutionAndVarsOverride verifies that Dataform resolves
+// destination action targets from top-level workflow_settings.yaml fields
+// (defaultProject, defaultLocation, defaultDataset, defaultAssertionDataset)
+// while --vars only overrides vars.* (source_project, source_dataset,
+// run_timestamp), and that deploy/dataform/README.md documents editing
+// workflow_settings.yaml before compiling or running.
+func TestDataformTargetResolutionAndVarsOverride(t *testing.T) {
+	files := dashLoadFileSet(t)
+	s, err := dfxDecodeSettings(files)
+	if err != nil {
+		t.Fatalf("dfxDecodeSettings: %v", err)
+	}
+	pkg := dfxLoad(files)
+
+	type resolvedTarget struct {
+		project, location, dataset, name string
+	}
+	resolve := func(cfg dfxSettings, cliVars map[string]string, a *dfxAction) resolvedTarget {
+		vars := map[string]string{}
+		for k, v := range cfg.Vars {
+			vars[k] = v
+		}
+		for k, v := range cliVars {
+			vars[k] = v
+		}
+		switch a.cfg.typ {
+		case "declaration":
+			return resolvedTarget{
+				project:  vars[strings.TrimPrefix(a.cfg.database, dfxVarExpr)],
+				location: cfg.DefaultLocation,
+				dataset:  vars[strings.TrimPrefix(a.cfg.schema, dfxVarExpr)],
+				name:     a.name,
+			}
+		case "assertion":
+			return resolvedTarget{
+				project:  cfg.DefaultProject,
+				location: cfg.DefaultLocation,
+				dataset:  cfg.DefaultAssertionDataset,
+				name:     a.name,
+			}
+		default:
+			return resolvedTarget{
+				project:  cfg.DefaultProject,
+				location: cfg.DefaultLocation,
+				dataset:  cfg.DefaultDataset,
+				name:     a.name,
+			}
+		}
+	}
+
+	// Passing only --vars leaves defaultProject at YOUR_PROJECT_ID for marts/tables/assertions.
+	cliOnly := resolve(*s, map[string]string{"source_project": "my-project", "source_dataset": "otel_export"}, pkg.byName[dfxStaging])
+	if cliOnly.project != dfxProjectPlaceholder {
+		t.Fatalf("with unedited workflow_settings.yaml, destination project = %q, want %q", cliOnly.project, dfxProjectPlaceholder)
+	}
+
+	// Setting defaultProject and defaultLocation in workflow_settings.yaml resolves all actions cleanly.
+	configured := *s
+	configured.DefaultProject = "my-project"
+	configured.DefaultLocation = "US"
+	configured.Vars = map[string]string{
+		"source_project": "my-project",
+		"source_dataset": "otel_export",
+		"run_timestamp":  "",
+	}
+	for _, e := range dfxPlan {
+		got := resolve(configured, nil, pkg.byName[e.name])
+		if got.project != "my-project" || got.location != "US" {
+			t.Errorf("%s resolved to %+v, want project=my-project location=US", e.name, got)
+		}
+	}
+
+	readme := dashSquash(files[dfxDoc])
+	for _, needle := range []string{
+		"Always set `defaultProject` and `defaultLocation` in [`workflow_settings.yaml`](workflow_settings.yaml) before running",
+		"`--vars` only overrides entries under `vars:`, so leaving `defaultProject` at `YOUR_PROJECT_ID` would still target `YOUR_PROJECT_ID` for the destination tables and assertion views",
+	} {
+		if !strings.Contains(readme, needle) {
+			t.Errorf("%s missing setup guidance %q", dfxDoc, needle)
+		}
 	}
 }

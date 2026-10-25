@@ -24,9 +24,9 @@ how.
 
 ### Requirements
 
-- Grafana 10.4 or later. The files are written in the dashboard JSON format of
-  Grafana 10.4 (`schemaVersion` 39); other versions may need panel options
-  adjusted.
+- Grafana 10.4 or later (including Grafana 11). The files are written in the
+  dashboard JSON format introduced in Grafana 10.4 (`schemaVersion` 39); earlier
+  versions may need panel options adjusted.
 - For the BigQuery dashboard, the
   [Google BigQuery data source plugin](https://grafana.com/grafana/plugins/grafana-bigquery-datasource/)
   (`grafana-bigquery-datasource`) and a data source that uses it:
@@ -66,14 +66,21 @@ Grafana provisions from files does not substitute inputs: replace
 | Tools and MCP | `v_mcp_tool_usage` | MCP calls, error rate and the share that is also tagged as a GenAI tool call; calls by JSON-RPC method; worst p95 latency by server; a server and method ledger; top error types |
 | Alerts | `otel_alerts` | Alert count, volume by hour and kind, and an alert log whose `trace_id` opens Cloud Trace Explorer |
 
-The dashboard has three variables:
+The dashboard has one template variable (`service`) and two import-time
+`__inputs` constants (`VAR_PROJECT` and `VAR_DATASET`):
 
-- `service` filters every panel. It lists the services that have GenAI or MCP
-  activity in the time range, and **All** selects every listed service. A service
-  name that contains a quote, a backslash, a backtick or a control character is
-  not listed (Grafana pastes the selected names into the SQL), so panels left on
-  **All** leave that service out.
-- `project` and `dataset` are constants that hold the values entered at import.
+- `service` filters every panel with `ARRAY<STRING>${service:json}` so selected
+  values are JSON-encoded as string literals and cannot break out of the array
+  literal. It lists the services that have GenAI or MCP activity in the time
+  range (`v_gen_ai_model_costs`, `v_mcp_tool_usage`, `v_gen_ai_sessions`), and
+  **All** sets the variable to the `__all` sentinel (`allValue: "__all"`),
+  which satisfies `'__all' IN UNNEST(ARRAY<STRING>${service:json})` and leaves
+  every panel (including `otel_alerts` for alert-only services) unfiltered by
+  the option list.
+- `VAR_PROJECT` and `VAR_DATASET` are import-time `__inputs` constants
+  substituted directly into the table identifiers when Grafana imports the
+  JSON; they are not runtime template variables and cannot be overridden by
+  `?var-project=` or `?var-dataset=` URL parameters.
 
 How the queries are written:
 
@@ -142,9 +149,9 @@ throughput, not the number of distinct rows in BigQuery.
 ### Pointing the BigQuery dashboard at the Dataform marts
 
 The marts have the same columns as the views, in a dataset of their own. In the
-dashboard's JSON model, replace `${dataset}.v_gen_ai_model_costs` by
-`<marts dataset>.m_gen_ai_model_costs_hourly`, and likewise for the sessions and
-MCP views. The mapping is in the
+dashboard's JSON model, replace `${VAR_DATASET}.v_gen_ai_model_costs` (or the
+imported dataset name) by `<marts dataset>.m_gen_ai_model_costs_hourly`, and
+likewise for the sessions and MCP views. The mapping is in the
 [Dataform README](../deploy/dataform/README.md#pointing-the-dashboards-at-the-marts).
 `otel_alerts` has no mart.
 
