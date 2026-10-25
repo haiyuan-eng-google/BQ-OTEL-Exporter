@@ -7,16 +7,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io/fs"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
@@ -24,6 +28,114 @@ import (
 )
 
 func TestGeneratorAllSevenFrameworksAndMCP(t *testing.T) {
+	// Verify DefaultFrameworks matches testdata/otlp/manifest.yaml and fixture
+	// scope/service conventions 1-to-1 so any mutation to ScopeName/ServiceName fails.
+	wantFrameworks := map[string]FrameworkSpec{
+		"google_adk": {
+			Framework:     "google_adk",
+			System:        "gcp.vertex.agent",
+			Model:         "gemini-2.5-pro",
+			ResponseModel: "gemini-2.5-pro-001",
+			AgentName:     "weather_coordinator",
+			AgentID:       "agent-adk-01",
+			ToolName:      "get_forecast",
+			ScopeName:     "gcp.vertex.agent",
+			ScopeVer:      "2.6.3",
+			ServiceName:   "adk-weather-agent",
+			ServiceVer:    "2.6.3",
+		},
+		"langgraph": {
+			Framework:     "langgraph",
+			System:        "langsmith",
+			Model:         "gpt-4o",
+			ResponseModel: "gpt-4o",
+			AgentName:     "research_supervisor",
+			AgentID:       "agent-lg-01",
+			ToolName:      "vector_store_lookup",
+			ScopeName:     "langsmith.otel",
+			ScopeVer:      "0.10.18",
+			ServiceName:   "langgraph-research-graph",
+			ServiceVer:    "1.2.0",
+		},
+		"openai_agents": {
+			Framework:     "openai_agents",
+			Provider:      "openai",
+			Model:         "gpt-4o",
+			ResponseModel: "gpt-4o-2024-08-06",
+			AgentName:     "billing_triage",
+			AgentID:       "agent-oai-01",
+			ToolName:      "fetch_customer_ledger",
+			ScopeName:     "opentelemetry.instrumentation.openai_agents",
+			ScopeVer:      "1.0b0",
+			ServiceName:   "openai-triage-agent",
+			ServiceVer:    "0.20.0",
+		},
+		"anthropic_agent_sdk": {
+			Framework:     "anthropic_agent_sdk",
+			System:        "anthropic",
+			Model:         "anthropic-v4-default",
+			ResponseModel: "anthropic-v4-default-20260514",
+			AgentName:     "code-assistant",
+			AgentID:       "agent-anth-01",
+			ToolName:      "sandbox_bash_exec",
+			ScopeName:     "com.anthropic.agent.sdk",
+			ScopeVer:      "2.1.229",
+			ServiceName:   "anthropic-agent-cli",
+			ServiceVer:    "2.1.229",
+		},
+		"crewai": {
+			Framework:     "crewai",
+			Model:         "gpt-4o-mini",
+			ResponseModel: "gpt-4o-mini",
+			AgentName:     "crew_financial_analyst",
+			AgentID:       "agent-crew-01",
+			ToolName:      "sec_filing_extractor",
+			ScopeName:     "openinference.instrumentation.crewai",
+			ScopeVer:      "1.1.12",
+			ServiceName:   "crewai-analyst-crew",
+			ServiceVer:    "1.15.15",
+		},
+		"aws_bedrock": {
+			Framework:     "aws_bedrock",
+			System:        "aws.bedrock",
+			Model:         "amazon.nova-pro-v1:0",
+			ResponseModel: "amazon.nova-pro-v1:0",
+			AgentName:     "bedrock_router",
+			AgentID:       "agent-bdrk-01",
+			ToolName:      "retrieve_and_generate",
+			ScopeName:     "opentelemetry.instrumentation.botocore.bedrock-runtime",
+			ScopeVer:      "0.65b0",
+			ServiceName:   "bedrock-converse-worker",
+			ServiceVer:    "0.65b0",
+		},
+		"microsoft_agent_framework": {
+			Framework:     "microsoft_agent_framework",
+			Provider:      "microsoft.agent_framework",
+			Model:         "gpt-4o",
+			ResponseModel: "gpt-4o",
+			AgentName:     "support_orchestrator",
+			AgentID:       "maf-agent-09",
+			ToolName:      "graph_calendar_query",
+			ScopeName:     "agent_framework.observability",
+			ScopeVer:      "1.12.0",
+			ServiceName:   "maf-orchestrator",
+			ServiceVer:    "1.12.0",
+		},
+	}
+	gotFrameworks := DefaultFrameworks()
+	if len(gotFrameworks) != 7 {
+		t.Fatalf("len(DefaultFrameworks()) = %d, want 7", len(gotFrameworks))
+	}
+	for _, fw := range gotFrameworks {
+		want, ok := wantFrameworks[fw.Framework]
+		if !ok {
+			t.Fatalf("unexpected framework %q", fw.Framework)
+		}
+		if fw != want {
+			t.Fatalf("DefaultFrameworks()[%q] = %+v, want %+v", fw.Framework, fw, want)
+		}
+	}
+
 	genCfg := GeneratorConfig{
 		PayloadBytes:   8192,
 		PlantSecrets:   true,
@@ -54,26 +166,67 @@ func TestGeneratorAllSevenFrameworksAndMCP(t *testing.T) {
 
 	seenFrameworks := make(map[string]bool)
 	seenOps := make(map[string]int)
+	seenOpenInferenceKinds := make(map[string]int)
 	seenMCP := make(map[string]bool)
-	spanPairs := make(map[string]bool)
+	spanServiceByPair := make(map[string]string)
 	var secretSpans int
 
 	rss := td.ResourceSpans()
 	for i := 0; i < rss.Len(); i++ {
 		rs := rss.At(i)
-		fw, ok := rs.Resource().Attributes().Get("gen_ai.framework")
+		fwAttr, ok := rs.Resource().Attributes().Get("gen_ai.framework")
 		if !ok {
 			t.Fatalf("resource %d missing gen_ai.framework", i)
 		}
-		seenFrameworks[fw.Str()] = true
+		fwName := fwAttr.Str()
+		seenFrameworks[fwName] = true
+		wantFW := wantFrameworks[fwName]
+
+		svcAttr, _ := rs.Resource().Attributes().Get("service.name")
+		if svcAttr.Str() != wantFW.ServiceName {
+			t.Fatalf("framework %s resource service.name = %q, want %q", fwName, svcAttr.Str(), wantFW.ServiceName)
+		}
 		sss := rs.ScopeSpans()
 		for j := 0; j < sss.Len(); j++ {
+			scope := sss.At(j).Scope()
+			if scope.Name() != wantFW.ScopeName || scope.Version() != wantFW.ScopeVer {
+				t.Fatalf("framework %s scope = (%q, %q), want (%q, %q)",
+					fwName, scope.Name(), scope.Version(), wantFW.ScopeName, wantFW.ScopeVer)
+			}
 			spans := sss.At(j).Spans()
 			for k := 0; k < spans.Len(); k++ {
 				sp := spans.At(k)
-				spanPairs[sp.TraceID().String()+"/"+sp.SpanID().String()] = true
+				pairKey := sp.TraceID().String() + "/" + sp.SpanID().String()
+				spanServiceByPair[pairKey] = svcAttr.Str()
+
 				if op, ok := sp.Attributes().Get("gen_ai.operation.name"); ok {
 					seenOps[op.Str()]++
+				}
+				if oiKind, ok := sp.Attributes().Get("openinference.span.kind"); ok {
+					seenOpenInferenceKinds[oiKind.Str()]++
+					if fwName != "crewai" {
+						t.Errorf("unexpected openinference.span.kind on framework %s", fwName)
+					}
+					if _, hasGenAIOp := sp.Attributes().Get("gen_ai.operation.name"); hasGenAIOp {
+						t.Errorf("CrewAI OpenInference span (%s) should not carry gen_ai.operation.name", oiKind.Str())
+					}
+				}
+				if fwName == "google_adk" {
+					for _, adkKey := range []string{
+						"gcp.vertex.agent.invocation_id",
+						"gcp.vertex.agent.session_id",
+						"gcp.vertex.agent.event_id",
+						"user.id",
+					} {
+						if v, ok := sp.Attributes().Get(adkKey); !ok || v.Str() == "" {
+							t.Errorf("google_adk span missing %s", adkKey)
+						}
+					}
+				}
+				if fwName == "langgraph" {
+					if v, ok := sp.Attributes().Get("langsmith.metadata.graph_node"); !ok || v.Str() == "" {
+						t.Error("langgraph span missing langsmith.metadata.graph_node")
+					}
 				}
 				if mcpMethod, ok := sp.Attributes().Get("mcp.method.name"); ok {
 					m := mcpMethod.Str()
@@ -89,6 +242,9 @@ func TestGeneratorAllSevenFrameworksAndMCP(t *testing.T) {
 						if _, ok := sp.Attributes().Get("gen_ai.tool.name"); !ok {
 							t.Error("MCP tools/call span missing gen_ai.tool.name")
 						}
+						if callID, ok := sp.Attributes().Get("gen_ai.tool.call.id"); !ok || callID.Str() == "" {
+							t.Error("MCP tools/call span missing non-empty gen_ai.tool.call.id")
+						}
 					case "resources/read":
 						if _, ok := sp.Attributes().Get("mcp.resource.uri"); !ok {
 							t.Error("MCP resources/read span missing mcp.resource.uri")
@@ -102,12 +258,14 @@ func TestGeneratorAllSevenFrameworksAndMCP(t *testing.T) {
 				if _, ok := sp.Attributes().Get("client.api_key"); ok {
 					secretSpans++
 				}
-				if msg, ok := sp.Attributes().Get("gen_ai.input.messages"); ok {
-					if len(msg.Str()) != 8192 {
-						t.Fatalf("gen_ai.input.messages len = %d, want 8192", len(msg.Str()))
-					}
-					if !json.Valid([]byte(msg.Str())) {
-						t.Fatalf("gen_ai.input.messages is not valid JSON: %.120s", msg.Str())
+				for _, payloadKey := range []string{"gen_ai.input.messages", "gen_ai.output.messages", "gen_ai.tool.call.result", "mcp.payload.content", "input.value", "output.value"} {
+					if msg, ok := sp.Attributes().Get(payloadKey); ok {
+						if len(msg.Str()) != 8192 {
+							t.Fatalf("%s len = %d, want 8192", payloadKey, len(msg.Str()))
+						}
+						if !json.Valid([]byte(msg.Str())) {
+							t.Fatalf("%s is not valid JSON: %.120s", payloadKey, msg.Str())
+						}
 					}
 				}
 			}
@@ -120,6 +278,9 @@ func TestGeneratorAllSevenFrameworksAndMCP(t *testing.T) {
 	if seenOps["invoke_agent"] == 0 || seenOps["chat"] == 0 || seenOps["execute_tool"] == 0 {
 		t.Fatalf("missing expected gen_ai.operation.name values: %v", seenOps)
 	}
+	if seenOpenInferenceKinds["AGENT"] != 1 || seenOpenInferenceKinds["LLM"] != 1 || seenOpenInferenceKinds["TOOL"] != 1 {
+		t.Fatalf("unexpected CrewAI OpenInference span kinds: %v", seenOpenInferenceKinds)
+	}
 	for _, wantMethod := range []string{"tools/call", "resources/read", "prompts/get"} {
 		if !seenMCP[wantMethod] {
 			t.Fatalf("missing MCP method %q in %v", wantMethod, seenMCP)
@@ -129,10 +290,10 @@ func TestGeneratorAllSevenFrameworksAndMCP(t *testing.T) {
 		t.Fatal("expected planted secret attributes when PlantSecrets=true")
 	}
 
-	ld := gen.LogsBatch(14)
-	ld2 := gen2.LogsBatch(14)
-	if got := ld.LogRecordCount(); got != 14 {
-		t.Fatalf("LogsBatch(14) LogRecordCount = %d, want 14", got)
+	ld := gen.LogsBatch(28)
+	ld2 := gen2.LogsBatch(28)
+	if got := ld.LogRecordCount(); got != 28 {
+		t.Fatalf("LogsBatch(28) LogRecordCount = %d, want 28", got)
 	}
 	logBytes1, err := (&plog.ProtoMarshaler{}).MarshalLogs(ld)
 	if err != nil {
@@ -146,23 +307,42 @@ func TestGeneratorAllSevenFrameworksAndMCP(t *testing.T) {
 		t.Fatal("LogsBatch protobuf bytes differ across two fresh NewGenerator instances with identical config")
 	}
 	for i := 0; i < ld.ResourceLogs().Len(); i++ {
-		sls := ld.ResourceLogs().At(i).ScopeLogs()
+		rl := ld.ResourceLogs().At(i)
+		svc, _ := rl.Resource().Attributes().Get("service.name")
+		fwAttr, _ := rl.Resource().Attributes().Get("gen_ai.framework")
+		sls := rl.ScopeLogs()
 		for j := 0; j < sls.Len(); j++ {
 			lrs := sls.At(j).LogRecords()
 			for k := 0; k < lrs.Len(); k++ {
 				lr := lrs.At(k)
 				key := lr.TraceID().String() + "/" + lr.SpanID().String()
-				if !spanPairs[key] {
+				wantSvc, ok := spanServiceByPair[key]
+				if !ok {
 					t.Fatalf("log record correlated pair %s not found in emitted TracesBatch(28)", key)
+				}
+				if svc.Str() != wantSvc {
+					t.Fatalf("log record pair %s service.name = %q, want %q (matching span service.name)", key, svc.Str(), wantSvc)
+				}
+				if fwAttr.Str() == "google_adk" {
+					for _, adkKey := range []string{
+						"gcp.vertex.agent.invocation_id",
+						"gcp.vertex.agent.session_id",
+						"gcp.vertex.agent.event_id",
+						"user.id",
+					} {
+						if v, ok := lr.Attributes().Get(adkKey); !ok || v.Str() == "" {
+							t.Errorf("google_adk log missing %s", adkKey)
+						}
+					}
 				}
 			}
 		}
 	}
 
-	md := gen.MetricsBatch(10)
-	md2 := gen2.MetricsBatch(10)
-	if got := md.DataPointCount(); got != 10 {
-		t.Fatalf("MetricsBatch(10) DataPointCount = %d, want 10", got)
+	md := gen.MetricsBatch(28)
+	md2 := gen2.MetricsBatch(28)
+	if got := md.DataPointCount(); got != 28 {
+		t.Fatalf("MetricsBatch(28) DataPointCount = %d, want 28", got)
 	}
 	metricBytes1, err := (&pmetric.ProtoMarshaler{}).MarshalMetrics(md)
 	if err != nil {
@@ -175,12 +355,70 @@ func TestGeneratorAllSevenFrameworksAndMCP(t *testing.T) {
 	if !bytes.Equal(metricBytes1, metricBytes2) {
 		t.Fatal("MetricsBatch protobuf bytes differ across two fresh NewGenerator instances with identical config")
 	}
-	dps := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Histogram().DataPoints()
-	for i := 0; i < dps.Len(); i++ {
-		ex := dps.At(i).Exemplars().At(0)
-		key := ex.TraceID().String() + "/" + ex.SpanID().String()
-		if !spanPairs[key] {
-			t.Fatalf("metric exemplar correlated pair %s not found in emitted TracesBatch(28)", key)
+
+	seenMetricNames := make(map[string]int)
+	for i := 0; i < md.ResourceMetrics().Len(); i++ {
+		rm := md.ResourceMetrics().At(i)
+		svc, _ := rm.Resource().Attributes().Get("service.name")
+		sms := rm.ScopeMetrics()
+		for j := 0; j < sms.Len(); j++ {
+			ms := sms.At(j).Metrics()
+			for k := 0; k < ms.Len(); k++ {
+				m := ms.At(k)
+				seenMetricNames[m.Name()] += m.Histogram().DataPoints().Len()
+				dps := m.Histogram().DataPoints()
+				for d := 0; d < dps.Len(); d++ {
+					ex := dps.At(d).Exemplars().At(0)
+					key := ex.TraceID().String() + "/" + ex.SpanID().String()
+					wantSvc, ok := spanServiceByPair[key]
+					if !ok {
+						t.Fatalf("metric exemplar correlated pair %s not found in emitted TracesBatch(28)", key)
+					}
+					if svc.Str() != wantSvc {
+						t.Fatalf("metric exemplar pair %s service.name = %q, want %q (required by v_gen_ai_metric_exemplars join)", key, svc.Str(), wantSvc)
+					}
+				}
+			}
+		}
+	}
+	if seenMetricNames["gen_ai.client.token.usage"] != 14 || seenMetricNames["gen_ai.client.operation.duration"] != 14 {
+		t.Fatalf("unexpected metric breakdown in MetricsBatch(28): %v", seenMetricNames)
+	}
+
+	// Transform all 3 batches through internal/transform and verify row counts and
+	// cross-signal trace_id/span_id/service_name join keys.
+	tOpts := transform.Options{Limits: transform.DefaultLimits()}
+	spanRows, spanErrs := transform.SpanRows(td, tOpts)
+	if len(spanErrs) != 0 || len(spanRows) != 28 {
+		t.Fatalf("transform.SpanRows: len=%d, errs=%v", len(spanRows), spanErrs)
+	}
+	logRows, logErrs := transform.LogRows(ld, tOpts)
+	if len(logErrs) != 0 || len(logRows) != 28 {
+		t.Fatalf("transform.LogRows: len=%d, errs=%v", len(logRows), logErrs)
+	}
+	metricRows, metricErrs := transform.MetricRows(md, tOpts)
+	if len(metricErrs) != 0 || len(metricRows) != 28 {
+		t.Fatalf("transform.MetricRows: len=%d, errs=%v", len(metricRows), metricErrs)
+	}
+	spanRowService := make(map[string]string, len(spanRows))
+	for _, sr := range spanRows {
+		key := sr["trace_id"].(string) + "/" + sr["span_id"].(string)
+		spanRowService[key] = sr["service_name"].(string)
+	}
+	for _, lr := range logRows {
+		key := lr["trace_id"].(string) + "/" + lr["span_id"].(string)
+		if spanRowService[key] != lr["service_name"].(string) {
+			t.Fatalf("transformed LogRow %s service_name = %q, want %q", key, lr["service_name"], spanRowService[key])
+		}
+	}
+	for _, mr := range metricRows {
+		exs, ok := mr["exemplars"].([]transform.Row)
+		if !ok || len(exs) != 1 {
+			t.Fatalf("transformed MetricRow exemplars = %T (len %d), want []transform.Row len 1", mr["exemplars"], len(exs))
+		}
+		key := exs[0]["trace_id"].(string) + "/" + exs[0]["span_id"].(string)
+		if spanRowService[key] != mr["service_name"].(string) {
+			t.Fatalf("transformed MetricRow %s service_name = %q, want %q", key, mr["service_name"], spanRowService[key])
 		}
 	}
 
@@ -229,7 +467,7 @@ func TestGeneratorAllSevenFrameworksAndMCP(t *testing.T) {
 						spans := sss.At(j).Spans()
 						for k := 0; k < spans.Len(); k++ {
 							sp := spans.At(k)
-							for _, key := range []string{"gen_ai.input.messages", "gen_ai.output.messages", "gen_ai.tool.call.result", "mcp.payload.content"} {
+							for _, key := range []string{"gen_ai.input.messages", "gen_ai.output.messages", "gen_ai.tool.call.result", "mcp.payload.content", "input.value", "output.value"} {
 								if v, ok := sp.Attributes().Get(key); ok && !json.Valid([]byte(v.Str())) {
 									t.Fatalf("TracesBatch(payloadBytes=%d, unique=%t, secrets=%t) attr %s invalid JSON: %s",
 										payloadBytes, unique, secrets, key, v.Str())
@@ -416,14 +654,13 @@ func TestRunBQFakeBackpressureAndLocalOffload(t *testing.T) {
 }
 
 func TestRunPerBatchCallTimeoutDoesNotExitWorker(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	// Batch 1 (seq == 1) and every 3rd batch receive a 120ms ack delay while
-	// per-batch CallTimeout is 40ms, so delayed batches fail with
-	// context.DeadlineExceeded while the parent ctx remains active and the single
-	// worker continues processing subsequent non-delayed batches.
-	cfg := RunnerConfig{
+	// 1. Default AllowPartialFailures=false: when per-batch CallTimeout < SimulateAckDelay,
+	// worker continues past delayed batches, and Run returns a non-nil error joined
+	// with the underlying context.DeadlineExceeded while still returning the report.
+	cfgStrict := RunnerConfig{
 		Mode:               ModeBQFake,
 		Signals:            []string{"traces"},
 		Duration:           350 * time.Millisecond,
@@ -434,9 +671,27 @@ func TestRunPerBatchCallTimeoutDoesNotExitWorker(t *testing.T) {
 		SimulateAckDelay:   120 * time.Millisecond,
 		CallTimeout:        40 * time.Millisecond,
 	}
-	report, err := Run(ctx, cfg)
+	reportStrict, errStrict := Run(ctx, cfgStrict)
+	if errStrict == nil {
+		t.Fatal("Run(AllowPartialFailures=false) with BatchesFailed > 0 succeeded, want non-nil error")
+	}
+	if !errors.Is(errStrict, context.DeadlineExceeded) && !strings.Contains(errStrict.Error(), "deadline exceeded") {
+		t.Fatalf("Run(AllowPartialFailures=false) error = %v, want underlying deadline exceeded error", errStrict)
+	}
+	if reportStrict == nil || len(reportStrict.Results) != 1 {
+		t.Fatalf("expected 1 result on strict report, got %+v", reportStrict)
+	}
+	if reportStrict.Results[0].BatchesFailed <= 0 || reportStrict.Results[0].BatchesSucceeded <= 0 {
+		t.Fatalf("strict result BatchesFailed=%d, BatchesSucceeded=%d, want both > 0",
+			reportStrict.Results[0].BatchesFailed, reportStrict.Results[0].BatchesSucceeded)
+	}
+
+	// 2. AllowPartialFailures=true permits non-zero BatchesFailed when BatchesSucceeded > 0.
+	cfgAllow := cfgStrict
+	cfgAllow.AllowPartialFailures = true
+	report, err := Run(ctx, cfgAllow)
 	if err != nil {
-		t.Fatalf("Run() error: %v", err)
+		t.Fatalf("Run(AllowPartialFailures=true) error: %v", err)
 	}
 	if len(report.Results) != 1 {
 		t.Fatalf("len(report.Results) = %d, want 1", len(report.Results))
@@ -447,6 +702,9 @@ func TestRunPerBatchCallTimeoutDoesNotExitWorker(t *testing.T) {
 	}
 	if res.BatchesSucceeded <= 0 {
 		t.Fatalf("BatchesSucceeded = %d, want > 0 (worker must continue after per-batch CallTimeout)", res.BatchesSucceeded)
+	}
+	if res.BatchesAttempted != res.BatchesSucceeded+res.BatchesFailed {
+		t.Fatalf("BatchesAttempted = %d, want %d+%d", res.BatchesAttempted, res.BatchesSucceeded, res.BatchesFailed)
 	}
 }
 
@@ -543,21 +801,31 @@ func TestRunStreamPoolSweepAndValidation(t *testing.T) {
 		t.Fatalf("unexpected stream pool sizes: %d, %d", report.Results[0].StreamPoolSize, report.Results[1].StreamPoolSize)
 	}
 
-	// Verify Normalize auto-generates otel_bench_<timestamp> when EphemeralDataset=true
-	// and DatasetID is empty, and allows subsequent Normalize calls on the generated config.
-	ephemeralCfg := RunnerConfig{
-		Mode:             ModeLive,
-		ProjectID:        "test-project",
-		EphemeralDataset: true,
-	}
-	if err := ephemeralCfg.Normalize(); err != nil {
-		t.Fatalf("Normalize(ephemeralCfg) unexpected error: %v", err)
-	}
-	if !strings.HasPrefix(ephemeralCfg.DatasetID, "otel_bench_") {
-		t.Fatalf("ephemeralCfg.DatasetID = %q, want prefix otel_bench_", ephemeralCfg.DatasetID)
-	}
-	if err := ephemeralCfg.Normalize(); err != nil {
-		t.Fatalf("second Normalize(ephemeralCfg) unexpected error: %v", err)
+	// Verify Normalize auto-generates otel_bench_<timestamp>_<random_hex> when
+	// EphemeralDataset=true and DatasetID is empty, produces 1,000 collision-free
+	// IDs across 1,000 tight-loop calls in the same millisecond, and allows
+	// subsequent Normalize calls on the generated config.
+	dsPattern := regexp.MustCompile(`^otel_bench_[0-9]+_[0-9a-f]{16}$`)
+	seenDatasetIDs := make(map[string]bool, 1000)
+	for i := 0; i < 1000; i++ {
+		ephemeralCfg := RunnerConfig{
+			Mode:             ModeLive,
+			ProjectID:        "test-project",
+			EphemeralDataset: true,
+		}
+		if err := ephemeralCfg.Normalize(); err != nil {
+			t.Fatalf("Normalize(ephemeralCfg #%d) unexpected error: %v", i, err)
+		}
+		if !dsPattern.MatchString(ephemeralCfg.DatasetID) {
+			t.Fatalf("ephemeralCfg.DatasetID = %q, want match %s", ephemeralCfg.DatasetID, dsPattern)
+		}
+		if seenDatasetIDs[ephemeralCfg.DatasetID] {
+			t.Fatalf("duplicate ephemeral DatasetID %q at iteration %d", ephemeralCfg.DatasetID, i)
+		}
+		seenDatasetIDs[ephemeralCfg.DatasetID] = true
+		if err := ephemeralCfg.Normalize(); err != nil {
+			t.Fatalf("second Normalize(ephemeralCfg #%d) unexpected error: %v", i, err)
+		}
 	}
 
 	invalidCases := []RunnerConfig{
@@ -573,10 +841,14 @@ func TestRunStreamPoolSweepAndValidation(t *testing.T) {
 		{Mode: ModeBQFake, OffloadGCSBucket: "bkt"},
 		{Mode: ModeBQFake, Duration: -time.Second},
 		{Mode: ModeBQFake, BatchSize: -1},
+		{Mode: ModeBQFake, BatchSize: MaxBenchmarkBatchSize + 1},
 		{Mode: ModeBQFake, Workers: -1},
+		{Mode: ModeBQFake, Workers: MaxBenchmarkWorkers + 1},
 		{Mode: ModeBQFake, StreamPoolSize: -1},
 		{Mode: ModeBQFake, ConnectionPoolSize: -1},
 		{Mode: ModeBQFake, PayloadBytes: -1},
+		{Mode: ModeBQFake, PayloadBytes: math.MaxInt},
+		{Mode: ModeBQFake, BatchSize: 1000, PayloadBytes: 512 * 1024},
 		{Mode: ModeBQFake, TargetRate: -1},
 		{Mode: ModeBQFake, SimulateThrottleEvery: -1},
 		{Mode: ModeBQFake, SimulateAckDelay: -time.Millisecond},
@@ -595,8 +867,14 @@ func TestDeleteDatasetWithContentsAndDatasetExistsHTTP(t *testing.T) {
 
 	var (
 		getCalls    atomic.Int32
+		postCalls   atomic.Int32
 		deleteCalls atomic.Int32
+		postStatus  atomic.Int32
+		delStatus   atomic.Int32
 	)
+	postStatus.Store(http.StatusOK)
+	delStatus.Store(http.StatusNoContent)
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
@@ -620,13 +898,28 @@ func TestDeleteDatasetWithContentsAndDatasetExistsHTTP(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = w.Write([]byte(`{"error":{"code":404,"message":"Not found"}}`))
+		case http.MethodPost:
+			postCalls.Add(1)
+			code := int(postStatus.Load())
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(code)
+			if code == http.StatusConflict {
+				_, _ = w.Write([]byte(`{"error":{"code":409,"message":"Already Exists"}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"datasetReference":{"projectId":"test-proj","datasetId":"created_ds"}}`))
 		case http.MethodDelete:
 			deleteCalls.Add(1)
 			if r.URL.Query().Get("deleteContents") != "true" {
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
-			w.WriteHeader(http.StatusNoContent)
+			code := int(delStatus.Load())
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(code)
+			if code >= 400 {
+				_, _ = w.Write([]byte(`{"error":{"code":403,"message":"Delete forbidden"}}`))
+			}
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
@@ -667,10 +960,235 @@ func TestDeleteDatasetWithContentsAndDatasetExistsHTTP(t *testing.T) {
 	if err := DeleteDatasetWithContents(ctx, "test-proj", "otel_bench_absent", opts...); err != nil {
 		t.Fatalf("DeleteDatasetWithContents error: %v", err)
 	}
-	if getCalls.Load() < 4 {
-		t.Fatalf("getCalls = %d, want >= 4", getCalls.Load())
-	}
 	if deleteCalls.Load() != 1 {
 		t.Fatalf("deleteCalls = %d, want 1", deleteCalls.Load())
+	}
+
+	// Verify createEphemeralDataset and Run/RunStreamPoolSweep ownership & pre-validation guards:
+	// 1. Pre-existing dataset (GET -> 200): 0 POSTs, 0 DELETEs.
+	postCalls.Store(0)
+	deleteCalls.Store(0)
+	if err := createEphemeralDataset(ctx, "test-proj", "existing_ds", "US", opts...); err == nil {
+		t.Fatal("createEphemeralDataset(existing_ds) succeeded, want error")
+	}
+	if postCalls.Load() != 0 || deleteCalls.Load() != 0 {
+		t.Fatalf("existing_ds triggered post=%d, delete=%d, want 0, 0", postCalls.Load(), deleteCalls.Load())
+	}
+
+	// 2. Concurrent creator race (GET -> 404, POST -> 409 Conflict): Run and RunStreamPoolSweep
+	// must abort before setting owned=true and must NEVER call DELETE on the concurrently created dataset.
+	postStatus.Store(http.StatusConflict)
+	for _, isSweep := range []bool{false, true} {
+		getCalls.Store(0)
+		postCalls.Store(0)
+		deleteCalls.Store(0)
+		raceCfg := RunnerConfig{
+			Mode:             ModeLive,
+			ProjectID:        "test-proj",
+			EphemeralDataset: true,
+			ClientOptions:    opts,
+		}
+		var raceErr error
+		if isSweep {
+			_, raceErr = RunStreamPoolSweep(ctx, raceCfg, []int{1, 2})
+		} else {
+			_, raceErr = Run(ctx, raceCfg)
+		}
+		if raceErr == nil || !strings.Contains(raceErr.Error(), "creating ephemeral dataset") {
+			t.Fatalf("isSweep=%t concurrent 409 error = %v, want creating ephemeral dataset error", isSweep, raceErr)
+		}
+		if postCalls.Load() != 1 || deleteCalls.Load() != 0 {
+			t.Fatalf("isSweep=%t concurrent 409 post=%d, delete=%d, want 1, 0", isSweep, postCalls.Load(), deleteCalls.Load())
+		}
+	}
+
+	// 3. Pre-validation failure (invalid streamPoolSizes [1, 99] or pre-canceled ctx)
+	// must fail BEFORE any dataset GET/POST/DELETE HTTP request is issued.
+	postStatus.Store(http.StatusOK)
+	getCalls.Store(0)
+	postCalls.Store(0)
+	deleteCalls.Store(0)
+	if _, err := RunStreamPoolSweep(ctx, RunnerConfig{
+		Mode:             ModeLive,
+		ProjectID:        "test-proj",
+		EphemeralDataset: true,
+		ClientOptions:    opts,
+	}, []int{1, 99}); err == nil {
+		t.Fatal("RunStreamPoolSweep([1, 99]) succeeded, want validation error")
+	}
+	if getCalls.Load() != 0 || postCalls.Load() != 0 || deleteCalls.Load() != 0 {
+		t.Fatalf("invalid sweep pool sizes made HTTP calls get=%d, post=%d, delete=%d, want 0, 0, 0",
+			getCalls.Load(), postCalls.Load(), deleteCalls.Load())
+	}
+
+	canceledCtx, cancelImmediate := context.WithCancel(ctx)
+	cancelImmediate()
+	if _, err := Run(canceledCtx, RunnerConfig{
+		Mode:             ModeLive,
+		ProjectID:        "test-proj",
+		EphemeralDataset: true,
+		ClientOptions:    opts,
+	}); err == nil {
+		t.Fatal("Run(canceledCtx) succeeded, want context.Canceled")
+	}
+	if getCalls.Load() != 0 || postCalls.Load() != 0 || deleteCalls.Load() != 0 {
+		t.Fatalf("pre-canceled ctx made HTTP calls get=%d, post=%d, delete=%d, want 0, 0, 0",
+			getCalls.Load(), postCalls.Load(), deleteCalls.Load())
+	}
+
+	// 4. Owned dataset cleanup failure (GET -> 404, POST -> 200, then exporter Start fails locally on missing ADC file, and DELETE -> 403):
+	// Run must execute DELETE because it created the dataset, and must join the DELETE error
+	// into the returned error while leaving EphemeralDatasetDeleted == false.
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(t.TempDir(), "missing-adc.json"))
+	delStatus.Store(http.StatusForbidden)
+	getCalls.Store(0)
+	postCalls.Store(0)
+	deleteCalls.Store(0)
+	delFailRep, delFailErr := Run(ctx, RunnerConfig{
+		Mode:             ModeLive,
+		ProjectID:        "test-proj",
+		EphemeralDataset: true,
+		Duration:         10 * time.Millisecond,
+		CallTimeout:      10 * time.Millisecond,
+		ClientOptions:    opts,
+	})
+	if delFailErr == nil || !strings.Contains(delFailErr.Error(), "deleting dataset") {
+		t.Fatalf("Run() with failing DELETE error = %v, want joined 'deleting dataset' error", delFailErr)
+	}
+	if postCalls.Load() != 1 || deleteCalls.Load() != 1 {
+		t.Fatalf("owned dataset cleanup failure post=%d, delete=%d, want 1, 1", postCalls.Load(), deleteCalls.Load())
+	}
+	if delFailRep != nil && delFailRep.EphemeralDatasetDeleted {
+		t.Fatal("EphemeralDatasetDeleted = true when DELETE returned 403, want false")
+	}
+}
+
+func TestRunPartialFailureEmptyWindowInvalidOffloadAndPanicRecovery(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// 1. Empty measurement window (Duration=1ns -> 0 samples / 0 acked rows) must fail.
+	if _, err := Run(ctx, RunnerConfig{
+		Mode:             ModeBQFake,
+		Signals:          []string{"traces"},
+		Duration:         time.Nanosecond,
+		BatchSize:        10,
+		Workers:          1,
+		TargetRate:       10,
+		SimulateAckDelay: 50 * time.Millisecond,
+	}); err == nil {
+		t.Fatal("Run(Duration=1ns) with 0 completed batches succeeded, want non-nil error")
+	}
+
+	// 2. Regular file passed as OffloadDir fails pre-validation with "not a directory".
+	tmpFile := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(tmpFile, []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile(%s): %v", tmpFile, err)
+	}
+	if _, err := Run(ctx, RunnerConfig{
+		Mode:       ModeBQFake,
+		Signals:    []string{"traces"},
+		Duration:   100 * time.Millisecond,
+		BatchSize:  4,
+		Workers:    1,
+		OffloadDir: tmpFile,
+	}); err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("Run(OffloadDir=regular file) error = %v, want 'not a directory'", err)
+	}
+
+	// 3. Underlying offload filesystem error during worker execution is preserved via errors.Join.
+	offloadRoot := t.TempDir()
+	// Create a regular file at "<offloadRoot>/local-offload-bench" so validateRunConfig
+	// sees offloadRoot as a valid directory, but WriteObject's MkdirAll("<offloadRoot>/local-offload-bench/...")
+	// fails with ENOTDIR ("not a directory") on every batch.
+	blockerFile := filepath.Join(offloadRoot, "local-offload-bench")
+	if err := os.WriteFile(blockerFile, []byte("blocker"), 0o600); err != nil {
+		t.Fatalf("WriteFile(%s): %v", blockerFile, err)
+	}
+	_, offloadErr := Run(ctx, RunnerConfig{
+		Mode:                  ModeBQFake,
+		Signals:               []string{"traces"},
+		Duration:              120 * time.Millisecond,
+		BatchSize:             4,
+		Workers:               1,
+		PayloadBytes:          1024,
+		OffloadDir:            offloadRoot,
+		OffloadThresholdBytes: 512,
+	})
+	if offloadErr == nil || !strings.Contains(offloadErr.Error(), "not a directory") {
+		t.Fatalf("Run() with failing offload WriteObject error = %v, want underlying 'not a directory' cause preserved", offloadErr)
+	}
+
+	// 4. Worker panic is recovered into a structured error and exporter is shut down cleanly (0 leaked goroutines).
+	_, panicErr := Run(ctx, RunnerConfig{
+		Mode:      ModeBQFake,
+		Signals:   []string{"traces"},
+		Duration:  200 * time.Millisecond,
+		BatchSize: 8,
+		Workers:   2,
+		workerHook: func(_, seq int) {
+			if seq == 1 {
+				panic("simulated worker fault")
+			}
+		},
+	})
+	if panicErr == nil || !strings.Contains(panicErr.Error(), "panicked: simulated worker fault") {
+		t.Fatalf("Run() with panicking worker error = %v, want recovered panic error", panicErr)
+	}
+
+	// 5. Large >4 MiB ProtoRows batch (500 spans x 16 KiB = ~8 MiB request) succeeds against bqfake.
+	largeRep, err := Run(ctx, RunnerConfig{
+		Mode:               ModeBQFake,
+		Signals:            []string{"traces"},
+		Duration:           200 * time.Millisecond,
+		BatchSize:          500,
+		Workers:            1,
+		StreamPoolSize:     1,
+		ConnectionPoolSize: 1,
+		PayloadBytes:       16384,
+	})
+	if err != nil {
+		t.Fatalf("Run(500 x 16 KiB >4 MiB batch) error: %v", err)
+	}
+	if largeRep.Results[0].BatchesFailed != 0 || largeRep.Results[0].Telemetry.AcknowledgedRows < 500 {
+		t.Fatalf("large batch result: failed=%d, acked=%d, want failed=0, acked>=500",
+			largeRep.Results[0].BatchesFailed, largeRep.Results[0].Telemetry.AcknowledgedRows)
+	}
+	if largeRep.Results[0].BytesPerRow <= 16384 {
+		t.Fatalf("large batch BytesPerRow = %f, want > 16384", largeRep.Results[0].BytesPerRow)
+	}
+
+	// 6. Retry-uninflated BytesPerRow vs AttemptedBytesPerAckedRow under SimulateThrottleEvery=2.
+	baseRep, err := Run(ctx, RunnerConfig{
+		Mode:      ModeBQFake,
+		Signals:   []string{"traces"},
+		Duration:  150 * time.Millisecond,
+		BatchSize: 28,
+		Workers:   1,
+	})
+	if err != nil {
+		t.Fatalf("Run(baseline) error: %v", err)
+	}
+	throttleRep, err := Run(ctx, RunnerConfig{
+		Mode:                  ModeBQFake,
+		Signals:               []string{"traces"},
+		Duration:              200 * time.Millisecond,
+		BatchSize:             28,
+		Workers:               1,
+		SimulateThrottleEvery: 2,
+	})
+	if err != nil {
+		t.Fatalf("Run(throttled) error: %v", err)
+	}
+	if throttleRep.Results[0].Telemetry.Retries <= 0 {
+		t.Fatalf("throttled Retries = %d, want > 0", throttleRep.Results[0].Telemetry.Retries)
+	}
+	if math.Abs(throttleRep.Results[0].BytesPerRow-baseRep.Results[0].BytesPerRow) > 5.0 {
+		t.Fatalf("throttled BytesPerRow = %.2f vs baseline %.2f, want retry-uninflated match",
+			throttleRep.Results[0].BytesPerRow, baseRep.Results[0].BytesPerRow)
+	}
+	if throttleRep.Results[0].AttemptedBytesPerAckedRow <= throttleRep.Results[0].BytesPerRow {
+		t.Fatalf("throttled AttemptedBytesPerAckedRow (%.2f) must exceed single-append BytesPerRow (%.2f)",
+			throttleRep.Results[0].AttemptedBytesPerAckedRow, throttleRep.Results[0].BytesPerRow)
 	}
 }

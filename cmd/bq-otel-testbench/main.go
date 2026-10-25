@@ -71,10 +71,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs.IntVar(&cfg.OffloadThresholdBytes, "offload-threshold-bytes", 4096, "Byte threshold when --offload-dir or --offload-gcs-bucket is enabled")
 	fs.DurationVar(&cfg.SimulateAckDelay, "simulate-ack-delay", 0, "Inject FaultDelayedAck into bqfake on batch 1 and every 3rd batch")
 	fs.IntVar(&cfg.SimulateThrottleEvery, "simulate-throttle-every", 0, "Inject FaultResourceExhausted into bqfake every N batches")
+	fs.DurationVar(&cfg.CallTimeout, "call-timeout", 0, "Optional per-batch Consume* timeout override")
+	fs.BoolVar(&cfg.AllowPartialFailures, "allow-partial-failures", false, "Permit non-zero failed batches when at least one batch succeeds")
 	fs.StringVar(&cfg.ProjectID, "project", "", "GCP project ID (required when --mode=live)")
 	fs.StringVar(&cfg.DatasetID, "dataset", "", "BigQuery dataset ID (required when --mode=live and --ephemeral-dataset=false; must be empty when --ephemeral-dataset=true)")
 	fs.StringVar(&cfg.Location, "location", "US", "BigQuery dataset location")
-	fs.BoolVar(&cfg.EphemeralDataset, "ephemeral-dataset", false, "Auto-create a unique otel_bench_<timestamp> dataset in live mode and delete it on teardown")
+	fs.BoolVar(&cfg.EphemeralDataset, "ephemeral-dataset", false, "Auto-create a unique otel_bench_<timestamp>_<random_hex> dataset in live mode and delete it on teardown")
 	fs.StringVar(&format, "format", "both", "Output format: markdown, json, or both")
 	fs.StringVar(&jsonOut, "json-out", "", "Optional file path to write JSON benchmark report")
 

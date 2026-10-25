@@ -6,6 +6,8 @@ package testbench
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -48,7 +50,24 @@ const (
 	ModeBQFake = "bqfake"
 	// ModeLive selects a live BigQuery dataset via Storage Write API.
 	ModeLive = "live"
+
+	// MaxBenchmarkPayloadBytes bounds synthetic payload_bytes (16 MiB) so extreme
+	// flag values fail closed during validation rather than panicking in make.
+	MaxBenchmarkPayloadBytes = 16 * 1024 * 1024
+	// MaxBenchmarkBatchSize bounds synthetic batch_size (100,000 records).
+	MaxBenchmarkBatchSize = 100_000
+	// MaxBenchmarkWorkers bounds concurrent benchmark workers (256 goroutines).
+	MaxBenchmarkWorkers = 256
+	// MaxBatchPayloadBudgetBytes bounds int64(batch_size)*int64(payload_bytes)
+	// (256 MiB per batch) to prevent pre-allocation OOM panics.
+	MaxBatchPayloadBudgetBytes = 256 * 1024 * 1024
 )
+
+var blockedSecretPatterns = []string{
+	`Bearer\s+sk-[A-Za-z0-9_-]{16,}`,
+	`ya29\.[0-9A-Za-z_-]{20,}`,
+	`AKIA[0-9A-Z]{16}`,
+}
 
 // RunnerConfig configures a single load benchmark execution.
 type RunnerConfig struct {
@@ -98,21 +117,37 @@ type RunnerConfig struct {
 	SimulateThrottleEvery int `json:"simulate_throttle_every,omitempty"`
 	// CallTimeout overrides the per-batch Consume* timeout when > 0.
 	CallTimeout time.Duration `json:"call_timeout,omitempty"`
+	// AllowPartialFailures permits Run to succeed when BatchesFailed > 0 as long
+	// as at least one batch succeeded and rows were acknowledged (used for
+	// fault-injection tests that intentionally trigger per-batch timeouts).
+	AllowPartialFailures bool `json:"allow_partial_failures,omitempty"`
 	// ProjectID is the target GCP project ("bench-project" in bqfake mode).
 	ProjectID string `json:"project_id"`
 	// DatasetID is the target BigQuery dataset ("otel_bench" in bqfake mode).
 	DatasetID string `json:"dataset_id"`
 	// Location is the BigQuery dataset location (default "US").
 	Location string `json:"location"`
-	// EphemeralDataset provisions a unique otel_bench_<timestamp> dataset and tables
-	// automatically in live mode and deletes the dataset with all contents on teardown.
-	// Must not be combined with an explicit DatasetID.
+	// EphemeralDataset provisions a unique otel_bench_<timestamp>_<random_hex>
+	// dataset and tables automatically in live mode and deletes the dataset with
+	// all contents on teardown. Must not be combined with an explicit DatasetID.
 	EphemeralDataset bool `json:"ephemeral_dataset"`
 	// KeepEphemeralDataset suppresses automatic deletion when EphemeralDataset is
 	// managed by an outer sweep loop.
 	KeepEphemeralDataset bool `json:"-"`
+	// ClientOptions injects optional Google API client options for BigQuery REST
+	// dataset lifecycle calls in tests.
+	ClientOptions []option.ClientOption `json:"-"`
 
 	ephemeralDatasetGenerated bool
+	workerHook                func(workerID, seq int)
+}
+
+func generateEphemeralDatasetID() (string, error) {
+	var randBytes [8]byte
+	if _, err := rand.Read(randBytes[:]); err != nil {
+		return "", fmt.Errorf("generating cryptographic random suffix for ephemeral dataset: %w", err)
+	}
+	return fmt.Sprintf("otel_bench_%d_%s", time.Now().UTC().UnixMilli(), hex.EncodeToString(randBytes[:])), nil
 }
 
 // Normalize applies defaults and validates c.
@@ -148,11 +183,17 @@ func (c *RunnerConfig) Normalize() error {
 	if c.BatchSize == 0 {
 		c.BatchSize = 500
 	}
+	if c.BatchSize > MaxBenchmarkBatchSize {
+		return fmt.Errorf("batch_size %d exceeds maximum %d", c.BatchSize, MaxBenchmarkBatchSize)
+	}
 	if c.Workers < 0 {
 		return fmt.Errorf("workers %d must be > 0", c.Workers)
 	}
 	if c.Workers == 0 {
 		c.Workers = 4
+	}
+	if c.Workers > MaxBenchmarkWorkers {
+		return fmt.Errorf("workers %d exceeds maximum %d", c.Workers, MaxBenchmarkWorkers)
 	}
 	if c.StreamPoolSize < 0 || c.StreamPoolSize > 16 {
 		return fmt.Errorf("stream_pool_size %d must be between 1 and 16", c.StreamPoolSize)
@@ -184,6 +225,13 @@ func (c *RunnerConfig) Normalize() error {
 	if c.PayloadBytes == 0 {
 		c.PayloadBytes = 1024
 	}
+	if c.PayloadBytes > MaxBenchmarkPayloadBytes {
+		return fmt.Errorf("payload_bytes %d exceeds maximum %d", c.PayloadBytes, MaxBenchmarkPayloadBytes)
+	}
+	if int64(c.BatchSize)*int64(c.PayloadBytes) > MaxBatchPayloadBudgetBytes {
+		return fmt.Errorf("batch payload budget (%d * %d = %d bytes) exceeds maximum %d bytes",
+			c.BatchSize, c.PayloadBytes, int64(c.BatchSize)*int64(c.PayloadBytes), MaxBatchPayloadBudgetBytes)
+	}
 	if c.OffloadThresholdBytes < 0 {
 		return fmt.Errorf("offload_threshold_bytes %d must be > 0", c.OffloadThresholdBytes)
 	}
@@ -209,7 +257,7 @@ func (c *RunnerConfig) Normalize() error {
 		c.Location = "US"
 	}
 	if c.EphemeralDataset && !c.ephemeralDatasetGenerated && strings.TrimSpace(c.DatasetID) != "" {
-		return errors.New("dataset_id must not be set when ephemeral_dataset is true; a unique otel_bench_<timestamp> dataset is generated automatically")
+		return errors.New("dataset_id must not be set when ephemeral_dataset is true; a unique otel_bench_<timestamp>_<random_hex> dataset is generated automatically")
 	}
 	if c.Mode == ModeBQFake {
 		if c.ProjectID == "" {
@@ -224,12 +272,123 @@ func (c *RunnerConfig) Normalize() error {
 		}
 		if c.EphemeralDataset {
 			if strings.TrimSpace(c.DatasetID) == "" {
-				c.DatasetID = fmt.Sprintf("otel_bench_%d", time.Now().UTC().UnixNano()/1e6)
+				dsID, err := generateEphemeralDatasetID()
+				if err != nil {
+					return err
+				}
+				c.DatasetID = dsID
 				c.ephemeralDatasetGenerated = true
 			}
 		} else if strings.TrimSpace(c.DatasetID) == "" {
 			return errors.New("dataset_id is required when mode is \"live\" and ephemeral_dataset is false")
 		}
+	}
+	return nil
+}
+
+func buildExporterConfig(cfg RunnerConfig, signal, fakeAddr string) (*bigqueryexporter.Config, error) {
+	factory := bigqueryexporter.NewFactory()
+	expCfg, ok := factory.CreateDefaultConfig().(*bigqueryexporter.Config)
+	if !ok {
+		return nil, errors.New("unexpected exporter config type")
+	}
+
+	// Disable the asynchronous sending_queue wrapper so ConsumeTraces/Logs/Metrics
+	// measures synchronous end-to-end pipeline + Storage Write API AppendRows
+	// acknowledgement latency directly instead of buffering in memory.
+	expCfg.QueueSettings = configoptional.None[exporterhelper.QueueBatchConfig]()
+	expCfg.Project = cfg.ProjectID
+	expCfg.Dataset = cfg.DatasetID
+	expCfg.Location = cfg.Location
+	expCfg.Write.StreamPoolSize = cfg.StreamPoolSize
+	expCfg.Write.ConnectionPoolSize = cfg.ConnectionPoolSize
+	expCfg.Write.MaxInflightRequests = cfg.MaxInflightRequests
+	expCfg.Write.MaxRequestBytes = cfg.MaxRequestBytes
+	expCfg.Write.Compression = cfg.Compression
+
+	useLocalOffload := cfg.OffloadDir != "" && (signal == "traces" || signal == "logs")
+	expCfg.Redaction.Enabled = cfg.Redaction && !useLocalOffload
+	if expCfg.Redaction.Enabled {
+		expCfg.Redaction.RedactLogBody = true
+		expCfg.Redaction.BlockedValuePatterns = blockedSecretPatterns
+	}
+	if cfg.OffloadGCSBucket != "" {
+		expCfg.Offload.Enabled = true
+		expCfg.Offload.Bucket = cfg.OffloadGCSBucket
+		if cfg.OffloadThresholdBytes > 0 {
+			expCfg.Offload.MinBytes = cfg.OffloadThresholdBytes
+		}
+	}
+	if cfg.Backpressure {
+		expCfg.Write.Backpressure.Enabled = true
+		if cfg.SimulateAckDelay > 0 {
+			expCfg.Write.Backpressure.LatencyThreshold = cfg.SimulateAckDelay / 2
+			if expCfg.Write.Backpressure.LatencyThreshold < time.Millisecond {
+				expCfg.Write.Backpressure.LatencyThreshold = time.Millisecond
+			}
+		}
+	}
+
+	if cfg.Mode == ModeBQFake {
+		expCfg.Endpoint.URL = fakeAddr
+		expCfg.Endpoint.Insecure = true
+		expCfg.Endpoint.WithoutAuthentication = true
+		expCfg.TimeoutSettings.Timeout = 10 * time.Second
+		expCfg.BackOffConfig.InitialInterval = 10 * time.Millisecond
+		expCfg.BackOffConfig.MaxInterval = 50 * time.Millisecond
+	} else {
+		expCfg.TimeoutSettings.Timeout = 30 * time.Second
+		if cfg.EphemeralDataset {
+			// Ephemeral datasets are explicitly created and ownership-verified
+			// by createEphemeralDataset before the exporter starts, so the
+			// exporter verifies dataset existence (AutoCreate.Dataset = false)
+			// and auto-provisions tables + views inside the owned dataset.
+			expCfg.AutoCreate.Dataset = false
+			expCfg.AutoCreate.Tables = true
+			expCfg.Quarantine.Enabled = true
+		}
+	}
+	if cfg.CallTimeout > 0 {
+		expCfg.TimeoutSettings.Timeout = cfg.CallTimeout
+	}
+	if err := expCfg.Validate(); err != nil {
+		return nil, fmt.Errorf("validating exporter config: %w", err)
+	}
+	return expCfg, nil
+}
+
+func validateRunConfig(ctx context.Context, cfg *RunnerConfig, poolSizes []int) error {
+	if err := cfg.Normalize(); err != nil {
+		return err
+	}
+	for _, ps := range poolSizes {
+		if ps < 1 || ps > 16 {
+			return fmt.Errorf("stream_pool_size %d must be between 1 and 16", ps)
+		}
+	}
+	if cfg.OffloadDir != "" {
+		if info, err := os.Stat(cfg.OffloadDir); err == nil && !info.IsDir() {
+			return fmt.Errorf("offload_dir %q is not a directory", cfg.OffloadDir)
+		}
+		if err := os.MkdirAll(cfg.OffloadDir, 0o750); err != nil {
+			return fmt.Errorf("validating offload_dir %q: %w", cfg.OffloadDir, err)
+		}
+	}
+	checkPools := poolSizes
+	if len(checkPools) == 0 {
+		checkPools = []int{cfg.StreamPoolSize}
+	}
+	for _, ps := range checkPools {
+		stepCfg := *cfg
+		stepCfg.StreamPoolSize = ps
+		for _, sig := range stepCfg.Signals {
+			if _, err := buildExporterConfig(stepCfg, sig, "127.0.0.1:1"); err != nil {
+				return err
+			}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -284,25 +443,28 @@ type TelemetrySnapshot struct {
 
 // SignalResult captures the benchmark measurements for one signal or combined run.
 type SignalResult struct {
-	Signal             string            `json:"signal"`
-	Mode               string            `json:"mode"`
-	StreamPoolSize     int               `json:"stream_pool_size"`
-	ConnectionPoolSize int               `json:"connection_pool_size"`
-	Workers            int               `json:"workers"`
-	BatchSize          int               `json:"batch_size"`
-	PayloadBytes       int               `json:"payload_bytes"`
-	Redaction          bool              `json:"redaction"`
-	Backpressure       bool              `json:"backpressure"`
-	ElapsedSeconds     float64           `json:"elapsed_seconds"`
-	BatchesSucceeded   int64             `json:"batches_succeeded"`
-	BatchesFailed      int64             `json:"batches_failed"`
-	RecordsSubmitted   int64             `json:"records_submitted"`
-	AchievedRowsPerSec float64           `json:"achieved_rows_per_sec"`
-	WireMBPerSec       float64           `json:"wire_mb_per_sec"`
-	BytesPerRow        float64           `json:"bytes_per_row"`
-	Latency            LatencySummary    `json:"latency"`
-	Memory             MemorySummary     `json:"memory"`
-	Telemetry          TelemetrySnapshot `json:"telemetry"`
+	Signal                    string            `json:"signal"`
+	Mode                      string            `json:"mode"`
+	StreamPoolSize            int               `json:"stream_pool_size"`
+	ConnectionPoolSize        int               `json:"connection_pool_size"`
+	Workers                   int               `json:"workers"`
+	BatchSize                 int               `json:"batch_size"`
+	PayloadBytes              int               `json:"payload_bytes"`
+	Redaction                 bool              `json:"redaction"`
+	Backpressure              bool              `json:"backpressure"`
+	ElapsedSeconds            float64           `json:"elapsed_seconds"`
+	BatchesAttempted          int64             `json:"batches_attempted"`
+	BatchesSucceeded          int64             `json:"batches_succeeded"`
+	BatchesFailed             int64             `json:"batches_failed"`
+	RecordsAttempted          int64             `json:"records_attempted"`
+	RecordsSubmitted          int64             `json:"records_submitted"`
+	AchievedRowsPerSec        float64           `json:"achieved_rows_per_sec"`
+	WireMBPerSec              float64           `json:"wire_mb_per_sec"`
+	BytesPerRow               float64           `json:"bytes_per_row"`
+	AttemptedBytesPerAckedRow float64           `json:"attempted_bytes_per_acked_row,omitempty"`
+	Latency                   LatencySummary    `json:"latency"`
+	Memory                    MemorySummary     `json:"memory"`
+	Telemetry                 TelemetrySnapshot `json:"telemetry"`
 }
 
 // BenchmarkReport aggregates one or more SignalResults from a run or sweep.
@@ -318,12 +480,12 @@ type BenchmarkReport struct {
 }
 
 // Run executes the benchmark specified by cfg and returns a structured report.
-func Run(ctx context.Context, cfg RunnerConfig) (*BenchmarkReport, error) {
-	if err := cfg.Normalize(); err != nil {
+func Run(ctx context.Context, cfg RunnerConfig) (report *BenchmarkReport, retErr error) {
+	if err := validateRunConfig(ctx, &cfg, nil); err != nil {
 		return nil, err
 	}
 
-	report := &BenchmarkReport{
+	report = &BenchmarkReport{
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		GoVersion: runtime.Version(),
 		GOOS:      runtime.GOOS,
@@ -333,57 +495,74 @@ func Run(ctx context.Context, cfg RunnerConfig) (*BenchmarkReport, error) {
 	}
 
 	if cfg.Mode == ModeLive && cfg.EphemeralDataset && !cfg.KeepEphemeralDataset {
-		exists, err := datasetExists(ctx, cfg.ProjectID, cfg.DatasetID)
-		if err != nil {
+		if err := createEphemeralDataset(ctx, cfg.ProjectID, cfg.DatasetID, cfg.Location, cfg.ClientOptions...); err != nil {
 			return nil, err
 		}
-		if exists {
-			return nil, fmt.Errorf("refusing to use existing dataset %s.%s with ephemeral_dataset=true", cfg.ProjectID, cfg.DatasetID)
+		owned := true
+		if owned {
+			defer func() {
+				cleanupCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+				defer cancel()
+				if delErr := DeleteDatasetWithContents(cleanupCtx, cfg.ProjectID, cfg.DatasetID, cfg.ClientOptions...); delErr != nil {
+					_, _ = fmt.Fprintf(os.Stderr, "bq-otel-testbench: failed to delete ephemeral dataset %s.%s: %v\n", cfg.ProjectID, cfg.DatasetID, delErr)
+					retErr = errors.Join(retErr, delErr)
+				} else if report != nil {
+					report.EphemeralDatasetDeleted = true
+				}
+			}()
 		}
-		defer func() {
-			cleanupCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-			defer cancel()
-			if err := DeleteDatasetWithContents(cleanupCtx, cfg.ProjectID, cfg.DatasetID); err != nil {
-				_, _ = fmt.Fprintf(os.Stderr, "bq-otel-testbench: failed to delete ephemeral dataset %s.%s: %v\n", cfg.ProjectID, cfg.DatasetID, err)
-			} else {
-				report.EphemeralDatasetDeleted = true
-			}
-		}()
 	}
 
-	var zeroAckErr error
+	var runErr error
 	for _, sig := range cfg.Signals {
-		res, err := runSingleSignal(ctx, cfg, sig)
+		res, firstConsumeErr, err := runSingleSignal(ctx, cfg, sig)
 		if err != nil {
-			return nil, fmt.Errorf("benchmark signal %s: %w", sig, err)
+			return report, fmt.Errorf("benchmark signal %s: %w", sig, err)
 		}
 		report.Results = append(report.Results, res)
 		if ctx.Err() != nil {
 			return report, fmt.Errorf("benchmark signal %s interrupted before completion: %w", sig, ctx.Err())
 		}
-		if res.Telemetry.AcknowledgedRows == 0 && (res.Telemetry.RejectedRows > 0 || res.BatchesFailed > 0 || res.RecordsSubmitted > 0) && zeroAckErr == nil {
-			zeroAckErr = fmt.Errorf("benchmark signal %s acknowledged 0 rows (submitted=%d, rejected=%d, batches_failed=%d)",
-				sig, res.RecordsSubmitted, res.Telemetry.RejectedRows, res.BatchesFailed)
+		if res.Latency.Samples == 0 || res.BatchesSucceeded == 0 || res.RecordsSubmitted == 0 || res.Telemetry.AcknowledgedRows == 0 {
+			sigErr := fmt.Errorf("benchmark signal %s acknowledged 0 rows or completed 0 batches (samples=%d, batches_attempted=%d, batches_succeeded=%d, batches_failed=%d, submitted=%d, rejected=%d, acked=%d)",
+				sig, res.Latency.Samples, res.BatchesAttempted, res.BatchesSucceeded, res.BatchesFailed, res.RecordsSubmitted, res.Telemetry.RejectedRows, res.Telemetry.AcknowledgedRows)
+			if firstConsumeErr != nil {
+				sigErr = errors.Join(sigErr, firstConsumeErr)
+			}
+			if runErr == nil {
+				runErr = sigErr
+			}
+			continue
+		}
+		if res.BatchesFailed > 0 && !cfg.AllowPartialFailures {
+			sigErr := fmt.Errorf("benchmark signal %s had %d failed batches out of %d attempted (succeeded=%d, acked=%d)",
+				sig, res.BatchesFailed, res.BatchesAttempted, res.BatchesSucceeded, res.Telemetry.AcknowledgedRows)
+			if firstConsumeErr != nil {
+				sigErr = errors.Join(sigErr, firstConsumeErr)
+			}
+			if runErr == nil {
+				runErr = sigErr
+			}
 		}
 	}
-	if zeroAckErr != nil {
-		return report, zeroAckErr
+	if runErr != nil {
+		return report, runErr
 	}
 	return report, nil
 }
 
 // RunStreamPoolSweep executes cfg across each streamPoolSizes value (e.g. 1, 2, 4, 8, 16)
 // and returns a combined BenchmarkReport. In live mode with EphemeralDataset, a single
-// ephemeral dataset is shared across the sweep and deleted upon completion.
-func RunStreamPoolSweep(ctx context.Context, cfg RunnerConfig, streamPoolSizes []int) (*BenchmarkReport, error) {
+// ephemeral dataset is created upfront, shared across the sweep, and deleted upon completion.
+func RunStreamPoolSweep(ctx context.Context, cfg RunnerConfig, streamPoolSizes []int) (combined *BenchmarkReport, retErr error) {
 	if len(streamPoolSizes) == 0 {
 		streamPoolSizes = []int{1, 2, 4, 8, 16}
 	}
-	if err := cfg.Normalize(); err != nil {
+	if err := validateRunConfig(ctx, &cfg, streamPoolSizes); err != nil {
 		return nil, err
 	}
 
-	combined := &BenchmarkReport{
+	combined = &BenchmarkReport{
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		GoVersion: runtime.Version(),
 		GOOS:      runtime.GOOS,
@@ -393,22 +572,22 @@ func RunStreamPoolSweep(ctx context.Context, cfg RunnerConfig, streamPoolSizes [
 	}
 
 	if cfg.Mode == ModeLive && cfg.EphemeralDataset && !cfg.KeepEphemeralDataset {
-		exists, err := datasetExists(ctx, cfg.ProjectID, cfg.DatasetID)
-		if err != nil {
+		if err := createEphemeralDataset(ctx, cfg.ProjectID, cfg.DatasetID, cfg.Location, cfg.ClientOptions...); err != nil {
 			return nil, err
 		}
-		if exists {
-			return nil, fmt.Errorf("refusing to use existing dataset %s.%s with ephemeral_dataset=true", cfg.ProjectID, cfg.DatasetID)
+		owned := true
+		if owned {
+			defer func() {
+				cleanupCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+				defer cancel()
+				if delErr := DeleteDatasetWithContents(cleanupCtx, cfg.ProjectID, cfg.DatasetID, cfg.ClientOptions...); delErr != nil {
+					_, _ = fmt.Fprintf(os.Stderr, "bq-otel-testbench: failed to delete ephemeral dataset %s.%s: %v\n", cfg.ProjectID, cfg.DatasetID, delErr)
+					retErr = errors.Join(retErr, delErr)
+				} else if combined != nil {
+					combined.EphemeralDatasetDeleted = true
+				}
+			}()
 		}
-		defer func() {
-			cleanupCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-			defer cancel()
-			if err := DeleteDatasetWithContents(cleanupCtx, cfg.ProjectID, cfg.DatasetID); err != nil {
-				_, _ = fmt.Fprintf(os.Stderr, "bq-otel-testbench: failed to delete ephemeral dataset %s.%s: %v\n", cfg.ProjectID, cfg.DatasetID, err)
-			} else {
-				combined.EphemeralDatasetDeleted = true
-			}
-		}()
 	}
 
 	for _, poolSize := range streamPoolSizes {
@@ -416,10 +595,12 @@ func RunStreamPoolSweep(ctx context.Context, cfg RunnerConfig, streamPoolSizes [
 		stepCfg.StreamPoolSize = poolSize
 		stepCfg.KeepEphemeralDataset = true
 		stepReport, err := Run(ctx, stepCfg)
-		if err != nil {
-			return nil, err
+		if stepReport != nil {
+			combined.Results = append(combined.Results, stepReport.Results...)
 		}
-		combined.Results = append(combined.Results, stepReport.Results...)
+		if err != nil {
+			return combined, err
+		}
 	}
 	return combined, nil
 }
@@ -462,6 +643,25 @@ func datasetExists(ctx context.Context, projectID, datasetID string, opts ...opt
 	return false, fmt.Errorf("checking whether dataset %s.%s exists: %w", projectID, datasetID, err)
 }
 
+func createEphemeralDataset(ctx context.Context, projectID, datasetID, location string, opts ...option.ClientOption) error {
+	exists, err := datasetExists(ctx, projectID, datasetID, opts...)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return fmt.Errorf("refusing to use existing dataset %s.%s with ephemeral_dataset=true", projectID, datasetID)
+	}
+	client, closeAll, err := newBigQueryClient(ctx, projectID, opts...)
+	if err != nil {
+		return fmt.Errorf("creating bigquery client for ephemeral dataset provisioning: %w", err)
+	}
+	defer closeAll()
+	if err := client.Dataset(datasetID).Create(ctx, &bigquery.DatasetMetadata{Location: location}); err != nil {
+		return fmt.Errorf("creating ephemeral dataset %s.%s: %w", projectID, datasetID, err)
+	}
+	return nil
+}
+
 // DeleteDatasetWithContents removes a BigQuery dataset and all tables inside it.
 func DeleteDatasetWithContents(ctx context.Context, projectID, datasetID string, opts ...option.ClientOption) error {
 	client, closeAll, err := newBigQueryClient(ctx, projectID, opts...)
@@ -475,141 +675,31 @@ func DeleteDatasetWithContents(ctx context.Context, projectID, datasetID string,
 	return nil
 }
 
-func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (SignalResult, error) {
+func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (SignalResult, error, error) {
 	var fakeSrv *bqfake.Server
+	var fakeAddr string
 	if cfg.Mode == ModeBQFake {
 		var err error
 		fakeSrv, err = bqfake.New()
 		if err != nil {
-			return SignalResult{}, fmt.Errorf("starting bqfake server: %w", err)
+			return SignalResult{}, nil, fmt.Errorf("starting bqfake server: %w", err)
 		}
 		defer func() { _ = fakeSrv.Close() }()
+		fakeAddr = fakeSrv.Addr()
 	}
 
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	defer func() { _ = mp.Shutdown(context.Background()) }()
 
-	factory := bigqueryexporter.NewFactory()
-	expCfg, ok := factory.CreateDefaultConfig().(*bigqueryexporter.Config)
-	if !ok {
-		return SignalResult{}, errors.New("unexpected exporter config type")
-	}
-
-	// Disable the asynchronous sending_queue wrapper so ConsumeTraces/Logs/Metrics
-	// measures synchronous end-to-end pipeline + Storage Write API AppendRows
-	// acknowledgement latency directly instead of buffering in memory.
-	expCfg.QueueSettings = configoptional.None[exporterhelper.QueueBatchConfig]()
-	expCfg.Project = cfg.ProjectID
-	expCfg.Dataset = cfg.DatasetID
-	expCfg.Location = cfg.Location
-	expCfg.Write.StreamPoolSize = cfg.StreamPoolSize
-	expCfg.Write.ConnectionPoolSize = cfg.ConnectionPoolSize
-	expCfg.Write.MaxInflightRequests = cfg.MaxInflightRequests
-	expCfg.Write.MaxRequestBytes = cfg.MaxRequestBytes
-	expCfg.Write.Compression = cfg.Compression
-	blockedPatterns := []string{
-		`Bearer\s+sk-[A-Za-z0-9_-]{16,}`,
-		`ya29\.[0-9A-Za-z_-]{20,}`,
-		`AKIA[0-9A-Z]{16}`,
-	}
-	useLocalOffload := cfg.OffloadDir != "" && (signal == "traces" || signal == "logs")
-	expCfg.Redaction.Enabled = cfg.Redaction && !useLocalOffload
-	if expCfg.Redaction.Enabled {
-		expCfg.Redaction.RedactLogBody = true
-		expCfg.Redaction.BlockedValuePatterns = blockedPatterns
-	}
-	if cfg.OffloadGCSBucket != "" {
-		expCfg.Offload.Enabled = true
-		expCfg.Offload.Bucket = cfg.OffloadGCSBucket
-		if cfg.OffloadThresholdBytes > 0 {
-			expCfg.Offload.MinBytes = cfg.OffloadThresholdBytes
-		}
-	}
-	if cfg.Backpressure {
-		expCfg.Write.Backpressure.Enabled = true
-		if cfg.SimulateAckDelay > 0 {
-			expCfg.Write.Backpressure.LatencyThreshold = cfg.SimulateAckDelay / 2
-			if expCfg.Write.Backpressure.LatencyThreshold < time.Millisecond {
-				expCfg.Write.Backpressure.LatencyThreshold = time.Millisecond
-			}
-		}
-	}
-
-	if cfg.Mode == ModeBQFake {
-		expCfg.Endpoint.URL = fakeSrv.Addr()
-		expCfg.Endpoint.Insecure = true
-		expCfg.Endpoint.WithoutAuthentication = true
-		expCfg.TimeoutSettings.Timeout = 10 * time.Second
-		expCfg.BackOffConfig.InitialInterval = 10 * time.Millisecond
-		expCfg.BackOffConfig.MaxInterval = 50 * time.Millisecond
-	} else {
-		expCfg.TimeoutSettings.Timeout = 30 * time.Second
-		if cfg.EphemeralDataset {
-			expCfg.AutoCreate.Dataset = true
-			expCfg.AutoCreate.Tables = true
-			expCfg.Quarantine.Enabled = true
-		}
-	}
-	if cfg.CallTimeout > 0 {
-		expCfg.TimeoutSettings.Timeout = cfg.CallTimeout
-	}
-
-	if err := expCfg.Validate(); err != nil {
-		return SignalResult{}, fmt.Errorf("validating exporter config: %w", err)
-	}
-
-	telSet := componenttest.NewNopTelemetrySettings()
-	telSet.Logger = zap.NewNop()
-	telSet.MeterProvider = mp
-	set := exporter.Settings{
-		ID:                component.NewID(component.MustNewType("bigquery")),
-		TelemetrySettings: telSet,
-	}
-
-	var (
-		tracesExp  exporter.Traces
-		logsExp    exporter.Logs
-		metricsExp exporter.Metrics
-		err        error
-	)
-
-	switch signal {
-	case "traces":
-		tracesExp, err = factory.CreateTraces(ctx, set, expCfg)
-	case "logs":
-		logsExp, err = factory.CreateLogs(ctx, set, expCfg)
-	case "metrics":
-		metricsExp, err = factory.CreateMetrics(ctx, set, expCfg)
-	}
+	expCfg, err := buildExporterConfig(cfg, signal, fakeAddr)
 	if err != nil {
-		return SignalResult{}, fmt.Errorf("creating %s exporter: %w", signal, err)
+		return SignalResult{}, nil, err
 	}
 
-	host := componenttest.NewNopHost()
-	startExp := func(c component.Component) error {
-		return c.Start(ctx, host)
-	}
-	stopExp := func(c component.Component) error {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		return c.Shutdown(shutdownCtx)
-	}
-
-	var activeComp component.Component
-	switch signal {
-	case "traces":
-		activeComp = tracesExp
-	case "logs":
-		activeComp = logsExp
-	case "metrics":
-		activeComp = metricsExp
-	}
-	if err := startExp(activeComp); err != nil {
-		return SignalResult{}, fmt.Errorf("starting %s exporter: %w", signal, err)
-	}
-
-	// Optional local-directory content-addressed payload offloader.
+	// Optional local-directory content-addressed payload offloader and generator
+	// are constructed BEFORE starting the exporter so any initialization error or
+	// allocation panic cannot leak started exporter background goroutines.
 	var (
 		localOffloader      *offload.Offloader
 		localRedactor       *redact.Redactor
@@ -640,19 +730,17 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 			},
 		})
 		if err != nil {
-			_ = stopExp(activeComp)
-			return SignalResult{}, fmt.Errorf("creating local offloader: %w", err)
+			return SignalResult{}, nil, fmt.Errorf("creating local offloader: %w", err)
 		}
 		if cfg.Redaction {
 			localRedactor, err = redact.New(redact.Config{
 				BlockedKeys:          redact.DefaultBlockedKeys(),
-				BlockedValuePatterns: blockedPatterns,
+				BlockedValuePatterns: blockedSecretPatterns,
 				MaskReplacement:      redact.DefaultMaskReplacement,
 				RedactLogBody:        true,
 			})
 			if err != nil {
-				_ = stopExp(activeComp)
-				return SignalResult{}, fmt.Errorf("creating local redactor: %w", err)
+				return SignalResult{}, nil, fmt.Errorf("creating local redactor: %w", err)
 			}
 		}
 	}
@@ -668,9 +756,6 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 	// stream pool routing, AIMD backpressure, gRPC Write API I/O) rather than
 	// synthetic string building. When UniquePayloads is true, workers generate
 	// fresh batches per dispatch so every record carries a distinct payload.
-	// In standard exporter mode, internal/redact.Redactor clones on write when a
-	// batch matches; in local-offload mode (localOffloader != nil), each worker
-	// clones the prebuilt batch before running Step-0 redaction and offload.
 	const prebuiltCount = 8
 	prebuiltTraces := make([]ptrace.Traces, prebuiltCount)
 	prebuiltLogs := make([]plog.Logs, prebuiltCount)
@@ -688,18 +773,86 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 		}
 	}
 
+	factory := bigqueryexporter.NewFactory()
+	telSet := componenttest.NewNopTelemetrySettings()
+	telSet.Logger = zap.NewNop()
+	telSet.MeterProvider = mp
+	set := exporter.Settings{
+		ID:                component.NewID(component.MustNewType("bigquery")),
+		TelemetrySettings: telSet,
+	}
+
+	var (
+		tracesExp  exporter.Traces
+		logsExp    exporter.Logs
+		metricsExp exporter.Metrics
+	)
+	switch signal {
+	case "traces":
+		tracesExp, err = factory.CreateTraces(ctx, set, expCfg)
+	case "logs":
+		logsExp, err = factory.CreateLogs(ctx, set, expCfg)
+	case "metrics":
+		metricsExp, err = factory.CreateMetrics(ctx, set, expCfg)
+	}
+	if err != nil {
+		return SignalResult{}, nil, fmt.Errorf("creating %s exporter: %w", signal, err)
+	}
+
+	host := componenttest.NewNopHost()
+	startExp := func(c component.Component) error {
+		return c.Start(ctx, host)
+	}
+	stopExp := func(c component.Component) error {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		return c.Shutdown(shutdownCtx)
+	}
+
+	var activeComp component.Component
+	switch signal {
+	case "traces":
+		activeComp = tracesExp
+	case "logs":
+		activeComp = logsExp
+	case "metrics":
+		activeComp = metricsExp
+	}
+	if err := startExp(activeComp); err != nil {
+		return SignalResult{}, nil, fmt.Errorf("starting %s exporter: %w", signal, err)
+	}
+
+	var (
+		stopOnce sync.Once
+		stopErr  error
+	)
+	shutdownExporter := func() error {
+		stopOnce.Do(func() {
+			stopErr = stopExp(activeComp)
+		})
+		return stopErr
+	}
+	defer func() {
+		_ = shutdownExporter()
+	}()
+
 	runtime.GC()
 	var memBefore runtime.MemStats
 	runtime.ReadMemStats(&memBefore)
 	cpuBefore, _ := readProcessCPUAndRSS()
 
 	var (
+		batchesAttempted atomic.Int64
 		batchesSucceeded atomic.Int64
 		batchesFailed    atomic.Int64
+		recordsAttempted atomic.Int64
 		recordsSubmitted atomic.Int64
 		batchSeq         atomic.Int64
 		latMu            sync.Mutex
 		latenciesMs      = make([]float64, 0, 1024)
+		errMu            sync.Mutex
+		firstConsumeErr  error
+		panicErr         error
 	)
 
 	targetTable := "otel_" + signal
@@ -725,6 +878,16 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					errMu.Lock()
+					if panicErr == nil {
+						panicErr = fmt.Errorf("worker %d panicked: %v", workerID, r)
+					}
+					errMu.Unlock()
+					cancelRun()
+				}
+			}()
 			var nextTick time.Time
 			if perWorkerInterval > 0 {
 				nextTick = time.Now()
@@ -746,6 +909,9 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 				}
 
 				seq := int(batchSeq.Add(1))
+				if cfg.workerHook != nil {
+					cfg.workerHook(workerID, seq)
+				}
 				if fakeSrv != nil {
 					if cfg.SimulateThrottleEvery > 0 && seq%cfg.SimulateThrottleEvery == 0 {
 						fakeSrv.EnqueueFault(bqfake.Fault{
@@ -832,10 +998,19 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 					if ctx.Err() != nil && (errors.Is(consumeErr, context.DeadlineExceeded) || errors.Is(consumeErr, context.Canceled)) {
 						return
 					}
+					batchesAttempted.Add(1)
+					recordsAttempted.Add(int64(cfg.BatchSize))
 					batchesFailed.Add(1)
+					errMu.Lock()
+					if firstConsumeErr == nil {
+						firstConsumeErr = consumeErr
+					}
+					errMu.Unlock()
 					continue
 				}
 
+				batchesAttempted.Add(1)
+				recordsAttempted.Add(int64(cfg.BatchSize))
 				batchesSucceeded.Add(1)
 				recordsSubmitted.Add(int64(cfg.BatchSize))
 				latMu.Lock()
@@ -846,6 +1021,10 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 	}
 
 	wg.Wait()
+	if panicErr != nil {
+		_ = shutdownExporter()
+		return SignalResult{}, firstConsumeErr, panicErr
+	}
 	elapsed := time.Since(startWall)
 	if elapsed <= 0 {
 		elapsed = time.Millisecond
@@ -856,8 +1035,8 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 	runtime.ReadMemStats(&memAfter)
 	cpuAfter, peakRSSMB := readProcessCPUAndRSS()
 
-	if err := stopExp(activeComp); err != nil {
-		return SignalResult{}, fmt.Errorf("shutting down %s exporter: %w", signal, err)
+	if err := shutdownExporter(); err != nil {
+		return SignalResult{}, firstConsumeErr, fmt.Errorf("shutting down %s exporter: %w", signal, err)
 	}
 
 	var rm metricdata.ResourceMetrics
@@ -888,9 +1067,18 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 	ackedRows := telem.AcknowledgedRows
 	rowsPerSec := float64(ackedRows) / elapsedSec
 	wireMBPerSec := (float64(telem.AppendBytesTotal) / (1024.0 * 1024.0)) / elapsedSec
-	var bytesPerRow float64
+	var (
+		bytesPerRow               float64
+		attemptedBytesPerAckedRow float64
+	)
 	if ackedRows > 0 {
-		bytesPerRow = float64(telem.AppendBytesTotal) / float64(ackedRows)
+		attemptedBytesPerAckedRow = float64(telem.AppendBytesTotal) / float64(ackedRows)
+		bytesPerRow = attemptedBytesPerAckedRow
+		succeededBatches := batchesSucceeded.Load()
+		totalAppendAttempts := succeededBatches + telem.Retries + batchesFailed.Load()
+		if succeededBatches > 0 && totalAppendAttempts > succeededBatches {
+			bytesPerRow = (float64(telem.AppendBytesTotal) * float64(succeededBatches) / float64(totalAppendAttempts)) / float64(ackedRows)
+		}
 	}
 
 	cpuDeltaSec := cpuAfter - cpuBefore
@@ -917,23 +1105,26 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 	}
 
 	return SignalResult{
-		Signal:             signal,
-		Mode:               cfg.Mode,
-		StreamPoolSize:     cfg.StreamPoolSize,
-		ConnectionPoolSize: cfg.ConnectionPoolSize,
-		Workers:            cfg.Workers,
-		BatchSize:          cfg.BatchSize,
-		PayloadBytes:       cfg.PayloadBytes,
-		Redaction:          cfg.Redaction,
-		Backpressure:       cfg.Backpressure,
-		ElapsedSeconds:     round2(elapsedSec),
-		BatchesSucceeded:   batchesSucceeded.Load(),
-		BatchesFailed:      batchesFailed.Load(),
-		RecordsSubmitted:   recordsSubmitted.Load(),
-		AchievedRowsPerSec: round2(rowsPerSec),
-		WireMBPerSec:       round2(wireMBPerSec),
-		BytesPerRow:        round2(bytesPerRow),
-		Latency:            computeLatencySummary(latenciesMs),
+		Signal:                    signal,
+		Mode:                      cfg.Mode,
+		StreamPoolSize:            cfg.StreamPoolSize,
+		ConnectionPoolSize:        cfg.ConnectionPoolSize,
+		Workers:                   cfg.Workers,
+		BatchSize:                 cfg.BatchSize,
+		PayloadBytes:              cfg.PayloadBytes,
+		Redaction:                 cfg.Redaction,
+		Backpressure:              cfg.Backpressure,
+		ElapsedSeconds:            round2(elapsedSec),
+		BatchesAttempted:          batchesAttempted.Load(),
+		BatchesSucceeded:          batchesSucceeded.Load(),
+		BatchesFailed:             batchesFailed.Load(),
+		RecordsAttempted:          recordsAttempted.Load(),
+		RecordsSubmitted:          recordsSubmitted.Load(),
+		AchievedRowsPerSec:        round2(rowsPerSec),
+		WireMBPerSec:              round2(wireMBPerSec),
+		BytesPerRow:               round2(bytesPerRow),
+		AttemptedBytesPerAckedRow: round2(attemptedBytesPerAckedRow),
+		Latency:                   computeLatencySummary(latenciesMs),
 		Memory: MemorySummary{
 			HeapAllocBytes:       memAfter.HeapAlloc,
 			HeapAllocMB:          round2(float64(memAfter.HeapAlloc) / (1024.0 * 1024.0)),
@@ -949,7 +1140,7 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 			CPUCoresPer10kRowsS:  round2(cpuCoresPer10k),
 		},
 		Telemetry: telem,
-	}, nil
+	}, firstConsumeErr, nil
 }
 
 type localDirBlobStore struct {

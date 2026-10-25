@@ -947,12 +947,12 @@ deadline, every sender returns at its deadline, only eight requests reach the
 stream, and the next append recovers on a new stream without a restart. The
 `cmd/bq-otel-testbench` load harness (`make bench-envelope`) validates both
 in-process `bqfake` pipeline scaling (`write.stream_pool_size` `1..16`, reaching
-`40,454` spans/s, `40,967` logs/s, and `35,459` metric points/s at
-`stream_pool_size: 4`, and peaking at `41,527` spans/s and `45,401` logs/s) and
-live BigQuery Storage Write API throughput (`15,206` spans/s at
-`stream_pool_size: 1` scaling to `24,066` spans/s / `67.48 MiB/s` wire and
-`26,604` logs/s / `57.26 MiB/s` wire at `stream_pool_size: 4`, `p50 = 110.6–120.7 ms`,
-`1.23–1.45` vCPU cores per `10,000` rows/s, `137.5 MiB` process peak RSS). Full
+`27,896` spans/s, `28,983` logs/s, and `23,544` metric points/s at
+`stream_pool_size: 4`, and peaking at `29,459` spans/s and `28,983` logs/s) and
+live BigQuery Storage Write API throughput (`10,404` spans/s / `28.72 MiB/s`
+wire, `9,594` logs/s / `21.81 MiB/s` wire, and `9,185` metric points/s /
+`10.97 MiB/s` wire at `stream_pool_size: 4`, `p50 = 114.9–129.9 ms`,
+`1.24–1.66` vCPU cores per `10,000` rows/s, `86.8 MiB` process peak RSS). Full
 tables and reproduction commands are recorded in
 [`docs/benchmarks/v0.1.0-performance-envelope.md`](docs/benchmarks/v0.1.0-performance-envelope.md),
 and monthly TCO formulas are documented in

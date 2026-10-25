@@ -19,99 +19,124 @@ import (
 )
 
 // FrameworkSpec describes one of the 7 supported GenAI agent frameworks
-// profiled by the workload generator.
+// profiled by the workload generator, matching testdata/otlp/manifest.yaml.
 type FrameworkSpec struct {
-	Framework   string
-	Provider    string
-	System      string
-	Model       string
-	AgentName   string
-	ToolName    string
-	ScopeName   string
-	ScopeVer    string
-	ServiceName string
+	Framework     string
+	Provider      string
+	System        string
+	Model         string
+	ResponseModel string
+	AgentName     string
+	AgentID       string
+	ToolName      string
+	ScopeName     string
+	ScopeVer      string
+	ServiceName   string
+	ServiceVer    string
 }
 
 // DefaultFrameworks returns the 7 canonical GenAI agent frameworks generated
-// across synthetic trace, log, and metric batches.
+// across synthetic trace, log, and metric batches, aligned with
+// testdata/otlp/manifest.yaml and internal/schema view predicates.
 func DefaultFrameworks() []FrameworkSpec {
 	return []FrameworkSpec{
 		{
-			Framework:   "google_adk",
-			Provider:    "gcp.vertex_ai",
-			System:      "vertex_ai",
-			Model:       "gemini-2.5-pro",
-			AgentName:   "bq_analytics_coordinator",
-			ToolName:    "execute_bigquery_sql",
-			ScopeName:   "google.adk.telemetry",
-			ScopeVer:    "1.4.0",
-			ServiceName: "adk-analytics-agent",
+			Framework:     "google_adk",
+			Provider:      "",
+			System:        "gcp.vertex.agent",
+			Model:         "gemini-2.5-pro",
+			ResponseModel: "gemini-2.5-pro-001",
+			AgentName:     "weather_coordinator",
+			AgentID:       "agent-adk-01",
+			ToolName:      "get_forecast",
+			ScopeName:     "gcp.vertex.agent",
+			ScopeVer:      "2.6.3",
+			ServiceName:   "adk-weather-agent",
+			ServiceVer:    "2.6.3",
 		},
 		{
-			Framework:   "langgraph",
-			Provider:    "openai",
-			System:      "openai",
-			Model:       "gpt-4o-2026-05",
-			AgentName:   "langgraph_research_supervisor",
-			ToolName:    "vector_store_lookup",
-			ScopeName:   "openinference.instrumentation.langchain",
-			ScopeVer:    "0.3.2",
-			ServiceName: "langgraph-router",
+			Framework:     "langgraph",
+			Provider:      "",
+			System:        "langsmith",
+			Model:         "gpt-4o",
+			ResponseModel: "gpt-4o",
+			AgentName:     "research_supervisor",
+			AgentID:       "agent-lg-01",
+			ToolName:      "vector_store_lookup",
+			ScopeName:     "langsmith.otel",
+			ScopeVer:      "0.10.18",
+			ServiceName:   "langgraph-research-graph",
+			ServiceVer:    "1.2.0",
 		},
 		{
-			Framework:   "openai_agents",
-			Provider:    "openai",
-			System:      "openai",
-			Model:       "o3-mini",
-			AgentName:   "triage_handoff_agent",
-			ToolName:    "fetch_customer_ledger",
-			ScopeName:   "openai.agents.tracing",
-			ScopeVer:    "0.2.1",
-			ServiceName: "openai-agents-gateway",
+			Framework:     "openai_agents",
+			Provider:      "openai",
+			System:        "",
+			Model:         "gpt-4o",
+			ResponseModel: "gpt-4o-2024-08-06",
+			AgentName:     "billing_triage",
+			AgentID:       "agent-oai-01",
+			ToolName:      "fetch_customer_ledger",
+			ScopeName:     "opentelemetry.instrumentation.openai_agents",
+			ScopeVer:      "1.0b0",
+			ServiceName:   "openai-triage-agent",
+			ServiceVer:    "0.20.0",
 		},
 		{
-			Framework:   "anthropic_agent_sdk",
-			Provider:    "anthropic",
-			System:      "anthropic",
-			Model:       "claude-sonnet-4-20250514",
-			AgentName:   "code_verification_agent",
-			ToolName:    "sandbox_bash_exec",
-			ScopeName:   "anthropic.agent.telemetry",
-			ScopeVer:    "0.9.0",
-			ServiceName: "anthropic-agent-worker",
+			Framework:     "anthropic_agent_sdk",
+			Provider:      "",
+			System:        "anthropic",
+			Model:         "anthropic-v4-default",
+			ResponseModel: "anthropic-v4-default-20260514",
+			AgentName:     "code-assistant",
+			AgentID:       "agent-anth-01",
+			ToolName:      "sandbox_bash_exec",
+			ScopeName:     "com.anthropic.agent.sdk",
+			ScopeVer:      "2.1.229",
+			ServiceName:   "anthropic-agent-cli",
+			ServiceVer:    "2.1.229",
 		},
 		{
-			Framework:   "crewai",
-			Provider:    "gcp.gemini",
-			System:      "gemini",
-			Model:       "gemini-2.5-flash",
-			AgentName:   "crew_financial_analyst",
-			ToolName:    "sec_filing_extractor",
-			ScopeName:   "openlit.otel.crewai",
-			ScopeVer:    "1.12.0",
-			ServiceName: "crewai-finops-pipeline",
+			Framework:     "crewai",
+			Provider:      "",
+			System:        "",
+			Model:         "gpt-4o-mini",
+			ResponseModel: "gpt-4o-mini",
+			AgentName:     "crew_financial_analyst",
+			AgentID:       "agent-crew-01",
+			ToolName:      "sec_filing_extractor",
+			ScopeName:     "openinference.instrumentation.crewai",
+			ScopeVer:      "1.1.12",
+			ServiceName:   "crewai-analyst-crew",
+			ServiceVer:    "1.15.15",
 		},
 		{
-			Framework:   "aws_bedrock",
-			Provider:    "aws.bedrock",
-			System:      "aws.bedrock",
-			Model:       "anthropic.claude-3-7-sonnet-20250219-v1:0",
-			AgentName:   "bedrock_knowledge_orchestrator",
-			ToolName:    "retrieve_and_generate",
-			ScopeName:   "aws.bedrock.agent.otel",
-			ScopeVer:    "1.1.0",
-			ServiceName: "bedrock-enterprise-agent",
+			Framework:     "aws_bedrock",
+			Provider:      "",
+			System:        "aws.bedrock",
+			Model:         "amazon.nova-pro-v1:0",
+			ResponseModel: "amazon.nova-pro-v1:0",
+			AgentName:     "bedrock_router",
+			AgentID:       "agent-bdrk-01",
+			ToolName:      "retrieve_and_generate",
+			ScopeName:     "opentelemetry.instrumentation.botocore.bedrock-runtime",
+			ScopeVer:      "0.65b0",
+			ServiceName:   "bedrock-converse-worker",
+			ServiceVer:    "0.65b0",
 		},
 		{
-			Framework:   "microsoft_agent_framework",
-			Provider:    "azure.ai.openai",
-			System:      "az.ai.inference",
-			Model:       "gpt-4.1",
-			AgentName:   "semantic_kernel_planner",
-			ToolName:    "graph_calendar_query",
-			ScopeName:   "Microsoft.Extensions.AI.OpenTelemetry",
-			ScopeVer:    "9.3.0",
-			ServiceName: "msft-agent-orchestrator",
+			Framework:     "microsoft_agent_framework",
+			Provider:      "microsoft.agent_framework",
+			System:        "",
+			Model:         "gpt-4o",
+			ResponseModel: "gpt-4o",
+			AgentName:     "support_orchestrator",
+			AgentID:       "maf-agent-09",
+			ToolName:      "graph_calendar_query",
+			ScopeName:     "agent_framework.observability",
+			ScopeVer:      "1.12.0",
+			ServiceName:   "maf-orchestrator",
+			ServiceVer:    "1.12.0",
 		},
 	}
 }
@@ -280,7 +305,7 @@ func (g *Generator) TracesBatch(spanCount int) ptrace.Traces {
 			rs := td.ResourceSpans().AppendEmpty()
 			resAttrs := rs.Resource().Attributes()
 			resAttrs.PutStr("service.name", fw.ServiceName)
-			resAttrs.PutStr("service.version", "0.1.0")
+			resAttrs.PutStr("service.version", fw.ServiceVer)
 			resAttrs.PutStr("deployment.environment.name", "benchmark")
 			resAttrs.PutStr("cloud.provider", "gcp")
 			resAttrs.PutStr("cloud.region", "us-central1")
@@ -310,75 +335,122 @@ func (g *Generator) TracesBatch(spanCount int) ptrace.Traces {
 
 		attrs := sp.Attributes()
 		attrs.PutStr("gen_ai.framework", fw.Framework)
-		attrs.PutStr("gen_ai.provider.name", fw.Provider)
-		attrs.PutStr("gen_ai.system", fw.System)
-		attrs.PutStr("gen_ai.request.model", fw.Model)
-		attrs.PutStr("gen_ai.response.model", fw.Model)
-		attrs.PutStr("gen_ai.agent.name", fw.AgentName)
-		attrs.PutStr("gen_ai.agent.id", fmt.Sprintf("agent-%s-%04d", fw.Framework, treeID%1000))
 		attrs.PutStr("gen_ai.conversation.id", fmt.Sprintf("conv-%08x", treeID%100000))
 		attrs.PutStr("session.id", fmt.Sprintf("sess-%08x", treeID%100000))
 
-		switch stepInTree {
-		case 0:
-			// Root invoke_agent span.
-			sp.SetName(fmt.Sprintf("invoke_agent %s", fw.AgentName))
-			sp.SetKind(ptrace.SpanKindInternal)
-			attrs.PutStr("gen_ai.operation.name", "invoke_agent")
-			attrs.PutInt("gen_ai.usage.input_tokens", 1420)
-			attrs.PutInt("gen_ai.usage.output_tokens", 380)
-			attrs.PutStr("gen_ai.input.messages", g.payloadFor(seq))
-		case 1:
-			// Child LLM chat completion span.
-			sp.SetParentSpanID(rootSpanID)
-			sp.SetName(fmt.Sprintf("chat %s", fw.Model))
-			sp.SetKind(ptrace.SpanKindClient)
-			attrs.PutStr("gen_ai.operation.name", "chat")
-			attrs.PutDouble("gen_ai.request.temperature", 0.2)
-			attrs.PutInt("gen_ai.request.max_tokens", 4096)
-			attrs.PutInt("gen_ai.usage.input_tokens", 980)
-			attrs.PutInt("gen_ai.usage.output_tokens", 310)
-			attrs.PutStr("gen_ai.response.id", fmt.Sprintf("chatcmpl-%012x", seq))
-			finish := attrs.PutEmptySlice("gen_ai.response.finish_reasons")
-			finish.AppendEmpty().SetStr("tool_calls")
-			attrs.PutStr("gen_ai.output.messages", g.payloadFor(seq))
-		case 2:
-			// Child tool execution span.
-			sp.SetParentSpanID(rootSpanID)
-			sp.SetName(fmt.Sprintf("execute_tool %s", fw.ToolName))
-			sp.SetKind(ptrace.SpanKindInternal)
-			attrs.PutStr("gen_ai.operation.name", "execute_tool")
-			attrs.PutStr("gen_ai.tool.name", fw.ToolName)
-			attrs.PutStr("gen_ai.tool.type", "function")
-			attrs.PutStr("gen_ai.tool.call.id", fmt.Sprintf("call_%012x", seq))
-			attrs.PutStr("gen_ai.tool.call.arguments", `{"dataset":"analytics_prod","limit":100}`)
-			attrs.PutStr("gen_ai.tool.call.result", g.payloadFor(seq))
-		case 3:
-			// Child MCP client span (tools/call, resources/read, or prompts/get).
-			mcp := mcpMethods[treeID%uint64(len(mcpMethods))]
-			sp.SetParentSpanID(spanIDFromPair(treeID, 2))
-			sp.SetName(fmt.Sprintf("mcp %s %s", mcp.Method, mcp.ToolOrURI))
-			sp.SetKind(ptrace.SpanKindClient)
-			attrs.PutStr("gen_ai.operation.name", "execute_tool")
-			attrs.PutStr("mcp.method.name", mcp.Method)
-			attrs.PutStr("mcp.server.name", mcp.ServerName)
-			attrs.PutStr("server.address", mcp.ServerName)
-			attrs.PutStr("mcp.session.id", fmt.Sprintf("mcp-sess-%08x", treeID%10000))
-			attrs.PutStr("mcp.protocol.version", "2025-06-18")
-			attrs.PutStr("rpc.system", "jsonrpc")
-			attrs.PutStr("rpc.jsonrpc.version", "2.0")
-			reqID := fmt.Sprintf("req-%d", seq)
-			attrs.PutStr("rpc.jsonrpc.request_id", reqID)
-			attrs.PutStr("jsonrpc.request.id", reqID)
-			switch mcp.Method {
-			case "resources/read":
-				attrs.PutStr("mcp.resource.uri", mcp.ToolOrURI)
-			case "prompts/get":
-				attrs.PutStr("gen_ai.prompt.name", mcp.ToolOrURI)
-			default:
-				attrs.PutStr("gen_ai.tool.name", mcp.ToolOrURI)
+		if fw.Framework == "crewai" && stepInTree < 3 {
+			// CrewAI uses OpenInference span attributes rather than standard gen_ai.*
+			// span attributes (testdata/otlp/manifest.yaml), exercising the
+			// openinference.span.kind / crew_tasks / llm.* SQL branches in v_gen_ai_spans.
+			switch stepInTree {
+			case 0:
+				sp.SetName("Crew.kickoff")
+				sp.SetKind(ptrace.SpanKindInternal)
+				attrs.PutStr("openinference.span.kind", "AGENT")
+				attrs.PutStr("crew_tasks", "Analyze quarterly market trends")
+				attrs.PutStr("input.value", g.payloadFor(seq))
+			case 1:
+				sp.SetParentSpanID(rootSpanID)
+				sp.SetName(fmt.Sprintf("ChatCompletion %s", fw.Model))
+				sp.SetKind(ptrace.SpanKindClient)
+				attrs.PutStr("openinference.span.kind", "LLM")
+				attrs.PutStr("llm.model_name", fw.Model)
+				attrs.PutInt("llm.token_count.prompt", 920)
+				attrs.PutInt("llm.token_count.completion", 410)
+				attrs.PutStr("output.value", g.payloadFor(seq))
+			case 2:
+				sp.SetParentSpanID(rootSpanID)
+				sp.SetName(fmt.Sprintf("ToolUsage %s", fw.ToolName))
+				sp.SetKind(ptrace.SpanKindInternal)
+				attrs.PutStr("openinference.span.kind", "TOOL")
+				attrs.PutStr("tool.name", fw.ToolName)
+				attrs.PutStr("output.value", g.payloadFor(seq))
 			}
-			attrs.PutStr("mcp.payload.content", g.payloadFor(seq))
+		} else {
+			if fw.Provider != "" {
+				attrs.PutStr("gen_ai.provider.name", fw.Provider)
+			}
+			if fw.System != "" {
+				attrs.PutStr("gen_ai.system", fw.System)
+			}
+			attrs.PutStr("gen_ai.request.model", fw.Model)
+			attrs.PutStr("gen_ai.response.model", fw.ResponseModel)
+			attrs.PutStr("gen_ai.agent.name", fw.AgentName)
+			attrs.PutStr("gen_ai.agent.id", fw.AgentID)
+
+			switch fw.Framework {
+			case "google_adk":
+				attrs.PutStr("gcp.vertex.agent.invocation_id", fmt.Sprintf("inv-adk-%08x", treeID))
+				attrs.PutStr("gcp.vertex.agent.session_id", fmt.Sprintf("sess-adk-%08x", treeID%100000))
+				attrs.PutStr("gcp.vertex.agent.event_id", fmt.Sprintf("evt-adk-%08x", seq))
+				attrs.PutStr("user.id", fmt.Sprintf("user-adk-%04d", treeID%1000))
+			case "langgraph":
+				attrs.PutStr("langsmith.metadata.graph_node", "planner")
+				attrs.PutStr("langsmith.span.kind", "chain")
+			}
+
+			switch stepInTree {
+			case 0:
+				// Root invoke_agent span.
+				sp.SetName(fmt.Sprintf("invoke_agent %s", fw.AgentName))
+				sp.SetKind(ptrace.SpanKindInternal)
+				attrs.PutStr("gen_ai.operation.name", "invoke_agent")
+				attrs.PutInt("gen_ai.usage.input_tokens", 1420)
+				attrs.PutInt("gen_ai.usage.output_tokens", 380)
+				attrs.PutStr("gen_ai.input.messages", g.payloadFor(seq))
+			case 1:
+				// Child LLM chat completion span.
+				sp.SetParentSpanID(rootSpanID)
+				sp.SetName(fmt.Sprintf("chat %s", fw.Model))
+				sp.SetKind(ptrace.SpanKindClient)
+				attrs.PutStr("gen_ai.operation.name", "chat")
+				attrs.PutDouble("gen_ai.request.temperature", 0.2)
+				attrs.PutInt("gen_ai.request.max_tokens", 4096)
+				attrs.PutInt("gen_ai.usage.input_tokens", 980)
+				attrs.PutInt("gen_ai.usage.output_tokens", 310)
+				attrs.PutStr("gen_ai.response.id", fmt.Sprintf("chatcmpl-%012x", seq))
+				finish := attrs.PutEmptySlice("gen_ai.response.finish_reasons")
+				finish.AppendEmpty().SetStr("tool_calls")
+				attrs.PutStr("gen_ai.output.messages", g.payloadFor(seq))
+			case 2:
+				// Child tool execution span.
+				sp.SetParentSpanID(rootSpanID)
+				sp.SetName(fmt.Sprintf("execute_tool %s", fw.ToolName))
+				sp.SetKind(ptrace.SpanKindInternal)
+				attrs.PutStr("gen_ai.operation.name", "execute_tool")
+				attrs.PutStr("gen_ai.tool.name", fw.ToolName)
+				attrs.PutStr("gen_ai.tool.type", "function")
+				attrs.PutStr("gen_ai.tool.call.id", fmt.Sprintf("call_%012x", seq))
+				attrs.PutStr("gen_ai.tool.call.arguments", `{"dataset":"analytics_prod","limit":100}`)
+				attrs.PutStr("gen_ai.tool.call.result", g.payloadFor(seq))
+			case 3:
+				// Child MCP client span (tools/call, resources/read, or prompts/get).
+				mcp := mcpMethods[treeID%uint64(len(mcpMethods))]
+				sp.SetParentSpanID(spanIDFromPair(treeID, 2))
+				sp.SetName(fmt.Sprintf("mcp %s %s", mcp.Method, mcp.ToolOrURI))
+				sp.SetKind(ptrace.SpanKindClient)
+				attrs.PutStr("gen_ai.operation.name", "execute_tool")
+				attrs.PutStr("mcp.method.name", mcp.Method)
+				attrs.PutStr("mcp.server.name", mcp.ServerName)
+				attrs.PutStr("server.address", mcp.ServerName)
+				attrs.PutStr("mcp.session.id", fmt.Sprintf("mcp-sess-%08x", treeID%10000))
+				attrs.PutStr("mcp.protocol.version", "2025-06-18")
+				attrs.PutStr("rpc.system", "jsonrpc")
+				attrs.PutStr("rpc.jsonrpc.version", "2.0")
+				reqID := fmt.Sprintf("req-%d", seq)
+				attrs.PutStr("rpc.jsonrpc.request_id", reqID)
+				attrs.PutStr("jsonrpc.request.id", reqID)
+				switch mcp.Method {
+				case "resources/read":
+					attrs.PutStr("mcp.resource.uri", mcp.ToolOrURI)
+				case "prompts/get":
+					attrs.PutStr("gen_ai.prompt.name", mcp.ToolOrURI)
+				default:
+					attrs.PutStr("gen_ai.tool.name", mcp.ToolOrURI)
+					attrs.PutStr("gen_ai.tool.call.id", fmt.Sprintf("call-mcp-%012x", seq))
+				}
+				attrs.PutStr("mcp.payload.content", g.payloadFor(seq))
+			}
 		}
 
 		// Attach an event to exercise repeated RECORD serialization.
@@ -395,7 +467,8 @@ func (g *Generator) TracesBatch(spanCount int) ptrace.Traces {
 }
 
 // LogsBatch generates a plog.Logs batch with exactly logCount GenAI event log
-// records distributed across the 7 GenAI frameworks.
+// records distributed across the 7 GenAI frameworks, correlated 1-to-1 with
+// the 4-span agent execution trees emitted by TracesBatch.
 func (g *Generator) LogsBatch(logCount int) plog.Logs {
 	if logCount <= 0 {
 		logCount = 1
@@ -415,14 +488,16 @@ func (g *Generator) LogsBatch(logCount int) plog.Logs {
 
 	for idx := 0; idx < logCount; idx++ {
 		seq := baseSeq + uint64(idx)
-		fwIdx := int(seq % uint64(numFrameworks))
+		treeID := seq / 4
+		stepInTree := seq % 4
+		fwIdx := int(treeID % uint64(numFrameworks))
 		fw := g.frameworks[fwIdx]
 
 		if !hasFramework[fwIdx] {
 			rl := ld.ResourceLogs().AppendEmpty()
 			resAttrs := rl.Resource().Attributes()
 			resAttrs.PutStr("service.name", fw.ServiceName)
-			resAttrs.PutStr("service.version", "0.1.0")
+			resAttrs.PutStr("service.version", fw.ServiceVer)
 			resAttrs.PutStr("deployment.environment.name", "benchmark")
 			resAttrs.PutStr("gen_ai.framework", fw.Framework)
 
@@ -440,11 +515,10 @@ func (g *Generator) LogsBatch(logCount int) plog.Logs {
 		lr.SetSeverityNumber(plog.SeverityNumberInfo)
 		lr.SetSeverityText("INFO")
 
-		evName := eventNames[seq%uint64(len(eventNames))]
+		evName := eventNames[stepInTree%uint64(len(eventNames))]
 		lr.SetEventName(evName)
-		treeID := seq / 4
 		lr.SetTraceID(traceIDFromTree(treeID))
-		lr.SetSpanID(spanIDFromPair(treeID, seq%4))
+		lr.SetSpanID(spanIDFromPair(treeID, stepInTree))
 		lr.SetFlags(1)
 
 		bodyMap := lr.Body().SetEmptyMap()
@@ -454,12 +528,33 @@ func (g *Generator) LogsBatch(logCount int) plog.Logs {
 
 		attrs := lr.Attributes()
 		attrs.PutStr("gen_ai.framework", fw.Framework)
-		attrs.PutStr("gen_ai.provider.name", fw.Provider)
-		attrs.PutStr("gen_ai.system", fw.System)
+		if fw.Provider != "" {
+			attrs.PutStr("gen_ai.provider.name", fw.Provider)
+		}
+		if fw.System != "" {
+			attrs.PutStr("gen_ai.system", fw.System)
+		} else if fw.Framework == "crewai" {
+			attrs.PutStr("gen_ai.system", "openai")
+		}
 		attrs.PutStr("gen_ai.request.model", fw.Model)
+		attrs.PutStr("gen_ai.response.model", fw.ResponseModel)
 		attrs.PutStr("gen_ai.agent.name", fw.AgentName)
+		attrs.PutStr("gen_ai.agent.id", fw.AgentID)
 		attrs.PutStr("gen_ai.conversation.id", fmt.Sprintf("conv-%08x", treeID%100000))
 		attrs.PutStr("event.name", evName)
+
+		switch fw.Framework {
+		case "google_adk":
+			attrs.PutStr("gcp.vertex.agent.invocation_id", fmt.Sprintf("inv-adk-%08x", treeID))
+			attrs.PutStr("gcp.vertex.agent.session_id", fmt.Sprintf("sess-adk-%08x", treeID%100000))
+			attrs.PutStr("gcp.vertex.agent.event_id", fmt.Sprintf("evt-adk-%08x", seq))
+			attrs.PutStr("user.id", fmt.Sprintf("user-adk-%04d", treeID%1000))
+		case "anthropic_agent_sdk":
+			attrs.PutDouble("cost_usd", 0.0184)
+			attrs.PutInt("duration_ms", 1250)
+			attrs.PutInt("input_tokens", 1420)
+			attrs.PutInt("output_tokens", 380)
+		}
 
 		if g.cfg.PlantSecrets && seq%4 == 0 {
 			plantSecretKeyAttribute(attrs, seq)
@@ -469,8 +564,9 @@ func (g *Generator) LogsBatch(logCount int) plog.Logs {
 }
 
 // MetricsBatch generates a pmetric.Metrics batch with exactly pointCount
-// Histogram data points (gen_ai.client.token.usage with trace exemplars)
-// distributed across the 7 GenAI frameworks.
+// Histogram data points (gen_ai.client.token.usage and
+// gen_ai.client.operation.duration with trace exemplars) distributed across
+// the 7 GenAI frameworks and correlated 1-to-1 with TracesBatch.
 func (g *Generator) MetricsBatch(pointCount int) pmetric.Metrics {
 	if pointCount <= 0 {
 		pointCount = 1
@@ -478,65 +574,122 @@ func (g *Generator) MetricsBatch(pointCount int) pmetric.Metrics {
 	md := pmetric.NewMetrics()
 	baseSeq := g.metricSeq.Add(uint64(pointCount)) - uint64(pointCount)
 
-	rm := md.ResourceMetrics().AppendEmpty()
-	resAttrs := rm.Resource().Attributes()
-	resAttrs.PutStr("service.name", "genai-fleet-collector")
-	resAttrs.PutStr("service.version", "0.1.0")
-	resAttrs.PutStr("deployment.environment.name", "benchmark")
-
-	sm := rm.ScopeMetrics().AppendEmpty()
-	sm.Scope().SetName("opentelemetry.instrumentation.genai")
-	sm.Scope().SetVersion("0.1.0")
-
-	tokenMetric := sm.Metrics().AppendEmpty()
-	tokenMetric.SetName("gen_ai.client.token.usage")
-	tokenMetric.SetDescription("Number of input and output tokens processed by GenAI invocations")
-	tokenMetric.SetUnit("{token}")
-	hist := tokenMetric.SetEmptyHistogram()
-	hist.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
-	hPoints := hist.DataPoints()
+	numFrameworks := len(g.frameworks)
+	smByFramework := make([]pmetric.ScopeMetrics, numFrameworks)
+	hasFramework := make([]bool, numFrameworks)
+	tokenDPByFramework := make([]pmetric.HistogramDataPointSlice, numFrameworks)
+	hasTokenMetric := make([]bool, numFrameworks)
+	durDPByFramework := make([]pmetric.HistogramDataPointSlice, numFrameworks)
+	hasDurMetric := make([]bool, numFrameworks)
 
 	for idx := 0; idx < pointCount; idx++ {
 		seq := baseSeq + uint64(idx)
-		fw := g.frameworks[seq%uint64(len(g.frameworks))]
-		dp := hPoints.AppendEmpty()
+		treeID := seq / 4
+		stepInTree := seq % 4
+		fwIdx := int(treeID % uint64(numFrameworks))
+		fw := g.frameworks[fwIdx]
+
+		if !hasFramework[fwIdx] {
+			rm := md.ResourceMetrics().AppendEmpty()
+			resAttrs := rm.Resource().Attributes()
+			resAttrs.PutStr("service.name", fw.ServiceName)
+			resAttrs.PutStr("service.version", fw.ServiceVer)
+			resAttrs.PutStr("deployment.environment.name", "benchmark")
+			resAttrs.PutStr("gen_ai.framework", fw.Framework)
+
+			sm := rm.ScopeMetrics().AppendEmpty()
+			sm.Scope().SetName(fw.ScopeName)
+			sm.Scope().SetVersion(fw.ScopeVer)
+			smByFramework[fwIdx] = sm
+			hasFramework[fwIdx] = true
+		}
+
 		pointTs := g.baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
-		dp.SetStartTimestamp(pcommon.NewTimestampFromTime(pointTs.Add(-10 * time.Second)))
-		dp.SetTimestamp(pcommon.NewTimestampFromTime(pointTs))
-		dp.SetCount(12)
-		dp.SetSum(float64(1420 + (seq % 500)))
-		dp.SetMin(64)
-		dp.SetMax(2048)
-		dp.ExplicitBounds().FromRaw([]float64{64, 256, 512, 1024, 2048, 4096})
-		dp.BucketCounts().FromRaw([]uint64{1, 2, 4, 3, 2, 0, 0})
+		isDurationPoint := stepInTree%2 == 1
+
+		var dp pmetric.HistogramDataPoint
+		if !isDurationPoint {
+			if !hasTokenMetric[fwIdx] {
+				tokenMetric := smByFramework[fwIdx].Metrics().AppendEmpty()
+				tokenMetric.SetName("gen_ai.client.token.usage")
+				tokenMetric.SetDescription("Number of input and output tokens processed by GenAI invocations")
+				tokenMetric.SetUnit("{token}")
+				hist := tokenMetric.SetEmptyHistogram()
+				hist.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
+				tokenDPByFramework[fwIdx] = hist.DataPoints()
+				hasTokenMetric[fwIdx] = true
+			}
+			dp = tokenDPByFramework[fwIdx].AppendEmpty()
+			dp.SetStartTimestamp(pcommon.NewTimestampFromTime(pointTs.Add(-10 * time.Second)))
+			dp.SetTimestamp(pcommon.NewTimestampFromTime(pointTs))
+			dp.SetCount(12)
+			dp.SetSum(float64(1420 + (seq % 500)))
+			dp.SetMin(64)
+			dp.SetMax(2048)
+			dp.ExplicitBounds().FromRaw([]float64{64, 256, 512, 1024, 2048, 4096})
+			dp.BucketCounts().FromRaw([]uint64{1, 2, 4, 3, 2, 0, 0})
+		} else {
+			if !hasDurMetric[fwIdx] {
+				durMetric := smByFramework[fwIdx].Metrics().AppendEmpty()
+				durMetric.SetName("gen_ai.client.operation.duration")
+				durMetric.SetDescription("GenAI operation duration")
+				durMetric.SetUnit("s")
+				hist := durMetric.SetEmptyHistogram()
+				hist.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
+				durDPByFramework[fwIdx] = hist.DataPoints()
+				hasDurMetric[fwIdx] = true
+			}
+			dp = durDPByFramework[fwIdx].AppendEmpty()
+			dp.SetStartTimestamp(pcommon.NewTimestampFromTime(pointTs.Add(-10 * time.Second)))
+			dp.SetTimestamp(pcommon.NewTimestampFromTime(pointTs))
+			dp.SetCount(1)
+			dp.SetSum(0.042)
+			dp.SetMin(0.042)
+			dp.SetMax(0.042)
+			dp.ExplicitBounds().FromRaw([]float64{0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96, 81.92})
+			dp.BucketCounts().FromRaw([]uint64{0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0})
+		}
 
 		attrs := dp.Attributes()
 		attrs.PutStr("gen_ai.framework", fw.Framework)
-		attrs.PutStr("gen_ai.provider.name", fw.Provider)
-		attrs.PutStr("gen_ai.system", fw.System)
-		attrs.PutStr("gen_ai.request.model", fw.Model)
-		attrs.PutStr("gen_ai.operation.name", "chat")
-		tokenType := "input"
-		if seq%2 == 1 {
-			tokenType = "output"
+		if fw.Provider != "" {
+			attrs.PutStr("gen_ai.provider.name", fw.Provider)
 		}
-		attrs.PutStr("gen_ai.token.type", tokenType)
-		if g.cfg.PayloadBytes > 1024 {
-			attrs.PutStr("gen_ai.baggage.context", g.payloadFor(seq))
+		if fw.System != "" {
+			attrs.PutStr("gen_ai.system", fw.System)
+		} else if fw.Framework == "crewai" {
+			attrs.PutStr("gen_ai.system", "openai")
+		}
+		attrs.PutStr("gen_ai.request.model", fw.Model)
+		attrs.PutStr("gen_ai.response.model", fw.ResponseModel)
+		opName := "chat"
+		if fw.Framework == "crewai" || stepInTree == 0 {
+			opName = "invoke_agent"
+		} else if stepInTree >= 2 {
+			opName = "execute_tool"
+		}
+		attrs.PutStr("gen_ai.operation.name", opName)
+		if !isDurationPoint {
+			tokenType := "input"
+			if stepInTree == 2 {
+				tokenType = "output"
+			}
+			attrs.PutStr("gen_ai.token.type", tokenType)
 		}
 		if g.cfg.PlantSecrets && seq%4 == 0 {
 			plantSecretKeyAttribute(attrs, seq)
-			if g.cfg.PayloadBytes <= 1024 {
-				attrs.PutStr("gen_ai.debug.auth_header", secretValueTokenFor(seq))
-			}
+			attrs.PutStr("gen_ai.debug.auth_header", secretValueTokenFor(seq))
 		}
 
 		ex := dp.Exemplars().AppendEmpty()
 		ex.SetTimestamp(pcommon.NewTimestampFromTime(pointTs))
-		ex.SetIntValue(int64(256 + (seq % 256)))
-		treeID := seq / 4
+		if !isDurationPoint {
+			ex.SetIntValue(int64(256 + (seq % 256)))
+		} else {
+			ex.SetDoubleValue(0.042)
+		}
 		ex.SetTraceID(traceIDFromTree(treeID))
-		ex.SetSpanID(spanIDFromPair(treeID, 1))
+		ex.SetSpanID(spanIDFromPair(treeID, stepInTree))
 		ex.FilteredAttributes().PutStr("gen_ai.agent.name", fw.AgentName)
 	}
 	return md

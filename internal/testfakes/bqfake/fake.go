@@ -112,6 +112,11 @@ func NewServer(t testing.TB) *Server {
 	return srv
 }
 
+// DefaultMaxServerMsgSize sets the in-process gRPC server receive/send limit
+// (32 MiB) well above BigQuery Storage Write API's 10 MiB request ceiling and
+// the exporter's default 8 MiB write.max_request_bytes chunk threshold.
+const DefaultMaxServerMsgSize = 32 * 1024 * 1024
+
 // New starts a new in-process gRPC and REST fake server.
 func New() (*Server, error) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -119,8 +124,11 @@ func New() (*Server, error) {
 		return nil, fmt.Errorf("listening on loopback: %w", err)
 	}
 	s := &Server{
-		lis:         lis,
-		grpcSrv:     grpc.NewServer(),
+		lis: lis,
+		grpcSrv: grpc.NewServer(
+			grpc.MaxRecvMsgSize(DefaultMaxServerMsgSize),
+			grpc.MaxSendMsgSize(DefaultMaxServerMsgSize),
+		),
 		servedCh:    make(chan struct{}),
 		schemas:     make(map[string]*storagepb.TableSchema),
 		descriptors: make(map[string]protoreflect.MessageDescriptor),
