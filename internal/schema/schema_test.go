@@ -2088,10 +2088,10 @@ func TestBoundedWindowTVFDDLsAndStaticPartitionBounds(t *testing.T) {
 			tvfName:   GenAIAgentTrajectoryTVFName,
 			viewQuery: fmt.Sprintf(GenAIAgentTrajectoryViewQuery, project, dataset),
 			wantSubstrs: []string{
-				"CREATE OR REPLACE TABLE FUNCTION `test-proj.test_ds.tvf_gen_ai_agent_trajectory`(start_ts TIMESTAMP, end_ts TIMESTAMP) AS (",
+				"CREATE OR REPLACE TABLE FUNCTION `test-proj.test_ds.tvf_gen_ai_agent_trajectory`(start_ts TIMESTAMP, end_ts TIMESTAMP, context_start_ts TIMESTAMP, context_end_ts TIMESTAMP) AS (",
 				"FROM `test-proj.test_ds.v_gen_ai_spans`",
-				"WHERE start_time >= TIMESTAMP_SUB(start_ts, INTERVAL 24 HOUR)",
-				"AND start_time <= TIMESTAMP_ADD(end_ts, INTERVAL 1 HOUR)",
+				"WHERE start_time >= context_start_ts",
+				"AND start_time < context_end_ts",
 				"WHERE t.start_time >= start_ts",
 				"AND t.start_time < end_ts",
 			},

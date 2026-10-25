@@ -41,7 +41,7 @@ func TestLiveContinuousQueriesDryRun(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	t.Cleanup(cancel)
-	dataset := fmt.Sprintf("otel_cq_it_%d", time.Now().UnixNano())
+	dataset := uniqueEphemeralDatasetID("otel_cq_it")
 
 	httpClient, _, closeHTTP, err := googlehttp.NewClient(ctx, []string{bigqueryapi.BigqueryScope})
 	if err != nil {
@@ -64,18 +64,9 @@ func TestLiveContinuousQueriesDryRun(t *testing.T) {
 		}
 		closeHTTP()
 	})
-
-	createErr := admin.Dataset(dataset).Create(ctx, &bq.DatasetMetadata{Location: location})
-	if !shouldDeleteDatasetOnCreate(createErr) {
-		t.Fatalf("create dataset %s.%s: %v", project, dataset, createErr)
+	if err := createOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup); err != nil {
+		t.Fatalf("create dataset %s.%s: %v", project, dataset, err)
 	}
-	t.Cleanup(func() {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
-		defer cleanupCancel()
-		if err := admin.Dataset(dataset).DeleteWithContents(cleanupCtx); err != nil {
-			t.Errorf("cleanup dataset %s.%s: %v", project, dataset, err)
-		}
-	})
 
 	const spansTable = "otel_spans"
 	spansMD, _, err := schema.DestinationMetadataWithOptions(
@@ -142,35 +133,9 @@ func TestLiveContinuousQueriesDryRun(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s inner SELECT dry-run failed: %v\nSQL:\n%s", name, err, innerSelect)
 			}
-			if got := selectJob.LastStatus().Statistics.TotalBytesProcessed; got != 0 {
-				t.Errorf("%s inner SELECT dry-run TotalBytesProcessed = %d, want 0", name, got)
-			}
+			assertDryRunJobSucceeded(t, name+" inner SELECT", selectJob)
 
-			// 2. Dry-run the Continuous Query EXPORT DATA ...CLOUD_PUBSUB statement
-			// with continuous=true on JobConfigurationQuery.
-			exportJob := &bigqueryapi.Job{
-				Configuration: &bigqueryapi.JobConfiguration{
-					DryRun: true,
-					Query: &bigqueryapi.JobConfigurationQuery{
-						Query:        rendered,
-						UseLegacySql: new(bool),
-						Continuous:   true,
-					},
-				},
-			}
-			if _, err := rawSvc.Jobs.Insert(project, exportJob).Context(subCtx).Do(); err != nil {
-				// On on-demand projects without an Enterprise Plus CONTINUOUS
-				// reservation or Pub/Sub export topic, BigQuery only returns a
-				// continuous-query reservation/feature or Pub/Sub permission error
-				// after parsing the query; any other error (such as "Unsupported
-				// export format") must fail the test.
-				if !isExpectedContinuousQueryDryRunError(err) {
-					t.Fatalf("%s EXPORT DATA continuous dry-run failed with unexpected error: %v", name, err)
-				}
-				t.Logf("%s EXPORT DATA continuous dry-run note: %v", name, err)
-			}
-
-			// 3. Dry-run the INSERT INTO `<project>.<dataset>.otel_alerts` table-sink
+			// 2. Dry-run the INSERT INTO `<project>.<dataset>.otel_alerts` table-sink
 			// query against the provisioned 7-column otel_alerts table.
 			qInsert := admin.Query(insertSQL)
 			qInsert.DryRun = true
@@ -178,10 +143,51 @@ func TestLiveContinuousQueriesDryRun(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s INSERT INTO otel_alerts dry-run failed: %v\nSQL:\n%s", name, err, insertSQL)
 			}
-			if got := insertJob.LastStatus().Statistics.TotalBytesProcessed; got != 0 {
-				t.Errorf("%s INSERT INTO otel_alerts dry-run TotalBytesProcessed = %d, want 0", name, got)
-			}
+			assertDryRunJobSucceeded(t, name+" INSERT INTO otel_alerts", insertJob)
+
+			// 3. Dry-run the Continuous Query EXPORT DATA ... CLOUD_PUBSUB statement
+			// with continuous=true on JobConfigurationQuery.
+			t.Run("export_data_continuous", func(t *testing.T) {
+				exportJob := &bigqueryapi.Job{
+					Configuration: &bigqueryapi.JobConfiguration{
+						DryRun: true,
+						Query: &bigqueryapi.JobConfigurationQuery{
+							Query:        rendered,
+							UseLegacySql: new(bool),
+							Continuous:   true,
+						},
+					},
+				}
+				insertedJob, err := rawSvc.Jobs.Insert(project, exportJob).Context(subCtx).Do()
+				skipReason, fatalErr := validateContinuousExportDryRunJob(insertedJob, err)
+				if fatalErr != nil {
+					t.Fatalf("%s EXPORT DATA continuous dry-run failed with unexpected error: %v", name, fatalErr)
+				}
+				if skipReason != "" {
+					t.Skipf("%s EXPORT DATA continuous dry-run not validated (Enterprise Continuous Queries / Pub/Sub entitlement unavailable in test project): %s", name, skipReason)
+				}
+			})
 		})
+	}
+}
+
+func assertDryRunJobSucceeded(t *testing.T, label string, job *bq.Job) {
+	t.Helper()
+	if job == nil {
+		t.Fatalf("%s dry-run returned nil job", label)
+	}
+	st := job.LastStatus()
+	if st == nil {
+		t.Fatalf("%s dry-run returned nil LastStatus()", label)
+	}
+	if err := st.Err(); err != nil {
+		t.Fatalf("%s dry-run job status error: %v", label, err)
+	}
+	if st.Statistics == nil {
+		t.Fatalf("%s dry-run job returned nil Statistics", label)
+	}
+	if got := st.Statistics.TotalBytesProcessed; got != 0 {
+		t.Errorf("%s dry-run TotalBytesProcessed = %d, want 0", label, got)
 	}
 }
 

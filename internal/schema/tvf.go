@@ -181,19 +181,24 @@ QUALIFY ROW_NUMBER() OVER (
 `
 
 // GenAIAgentTrajectoryTVFDDL creates
-// tvf_gen_ai_agent_trajectory(start_ts TIMESTAMP, end_ts TIMESTAMP): the
-// bounded-window Table-Valued Function counterpart of
-// v_gen_ai_agent_trajectory over the half-open window [start_ts, end_ts).
+// tvf_gen_ai_agent_trajectory(start_ts TIMESTAMP, end_ts TIMESTAMP, context_start_ts TIMESTAMP, context_end_ts TIMESTAMP):
+// the caller-bounded context-horizon Table-Valued Function counterpart of
+// v_gen_ai_agent_trajectory over the half-open output window [start_ts, end_ts)
+// with span context reconstructed over [context_start_ts, context_end_ts).
 //
 // BigQuery does not allow WITH RECURSIVE inside a SQL TABLE FUNCTION body, so
 // the 0..16-hop tree walk and 1..32-hop multi-segment token-coverage walk are
 // expressed via 6-step binary lifting (pointer jumping: hop0..hop32, up to 63
 // ancestor hops) with per-hop in_tree_window flags, rooted_chains
-// (tree_start_idx), and mutual-reachability reverse_path cycle tie-breaking
-// over the [-24h, +1h] span horizon before filtering emitted rows to
-// [start_ts, end_ts).
+// (tree_start_idx), contiguous emitted-ancestor checks, and mutual-reachability
+// reverse_path cycle tie-breaking over the caller-supplied
+// [context_start_ts, context_end_ts) span horizon before filtering emitted rows
+// to [start_ts, end_ts). It matches v_gen_ai_agent_trajectory when all spans of
+// a trace fall within [context_start_ts, context_end_ts), and otherwise
+// computes depth, root_span_id, is_orphan, is_leaf, is_token_leaf, and
+// step_index strictly within [context_start_ts, context_end_ts).
 const GenAIAgentTrajectoryTVFDDL = `
-CREATE OR REPLACE TABLE FUNCTION ` + "`%[1]s.%[2]s." + GenAIAgentTrajectoryTVFName + "`" + `(start_ts TIMESTAMP, end_ts TIMESTAMP) AS (
+CREATE OR REPLACE TABLE FUNCTION ` + "`%[1]s.%[2]s." + GenAIAgentTrajectoryTVFName + "`" + `(start_ts TIMESTAMP, end_ts TIMESTAMP, context_start_ts TIMESTAMP, context_end_ts TIMESTAMP) AS (
 ` + GenAIAgentTrajectoryTVFQuery + `
 );
 `
@@ -245,8 +250,8 @@ WITH
         IF(gen_ai_operation_name IN ('invoke_agent', 'create_agent'), gen_ai_agent_name, NULL)
       ) AS agent_path_name
     FROM ` + "`%[1]s.%[2]s." + GenAISpansViewName + "`" + `
-    WHERE start_time >= TIMESTAMP_SUB(start_ts, INTERVAL 24 HOUR)
-      AND start_time <= TIMESTAMP_ADD(end_ts, INTERVAL 1 HOUR)
+    WHERE start_time >= context_start_ts
+      AND start_time < context_end_ts
     QUALIFY ROW_NUMBER() OVER (
       PARTITION BY trace_id, service_name, span_id
       ORDER BY start_time ASC, end_time DESC, span_name ASC, duration_nano DESC
@@ -432,7 +437,14 @@ WITH
           LIMIT 1
         )
       ) AS nearest_agent_span_id,
-      COALESCE(
+      IF(
+        EXISTS (
+          SELECT 1
+          FROM UNNEST(h.chain) AS n
+            WITH OFFSET AS idx
+          WHERE idx >= h.tree_start_idx
+            AND n.is_agent_op
+        ),
         (
           SELECT n.resolved_agent_name
           FROM UNNEST(h.chain) AS n
@@ -507,17 +519,22 @@ WITH
         WHERE x_idx > a_idx
           AND x.span_id = anc.span_id
       )
-      AND (
-        a_idx >= t.tree_start_idx
-        OR (
-          a_idx - (
-            SELECT MAX(i2)
-            FROM UNNEST(t.chain) AS n2
-              WITH OFFSET AS i2
-            WHERE i2 <= a_idx
-              AND NOT n2.in_tree_window
-          )
-        ) <= 16
+      AND NOT EXISTS (
+        SELECT 1
+        FROM UNNEST(t.chain) AS m
+          WITH OFFSET AS m_idx
+        WHERE m_idx >= a_idx
+          AND m_idx < ARRAY_LENGTH(t.chain) - 1
+          AND COALESCE(
+            m_idx - (
+              SELECT MAX(i2)
+              FROM UNNEST(t.chain) AS n2
+                WITH OFFSET AS i2
+              WHERE i2 <= m_idx
+                AND NOT n2.in_tree_window
+            ),
+            17
+          ) > 16
       )
   ),
   token_parent_coverage AS (

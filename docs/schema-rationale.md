@@ -242,11 +242,11 @@ never retries internally: `exporterhelper` remains the single retry owner.
 
 ## Partition pruning, `allow_unprunable_views`, and bounded-window TVFs
 
-Seven of the ten companion views (`v_gen_ai_spans`, `v_gen_ai_metrics`,
+Seven of the ten GenAI and MCP semantic views (`v_gen_ai_spans`, `v_gen_ai_metrics`,
 `v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_gen_ai_tool_usage`,
-`v_mcp_spans`, and `v_mcp_tool_usage`, alongside the three `*_dedup` views)
-preserve static partition pruning when queried with a filter on `start_time`,
-`timestamp`, `usage_hour`, or `session_start_date`.
+`v_mcp_spans`, and `v_mcp_tool_usage`, alongside `otel_spans_as_allspans` and
+the three `*_dedup` views) preserve static partition pruning when queried with a
+filter on `start_time`, `timestamp`, `usage_hour`, or `session_start_date`.
 
 Three companion views join `otel_spans_dedup` on a per-row correlation window or
 recursive self-join:
@@ -267,34 +267,47 @@ and the Terraform module (`allow_unprunable_views = false`) skip creating those
 three views when `otel_spans` requires a partition filter.
 
 For deployments that enforce `require_partition_filter = true`, three
-bounded-window Table-Valued Functions (TVFs) — provisioned via `deploy/terraform`
+Table-Valued Functions (TVFs) — provisioned via `deploy/terraform`
 (`google_bigquery_routine`) or operator DDL (`schema.CompanionTVFDDLs`; runtime
 `auto_create.companion_views` creates `VIEW` resources only, not routines) —
-provide identical output schemas with explicit half-open `[start_ts, end_ts)`
-(`>= start_ts AND < end_ts`) output windows and `[-24h, +1h]` cross-window span
-correlation bounds pushed directly into the base deduplication views. Because
-BigQuery `CREATE TABLE FUNCTION` forbids `WITH RECURSIVE`,
-`tvf_gen_ai_agent_trajectory` reconstructs parent chains over the
-`[start_ts - 24h, end_ts + 1h]` span horizon via 6-step binary-lifting pointer
-jumping (`hop0..hop32`, up to 64 nodes / 63 ancestor hops), projects each
-in-window tree segment up to depth 16 (`rooted_chains`), computes trace-wide
-`step_index` in the `trajectory` CTE before applying the outer `[start_ts, end_ts)`
-window filter, and resolves 1..32-hop multi-segment token coverage with
-mutual-reachability cycle tie-breaking:
+provide identical output schemas with static partition bounds pushed directly
+into the base deduplication views:
 
-| Unprunable View | Partition-Prunable TVF (`(start_ts TIMESTAMP, end_ts TIMESTAMP)`) | Pushed Partition & Output Bounds |
+- `tvf_gen_ai_logs(start_ts TIMESTAMP, end_ts TIMESTAMP)` and
+  `tvf_gen_ai_metric_exemplars(start_ts TIMESTAMP, end_ts TIMESTAMP)` are
+  exact full-parity bounded-window counterparts of `v_gen_ai_logs` and
+  `v_gen_ai_metric_exemplars` over `[start_ts, end_ts)` because their single-hop
+  `[-24h, +1h]` span join window is closed under `[start_ts - 24h, end_ts + 1h]`.
+- `tvf_gen_ai_agent_trajectory(start_ts TIMESTAMP, end_ts TIMESTAMP, context_start_ts TIMESTAMP, context_end_ts TIMESTAMP)`
+  is a **caller-bounded context-horizon** TVF: because BigQuery `CREATE TABLE FUNCTION`
+  forbids `WITH RECURSIVE` and requires a static partition predicate on
+  `otel_spans`, it reconstructs parent chains over the caller-supplied
+  `[context_start_ts, context_end_ts)` span horizon via 6-step binary-lifting
+  pointer jumping (`hop0..hop32`, up to 64 nodes / 63 ancestor hops), projects
+  each in-horizon tree segment up to depth 16 (`rooted_chains`), computes
+  `step_index` in the `trajectory` CTE before applying the outer `[start_ts, end_ts)`
+  output filter, and resolves 1..32-hop contiguous emitted-ancestor token
+  coverage with mutual-reachability cycle tie-breaking. It matches
+  `v_gen_ai_agent_trajectory` when all spans of a trace fall within
+  `[context_start_ts, context_end_ts)`, and otherwise computes `depth`,
+  `root_span_id`, `is_orphan`, `is_leaf`, `is_token_leaf`, and `step_index`
+  strictly within `[context_start_ts, context_end_ts)` rather than table-wide:
+
+| Unprunable View | Partition-Prunable TVF Signature | Pushed Partition & Output Bounds |
 | --- | --- | --- |
 | `v_gen_ai_logs` | `tvf_gen_ai_logs(start_ts, end_ts)` | `otel_logs_dedup.timestamp >= start_ts AND < end_ts` and `otel_spans_dedup.start_time >= start_ts - 24h AND <= end_ts + 1h` |
 | `v_gen_ai_metric_exemplars` | `tvf_gen_ai_metric_exemplars(start_ts, end_ts)` | `v_gen_ai_metrics.timestamp >= start_ts AND < end_ts` and `otel_spans_dedup.start_time >= start_ts - 24h AND <= end_ts + 1h` |
-| `v_gen_ai_agent_trajectory` | `tvf_gen_ai_agent_trajectory(start_ts, end_ts)` | `v_gen_ai_spans.start_time >= start_ts - 24h AND <= end_ts + 1h` in the `spans` CTE, and `t.start_time >= start_ts AND < end_ts` on the outer `SELECT` |
+| `v_gen_ai_agent_trajectory` | `tvf_gen_ai_agent_trajectory(start_ts, end_ts, context_start_ts, context_end_ts)` | `v_gen_ai_spans.start_time >= context_start_ts AND < context_end_ts` in the `spans` CTE, and `t.start_time >= start_ts AND < end_ts` on the outer `SELECT` |
 
-Example query on a partition-filter-enforced dataset:
+Example query on a partition-filter-enforced dataset (output window `[now - 6h, now)` with a 30-hour context horizon `[now - 30h, now + 1h)`):
 
 ```sql
 SELECT trace_id, span_id, depth, agent_path, step_index, is_token_leaf
 FROM `my-project.otel.tvf_gen_ai_agent_trajectory`(
   TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 6 HOUR),
-  CURRENT_TIMESTAMP()
+  CURRENT_TIMESTAMP(),
+  TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 HOUR),
+  TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
 )
 WHERE service_name = 'checkout-agent';
 ```

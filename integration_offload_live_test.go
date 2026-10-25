@@ -80,7 +80,7 @@ func testLiveGCSAndBigQueryOffloadRoundTrip(t *testing.T) {
 	t.Cleanup(cancel)
 
 	runNano := time.Now().UnixNano()
-	dataset := fmt.Sprintf("otel_offload_it_%d", runNano)
+	dataset := uniqueEphemeralDatasetID("otel_offload_it")
 	prefix := fmt.Sprintf("it-offload-%d", runNano)
 
 	httpClient, _, closeHTTP, err := googlehttp.NewClient(ctx, []string{
@@ -110,17 +110,15 @@ func testLiveGCSAndBigQueryOffloadRoundTrip(t *testing.T) {
 		uriMu.Unlock()
 	}
 
-	if _, err := admin.Dataset(dataset).Metadata(ctx); err == nil {
-		t.Fatalf("ephemeral dataset %s.%s already exists before test start", project, dataset)
-	}
-	ownsDataset := false
-
 	t.Cleanup(func() {
 		if err := admin.Close(); err != nil {
 			t.Errorf("close BigQuery admin client: %v", err)
 		}
 		closeHTTP()
 	})
+	if err := createOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup); err != nil {
+		t.Fatalf("create dataset %s.%s: %v", project, dataset, err)
+	}
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cleanupCancel()
@@ -131,11 +129,6 @@ func testLiveGCSAndBigQueryOffloadRoundTrip(t *testing.T) {
 			deleteGCSObject(cleanupCtx, t, httpClient, uri)
 		}
 		listAndDeleteGCSPrefix(cleanupCtx, t, httpClient, bucket, prefix+"/")
-		if ownsDataset {
-			if err := admin.Dataset(dataset).DeleteWithContents(cleanupCtx); err != nil {
-				t.Errorf("cleanup dataset %s.%s: %v", project, dataset, err)
-			}
-		}
 	})
 
 	cfg := validConfig()
@@ -168,7 +161,6 @@ func testLiveGCSAndBigQueryOffloadRoundTrip(t *testing.T) {
 	if err := traces.start(ctx, nil); err != nil {
 		t.Fatalf("traces.start: %v", err)
 	}
-	ownsDataset = true
 	rawTraceStore := traces.offloader.Store()
 	traces.offloader.SetStore(&recordingBlobStore{inner: rawTraceStore, onWrite: recordURI})
 	defer func() { _ = traces.shutdown(context.Background()) }()
@@ -302,9 +294,12 @@ func testLiveGCSAndBigQueryOffloadRoundTrip(t *testing.T) {
 			t.Errorf("%s object_ref.details = %q, want sha256 %s", tc.table, detailsStr, wantSHA)
 		}
 
-		blob, err := fetcher(ctx, uri)
+		blob, err := fetcher(ctx, uri+"?generation="+version)
 		if err != nil {
-			t.Fatalf("fetch live GCS object %s: %v", uri, err)
+			t.Fatalf("fetch generation-pinned live GCS object %s?generation=%s: %v", uri, version, err)
+		}
+		if _, wrongGenErr := fetcher(ctx, uri+"?generation=1"); wrongGenErr == nil && version != "1" {
+			t.Fatalf("%s live GCS fetch with wrong generation=1 succeeded, want error", tc.table)
 		}
 		if int64(len(blob)) != byteSize {
 			t.Errorf("%s fetched len = %d, want byte_size %d", tc.table, len(blob), byteSize)
@@ -374,9 +369,14 @@ func testLiveGCSAndBigQueryOffloadRoundTrip(t *testing.T) {
 			t.Errorf("quarantine row %d payload_ref.details is empty", quarantineCount)
 		}
 
-		qBlob, err := fetcher(ctx, uri)
+		qBlob, err := fetcher(ctx, uri+"?generation="+version)
 		if err != nil {
-			t.Fatalf("fetch quarantine GCS object %s: %v", uri, err)
+			t.Fatalf("fetch generation-pinned quarantine GCS object %s?generation=%s: %v", uri, version, err)
+		}
+		qSum := sha256.Sum256(qBlob)
+		qWantSHA := hex.EncodeToString(qSum[:])
+		if !strings.Contains(detailsStr, qWantSHA) {
+			t.Errorf("quarantine row %d payload_ref.details = %q, want sha256 %s", quarantineCount, detailsStr, qWantSHA)
 		}
 		if strings.Contains(string(qBlob), plantedSecret) {
 			t.Fatalf("quarantine GCS object %s contains unredacted secret", uri)

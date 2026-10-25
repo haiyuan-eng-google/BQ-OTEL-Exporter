@@ -3253,7 +3253,15 @@ func TestTerraformBoundedWindowTVFsMatchSchemaContract(t *testing.T) {
 			t.Errorf("Terraform routine %s missing language = \"SQL\"", tvfName)
 		}
 		args := argRe.FindAllStringSubmatch(block, -1)
-		if len(args) != 2 ||
+		if tvfName == schema.GenAIAgentTrajectoryTVFName {
+			if len(args) != 4 ||
+				args[0][1] != "start_ts" || args[0][2] != "TIMESTAMP" ||
+				args[1][1] != "end_ts" || args[1][2] != "TIMESTAMP" ||
+				args[2][1] != "context_start_ts" || args[2][2] != "TIMESTAMP" ||
+				args[3][1] != "context_end_ts" || args[3][2] != "TIMESTAMP" {
+				t.Errorf("Terraform routine %s arguments = %v, want [(start_ts TIMESTAMP), (end_ts TIMESTAMP), (context_start_ts TIMESTAMP), (context_end_ts TIMESTAMP)]", tvfName, args)
+			}
+		} else if len(args) != 2 ||
 			args[0][1] != "start_ts" || args[0][2] != "TIMESTAMP" ||
 			args[1][1] != "end_ts" || args[1][2] != "TIMESTAMP" {
 			t.Errorf("Terraform routine %s arguments = %v, want [(start_ts TIMESTAMP), (end_ts TIMESTAMP)]", tvfName, args)

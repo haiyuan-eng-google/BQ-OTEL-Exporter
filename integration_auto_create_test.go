@@ -46,11 +46,11 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 		location = "US"
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	// Register cancel first so t.Cleanup's LIFO order runs dataset deletion
 	// and admin.Close before canceling ctx.
 	t.Cleanup(cancel)
-	dataset := fmt.Sprintf("otel_exporter_it_%d", time.Now().UnixNano())
+	dataset := uniqueEphemeralDatasetID("otel_exporter_it")
 
 	httpClient, _, closeHTTP, err := googlehttp.NewClient(ctx, []string{bigqueryapi.BigqueryScope})
 	if err != nil {
@@ -61,27 +61,15 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 		closeHTTP()
 		t.Fatalf("create cleanup/query client: %v", err)
 	}
-	if _, err := admin.Dataset(dataset).Metadata(ctx); err == nil {
-		t.Fatalf("ephemeral dataset %s.%s already exists before test start", project, dataset)
-	}
-	ownsDataset := false
-
 	t.Cleanup(func() {
 		if err := admin.Close(); err != nil {
 			t.Errorf("close cleanup/query client: %v", err)
 		}
 		closeHTTP()
 	})
-	t.Cleanup(func() {
-		if !ownsDataset {
-			return
-		}
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
-		defer cleanupCancel()
-		if err := admin.Dataset(dataset).DeleteWithContents(cleanupCtx); err != nil {
-			t.Errorf("cleanup dataset %s.%s: %v", project, dataset, err)
-		}
-	})
+	if err := createOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup); err != nil {
+		t.Fatalf("create dataset %s.%s: %v", project, dataset, err)
+	}
 
 	cfg := validConfig()
 	cfg.Project = project
@@ -107,7 +95,6 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 	if err := traces.start(ctx, nil); err != nil {
 		t.Fatalf("first trace startup: %v", err)
 	}
-	ownsDataset = true
 	defer func() { _ = traces.shutdown(context.Background()) }()
 
 	if err := assertIntegrationTrajectoryDryRunAndPartitionFilter(ctx, admin, project, dataset); err != nil {
@@ -459,7 +446,7 @@ func assertIntegrationTrajectoryTVFLiveExecution(ctx context.Context, t *testing
 	t.Helper()
 	sql := fmt.Sprintf(
 		"SELECT span_id, depth, root_span_id, nearest_agent_name, is_orphan, step_index, is_leaf, is_token_leaf "+
-			"FROM `%s.%s.%s`(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE), TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE)) "+
+			"FROM `%s.%s.%s`(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE), TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE), TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 25 HOUR), TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)) "+
 			"ORDER BY span_id",
 		project, dataset, schema.GenAIAgentTrajectoryTVFName,
 	)
@@ -586,9 +573,13 @@ func assertIntegrationViewDryRuns(ctx context.Context, t *testing.T, client *bq.
 			t.Fatalf("TVF %s DDL status: %v", tvfName, err)
 		}
 
+		callArgs := "TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR), CURRENT_TIMESTAMP()"
+		if tvfName == schema.GenAIAgentTrajectoryTVFName {
+			callArgs = "TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR), CURRENT_TIMESTAMP(), TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 25 HOUR), TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)"
+		}
 		q := client.Query(fmt.Sprintf(
-			"SELECT * FROM `%s.%s.%s`(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR), CURRENT_TIMESTAMP())",
-			project, dataset, tvfName,
+			"SELECT * FROM `%s.%s.%s`(%s)",
+			project, dataset, tvfName, callArgs,
 		))
 		q.DryRun = true
 		dryJob, err := q.Run(ctx)
@@ -793,12 +784,47 @@ func assertIntegrationTrajectoryDryRunAndPartitionFilter(ctx context.Context, cl
 	)
 
 	for _, tc := range []struct {
-		name string
-		ddl  string
+		name      string
+		ddl       string
+		narrowSQL string
+		wideSQL   string
 	}{
-		{"tvf_gen_ai_logs_rpf", rpfLogsTVFDDL},
-		{"tvf_gen_ai_metric_exemplars_rpf", rpfExemplarsTVFDDL},
-		{"tvf_gen_ai_agent_trajectory_rpf", rpfTrajectoryTVFDDL},
+		{
+			name: "tvf_gen_ai_logs_rpf",
+			ddl:  rpfLogsTVFDDL,
+			narrowSQL: fmt.Sprintf(
+				"SELECT * FROM `%s.%s.tvf_gen_ai_logs_rpf`(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 2 HOUR), CURRENT_TIMESTAMP())",
+				project, dataset,
+			),
+			wideSQL: fmt.Sprintf(
+				"SELECT * FROM `%s.%s.tvf_gen_ai_logs_rpf`(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 96 HOUR), CURRENT_TIMESTAMP())",
+				project, dataset,
+			),
+		},
+		{
+			name: "tvf_gen_ai_metric_exemplars_rpf",
+			ddl:  rpfExemplarsTVFDDL,
+			narrowSQL: fmt.Sprintf(
+				"SELECT * FROM `%s.%s.tvf_gen_ai_metric_exemplars_rpf`(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 2 HOUR), CURRENT_TIMESTAMP())",
+				project, dataset,
+			),
+			wideSQL: fmt.Sprintf(
+				"SELECT * FROM `%s.%s.tvf_gen_ai_metric_exemplars_rpf`(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 96 HOUR), CURRENT_TIMESTAMP())",
+				project, dataset,
+			),
+		},
+		{
+			name: "tvf_gen_ai_agent_trajectory_rpf",
+			ddl:  rpfTrajectoryTVFDDL,
+			narrowSQL: fmt.Sprintf(
+				"SELECT * FROM `%s.%s.tvf_gen_ai_agent_trajectory_rpf`(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 2 HOUR), CURRENT_TIMESTAMP(), TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 2 HOUR), CURRENT_TIMESTAMP())",
+				project, dataset,
+			),
+			wideSQL: fmt.Sprintf(
+				"SELECT * FROM `%s.%s.tvf_gen_ai_agent_trajectory_rpf`(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 96 HOUR), CURRENT_TIMESTAMP(), TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 96 HOUR), CURRENT_TIMESTAMP())",
+				project, dataset,
+			),
+		},
 	} {
 		tvfJob, err := client.Query(tc.ddl).Run(ctx)
 		if err != nil {
@@ -811,17 +837,154 @@ func assertIntegrationTrajectoryDryRunAndPartitionFilter(ctx context.Context, cl
 		if err := st.Err(); err != nil {
 			return fmt.Errorf("status %s: %w", tc.name, err)
 		}
-		rpfTVFSelect := client.Query(fmt.Sprintf(
-			"SELECT * FROM `%s.%s.%s`(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR), CURRENT_TIMESTAMP())",
-			project, dataset, tc.name,
-		))
+		rpfTVFSelect := client.Query(tc.narrowSQL)
 		rpfTVFSelect.DryRun = true
 		rpfTVFJob, err := rpfTVFSelect.Run(ctx)
 		if err != nil {
 			return fmt.Errorf("dry-run SELECT over %s with require_partition_filter=true failed: %w", tc.name, err)
 		}
 		if got := rpfTVFJob.LastStatus().Statistics.TotalBytesProcessed; got != 0 {
-			return fmt.Errorf("%s dry-run TotalBytesProcessed = %d, want 0", tc.name, got)
+			return fmt.Errorf("%s empty-table dry-run TotalBytesProcessed = %d, want 0", tc.name, got)
+		}
+	}
+
+	// Seed two distinct partitions (-72h and -30m) in otel_spans_rpf, otel_logs_rpf,
+	// and otel_metrics_rpf via DML INSERT INTO so dry-run TotalBytesProcessed proves
+	// nonzero partition pruning (0 < narrowBytes < wideBytes) across all three TVFs.
+	seedSQL := fmt.Sprintf(`
+		INSERT INTO `+"`%s.%s.%s`"+` (
+			start_time, start_time_unix_nano, end_time, end_time_unix_nano,
+			receive_time, receive_time_unix_nano, duration_nano,
+			trace_id, span_id, name, kind, service_name, attributes, schema_version
+		)
+		VALUES
+			(
+				TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 72 HOUR), 1000,
+				TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 72 HOUR), 2000,
+				CURRENT_TIMESTAMP(), 3000, 1000,
+				'0102030405060708090a0b0c0d0e0f10', '0102030405060708',
+				'invoke_agent old', 1, 'rpf-svc', JSON '{"gen_ai.operation.name":"invoke_agent","gen_ai.agent.name":"planner"}', 'v0alpha2'
+			),
+			(
+				TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE), 4000,
+				TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE), 5000,
+				CURRENT_TIMESTAMP(), 6000, 1000,
+				'1112131415161718191a1b1c1d1e1f20', '1112131415161718',
+				'invoke_agent recent', 1, 'rpf-svc', JSON '{"gen_ai.operation.name":"invoke_agent","gen_ai.agent.name":"planner"}', 'v0alpha2'
+			);
+		INSERT INTO `+"`%s.%s.%s`"+` (
+			timestamp, timestamp_source, time_unix_nano, observed_time_unix_nano,
+			receive_time, receive_time_unix_nano, trace_id, span_id,
+			event_name, service_name, log_name, insert_id, schema_version
+		)
+		VALUES
+			(
+				TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 72 HOUR), 'event_time', 1000, 1000,
+				CURRENT_TIMESTAMP(), 3000, '0102030405060708090a0b0c0d0e0f10', '0102030405060708',
+				'gen_ai.choice', 'rpf-svc', 'otel', 'ins-old', 'v0alpha2'
+			),
+			(
+				TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE), 'event_time', 4000, 4000,
+				CURRENT_TIMESTAMP(), 6000, '1112131415161718191a1b1c1d1e1f20', '1112131415161718',
+				'gen_ai.choice', 'rpf-svc', 'otel', 'ins-recent', 'v0alpha2'
+			);
+		INSERT INTO `+"`%s.%s.%s`"+` (
+			timestamp, time_unix_nano, receive_time, receive_time_unix_nano,
+			service_name, metric_name, metric_type, value_type, value_int64,
+			exemplars, point_fingerprint, schema_version
+		)
+		VALUES
+			(
+				TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 72 HOUR), 1000, CURRENT_TIMESTAMP(), 3000,
+				'rpf-svc', 'gen_ai.client.token.usage', 'SUM', 'INT64', 100,
+				[STRUCT(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 72 HOUR) AS time, 1000 AS time_unix_nano, CAST(NULL AS FLOAT64) AS value_double, 100 AS value_int64, '0102030405060708' AS span_id, '0102030405060708090a0b0c0d0e0f10' AS trace_id, CAST(NULL AS JSON) AS filtered_attributes, CAST(NULL AS JSON) AS filtered_attributes_schema)],
+				'fp-old', 'v0alpha2'
+			),
+			(
+				TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE), 4000, CURRENT_TIMESTAMP(), 6000,
+				'rpf-svc', 'gen_ai.client.token.usage', 'SUM', 'INT64', 200,
+				[STRUCT(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE) AS time, 4000 AS time_unix_nano, CAST(NULL AS FLOAT64) AS value_double, 200 AS value_int64, '1112131415161718' AS span_id, '1112131415161718191a1b1c1d1e1f20' AS trace_id, CAST(NULL AS JSON) AS filtered_attributes, CAST(NULL AS JSON) AS filtered_attributes_schema)],
+				'fp-recent', 'v0alpha2'
+			);
+	`, project, dataset, rpfSpansTable, project, dataset, rpfLogsTable, project, dataset, rpfMetricsTable)
+	seedJob, err := client.Query(seedSQL).Run(ctx)
+	if err != nil {
+		return fmt.Errorf("seed RPF partitions: %w", err)
+	}
+	seedStatus, err := seedJob.Wait(ctx)
+	if err != nil {
+		return fmt.Errorf("wait seed RPF partitions: %w", err)
+	}
+	if err := seedStatus.Err(); err != nil {
+		return fmt.Errorf("seed RPF partitions status: %w", err)
+	}
+
+	dryRunBytes := func(sql string) (int64, error) {
+		q := client.Query(sql)
+		q.DryRun = true
+		j, err := q.Run(ctx)
+		if err != nil {
+			return 0, err
+		}
+		st := j.LastStatus()
+		if st == nil || st.Statistics == nil {
+			return 0, errors.New("dry-run job missing LastStatus().Statistics")
+		}
+		if err := st.Err(); err != nil {
+			return 0, err
+		}
+		return st.Statistics.TotalBytesProcessed, nil
+	}
+
+	for _, tc := range []struct {
+		name      string
+		narrowSQL string
+		wideSQL   string
+	}{
+		{
+			name: "tvf_gen_ai_logs_rpf",
+			narrowSQL: fmt.Sprintf(
+				"SELECT * FROM `%s.%s.tvf_gen_ai_logs_rpf`(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 2 HOUR), CURRENT_TIMESTAMP())",
+				project, dataset,
+			),
+			wideSQL: fmt.Sprintf(
+				"SELECT * FROM `%s.%s.tvf_gen_ai_logs_rpf`(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 96 HOUR), CURRENT_TIMESTAMP())",
+				project, dataset,
+			),
+		},
+		{
+			name: "tvf_gen_ai_metric_exemplars_rpf",
+			narrowSQL: fmt.Sprintf(
+				"SELECT * FROM `%s.%s.tvf_gen_ai_metric_exemplars_rpf`(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 2 HOUR), CURRENT_TIMESTAMP())",
+				project, dataset,
+			),
+			wideSQL: fmt.Sprintf(
+				"SELECT * FROM `%s.%s.tvf_gen_ai_metric_exemplars_rpf`(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 96 HOUR), CURRENT_TIMESTAMP())",
+				project, dataset,
+			),
+		},
+		{
+			name: "tvf_gen_ai_agent_trajectory_rpf",
+			narrowSQL: fmt.Sprintf(
+				"SELECT * FROM `%s.%s.tvf_gen_ai_agent_trajectory_rpf`(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 2 HOUR), CURRENT_TIMESTAMP(), TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 2 HOUR), CURRENT_TIMESTAMP())",
+				project, dataset,
+			),
+			wideSQL: fmt.Sprintf(
+				"SELECT * FROM `%s.%s.tvf_gen_ai_agent_trajectory_rpf`(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 96 HOUR), CURRENT_TIMESTAMP(), TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 96 HOUR), CURRENT_TIMESTAMP())",
+				project, dataset,
+			),
+		},
+	} {
+		narrowBytes, err := dryRunBytes(tc.narrowSQL)
+		if err != nil {
+			return fmt.Errorf("%s narrow dry-run failed: %w", tc.name, err)
+		}
+		wideBytes, err := dryRunBytes(tc.wideSQL)
+		if err != nil {
+			return fmt.Errorf("%s wide dry-run failed: %w", tc.name, err)
+		}
+		if narrowBytes <= 0 || narrowBytes >= wideBytes {
+			return fmt.Errorf("%s partition pruning check: narrowBytes=%d, wideBytes=%d; want 0 < narrowBytes < wideBytes", tc.name, narrowBytes, wideBytes)
 		}
 	}
 	return nil

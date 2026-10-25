@@ -6,20 +6,31 @@ package bigqueryexporter
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	bq "cloud.google.com/go/bigquery"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	bigqueryapi "google.golang.org/api/bigquery/v2"
+	"google.golang.org/api/googleapi"
+	"google.golang.org/api/option"
 
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/quarantinereplay"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/testfakes/bqfake"
@@ -78,6 +89,20 @@ func (m *memOffloadStore) Fetch(_ context.Context, uri string) ([]byte, error) {
 		return nil, fmt.Errorf("object %q generation = %q, want %q", uri, entry.version, wantGen)
 	}
 	return bytes.Clone(entry.data), nil
+}
+
+// Overwrite replaces an existing object in memOffloadStore with a new generation
+// and payload so tests can verify generation-pinned reads against overwritten URIs.
+func (m *memOffloadStore) Overwrite(uri string, data []byte) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.seq++
+	ver := strconv.FormatInt(m.seq, 10)
+	m.objects[uri] = memOffloadEntry{
+		data:    bytes.Clone(data),
+		version: ver,
+	}
+	return ver
 }
 
 func (m *memOffloadStore) Close() error { return nil }
@@ -424,25 +449,110 @@ func stringOrEmpty(v any) string {
 // Continuous Query EXPORT DATA ... CLOUD_PUBSUB job on an on-demand project
 // without an Enterprise/Enterprise Plus CONTINUOUS reservation or Pub/Sub
 // topic is an expected environment/reservation/topic-permission rejection
-// rather than a SQL syntax or EXPORT DATA option error (such as "Unsupported
-// export format").
+// rather than a SQL syntax, EXPORT DATA option, missing table/dataset, or
+// transient 5xx service error.
 func isExpectedContinuousQueryDryRunError(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := strings.ToLower(err.Error())
-	if strings.Contains(msg, "syntax error") ||
-		strings.Contains(msg, "unsupported export format") ||
-		strings.Contains(msg, "unrecognized name") ||
-		strings.Contains(msg, "table not found") {
+	code := extractHTTPStatusCode(err)
+	// Only HTTP 400 (edition/reservation capability check) and HTTP 403
+	// (accessDenied/permissionDenied on Pub/Sub topic or CONTINUOUS assignment)
+	// can qualify as expected environment capability rejections; 404, 5xx, and
+	// unknown errors must always fail the test.
+	if code != http.StatusBadRequest && code != http.StatusForbidden {
 		return false
 	}
-	return strings.Contains(msg, "continuous query") ||
-		strings.Contains(msg, "continuous queries") ||
-		strings.Contains(msg, "reservation") ||
-		strings.Contains(msg, "enterprise") ||
-		strings.Contains(msg, "pubsub") ||
-		strings.Contains(msg, "cloud_pubsub")
+	msg := strings.ToLower(primaryErrorMessage(err))
+	for _, reject := range []string{
+		"syntax error",
+		"order by",
+		"unsupported",
+		"invalid value for option",
+		"unrecognized",
+		"not found",
+		"dataset",
+		"table",
+		"column",
+	} {
+		if strings.Contains(msg, reject) {
+			return false
+		}
+	}
+	hasReservationOrEditionGate := (strings.Contains(msg, "continuous queries") || strings.Contains(msg, "continuous query")) &&
+		(strings.Contains(msg, "reservation") ||
+			strings.Contains(msg, "assignment") ||
+			strings.Contains(msg, "edition") ||
+			strings.Contains(msg, "enterprise") ||
+			strings.Contains(msg, "not enabled") ||
+			strings.Contains(msg, "not supported in this"))
+	hasPubSubPermGate := (strings.Contains(msg, "access denied") || strings.Contains(msg, "permission denied") || strings.Contains(msg, "permission")) &&
+		(strings.Contains(msg, "pubsub") || strings.Contains(msg, "topic"))
+	return hasReservationOrEditionGate || hasPubSubPermGate
+}
+
+var googleapiStatusRe = regexp.MustCompile(`googleapi:\s*Error\s+(\d{3})\b`)
+
+func primaryErrorMessage(err error) string {
+	var apiErr *googleapi.Error
+	if errors.As(err, &apiErr) && apiErr.Message != "" {
+		return apiErr.Message
+	}
+	msg := err.Error()
+	if before, _, ok := strings.Cut(msg, "\nDetails:"); ok {
+		return before
+	}
+	return msg
+}
+
+func extractHTTPStatusCode(err error) int {
+	var apiErr *googleapi.Error
+	if errors.As(err, &apiErr) && apiErr.Code != 0 {
+		return apiErr.Code
+	}
+	if m := googleapiStatusRe.FindStringSubmatch(err.Error()); len(m) == 2 {
+		if n, convErr := strconv.Atoi(m[1]); convErr == nil {
+			return n
+		}
+	}
+	return 0
+}
+
+// validateContinuousExportDryRunJob inspects both the RPC error and the returned
+// *bigqueryapi.Job payload from rawSvc.Jobs.Insert(...).Do(). BigQuery can return
+// HTTP 200 with job.Status.ErrorResult populated or Statistics == nil; those must
+// never be treated as validated dry-runs.
+func validateContinuousExportDryRunJob(job *bigqueryapi.Job, err error) (skipReason string, fatalErr error) {
+	if err != nil {
+		if isExpectedContinuousQueryDryRunError(err) {
+			return primaryErrorMessage(err), nil
+		}
+		return "", err
+	}
+	if job == nil {
+		return "", errors.New("Jobs.Insert returned nil job without error")
+	}
+	if job.Status == nil {
+		return "", errors.New("Jobs.Insert returned job with nil Status")
+	}
+	if job.Status.ErrorResult != nil {
+		statusErr := &googleapi.Error{
+			Code:    http.StatusBadRequest,
+			Message: fmt.Sprintf("%s: %s", job.Status.ErrorResult.Reason, job.Status.ErrorResult.Message),
+		}
+		if isExpectedContinuousQueryDryRunError(statusErr) {
+			return statusErr.Error(), nil
+		}
+		return "", fmt.Errorf("job.Status.ErrorResult = %s: %s", job.Status.ErrorResult.Reason, job.Status.ErrorResult.Message)
+	}
+	if len(job.Status.Errors) > 0 {
+		first := job.Status.Errors[0]
+		return "", fmt.Errorf("job.Status.Errors[0] = %s: %s", first.Reason, first.Message)
+	}
+	if job.Statistics == nil {
+		return "", errors.New("Jobs.Insert dry-run returned nil job.Statistics")
+	}
+	return "", nil
 }
 
 // shouldDeleteDatasetOnCreate reports whether an integration test owns the
@@ -451,6 +561,32 @@ func isExpectedContinuousQueryDryRunError(err error) bool {
 // or any other error).
 func shouldDeleteDatasetOnCreate(createErr error) bool {
 	return createErr == nil
+}
+
+func uniqueEphemeralDatasetID(prefix string) string {
+	var rnd [4]byte
+	_, _ = rand.Read(rnd[:])
+	return fmt.Sprintf("%s_%d_%s", prefix, time.Now().UnixMilli(), hex.EncodeToString(rnd[:]))
+}
+
+// createOwnedEphemeralDataset creates dataset via Dataset.Create(ctx, &bq.DatasetMetadata{Location: location})
+// and registers DeleteWithContents on cleanup ONLY if Dataset.Create returns nil.
+func createOwnedEphemeralDataset(
+	ctx context.Context,
+	admin *bq.Client,
+	dataset, location string,
+	registerCleanup func(func()),
+) error {
+	createErr := admin.Dataset(dataset).Create(ctx, &bq.DatasetMetadata{Location: location})
+	if !shouldDeleteDatasetOnCreate(createErr) {
+		return createErr
+	}
+	registerCleanup(func() {
+		cleanCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = admin.Dataset(dataset).DeleteWithContents(cleanCtx)
+	})
+	return nil
 }
 
 func TestIsExpectedContinuousQueryDryRunError(t *testing.T) {
@@ -463,12 +599,44 @@ func TestIsExpectedContinuousQueryDryRunError(t *testing.T) {
 		{"unsupported export format", errors.New("googleapi: Error 400: Unsupported export format: CLOUD_PUBSUB, invalid"), false},
 		{"syntax error mentioning continuous", errors.New("googleapi: Error 400: Syntax error: Unexpected identifier \"continuous\" at [1:1]"), false},
 		{"unrecognized column", errors.New("googleapi: Error 400: Unrecognized name: bad_col"), false},
+		{"probe 1: 500 backend error mentioning reservation", errors.New("googleapi: Error 500: Internal error while checking continuous query reservation"), false},
+		{"probe 1b: 503 backend outage mentioning continuous query", errors.New("googleapi: Error 503: Service unavailable for continuous query"), false},
+		{"probe 2: 400 invalidQuery continuous queries do not support ORDER BY", errors.New("googleapi: Error 400: Continuous queries do not support ORDER BY, invalidQuery"), false},
+		{"probe 3: 400 invalidQuery invalid value for option format CLOUD_PUBSUB", errors.New("googleapi: Error 400: Invalid value for option 'format': CLOUD_PUBSUB, invalidQuery"), false},
+		{"probe 4: 404 notFound dataset my-enterprise-proj:otel_cq_it", errors.New("googleapi: Error 404: Not found: Dataset my-enterprise-proj:otel_cq_it, notFound"), false},
 		{"enterprise reservation required", errors.New("googleapi: Error 400: Continuous queries require an Enterprise or Enterprise Plus reservation"), true},
 		{"pubsub permission denied", errors.New("googleapi: Error 403: Access Denied: Cloud_Pubsub topic permission denied"), true},
 	} {
 		if got := isExpectedContinuousQueryDryRunError(tc.err); got != tc.want {
 			t.Errorf("%s: isExpectedContinuousQueryDryRunError(%v) = %v, want %v", tc.name, tc.err, got, tc.want)
 		}
+	}
+
+	// Probe 5: HTTP 200 *bigqueryapi.Job carrying Status.ErrorResult or nil Statistics.
+	jobWithErrResult := &bigqueryapi.Job{
+		Status: &bigqueryapi.JobStatus{
+			ErrorResult: &bigqueryapi.ErrorProto{
+				Reason:  "invalidQuery",
+				Message: "Continuous queries do not support ORDER BY",
+			},
+		},
+		Statistics: &bigqueryapi.JobStatistics{},
+	}
+	if skipReason, fatalErr := validateContinuousExportDryRunJob(jobWithErrResult, nil); fatalErr == nil || skipReason != "" {
+		t.Fatalf("validateContinuousExportDryRunJob(Status.ErrorResult invalidQuery) = (skip=%q, err=%v), want non-nil fatalErr", skipReason, fatalErr)
+	}
+	jobNilStats := &bigqueryapi.Job{
+		Status: &bigqueryapi.JobStatus{},
+	}
+	if skipReason, fatalErr := validateContinuousExportDryRunJob(jobNilStats, nil); fatalErr == nil || skipReason != "" {
+		t.Fatalf("validateContinuousExportDryRunJob(nil Statistics) = (skip=%q, err=%v), want non-nil fatalErr", skipReason, fatalErr)
+	}
+	jobOK := &bigqueryapi.Job{
+		Status:     &bigqueryapi.JobStatus{},
+		Statistics: &bigqueryapi.JobStatistics{TotalBytesProcessed: 0},
+	}
+	if skipReason, fatalErr := validateContinuousExportDryRunJob(jobOK, nil); fatalErr != nil || skipReason != "" {
+		t.Fatalf("validateContinuousExportDryRunJob(valid dry-run job) = (skip=%q, err=%v), want (\"\", nil)", skipReason, fatalErr)
 	}
 }
 
@@ -478,5 +646,266 @@ func TestShouldDeleteDatasetOnCreate(t *testing.T) {
 	}
 	if shouldDeleteDatasetOnCreate(errors.New("googleapi: Error 409: Already Exists: Dataset")) {
 		t.Error("shouldDeleteDatasetOnCreate(409 Already Exists) = true, want false")
+	}
+	ds1 := uniqueEphemeralDatasetID("otel_exporter_it")
+	ds2 := uniqueEphemeralDatasetID("otel_exporter_it")
+	if !strings.HasPrefix(ds1, "otel_exporter_it_") || ds1 == ds2 {
+		t.Errorf("uniqueEphemeralDatasetID produced non-unique or malformed IDs: %q vs %q", ds1, ds2)
+	}
+}
+
+func TestEphemeralDatasetOwnershipFake409NeverDeletes(t *testing.T) {
+	var createCalls atomic.Int32
+	var deleteCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/datasets"):
+			createCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":{"code":409,"message":"Already Exists: Dataset test-proj:preexisting_ds","errors":[{"reason":"duplicate"}]}}`))
+		case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/datasets/"):
+			deleteCalls.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	admin, err := bq.NewClient(ctx, "test-proj",
+		option.WithEndpoint(srv.URL),
+		option.WithoutAuthentication(),
+	)
+	if err != nil {
+		t.Fatalf("bq.NewClient: %v", err)
+	}
+	defer func() { _ = admin.Close() }()
+
+	var cleanups []func()
+	createErr := createOwnedEphemeralDataset(ctx, admin, "preexisting_ds", "US", func(fn func()) {
+		cleanups = append(cleanups, fn)
+	})
+	if createErr == nil {
+		t.Fatal("createOwnedEphemeralDataset on 409 response returned nil error, want 409 error")
+	}
+	for _, fn := range cleanups {
+		fn()
+	}
+	if got := createCalls.Load(); got != 1 {
+		t.Fatalf("POST /datasets calls = %d, want 1", got)
+	}
+	if got := deleteCalls.Load(); got != 0 {
+		t.Fatalf("DELETE /datasets calls after 409 = %d, want 0 (must never delete pre-existing dataset)", got)
+	}
+}
+
+func TestOffloadPayloadRefRejectsStaleOrWrongGenerationOnOverwrite(t *testing.T) {
+	store := newMemOffloadStore()
+	origBytes := bytes.Repeat([]byte("original-redacted-payload-"), 12)
+	ver1, err := store.WriteObject(context.Background(), "hermetic-bucket", "prefix/spans/obj.txt", "text/plain", origBytes)
+	if err != nil {
+		t.Fatalf("WriteObject: %v", err)
+	}
+	uri := "gs://hermetic-bucket/prefix/spans/obj.txt"
+	sum1 := sha256.Sum256(origBytes)
+	sha1 := hex.EncodeToString(sum1[:])
+
+	row := map[string]any{
+		"payload_refs": []map[string]any{
+			{
+				"storage_mode":   "gcs_object_ref",
+				"attribute_path": "attributes.gen_ai.prompt",
+				"part_index":     int64(0),
+				"mime_type":      "text/plain",
+				"byte_size":      int64(len(origBytes)),
+				"sha256":         sha1,
+				"object_ref": map[string]any{
+					"uri":        uri,
+					"version":    ver1,
+					"authorizer": "us.conn",
+					"details":    fmt.Sprintf(`{"sha256":%q,"content_type":"text/plain"}`, sha1),
+				},
+			},
+		},
+	}
+	if err := assertFakeRowPayloadRef(store, row, "gs://hermetic-bucket/prefix/spans/", "us.conn", "attributes.gen_ai.prompt", "text/plain"); err != nil {
+		t.Fatalf("assertFakeRowPayloadRef before overwrite: %v", err)
+	}
+
+	// Overwrite the same URI with a new generation and modified bytes.
+	ver2 := store.Overwrite(uri, bytes.Repeat([]byte("overwritten-corrupted-payload-"), 12))
+	if ver2 == ver1 {
+		t.Fatalf("Overwrite version = %q, want != %q", ver2, ver1)
+	}
+	// Fetching with the original generation ver1 must fail on an overwritten store,
+	// whereas an unversioned fetch would have silently returned the overwritten bytes.
+	if err := assertFakeRowPayloadRef(store, row, "gs://hermetic-bucket/prefix/spans/", "us.conn", "attributes.gen_ai.prompt", "text/plain"); err == nil {
+		t.Fatal("assertFakeRowPayloadRef succeeded after object overwrite with new generation, want generation mismatch error")
+	}
+
+	qRows := []map[string]any{
+		{
+			"signal":      "traces",
+			"error_code":  "limit_exceeded",
+			"raw_payload": "",
+			"payload_ref": map[string]any{
+				"uri":        uri,
+				"version":    ver1,
+				"authorizer": "us.conn",
+				"details":    fmt.Sprintf(`{"sha256":%q,"content_type":"application/json"}`, sha1),
+			},
+		},
+	}
+	if _, err := formatFakeQuarantineRowsAsJSONL(store, qRows); err == nil {
+		t.Fatal("formatFakeQuarantineRowsAsJSONL succeeded with stale generation after overwrite, want generation mismatch error")
+	}
+}
+
+func TestTerraformGitHubWIFOIDCClaimMappingAndCondition(t *testing.T) {
+	raw, err := os.ReadFile("deploy/terraform/ci_wif.tf")
+	if err != nil {
+		t.Fatalf("read deploy/terraform/ci_wif.tf: %v", err)
+	}
+	tf := string(raw)
+
+	// Extract attribute_mapping entries from google_iam_workload_identity_pool_provider.github_ci.
+	mapBlockRe := regexp.MustCompile(`(?s)attribute_mapping\s*=\s*\{(.*?)\n\s*\}`)
+	mm := mapBlockRe.FindStringSubmatch(tf)
+	if mm == nil {
+		t.Fatal("deploy/terraform/ci_wif.tf missing attribute_mapping block")
+	}
+	entryRe := regexp.MustCompile(`"([^"]+)"\s*=\s*"([^"]+)"`)
+	mapping := make(map[string]string)
+	for _, m := range entryRe.FindAllStringSubmatch(mm[1], -1) {
+		mapping[m[1]] = m[2]
+	}
+
+	// Regression check for P1-1: attribute.workflow_ref MUST map from
+	// assertion.workflow_ref (always present on schedule and workflow_dispatch),
+	// never assertion.job_workflow_ref.
+	if got := mapping["attribute.workflow_ref"]; got != "assertion.workflow_ref" {
+		t.Fatalf("attribute_mapping[\"attribute.workflow_ref\"] = %q, want \"assertion.workflow_ref\"", got)
+	}
+
+	condBlockRe := regexp.MustCompile(`(?s)attribute_condition\s*=\s*join\(" && ",\s*\[(.*?)\n\s*\]\)`)
+	cm := condBlockRe.FindStringSubmatch(tf)
+	if cm == nil {
+		t.Fatal("deploy/terraform/ci_wif.tf missing attribute_condition join block")
+	}
+	condText := cm[1]
+	for _, wantClause := range []string{
+		`attribute.repository_owner_id == \"${var.github_repository_owner_id}\"`,
+		`attribute.repository_id == \"${var.github_repository_id}\"`,
+		`attribute.repository == \"${var.github_repository}\"`,
+		`attribute.ref == \"refs/heads/main\"`,
+		`attribute.workflow_ref == \"${var.github_repository}/${var.github_workflow_ref}@refs/heads/main\"`,
+		`attribute.event_name in [${join(", ", formatlist("%q", var.github_allowed_events))}]`,
+	} {
+		if !strings.Contains(condText, wantClause) {
+			t.Fatalf("attribute_condition missing clause %q in:\n%s", wantClause, condText)
+		}
+	}
+
+	const (
+		cfgRepo        = "haiyuan-eng-google/BQ-OTEL-Exporter"
+		cfgRepoID      = "123456789"
+		cfgOwnerID     = "987654321"
+		cfgWorkflowRef = ".github/workflows/live-integration.yml"
+	)
+	allowedEvents := []string{"schedule", "workflow_dispatch"}
+
+	// evaluateWIF simulates GCP Workload Identity Pool Provider attribute_mapping +
+	// attribute_condition against a raw GitHub Actions OIDC JWT assertion payload.
+	evaluateWIF := func(assertion map[string]string) bool {
+		attrs := make(map[string]string, len(mapping))
+		for attrKey, expr := range mapping {
+			claimName := strings.TrimPrefix(expr, "assertion.")
+			attrs[attrKey] = assertion[claimName]
+		}
+		return attrs["attribute.repository_owner_id"] == cfgOwnerID &&
+			attrs["attribute.repository_id"] == cfgRepoID &&
+			attrs["attribute.repository"] == cfgRepo &&
+			attrs["attribute.ref"] == "refs/heads/main" &&
+			attrs["attribute.workflow_ref"] == cfgRepo+"/"+cfgWorkflowRef+"@refs/heads/main" &&
+			slices.Contains(allowedEvents, attrs["attribute.event_name"])
+	}
+
+	validBase := func() map[string]string {
+		return map[string]string{
+			"sub":                 "repo:haiyuan-eng-google/BQ-OTEL-Exporter:ref:refs/heads/main",
+			"actor":               "haiyuan-eng-google",
+			"repository":          cfgRepo,
+			"repository_id":       cfgRepoID,
+			"repository_owner_id": cfgOwnerID,
+			"ref":                 "refs/heads/main",
+			// Top-level GitHub Actions schedule/workflow_dispatch OIDC tokens emit
+			// workflow_ref (and do NOT need job_workflow_ref).
+			"workflow_ref": "haiyuan-eng-google/BQ-OTEL-Exporter/.github/workflows/live-integration.yml@refs/heads/main",
+			"event_name":   "schedule",
+		}
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(m map[string]string)
+		want   bool
+	}{
+		{
+			name:   "1. positive: scheduled run on refs/heads/main",
+			mutate: func(m map[string]string) { m["event_name"] = "schedule" },
+			want:   true,
+		},
+		{
+			name:   "2. positive: manual workflow_dispatch on refs/heads/main",
+			mutate: func(m map[string]string) { m["event_name"] = "workflow_dispatch" },
+			want:   true,
+		},
+		{
+			name: "3. negative: fork pull_request",
+			mutate: func(m map[string]string) {
+				m["event_name"] = "pull_request"
+				m["ref"] = "refs/pull/70/merge"
+			},
+			want: false,
+		},
+		{
+			name: "4. negative: pull_request_target on refs/heads/main",
+			mutate: func(m map[string]string) {
+				m["event_name"] = "pull_request_target"
+			},
+			want: false,
+		},
+		{
+			name: "5. negative: other workflow file on refs/heads/main",
+			mutate: func(m map[string]string) {
+				m["workflow_ref"] = "haiyuan-eng-google/BQ-OTEL-Exporter/.github/workflows/ci.yml@refs/heads/main"
+			},
+			want: false,
+		},
+		{
+			name: "6. negative: tag ref",
+			mutate: func(m map[string]string) {
+				m["ref"] = "refs/tags/v0.1.0"
+				m["workflow_ref"] = "haiyuan-eng-google/BQ-OTEL-Exporter/.github/workflows/live-integration.yml@refs/tags/v0.1.0"
+			},
+			want: false,
+		},
+		{
+			name: "7. negative: wrong repository_owner_id",
+			mutate: func(m map[string]string) {
+				m["repository_owner_id"] = "111111111"
+			},
+			want: false,
+		},
+	}
+
+	for _, tc := range cases {
+		claims := validBase()
+		tc.mutate(claims)
+		if got := evaluateWIF(claims); got != tc.want {
+			t.Errorf("%s: evaluateWIF = %v, want %v (claims=%v)", tc.name, got, tc.want, claims)
+		}
 	}
 }

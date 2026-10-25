@@ -1789,7 +1789,7 @@ resource "google_bigquery_routine" "tvf_gen_ai_agent_trajectory" {
   routine_id   = "tvf_gen_ai_agent_trajectory"
   routine_type = "TABLE_VALUED_FUNCTION"
   language     = "SQL"
-  description  = "Bounded-window partition-prunable counterpart of v_gen_ai_agent_trajectory accepting (start_ts, end_ts)."
+  description  = "Caller-bounded context-horizon partition-prunable counterpart of v_gen_ai_agent_trajectory accepting (start_ts, end_ts, context_start_ts, context_end_ts)."
 
   arguments {
     name      = "start_ts"
@@ -1798,6 +1798,16 @@ resource "google_bigquery_routine" "tvf_gen_ai_agent_trajectory" {
 
   arguments {
     name      = "end_ts"
+    data_type = jsonencode({ typeKind = "TIMESTAMP" })
+  }
+
+  arguments {
+    name      = "context_start_ts"
+    data_type = jsonencode({ typeKind = "TIMESTAMP" })
+  }
+
+  arguments {
+    name      = "context_end_ts"
     data_type = jsonencode({ typeKind = "TIMESTAMP" })
   }
 
@@ -1846,8 +1856,8 @@ resource "google_bigquery_routine" "tvf_gen_ai_agent_trajectory" {
             IF(gen_ai_operation_name IN ('invoke_agent', 'create_agent'), gen_ai_agent_name, NULL)
           ) AS agent_path_name
         FROM `${var.project_id}.${google_bigquery_dataset.otel.dataset_id}.${google_bigquery_table.v_gen_ai_spans.table_id}`
-        WHERE start_time >= TIMESTAMP_SUB(start_ts, INTERVAL 24 HOUR)
-          AND start_time <= TIMESTAMP_ADD(end_ts, INTERVAL 1 HOUR)
+        WHERE start_time >= context_start_ts
+          AND start_time < context_end_ts
         QUALIFY ROW_NUMBER() OVER (
           PARTITION BY trace_id, service_name, span_id
           ORDER BY start_time ASC, end_time DESC, span_name ASC, duration_nano DESC
@@ -2033,7 +2043,14 @@ resource "google_bigquery_routine" "tvf_gen_ai_agent_trajectory" {
               LIMIT 1
             )
           ) AS nearest_agent_span_id,
-          COALESCE(
+          IF(
+            EXISTS (
+              SELECT 1
+              FROM UNNEST(h.chain) AS n
+                WITH OFFSET AS idx
+              WHERE idx >= h.tree_start_idx
+                AND n.is_agent_op
+            ),
             (
               SELECT n.resolved_agent_name
               FROM UNNEST(h.chain) AS n
@@ -2108,17 +2125,22 @@ resource "google_bigquery_routine" "tvf_gen_ai_agent_trajectory" {
             WHERE x_idx > a_idx
               AND x.span_id = anc.span_id
           )
-          AND (
-            a_idx >= t.tree_start_idx
-            OR (
-              a_idx - (
-                SELECT MAX(i2)
-                FROM UNNEST(t.chain) AS n2
-                  WITH OFFSET AS i2
-                WHERE i2 <= a_idx
-                  AND NOT n2.in_tree_window
-              )
-            ) <= 16
+          AND NOT EXISTS (
+            SELECT 1
+            FROM UNNEST(t.chain) AS m
+              WITH OFFSET AS m_idx
+            WHERE m_idx >= a_idx
+              AND m_idx < ARRAY_LENGTH(t.chain) - 1
+              AND COALESCE(
+                m_idx - (
+                  SELECT MAX(i2)
+                  FROM UNNEST(t.chain) AS n2
+                    WITH OFFSET AS i2
+                  WHERE i2 <= m_idx
+                    AND NOT n2.in_tree_window
+                ),
+                17
+              ) > 16
           )
       ),
       token_parent_coverage AS (

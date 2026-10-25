@@ -106,10 +106,11 @@ resource "google_iam_workload_identity_pool_provider" "github_ci" {
     "attribute.repository_id"       = "assertion.repository_id"
     "attribute.repository_owner_id" = "assertion.repository_owner_id"
     "attribute.ref"                 = "assertion.ref"
-    # GitHub Actions OIDC tokens emit the workflow reference claim as
-    # assertion.job_workflow_ref ("<owner>/<repo>/<workflow_path>@<ref>"),
-    # which we map to attribute.workflow_ref for attribute_condition.
-    "attribute.workflow_ref" = "assertion.job_workflow_ref"
+    # GitHub Actions OIDC tokens for top-level schedule and workflow_dispatch
+    # runs emit the workflow reference claim as assertion.workflow_ref
+    # ("<owner>/<repo>/<workflow_path>@<ref>"); assertion.job_workflow_ref is
+    # only populated for reusable workflow_call invocations.
+    "attribute.workflow_ref" = "assertion.workflow_ref"
     "attribute.event_name"   = "assertion.event_name"
   }
 

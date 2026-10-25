@@ -67,13 +67,18 @@ func TestRecoveryAfterAttemptTimeoutsLiveBigQuery(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	dataset := fmt.Sprintf("otel_exporter_recovery_it_%d", time.Now().UnixNano())
-	admin := newLiveBigQueryAdmin(ctx, t, project, dataset)
+	dataset := uniqueEphemeralDatasetID("otel_exporter_recovery_it")
+	admin := newLiveBigQueryAdmin(ctx, t, project, dataset, location)
 
-	reader := sdkmetric.NewManualReader()
-	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
-	settings := component.TelemetrySettings{Logger: zap.NewNop(), MeterProvider: provider}
+	readers := make(map[string]*sdkmetric.ManualReader, 3)
+	settingsBySignal := make(map[string]component.TelemetrySettings, 3)
+	for _, sig := range []string{"traces", "logs", "metrics"} {
+		r := sdkmetric.NewManualReader()
+		p := sdkmetric.NewMeterProvider(sdkmetric.WithReader(r))
+		t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+		readers[sig] = r
+		settingsBySignal[sig] = component.TelemetrySettings{Logger: zap.NewNop(), MeterProvider: p}
+	}
 
 	cfg := validConfig()
 	cfg.Project = project
@@ -82,14 +87,14 @@ func TestRecoveryAfterAttemptTimeoutsLiveBigQuery(t *testing.T) {
 	cfg.AutoCreate.Dataset = true
 	cfg.AutoCreate.Tables = true
 
-	traces, err := newTracesExporter(settings, cfg)
+	traces, err := newTracesExporter(settingsBySignal["traces"], cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := traces.start(ctx, nil); err != nil {
 		t.Fatalf("trace startup: %v", err)
 	}
-	logs, err := newLogsExporter(settings, cfg)
+	logs, err := newLogsExporter(settingsBySignal["logs"], cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +102,7 @@ func TestRecoveryAfterAttemptTimeoutsLiveBigQuery(t *testing.T) {
 		_ = traces.shutdown(context.Background())
 		t.Fatalf("log startup: %v", err)
 	}
-	metrics, err := newMetricsExporter(settings, cfg)
+	metrics, err := newMetricsExporter(settingsBySignal["metrics"], cfg)
 	if err != nil {
 		_ = traces.shutdown(context.Background())
 		_ = logs.shutdown(context.Background())
@@ -146,15 +151,21 @@ func TestRecoveryAfterAttemptTimeoutsLiveBigQuery(t *testing.T) {
 		return b(attemptCtx)
 	}
 
+	type taggedBatch struct {
+		signal string
+		run    batch
+	}
 	var mu sync.Mutex
-	var failed []batch
+	var failed []taggedBatch
+	failedBySignal := map[string]int{}
 	dropped := 0
 	for burst := 0; burst < 3; burst++ {
 		// An ordinary attempt per signal first, so the burst dispatches onto
 		// open streams rather than timing out while one is created.
 		for _, signal := range []string{"traces", "logs", "metrics"} {
 			if b := newBatch(signal); attempt(b, cfg.TimeoutSettings.Timeout) != nil {
-				failed = append(failed, b)
+				failed = append(failed, taggedBatch{signal: signal, run: b})
+				failedBySignal[signal]++
 			}
 		}
 		var wg sync.WaitGroup
@@ -162,7 +173,7 @@ func TestRecoveryAfterAttemptTimeoutsLiveBigQuery(t *testing.T) {
 			for _, signal := range []string{"traces", "logs", "metrics"} {
 				b := newBatch(signal)
 				wg.Add(1)
-				go func() {
+				go func(sig string, b batch) {
 					defer wg.Done()
 					err := attempt(b, burstTimeout)
 					if err == nil {
@@ -175,47 +186,115 @@ func TestRecoveryAfterAttemptTimeoutsLiveBigQuery(t *testing.T) {
 						t.Errorf("burst batch rejected permanently: %v", err)
 						return
 					}
-					failed = append(failed, b)
-				}()
+					failed = append(failed, taggedBatch{signal: sig, run: b})
+					failedBySignal[sig]++
+				}(signal, b)
 			}
 		}
 		wg.Wait()
 	}
-	if n := liveMetricSum(t, reader, "otelcol_exporter_bigquery_timeouts_after_dispatch"); n == 0 {
-		t.Fatalf("no attempt timed out after dispatch with a %v burst timeout; lower BQ_RECOVERY_BURST_TIMEOUT", burstTimeout)
+
+	// Ensure every signal (traces, logs, and metrics) experienced at least one
+	// post-dispatch attempt timeout and queued a failed batch for replay.
+	for _, signal := range []string{"traces", "logs", "metrics"} {
+		sigReader := readers[signal]
+		for round := 0; round < 6 && (failedBySignal[signal] == 0 || liveMetricSum(t, sigReader, "otelcol_exporter_bigquery_timeouts_after_dispatch") == 0); round++ {
+			// Sweep candidate post-dispatch timeouts (15ms, 10ms, 20ms, 8ms, 12ms, 25ms)
+			// after warming the stream so at least one AppendRows call dispatches and
+			// times out while waiting for the server ack.
+			candidates := []time.Duration{
+				15 * time.Millisecond,
+				10 * time.Millisecond,
+				20 * time.Millisecond,
+				8 * time.Millisecond,
+				12 * time.Millisecond,
+				burstTimeout,
+			}
+			tryTimeout := candidates[round%len(candidates)]
+			if b := newBatch(signal); attempt(b, cfg.TimeoutSettings.Timeout) != nil {
+				failed = append(failed, taggedBatch{signal: signal, run: b})
+				failedBySignal[signal]++
+			}
+			var wg sync.WaitGroup
+			for range 10 {
+				b := newBatch(signal)
+				wg.Add(1)
+				go func(b batch) {
+					defer wg.Done()
+					err := attempt(b, tryTimeout)
+					if err == nil {
+						return
+					}
+					mu.Lock()
+					defer mu.Unlock()
+					if consumererror.IsPermanent(err) {
+						dropped++
+						t.Errorf("targeted %s burst batch rejected permanently: %v", signal, err)
+						return
+					}
+					failed = append(failed, taggedBatch{signal: signal, run: b})
+					failedBySignal[signal]++
+				}(b)
+			}
+			wg.Wait()
+		}
+		if failedBySignal[signal] == 0 {
+			t.Fatalf("no %s batch timed out for replay; lower BQ_RECOVERY_BURST_TIMEOUT", signal)
+		}
+		if n := liveMetricSum(t, sigReader, "otelcol_exporter_bigquery_timeouts_after_dispatch"); n == 0 {
+			t.Fatalf("no %s attempt timed out after dispatch with a %v burst timeout; lower BQ_RECOVERY_BURST_TIMEOUT", signal, burstTimeout)
+		}
 	}
 
 	// Replay in the same exporters with the configured attempt timeout. A batch
 	// that is rejected permanently or outlives the horizon is a dropped batch.
+	replayedBySignal := map[string]int{}
 	horizon := time.Now().Add(3 * time.Minute)
-	for _, b := range failed {
+	for _, tb := range failed {
 		for {
-			err := attempt(b, cfg.TimeoutSettings.Timeout)
+			err := attempt(tb.run, cfg.TimeoutSettings.Timeout)
 			if err == nil {
+				replayedBySignal[tb.signal]++
 				break
 			}
 			if consumererror.IsPermanent(err) || time.Now().After(horizon) {
 				dropped++
-				t.Errorf("replayed batch dropped: %v", err)
+				t.Errorf("replayed %s batch dropped: %v", tb.signal, err)
 				break
 			}
 			time.Sleep(200 * time.Millisecond)
 		}
 	}
-	t.Logf("burst timeout %v: %d batches replayed, %d dropped, %d timeouts after dispatch, %d stream retirements",
-		burstTimeout, len(failed), dropped,
-		liveMetricSum(t, reader, "otelcol_exporter_bigquery_timeouts_after_dispatch"),
-		liveMetricSum(t, reader, "otelcol_exporter_bigquery_stream_retirements"))
+	traceTimeouts := liveMetricSum(t, readers["traces"], "otelcol_exporter_bigquery_timeouts_after_dispatch")
+	logTimeouts := liveMetricSum(t, readers["logs"], "otelcol_exporter_bigquery_timeouts_after_dispatch")
+	metricTimeouts := liveMetricSum(t, readers["metrics"], "otelcol_exporter_bigquery_timeouts_after_dispatch")
+	totalTimeouts := traceTimeouts + logTimeouts + metricTimeouts
+	totalRetirements := liveMetricSum(t, readers["traces"], "otelcol_exporter_bigquery_stream_retirements") +
+		liveMetricSum(t, readers["logs"], "otelcol_exporter_bigquery_stream_retirements") +
+		liveMetricSum(t, readers["metrics"], "otelcol_exporter_bigquery_stream_retirements")
+	t.Logf("burst timeout %v: %d batches replayed (traces=%d, logs=%d, metrics=%d), %d dropped, %d timeouts after dispatch (traces=%d, logs=%d, metrics=%d), %d stream retirements",
+		burstTimeout, len(failed),
+		replayedBySignal["traces"], replayedBySignal["logs"], replayedBySignal["metrics"],
+		dropped,
+		totalTimeouts, traceTimeouts, logTimeouts, metricTimeouts,
+		totalRetirements)
 	if dropped != 0 {
 		t.Fatalf("%d batches dropped, want 0", dropped)
 	}
+	for _, signal := range []string{"traces", "logs", "metrics"} {
+		if replayedBySignal[signal] == 0 {
+			t.Fatalf("replayedBySignal[%q] = 0, want >= 1", signal)
+		}
+	}
 
-	for _, gauge := range []string{
-		"otelcol_exporter_bigquery_inflight_requests",
-		"otelcol_exporter_bigquery_unresolved_results",
-	} {
-		if err := waitForZeroGauge(ctx, t, reader, gauge); err != nil {
-			t.Error(err)
+	for _, signal := range []string{"traces", "logs", "metrics"} {
+		for _, gauge := range []string{
+			"otelcol_exporter_bigquery_inflight_requests",
+			"otelcol_exporter_bigquery_unresolved_results",
+		} {
+			if err := waitForZeroGauge(ctx, t, readers[signal], gauge); err != nil {
+				t.Errorf("%s: %v", signal, err)
+			}
 		}
 	}
 
@@ -392,7 +471,7 @@ func recoveryLogs(runID uint64, seq *atomic.Uint64, n int) plog.Logs {
 	return ld
 }
 
-func newLiveBigQueryAdmin(ctx context.Context, t *testing.T, project, dataset string) *bq.Client {
+func newLiveBigQueryAdmin(ctx context.Context, t *testing.T, project, dataset, location string) *bq.Client {
 	t.Helper()
 	httpClient, _, closeHTTP, err := googlehttp.NewClient(ctx, []string{bigqueryapi.BigqueryScope})
 	if err != nil {
@@ -409,19 +488,22 @@ func newLiveBigQueryAdmin(ctx context.Context, t *testing.T, project, dataset st
 		}
 		closeHTTP()
 	})
-	t.Cleanup(func() {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
-		defer cleanupCancel()
-		if err := admin.Dataset(dataset).DeleteWithContents(cleanupCtx); err != nil {
-			t.Errorf("cleanup dataset %s.%s: %v", project, dataset, err)
-		}
-	})
+	if err := createOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup); err != nil {
+		t.Fatalf("create dataset %s.%s: %v", project, dataset, err)
+	}
 	return admin
 }
 
 // liveMetricSum returns the current value of an int64 sum, or zero when the
 // instrument has not recorded anything yet.
 func liveMetricSum(t *testing.T, reader *sdkmetric.ManualReader, name string) int64 {
+	t.Helper()
+	return liveMetricSumBySignal(t, reader, name, "")
+}
+
+// liveMetricSumBySignal returns the current value of an int64 sum filtered by
+// the "signal" attribute when wantSignal is non-empty.
+func liveMetricSumBySignal(t *testing.T, reader *sdkmetric.ManualReader, name, wantSignal string) int64 {
 	t.Helper()
 	var rm metricdata.ResourceMetrics
 	if err := reader.Collect(context.Background(), &rm); err != nil {
@@ -432,6 +514,12 @@ func liveMetricSum(t *testing.T, reader *sdkmetric.ManualReader, name string) in
 		for _, m := range sm.Metrics {
 			if sum, ok := m.Data.(metricdata.Sum[int64]); ok && m.Name == name {
 				for _, point := range sum.DataPoints {
+					if wantSignal != "" {
+						sigVal, ok := point.Attributes.Value("signal")
+						if !ok || sigVal.AsString() != wantSignal {
+							continue
+						}
+					}
 					total += point.Value
 				}
 			}
