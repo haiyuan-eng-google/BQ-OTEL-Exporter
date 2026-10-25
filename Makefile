@@ -158,3 +158,23 @@ fuzz:
 			$(GOTEST) -run '^$$' -fuzz "^$$target$$" -fuzztime $(FUZZTIME) $$pkg; \
 		done; \
 	done
+
+# Runs the synthetic OpenTelemetry GenAI & MCP load testbench across stream
+# pool sizes 1, 2, 4, 8, and 16 against the in-process bqfake Storage Write API
+# server (or live BigQuery when BENCH_MODE=live and BQ_PROJECT is set).
+BENCH_MODE     ?= bqfake
+BENCH_DURATION ?= 1s
+.PHONY: bench-envelope
+bench-envelope:
+	$(GOCMD) run ./cmd/bq-otel-testbench \
+		-mode=$(BENCH_MODE) \
+		-signals=traces,logs,metrics \
+		-stream-pool-sweep=1,2,4,8,16 \
+		-duration=$(BENCH_DURATION) \
+		-batch-size=500 \
+		-workers=4 \
+		-project="$(BQ_PROJECT)" \
+		-dataset="$(BQ_DATASET)" \
+		-ephemeral-dataset=$(if $(BQ_PROJECT),true,false) \
+		-format=markdown
+
