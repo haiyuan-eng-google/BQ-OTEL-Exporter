@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"cloud.google.com/go/auth/credentials"
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
 	"go.opentelemetry.io/collector/component"
@@ -32,6 +33,7 @@ import (
 
 	bqi "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/bigquery"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/diag"
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/googlehttp"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/metadata"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/offload"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/protoenc"
@@ -84,6 +86,7 @@ type signalExporter struct {
 	host   component.Host
 
 	lifetimeCancel context.CancelFunc
+	authCleanup    []func()
 
 	client *managedwriter.Client
 	writer rowAppender
@@ -248,10 +251,11 @@ func (e *signalExporter) authenticationOptions(
 	ctx context.Context, scopes []string,
 ) ([]option.ClientOption, error) {
 	var opts []option.ClientOption
+	var rawJSON []byte
 
 	switch {
 	case e.cfg.Credentials.JSON != "":
-		rawJSON := []byte(e.cfg.Credentials.JSON)
+		rawJSON = []byte(e.cfg.Credentials.JSON)
 		credType, err := loadCredentialsJSON(
 			ctx, rawJSON, scopes, e.cfg.Credentials.UniverseDomain)
 		if err != nil {
@@ -263,10 +267,11 @@ func (e *signalExporter) authenticationOptions(
 		)
 
 	case e.cfg.Credentials.File != "":
-		credOpt, err := credentialsFileOption(ctx, e.cfg.Credentials.File, scopes)
+		credOpt, data, err := credentialsFileOptionAndData(ctx, e.cfg.Credentials.File, scopes)
 		if err != nil {
 			return nil, err
 		}
+		rawJSON = data
 		// The scopes are repeated as a client option so the client library
 		// sees the same explicit scope list on every authentication path.
 		opts = append(opts,
@@ -275,11 +280,28 @@ func (e *signalExporter) authenticationOptions(
 		)
 
 	case e.cfg.Credentials.ImpersonateServiceAccount != "":
+		var sourceOpts []option.ClientOption
+		if e.lifetimeCancel != nil {
+			creds, closeAuth, err := googlehttp.Credentials(credentials.DetectOptions{
+				Scopes: []string{bigqueryapi.CloudPlatformScope}, UseSelfSignedJWT: true,
+				UniverseDomain: e.cfg.Credentials.UniverseDomain,
+			}, nil)
+			if err != nil {
+				return nil, err
+			}
+			e.authCleanup = append(e.authCleanup, closeAuth)
+			client, base, err := newBigQueryHTTPClient(ctx, option.WithAuthCredentials(creds))
+			if err != nil {
+				return nil, err
+			}
+			e.authCleanup = append(e.authCleanup, base.CloseIdleConnections)
+			sourceOpts = append(sourceOpts, option.WithHTTPClient(client))
+		}
 		ts, err := impersonate.CredentialsTokenSource(ctx, impersonate.CredentialsConfig{
 			TargetPrincipal: e.cfg.Credentials.ImpersonateServiceAccount,
 			Delegates:       e.cfg.Credentials.ImpersonateDelegates,
 			Scopes:          scopes,
-		})
+		}, sourceOpts...)
 		if err != nil {
 			return nil, fmt.Errorf("configuring impersonation of %s: %w",
 				e.cfg.Credentials.ImpersonateServiceAccount, err)
@@ -288,6 +310,19 @@ func (e *signalExporter) authenticationOptions(
 
 	default:
 		opts = append(opts, option.WithScopes(scopes...))
+	}
+	// A running exporter owns the token pools too. Keep option inspection
+	// outside Start free of credential discovery and transport allocation.
+	if e.lifetimeCancel != nil && e.cfg.Credentials.ImpersonateServiceAccount == "" {
+		creds, closeAuth, err := googlehttp.Credentials(credentials.DetectOptions{
+			Scopes: scopes, UseSelfSignedJWT: true,
+			UniverseDomain: e.cfg.Credentials.UniverseDomain,
+		}, rawJSON)
+		if err != nil {
+			return nil, err
+		}
+		e.authCleanup = append(e.authCleanup, closeAuth)
+		opts = []option.ClientOption{option.WithAuthCredentials(creds), option.WithScopes(scopes...)}
 	}
 
 	if e.cfg.Credentials.QuotaProject != "" {
@@ -342,21 +377,28 @@ var credentialFileTypes = []google.CredentialsType{
 func credentialsFileOption(
 	ctx context.Context, path string, scopes []string,
 ) (option.ClientOption, error) {
+	opt, _, err := credentialsFileOptionAndData(ctx, path, scopes)
+	return opt, err
+}
+
+func credentialsFileOptionAndData(
+	ctx context.Context, path string, scopes []string,
+) (option.ClientOption, []byte, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("reading credentials file: %w", err)
+		return nil, nil, fmt.Errorf("reading credentials file: %w", err)
 	}
 
 	var declared struct {
 		Type string `json:"type"`
 	}
 	if err := json.Unmarshal(data, &declared); err != nil {
-		return nil, fmt.Errorf("parsing credentials file %q: %w", path, err)
+		return nil, nil, fmt.Errorf("parsing credentials file %q: %w", path, err)
 	}
 
 	credType := google.CredentialsType(declared.Type)
 	if !slices.Contains(credentialFileTypes, credType) {
-		return nil, fmt.Errorf("credentials file %q has unsupported type %q; supported types: %v",
+		return nil, nil, fmt.Errorf("credentials file %q has unsupported type %q; supported types: %v",
 			path, declared.Type, credentialFileTypes)
 	}
 
@@ -364,10 +406,10 @@ func credentialsFileOption(
 	// rather than on the first export. The token is not fetched here;
 	// CredentialsFromJSONWithType only parses and constructs the token source.
 	if _, err := google.CredentialsFromJSONWithType(ctx, data, credType, scopes...); err != nil {
-		return nil, fmt.Errorf("loading credentials file %q: %w", path, err)
+		return nil, nil, fmt.Errorf("loading credentials file %q: %w", path, err)
 	}
 
-	return option.WithAuthCredentialsJSON(option.CredentialsType(declared.Type), data), nil
+	return option.WithAuthCredentialsJSON(option.CredentialsType(declared.Type), data), data, nil
 }
 
 func (e *signalExporter) metadataClientOptions(ctx context.Context) ([]option.ClientOption, error) {
@@ -474,6 +516,7 @@ func (e *signalExporter) start(ctx context.Context, host component.Host) (err er
 		clientCtx, clientCancel := context.WithTimeout(ctx, e.cfg.TimeoutSettings.Timeout)
 		defer clientCancel()
 
+		cleanupMark := len(e.authCleanup)
 		metadataOpts, metadataErr := e.metadataClientOptions(clientCtx)
 		if metadataErr != nil {
 			return metadataErr
@@ -481,10 +524,18 @@ func (e *signalExporter) start(ctx context.Context, host component.Host) (err er
 		admin, adminErr := newDestinationAdmin(
 			clientCtx, e.cfg.Project, e.cfg.Dataset, metadataOpts...)
 		if adminErr != nil {
+			for i := len(e.authCleanup) - 1; i >= cleanupMark; i-- {
+				e.authCleanup[i]()
+			}
+			e.authCleanup = e.authCleanup[:cleanupMark]
 			return fmt.Errorf("creating BigQuery metadata client: %w", adminErr)
 		}
 		defer func() {
 			closeErr := admin.Close()
+			for i := len(e.authCleanup) - 1; i >= cleanupMark; i-- {
+				e.authCleanup[i]()
+			}
+			e.authCleanup = e.authCleanup[:cleanupMark]
 			if closeErr == nil {
 				return
 			}
@@ -654,6 +705,10 @@ func (e *signalExporter) shutdownStatus(_ context.Context, report bool) error {
 		e.lifetimeCancel()
 		e.lifetimeCancel = nil
 	}
+	for i := len(e.authCleanup) - 1; i >= 0; i-- {
+		e.authCleanup[i]()
+	}
+	e.authCleanup = nil
 	if report {
 		componentstatus.ReportStatus(e.host, componentstatus.NewEvent(componentstatus.StatusStopped))
 	}

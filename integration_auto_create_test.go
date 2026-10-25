@@ -26,6 +26,7 @@ import (
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/googlehttp"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 )
 
@@ -51,20 +52,20 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 	t.Cleanup(cancel)
 	dataset := fmt.Sprintf("otel_exporter_it_%d", time.Now().UnixNano())
 
-	httpClient, httpBase, err := newBigQueryHTTPClient(ctx, option.WithScopes(bigqueryapi.BigqueryScope))
+	httpClient, _, closeHTTP, err := googlehttp.NewClient(ctx, []string{bigqueryapi.BigqueryScope})
 	if err != nil {
 		t.Fatalf("create cleanup/query HTTP client: %v", err)
 	}
 	admin, err := bq.NewClient(ctx, project, option.WithHTTPClient(httpClient))
 	if err != nil {
-		httpBase.CloseIdleConnections()
+		closeHTTP()
 		t.Fatalf("create cleanup/query client: %v", err)
 	}
 	t.Cleanup(func() {
 		if err := admin.Close(); err != nil {
 			t.Errorf("close cleanup/query client: %v", err)
 		}
-		httpBase.CloseIdleConnections()
+		closeHTTP()
 	})
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
