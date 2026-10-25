@@ -210,3 +210,58 @@ func newTransportLifecycleServer(t *testing.T, protocol string, handler http.Han
 	t.Cleanup(server.Close)
 	return server, closed
 }
+
+func TestGCSClientsCloseADCTokenTransportsWithEndpoint(t *testing.T) {
+	for _, protocol := range []string{"http1", "http2"} {
+		for _, operation := range []string{"offload", "replay"} {
+			t.Run(protocol+"/"+operation, func(t *testing.T) {
+				tokenServer, tokenClosed := newTransportLifecycleServer(t, protocol, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = fmt.Fprint(w, `{"access_token":"adc-token","token_type":"Bearer","expires_in":3600}`)
+				}))
+				apiServer, apiClosed := newTransportLifecycleServer(t, protocol, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if got := r.Header.Get("Authorization"); got != "Bearer adc-token" {
+						t.Errorf("Authorization=%q", got)
+					}
+					_, _ = io.Copy(io.Discard, r.Body)
+					_, _ = fmt.Fprint(w, `{"generation":"1"}`)
+				}))
+				subject := filepath.Join(t.TempDir(), "subject-token")
+				writePrivateFile(t, subject, []byte("subject"))
+				data := fmt.Sprintf(`{"type":"external_account","audience":"test-audience","subject_token_type":"urn:ietf:params:oauth:token-type:jwt","token_url":%q,"credential_source":{"file":%q}}`, tokenServer.URL, subject)
+				t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", writeCredentialsFile(t, data))
+				t.Setenv("GOOGLE_API_USE_CLIENT_CERTIFICATE", "false")
+				baseline := goleak.IgnoreCurrent()
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				opts := []option.ClientOption{option.WithEndpoint(apiServer.URL)}
+				if operation == "offload" {
+					store, err := offload.NewGCSBlobStore(ctx, opts...)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer func() { _ = store.Close() }()
+					if _, err := store.WriteObject(ctx, "bucket", "object", "text/plain", []byte("payload")); err != nil {
+						t.Fatal(err)
+					}
+					if err := store.Close(); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					fetch, cleanup, err := quarantinereplay.NewGCSObjectFetcher(ctx, opts...)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer cleanup()
+					if _, err := fetch(ctx, "gs://bucket/object"); err != nil {
+						t.Fatal(err)
+					}
+					cleanup()
+				}
+				waitForPoolClose(t, tokenClosed)
+				waitForPoolClose(t, apiClosed)
+				goleak.VerifyNone(t, baseline)
+			})
+		}
+	}
+}

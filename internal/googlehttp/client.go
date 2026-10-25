@@ -11,9 +11,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/http/httptrace"
 	"os"
+	"os/user"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"sync"
 	"time"
 
@@ -32,7 +37,8 @@ func newBase() (*http.Transport, error) {
 	return base.Clone(), nil
 }
 
-// Credentials creates credentials whose token requests use an owned pool.
+// Credentials owns ordinary token pools and drains certificate-specific
+// connections after each synchronous token exchange.
 // The provided JSON is restricted to supported credential types and loaded
 // through the typed API. Nil JSON selects ADC. The returned cleanup must run
 // after all clients using the credentials close.
@@ -78,11 +84,12 @@ func Credentials(detect credentials.DetectOptions, data []byte) (*auth.Credentia
 }
 
 type lazyCredentials struct {
-	once   sync.Once
-	detect credentials.DetectOptions
-	data   []byte
-	creds  *auth.Credentials
-	err    error
+	closeTokenConnections bool
+	once                  sync.Once
+	detect                credentials.DetectOptions
+	data                  []byte
+	creds                 *auth.Credentials
+	err                   error
 }
 
 func (l *lazyCredentials) load() (*auth.Credentials, error) {
@@ -95,8 +102,21 @@ func (l *lazyCredentials) load() (*auth.Credentials, error) {
 					return
 				}
 			} else {
-				l.creds, l.err = credentials.DetectDefault(&l.detect)
-				return
+				homeDir := os.Getenv("HOME")
+				if homeDir == "" {
+					if current, err := user.Current(); err == nil {
+						homeDir = current.HomeDir
+					}
+				}
+				filename := filepath.Join(homeDir, ".config", "gcloud", "application_default_credentials.json")
+				if runtime.GOOS == "windows" {
+					filename = filepath.Join(os.Getenv("APPDATA"), "gcloud", "application_default_credentials.json")
+				}
+				data, _ = os.ReadFile(filename)
+				if len(data) == 0 {
+					l.creds, l.err = credentials.DetectDefault(&l.detect)
+					return
+				}
 			}
 		}
 		var header struct {
@@ -105,6 +125,24 @@ func (l *lazyCredentials) load() (*auth.Credentials, error) {
 		if err := json.Unmarshal(data, &header); err != nil {
 			l.err = fmt.Errorf("parsing credentials JSON: %w", err)
 			return
+		}
+		if header.Type == credentials.ExternalAccount {
+			var file struct {
+				Source struct {
+					Certificate json.RawMessage `json:"certificate"`
+				} `json:"credential_source"`
+			}
+			if err := json.Unmarshal(data, &file); err != nil {
+				l.err = err
+				return
+			}
+			if len(file.Source.Certificate) > 0 && string(file.Source.Certificate) != "null" {
+				// A custom client suppresses default workload certificate selection. Let
+				// the typed library resolve both default and explicit locations, regardless
+				// of the separate ambient API certificate setting.
+				l.detect.Client = nil
+				l.closeTokenConnections = true
+			}
 		}
 		switch header.Type {
 		case credentials.ServiceAccount, credentials.AuthorizedUser,
@@ -127,7 +165,34 @@ func (l *lazyCredentials) Token(ctx context.Context) (*auth.Token, error) {
 	if err != nil {
 		return nil, err
 	}
+	if l.closeTokenConnections {
+		// The pinned library does not expose its certificate-specific transport.
+		// These refreshes are synchronous: close their actual connections once all
+		// token response bodies have been consumed, instead of leaving a hidden pool
+		// alive until process exit. This also covers HTTP/2 and impersonation hops.
+		trace, closeConnections := tokenConnectionTrace()
+		defer closeConnections()
+		ctx = httptrace.WithClientTrace(ctx, trace)
+	}
 	return creds.Token(ctx)
+}
+
+func tokenConnectionTrace() (*httptrace.ClientTrace, func()) {
+	var mu sync.Mutex
+	connections := make(map[net.Conn]struct{})
+	trace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) {
+		mu.Lock()
+		connections[info.Conn] = struct{}{}
+		mu.Unlock()
+	}}
+	closeConnections := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		for conn := range connections {
+			_ = conn.Close()
+		}
+	}
+	return trace, closeConnections
 }
 
 func (l *lazyCredentials) property(get func(*auth.Credentials, context.Context) (string, error)) auth.CredentialsPropertyProvider {
@@ -155,8 +220,8 @@ func hasAuthOption(opts []option.ClientOption) bool {
 }
 
 // NewClient creates an API client and returns its endpoint and pool cleanup.
-// With no options it also owns ADC token transport. Callers supplying options
-// must supply credentials with their own lifetime, or disable authentication.
+// It also owns ADC token transport when options only configure the API.
+// Explicit credentials and HTTP clients retain their caller-owned lifetime.
 func NewClient(ctx context.Context, scopes []string, opts ...option.ClientOption) (*http.Client, string, func(), error) {
 	for _, opt := range opts {
 		if typ := reflect.TypeOf(opt); typ != nil && typ.Name() == "withHTTPClient" {
@@ -183,6 +248,10 @@ func NewClient(ctx context.Context, scopes []string, opts ...option.ClientOption
 		base.CloseIdleConnections()
 		closeAuth()
 	}
+	if err := configureAPICertificate(base, opts); err != nil {
+		cleanup()
+		return nil, "", nil, err
+	}
 	allOpts := append([]option.ClientOption{option.WithScopes(scopes...)}, opts...)
 	rt, err := htransport.NewTransport(ctx, base, allOpts...)
 	if err != nil {
@@ -204,4 +273,42 @@ func NewClient(ctx context.Context, scopes []string, opts ...option.ClientOption
 		return nil, "", nil, err
 	}
 	return client, endpoint, cleanup, nil
+}
+
+// configureAPICertificate resolves the provider before auth middleware wraps the
+// retained pool. NewTransport leaves this step to callers supplying a base.
+func configureAPICertificate(base *http.Transport, opts []option.ClientOption) error {
+	config := &httptransport.Options{DisableAuthentication: true, BaseRoundTripper: base}
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		switch reflect.TypeOf(opt).Name() {
+		case "withUniverseDomain":
+			config.UniverseDomain = reflect.ValueOf(opt).String()
+		case "withEndpoint":
+			config.Endpoint = reflect.ValueOf(opt).String()
+		case "withClientCertSource":
+			// ClientOption.Apply exposes its settings argument only through an internal
+			// type. Apply the option to that type to read its exported certificate
+			// callback, without inspecting private option fields or using unsafe.
+			apply := reflect.ValueOf(opt).MethodByName("Apply")
+			settings := reflect.New(apply.Type().In(0).Elem())
+			apply.Call([]reflect.Value{settings})
+			source := settings.Elem().FieldByName("ClientCertSource").Interface().(option.ClientCertSource)
+			config.ClientCertProvider = source
+		}
+	}
+	if _, err := httptransport.NewClient(config); err != nil {
+		return err
+	}
+	if config.ClientCertProvider != nil {
+		if base.TLSClientConfig == nil {
+			base.TLSClientConfig = &tls.Config{}
+		}
+		base.TLSClientConfig.GetClientCertificate = config.ClientCertProvider
+	}
+	// newBase clones DialTLSContext as well as TLSClientConfig. In particular,
+	// installing the certificate must not discard a caller's TLS dialer.
+	return nil
 }
