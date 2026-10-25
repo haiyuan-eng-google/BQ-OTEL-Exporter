@@ -61,6 +61,11 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 		closeHTTP()
 		t.Fatalf("create cleanup/query client: %v", err)
 	}
+	if _, err := admin.Dataset(dataset).Metadata(ctx); err == nil {
+		t.Fatalf("ephemeral dataset %s.%s already exists before test start", project, dataset)
+	}
+	ownsDataset := false
+
 	t.Cleanup(func() {
 		if err := admin.Close(); err != nil {
 			t.Errorf("close cleanup/query client: %v", err)
@@ -68,6 +73,9 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 		closeHTTP()
 	})
 	t.Cleanup(func() {
+		if !ownsDataset {
+			return
+		}
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cleanupCancel()
 		if err := admin.Dataset(dataset).DeleteWithContents(cleanupCtx); err != nil {
@@ -99,6 +107,7 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 	if err := traces.start(ctx, nil); err != nil {
 		t.Fatalf("first trace startup: %v", err)
 	}
+	ownsDataset = true
 	defer func() { _ = traces.shutdown(context.Background()) }()
 
 	if err := assertIntegrationTrajectoryDryRunAndPartitionFilter(ctx, admin, project, dataset); err != nil {
@@ -124,7 +133,9 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 	defer func() { _ = metrics.shutdown(context.Background()) }()
 
 	assertIntegrationViewDryRuns(ctx, t, admin, project, dataset, cfg.Traces.Table, cfg.Logs.Table)
-	assertIntegrationSearchIndexes(ctx, t, admin, project, dataset, cfg.Traces.Table, cfg.Logs.Table, cfg.Metrics.Table)
+	if err := assertIntegrationSearchIndexes(ctx, admin, project, dataset, cfg.Traces.Table, cfg.Logs.Table, cfg.Metrics.Table); err != nil {
+		t.Fatalf("search index verification: %v", err)
+	}
 
 	if err := traces.pushTraceData(ctx, oneIntegrationTrace()); err != nil {
 		t.Fatalf("write trace: %v", err)
@@ -202,7 +213,9 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 	}
 
 	assertIntegrationViewColumns(ctx, t, admin, project, dataset)
-	assertIntegrationTrajectoryTVFLiveExecution(ctx, t, admin, project, dataset)
+	if err := assertIntegrationTrajectoryTVFLiveExecution(ctx, t, admin, project, dataset); err != nil {
+		t.Fatalf("live trajectory TVF execution: %v", err)
+	}
 }
 
 func oneIntegrationTrace() ptrace.Traces {
@@ -270,6 +283,47 @@ func oneIntegrationTrace() ptrace.Traces {
 	okAttrs.PutStr("mcp.method.name", "tools/call")
 	okAttrs.PutInt("gen_ai.usage.input_tokens", 8)
 	okAttrs.PutInt("gen_ai.usage.output_tokens", 4)
+
+	// TraceID{3} in a second ResourceSpans ("it-trajectory-svc") exercises
+	// cross-window [-24h, +1h] parent correlation, orphan-flag inheritance, and
+	// pre-filter step_index in tvf_gen_ai_agent_trajectory:
+	// - SpanID{4} starts at now - 2h (outside a [now - 30m, now + 30m) TVF query
+	//   window, but inside [start_ts - 24h, end_ts + 1h]) with missing parent
+	//   SpanID{99} (so it is an orphan root at step_index = 1).
+	// - SpanID{5} starts at now - 400ms (inside [now - 30m, now + 30m)) with
+	//   parent SpanID{4}, so it is emitted with depth = 1, root_span_id = "04...",
+	//   nearest_agent_name = "orphan_root", is_orphan = true, step_index = 2,
+	//   is_leaf = true, and is_token_leaf = true.
+	rsTraj := td.ResourceSpans().AppendEmpty()
+	rsTraj.Resource().Attributes().PutStr("service.name", "it-trajectory-svc")
+	trajSpans := rsTraj.ScopeSpans().AppendEmpty().Spans()
+
+	orphanRoot := trajSpans.AppendEmpty()
+	orphanRoot.SetName("invoke_agent orphan_root")
+	orphanRoot.SetTraceID(pcommon.TraceID{3})
+	orphanRoot.SetSpanID(pcommon.SpanID{4})
+	orphanRoot.SetParentSpanID(pcommon.SpanID{0x99})
+	orphanRoot.SetStartTimestamp(pcommon.NewTimestampFromTime(now.Add(-2 * time.Hour)))
+	orphanRoot.SetEndTimestamp(pcommon.NewTimestampFromTime(now.Add(-2*time.Hour + time.Second)))
+	orphanRoot.Status().SetCode(ptrace.StatusCodeOk)
+	orAttrs := orphanRoot.Attributes()
+	orAttrs.PutStr("gen_ai.operation.name", "invoke_agent")
+	orAttrs.PutStr("gen_ai.system", "gcp.vertex.agent")
+	orAttrs.PutStr("gen_ai.agent.name", "orphan_root")
+	orAttrs.PutInt("gen_ai.usage.input_tokens", 20)
+
+	orphanChild := trajSpans.AppendEmpty()
+	orphanChild.SetName("chat gemini-2.5-pro orphan-child")
+	orphanChild.SetTraceID(pcommon.TraceID{3})
+	orphanChild.SetSpanID(pcommon.SpanID{5})
+	orphanChild.SetParentSpanID(pcommon.SpanID{4})
+	orphanChild.SetStartTimestamp(pcommon.NewTimestampFromTime(now.Add(-400 * time.Millisecond)))
+	orphanChild.SetEndTimestamp(pcommon.NewTimestampFromTime(now))
+	orphanChild.Status().SetCode(ptrace.StatusCodeOk)
+	ocAttrs := orphanChild.Attributes()
+	ocAttrs.PutStr("gen_ai.operation.name", "chat")
+	ocAttrs.PutStr("gen_ai.system", "gcp.vertex.agent")
+	ocAttrs.PutInt("gen_ai.usage.input_tokens", 20)
 	return td
 }
 
@@ -346,17 +400,17 @@ func assertIntegrationViewColumns(ctx context.Context, t *testing.T, client *bq.
 		},
 		{
 			name: "v_gen_ai_model_costs",
-			sql:  fmt.Sprintf("SELECT typed_error_count, ARRAY_LENGTH(top_error_types), top_error_types[OFFSET(0)].value FROM `%s.%s.v_gen_ai_model_costs` LIMIT 1", project, dataset),
+			sql:  fmt.Sprintf("SELECT typed_error_count, ARRAY_LENGTH(top_error_types), top_error_types[OFFSET(0)].value FROM `%s.%s.v_gen_ai_model_costs` WHERE service_name = 'it-agent' LIMIT 1", project, dataset),
 			want: []bq.Value{int64(1), int64(1), "rate_limited"},
 		},
 		{
 			name: "v_gen_ai_sessions",
-			sql:  fmt.Sprintf("SELECT typed_error_count, ARRAY_LENGTH(top_error_types), top_error_types[OFFSET(0)].value FROM `%s.%s.v_gen_ai_sessions` LIMIT 1", project, dataset),
+			sql:  fmt.Sprintf("SELECT typed_error_count, ARRAY_LENGTH(top_error_types), top_error_types[OFFSET(0)].value FROM `%s.%s.v_gen_ai_sessions` WHERE service_name = 'it-agent' LIMIT 1", project, dataset),
 			want: []bq.Value{int64(1), int64(1), "rate_limited"},
 		},
 		{
 			name: "v_gen_ai_tool_usage",
-			sql:  fmt.Sprintf("SELECT typed_error_count, ARRAY_LENGTH(top_error_types), top_error_types[OFFSET(0)].value FROM `%s.%s.v_gen_ai_tool_usage` LIMIT 1", project, dataset),
+			sql:  fmt.Sprintf("SELECT typed_error_count, ARRAY_LENGTH(top_error_types), top_error_types[OFFSET(0)].value FROM `%s.%s.v_gen_ai_tool_usage` WHERE service_name = 'it-agent' LIMIT 1", project, dataset),
 			want: []bq.Value{int64(1), int64(1), "rate_limited"},
 		},
 		{
@@ -371,7 +425,7 @@ func assertIntegrationViewColumns(ctx context.Context, t *testing.T, client *bq.
 		},
 		{
 			name: "v_gen_ai_agent_trajectory (recursive depth 1 child)",
-			sql:  fmt.Sprintf("SELECT depth, root_span_id, nearest_agent_name, is_orphan, is_leaf, is_token_leaf FROM `%s.%s.v_gen_ai_agent_trajectory` WHERE depth = 1 LIMIT 1", project, dataset),
+			sql:  fmt.Sprintf("SELECT depth, root_span_id, nearest_agent_name, is_orphan, is_leaf, is_token_leaf FROM `%s.%s.v_gen_ai_agent_trajectory` WHERE span_id = '0200000000000000' LIMIT 1", project, dataset),
 			want: []bq.Value{int64(1), "0300000000000000", "planner", false, true, true},
 		},
 		{
@@ -401,24 +455,24 @@ func assertIntegrationViewColumns(ctx context.Context, t *testing.T, client *bq.
 	}
 }
 
-func assertIntegrationTrajectoryTVFLiveExecution(ctx context.Context, t *testing.T, client *bq.Client, project, dataset string) {
+func assertIntegrationTrajectoryTVFLiveExecution(ctx context.Context, t *testing.T, client *bq.Client, project, dataset string) error {
 	t.Helper()
 	sql := fmt.Sprintf(
-		"SELECT span_id, depth, root_span_id, nearest_agent_name, is_orphan, is_leaf, is_token_leaf "+
-			"FROM `%s.%s.%s`(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR), TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)) "+
+		"SELECT span_id, depth, root_span_id, nearest_agent_name, is_orphan, step_index, is_leaf, is_token_leaf "+
+			"FROM `%s.%s.%s`(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE), TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE)) "+
 			"ORDER BY span_id",
 		project, dataset, schema.GenAIAgentTrajectoryTVFName,
 	)
 	job, err := client.Query(sql).Run(ctx)
 	if err != nil {
-		t.Fatalf("live query %s: %v", schema.GenAIAgentTrajectoryTVFName, err)
+		return fmt.Errorf("live query %s: %w", schema.GenAIAgentTrajectoryTVFName, err)
 	}
 	st, err := job.Wait(ctx)
 	if err != nil {
-		t.Fatalf("wait live query %s: %v", schema.GenAIAgentTrajectoryTVFName, err)
+		return fmt.Errorf("wait live query %s: %w", schema.GenAIAgentTrajectoryTVFName, err)
 	}
 	if err := st.Err(); err != nil {
-		t.Fatalf("status live query %s: %v", schema.GenAIAgentTrajectoryTVFName, err)
+		return fmt.Errorf("status live query %s: %w", schema.GenAIAgentTrajectoryTVFName, err)
 	}
 	if st.Statistics != nil {
 		var slotMillis int64
@@ -432,7 +486,7 @@ func assertIntegrationTrajectoryTVFLiveExecution(ctx context.Context, t *testing
 	}
 	it, err := job.Read(ctx)
 	if err != nil {
-		t.Fatalf("read live query %s: %v", schema.GenAIAgentTrajectoryTVFName, err)
+		return fmt.Errorf("read live query %s: %w", schema.GenAIAgentTrajectoryTVFName, err)
 	}
 	var got [][]bq.Value
 	for {
@@ -442,18 +496,20 @@ func assertIntegrationTrajectoryTVFLiveExecution(ctx context.Context, t *testing
 			break
 		}
 		if err != nil {
-			t.Fatalf("next live query %s: %v", schema.GenAIAgentTrajectoryTVFName, err)
+			return fmt.Errorf("next live query %s: %w", schema.GenAIAgentTrajectoryTVFName, err)
 		}
 		got = append(got, row)
 	}
 	want := [][]bq.Value{
-		{"0100000000000000", int64(0), "0100000000000000", nil, false, true, true},
-		{"0200000000000000", int64(1), "0300000000000000", "planner", false, true, true},
-		{"0300000000000000", int64(0), "0300000000000000", "planner", false, false, false},
+		{"0100000000000000", int64(0), "0100000000000000", nil, false, int64(1), true, true},
+		{"0200000000000000", int64(1), "0300000000000000", "planner", false, int64(2), true, true},
+		{"0300000000000000", int64(0), "0300000000000000", "planner", false, int64(1), false, false},
+		{"0500000000000000", int64(1), "0400000000000000", "orphan_root", true, int64(2), true, true},
 	}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Errorf("live %s rows = %v, want %v", schema.GenAIAgentTrajectoryTVFName, got, want)
+		return fmt.Errorf("live %s rows = %v, want %v", schema.GenAIAgentTrajectoryTVFName, got, want)
 	}
+	return nil
 }
 
 func assertIntegrationViewDryRuns(ctx context.Context, t *testing.T, client *bq.Client, project, dataset, spansTable, logsTable string) {
@@ -551,10 +607,9 @@ func assertIntegrationViewDryRuns(ctx context.Context, t *testing.T, client *bq.
 }
 
 func assertIntegrationSearchIndexes(
-	ctx context.Context, t *testing.T, client *bq.Client,
+	ctx context.Context, client *bq.Client,
 	project, dataset, spansTable, logsTable, metricsTable string,
-) {
-	t.Helper()
+) error {
 	wantIndexes := map[string]string{
 		spansTable:   "otel_spans_trace_lookup_idx",
 		logsTable:    "otel_logs_trace_lookup_idx",
@@ -566,7 +621,7 @@ func assertIntegrationSearchIndexes(
 	))
 	rows, err := q.Read(ctx)
 	if err != nil {
-		t.Fatalf("query INFORMATION_SCHEMA.SEARCH_INDEXES: %v", err)
+		return fmt.Errorf("query INFORMATION_SCHEMA.SEARCH_INDEXES: %w", err)
 	}
 	found := make(map[string]string)
 	statuses := make(map[string]string)
@@ -577,7 +632,7 @@ func assertIntegrationSearchIndexes(
 			break
 		}
 		if err != nil {
-			t.Fatalf("read INFORMATION_SCHEMA.SEARCH_INDEXES: %v", err)
+			return fmt.Errorf("read INFORMATION_SCHEMA.SEARCH_INDEXES: %w", err)
 		}
 		if len(vals) >= 3 {
 			tbl, _ := vals[0].(string)
@@ -589,12 +644,14 @@ func assertIntegrationSearchIndexes(
 	}
 	for tbl, wantIdx := range wantIndexes {
 		if gotIdx := found[tbl]; gotIdx != wantIdx {
-			t.Errorf("search index on %s = %q, want %q (all found: %v)", tbl, gotIdx, wantIdx, found)
+			return fmt.Errorf("search index on %s = %q, want %q (all found: %v)", tbl, gotIdx, wantIdx, found)
 		}
-		if status := statuses[tbl]; status == "" {
-			t.Errorf("search index status on %s is empty", tbl)
+		status := statuses[tbl]
+		if status != "ACTIVE" && status != "PENDING" && status != "TEMPORARILY DISABLED" {
+			return fmt.Errorf("search index status on %s = %q, want ACTIVE, PENDING, or TEMPORARILY DISABLED", tbl, status)
 		}
 	}
+	return nil
 }
 
 func waitForRows(ctx context.Context, client *bq.Client, project, dataset, table string) error {

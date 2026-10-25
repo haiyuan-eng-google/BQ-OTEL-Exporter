@@ -19,6 +19,7 @@ import (
 	"google.golang.org/api/option"
 	"google.golang.org/api/option/internaloption"
 
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/offload"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 )
 
@@ -45,13 +46,16 @@ func TestSignalExporterRetainsDataPlaneAuthCleanupUntilShutdown(t *testing.T) {
 
 	cfg := validConfig()
 	cfg.Credentials.JSON = configopaque.String(data)
+	cfg.Offload.Enabled = true
+	cfg.Offload.Bucket = "test-offload-bucket"
 
-	originalAdmin, originalWriter := newDestinationAdmin, newManagedWriterClient
+	originalAdmin, originalWriter, originalBlob := newDestinationAdmin, newManagedWriterClient, newBlobStore
 	t.Cleanup(func() {
-		newDestinationAdmin, newManagedWriterClient = originalAdmin, originalWriter
+		newDestinationAdmin, newManagedWriterClient, newBlobStore = originalAdmin, originalWriter, originalBlob
 	})
 
 	var retainedWriterOpts []option.ClientOption
+	var retainedOffloadOpts []option.ClientOption
 	newDestinationAdmin = func(context.Context, string, string, ...option.ClientOption) (destinationAdmin, error) {
 		return &fakeDestinationAdmin{
 			tableMetadata: &bq.TableMetadata{
@@ -63,6 +67,10 @@ func TestSignalExporterRetainsDataPlaneAuthCleanupUntilShutdown(t *testing.T) {
 		retainedWriterOpts = append([]option.ClientOption(nil), clientOpts...)
 		return &managedwriter.Client{}, nil
 	}
+	newBlobStore = func(_ context.Context, clientOpts ...option.ClientOption) (offload.BlobStore, error) {
+		retainedOffloadOpts = append([]option.ClientOption(nil), clientOpts...)
+		return offload.NewMemoryBlobStore(), nil
+	}
 
 	exp := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
 	if err := exp.start(context.Background(), nil); err != nil {
@@ -71,17 +79,25 @@ func TestSignalExporterRetainsDataPlaneAuthCleanupUntilShutdown(t *testing.T) {
 	exp.client = nil
 	t.Cleanup(func() { _ = exp.shutdownStatus(context.Background(), false) })
 
-	if len(exp.authCleanup) == 0 {
-		t.Fatal("exp.authCleanup is empty after start(); writer authCleanup was prematurely unwound by metadata client cleanup")
+	if len(exp.authCleanup) != 2 {
+		t.Fatalf("len(exp.authCleanup) = %d after start(), want 2 (writer + offload authCleanup retained after metadata cleanup)", len(exp.authCleanup))
 	}
 
-	// Simulate a data-plane token fetch occurring after start() has returned.
-	creds, err := internaloption.AuthCreds(context.Background(), retainedWriterOpts)
-	if err != nil {
-		t.Fatalf("internaloption.AuthCreds after start() failed: %v", err)
-	}
-	if _, err := creds.Token(context.Background()); err != nil {
-		t.Fatalf("creds.Token() after start() failed: %v", err)
+	// Simulate data-plane token fetches for both writer and offload occurring after start() has returned.
+	for _, tc := range []struct {
+		name string
+		opts []option.ClientOption
+	}{
+		{"writer", retainedWriterOpts},
+		{"offload", retainedOffloadOpts},
+	} {
+		creds, err := internaloption.AuthCreds(context.Background(), tc.opts)
+		if err != nil {
+			t.Fatalf("%s internaloption.AuthCreds after start() failed: %v", tc.name, err)
+		}
+		if _, err := creds.Token(context.Background()); err != nil {
+			t.Fatalf("%s creds.Token() after start() failed: %v", tc.name, err)
+		}
 	}
 
 	if err := exp.shutdownStatus(context.Background(), false); err != nil {

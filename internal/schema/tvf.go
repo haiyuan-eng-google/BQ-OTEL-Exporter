@@ -187,9 +187,11 @@ QUALIFY ROW_NUMBER() OVER (
 //
 // BigQuery does not allow WITH RECURSIVE inside a SQL TABLE FUNCTION body, so
 // the 0..16-hop tree walk and 1..32-hop multi-segment token-coverage walk are
-// expressed via 5-step binary lifting (pointer jumping: hop0..hop16) with
-// per-hop in_tree_window flags and rooted_chains (tree_start_idx) over the
-// [-24h, +1h] span horizon before filtering the emitted rows to [start_ts, end_ts).
+// expressed via 6-step binary lifting (pointer jumping: hop0..hop32, up to 63
+// ancestor hops) with per-hop in_tree_window flags, rooted_chains
+// (tree_start_idx), and mutual-reachability reverse_path cycle tie-breaking
+// over the [-24h, +1h] span horizon before filtering emitted rows to
+// [start_ts, end_ts).
 const GenAIAgentTrajectoryTVFDDL = `
 CREATE OR REPLACE TABLE FUNCTION ` + "`%[1]s.%[2]s." + GenAIAgentTrajectoryTVFName + "`" + `(start_ts TIMESTAMP, end_ts TIMESTAMP) AS (
 ` + GenAIAgentTrajectoryTVFQuery + `
@@ -352,6 +354,18 @@ WITH
       AND anc.service_name IS NOT DISTINCT FROM h.service_name
       AND anc.span_id = h.top_parent_id
   ),
+  hop32 AS (
+    SELECT
+      h.* EXCEPT (top_parent_id, chain),
+      IF(anc.span_id IS NOT NULL, anc.top_parent_id, h.top_parent_id) AS top_parent_id,
+      IF(anc.span_id IS NOT NULL, ARRAY_CONCAT(anc.chain, h.chain), h.chain) AS chain
+    FROM hop16 AS h
+    LEFT JOIN hop16 AS anc
+      ON h.top_parent_id IS NOT NULL
+      AND anc.trace_id = h.trace_id
+      AND anc.service_name IS NOT DISTINCT FROM h.service_name
+      AND anc.span_id = h.top_parent_id
+  ),
   rooted_chains AS (
     SELECT
       h.*,
@@ -361,7 +375,7 @@ WITH
           WITH OFFSET AS idx
         WHERE NOT n.in_tree_window
       ) AS tree_start_idx
-    FROM hop16 AS h
+    FROM hop32 AS h
   ),
   trajectory AS (
     SELECT
@@ -460,6 +474,10 @@ WITH
         ORDER BY idx ASC
       ) AS agent_path,
       h.chain[OFFSET(h.tree_start_idx)].is_orphan AS is_orphan,
+      ROW_NUMBER() OVER (
+        PARTITION BY h.trace_id, h.service_name
+        ORDER BY h.start_time ASC, h.span_id ASC
+      ) AS step_index,
       h.tree_start_idx AS tree_start_idx,
       h.chain AS chain
     FROM rooted_chains AS h
@@ -467,7 +485,7 @@ WITH
       AND (ARRAY_LENGTH(h.chain) - 1 - h.tree_start_idx) <= 16
   ),
   emitted_ancestors AS (
-    SELECT
+    SELECT DISTINCT
       t.trace_id,
       t.service_name,
       t.span_id AS descendant_span_id,
@@ -476,19 +494,19 @@ WITH
       t.gen_ai_usage_output_tokens IS NOT NULL AS has_output,
       t.gen_ai_usage_reasoning_tokens IS NOT NULL AS has_reasoning,
       anc.span_id AS ancestor_span_id,
-      anc.start_time AS ancestor_start_time,
-      EXISTS (
-        SELECT 1
-        FROM UNNEST(t.chain) AS x
-          WITH OFFSET AS x_idx
-        WHERE x_idx < a_idx
-          AND x.span_id = t.span_id
-      ) AS has_reverse_path
+      anc.start_time AS ancestor_start_time
     FROM trajectory AS t
     INNER JOIN UNNEST(t.chain) AS anc
       WITH OFFSET AS a_idx
     WHERE a_idx < ARRAY_LENGTH(t.chain) - 1
-      AND anc.span_id != t.span_id
+      AND a_idx >= ARRAY_LENGTH(t.chain) - 33
+      AND NOT EXISTS (
+        SELECT 1
+        FROM UNNEST(t.chain) AS x
+          WITH OFFSET AS x_idx
+        WHERE x_idx > a_idx
+          AND x.span_id = anc.span_id
+      )
       AND (
         a_idx >= t.tree_start_idx
         OR (
@@ -511,9 +529,14 @@ WITH
       LOGICAL_OR(ea.has_output) AS has_output,
       LOGICAL_OR(ea.has_reasoning) AS has_reasoning
     FROM emitted_ancestors AS ea
+    LEFT JOIN emitted_ancestors AS reverse_path
+      ON reverse_path.trace_id = ea.trace_id
+      AND reverse_path.service_name IS NOT DISTINCT FROM ea.service_name
+      AND reverse_path.descendant_span_id = ea.ancestor_span_id
+      AND reverse_path.ancestor_span_id = ea.descendant_span_id
     WHERE (ea.has_input OR ea.has_output OR ea.has_reasoning)
       AND (
-        NOT ea.has_reverse_path
+        reverse_path.ancestor_span_id IS NULL
         OR ea.descendant_start_time > ea.ancestor_start_time
         OR (
           ea.descendant_start_time = ea.ancestor_start_time
@@ -584,10 +607,7 @@ SELECT
   t.nearest_agent_name,
   t.agent_path,
   t.is_orphan,
-  ROW_NUMBER() OVER (
-    PARTITION BY t.trace_id, t.service_name
-    ORDER BY t.start_time ASC, t.span_id ASC
-  ) AS step_index,
+  t.step_index,
   (leaf_check.span_id IS NULL) AS is_leaf,
   (
     (t.gen_ai_usage_input_tokens IS NOT NULL AND NOT COALESCE(token_leaf_check.has_input, FALSE))

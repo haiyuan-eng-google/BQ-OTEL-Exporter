@@ -242,10 +242,10 @@ never retries internally: `exporterhelper` remains the single retry owner.
 
 ## Partition pruning, `allow_unprunable_views`, and bounded-window TVFs
 
-Eight of the eleven companion views (`v_gen_ai_spans`, `v_gen_ai_metrics`,
+Seven of the ten companion views (`v_gen_ai_spans`, `v_gen_ai_metrics`,
 `v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_gen_ai_tool_usage`,
-`v_mcp_spans`, `v_mcp_tool_usage`, and the three `*_dedup` views) preserve
-static partition pruning when queried with a filter on `start_time`,
+`v_mcp_spans`, and `v_mcp_tool_usage`, alongside the three `*_dedup` views)
+preserve static partition pruning when queried with a filter on `start_time`,
 `timestamp`, `usage_hour`, or `session_start_date`.
 
 Three companion views join `otel_spans_dedup` on a per-row correlation window or
@@ -267,13 +267,20 @@ and the Terraform module (`allow_unprunable_views = false`) skip creating those
 three views when `otel_spans` requires a partition filter.
 
 For deployments that enforce `require_partition_filter = true`, three
-bounded-window Table-Valued Functions (TVFs) provide identical output schemas
-with explicit half-open `[start_ts, end_ts)` (`>= start_ts AND < end_ts`) output
-windows and `[-24h, +1h]` cross-window span correlation bounds pushed directly
-into the base deduplication views (because BigQuery `CREATE TABLE FUNCTION`
-forbids `WITH RECURSIVE`, `tvf_gen_ai_agent_trajectory` evaluates the 16-hop
-parent chain and 32-hop multi-segment token-coverage walk via 5-step
-binary-lifting pointer jumping):
+bounded-window Table-Valued Functions (TVFs) — provisioned via `deploy/terraform`
+(`google_bigquery_routine`) or operator DDL (`schema.CompanionTVFDDLs`; runtime
+`auto_create.companion_views` creates `VIEW` resources only, not routines) —
+provide identical output schemas with explicit half-open `[start_ts, end_ts)`
+(`>= start_ts AND < end_ts`) output windows and `[-24h, +1h]` cross-window span
+correlation bounds pushed directly into the base deduplication views. Because
+BigQuery `CREATE TABLE FUNCTION` forbids `WITH RECURSIVE`,
+`tvf_gen_ai_agent_trajectory` reconstructs parent chains over the
+`[start_ts - 24h, end_ts + 1h]` span horizon via 6-step binary-lifting pointer
+jumping (`hop0..hop32`, up to 64 nodes / 63 ancestor hops), projects each
+in-window tree segment up to depth 16 (`rooted_chains`), computes trace-wide
+`step_index` in the `trajectory` CTE before applying the outer `[start_ts, end_ts)`
+window filter, and resolves 1..32-hop multi-segment token coverage with
+mutual-reachability cycle tie-breaking:
 
 | Unprunable View | Partition-Prunable TVF (`(start_ts TIMESTAMP, end_ts TIMESTAMP)`) | Pushed Partition & Output Bounds |
 | --- | --- | --- |

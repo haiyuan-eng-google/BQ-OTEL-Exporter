@@ -106,8 +106,11 @@ resource "google_iam_workload_identity_pool_provider" "github_ci" {
     "attribute.repository_id"       = "assertion.repository_id"
     "attribute.repository_owner_id" = "assertion.repository_owner_id"
     "attribute.ref"                 = "assertion.ref"
-    "attribute.workflow_ref"        = "assertion.job_workflow_ref"
-    "attribute.event_name"          = "assertion.event_name"
+    # GitHub Actions OIDC tokens emit the workflow reference claim as
+    # assertion.job_workflow_ref ("<owner>/<repo>/<workflow_path>@<ref>"),
+    # which we map to attribute.workflow_ref for attribute_condition.
+    "attribute.workflow_ref" = "assertion.job_workflow_ref"
+    "attribute.event_name"   = "assertion.event_name"
   }
 
   # Restrict token exchange to immutable numeric owner/repo IDs, the configured
@@ -159,6 +162,13 @@ resource "google_project_iam_member" "github_ci_bigquery_user" {
   member  = "serviceAccount:${google_service_account.github_ci[0].email}"
 }
 
+# Prerequisite: var.ci_offload_bucket must have Uniform Bucket-Level Access
+# (UBLA) enabled so Cloud Storage evaluates the conditional IAM binding below.
+# The resource.name.startsWith(".../objects/it-offload-") condition scopes
+# per-object create/get/delete calls (TestLiveGCSOffloadAndQuarantineReplay
+# records uploaded object URIs at the write boundary and deletes each object
+# directly without requiring bucket-wide storage.objects.list; operators should
+# also configure a 1-day Delete lifecycle rule on prefix "it-offload-").
 resource "google_storage_bucket_iam_member" "github_ci_offload_object_user" {
   count  = var.enable_github_wif && var.ci_offload_bucket != "" ? 1 : 0
   bucket = var.ci_offload_bucket

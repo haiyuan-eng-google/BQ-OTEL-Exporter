@@ -2134,6 +2134,16 @@ func TestBoundedWindowTVFDDLsAndStaticPartitionBounds(t *testing.T) {
 				_, tvfSelect, _ = strings.Cut(tvfSelect, "\nSELECT\n")
 				_, viewSelect, _ = strings.Cut(viewSelect, "\nSELECT\n")
 			}
+			if tc.tvfName == GenAIAgentTrajectoryTVFName {
+				// tvf_gen_ai_agent_trajectory computes step_index inside the trajectory CTE
+				// (before the outer [start_ts, end_ts) filter) and projects t.step_index in
+				// the outer SELECT so tiled window queries preserve trace-wide step_index.
+				const viewStepIndexExpr = "  ROW_NUMBER() OVER (\n    PARTITION BY t.trace_id, t.service_name\n    ORDER BY t.start_time ASC, t.span_id ASC\n  ) AS step_index,"
+				if !strings.Contains(viewSelect, viewStepIndexExpr) {
+					t.Fatalf("%s companion view missing expected step_index expression", tc.tvfName)
+				}
+				viewSelect = strings.Replace(viewSelect, viewStepIndexExpr, "  t.step_index,", 1)
+			}
 			if tvfSelect != viewSelect {
 				t.Errorf("%s outer SELECT projection drifted from companion view:\ngot:\n%s\nwant:\n%s", tc.tvfName, tvfSelect, viewSelect)
 			}

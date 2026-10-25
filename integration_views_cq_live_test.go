@@ -64,6 +64,11 @@ func TestLiveContinuousQueriesDryRun(t *testing.T) {
 		}
 		closeHTTP()
 	})
+
+	createErr := admin.Dataset(dataset).Create(ctx, &bq.DatasetMetadata{Location: location})
+	if !shouldDeleteDatasetOnCreate(createErr) {
+		t.Fatalf("create dataset %s.%s: %v", project, dataset, createErr)
+	}
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cleanupCancel()
@@ -71,10 +76,6 @@ func TestLiveContinuousQueriesDryRun(t *testing.T) {
 			t.Errorf("cleanup dataset %s.%s: %v", project, dataset, err)
 		}
 	})
-
-	if err := admin.Dataset(dataset).Create(ctx, &bq.DatasetMetadata{Location: location}); err != nil {
-		t.Fatalf("create dataset %s.%s: %v", project, dataset, err)
-	}
 
 	const spansTable = "otel_spans"
 	spansMD, _, err := schema.DestinationMetadataWithOptions(
@@ -161,14 +162,9 @@ func TestLiveContinuousQueriesDryRun(t *testing.T) {
 				// On on-demand projects without an Enterprise Plus CONTINUOUS
 				// reservation or Pub/Sub export topic, BigQuery only returns a
 				// continuous-query reservation/feature or Pub/Sub permission error
-				// after parsing the query; any other error must fail the test.
-				msg := strings.ToLower(err.Error())
-				allowed := strings.Contains(msg, "continuous") ||
-					strings.Contains(msg, "reservation") ||
-					strings.Contains(msg, "enterprise") ||
-					strings.Contains(msg, "pubsub") ||
-					strings.Contains(msg, "permission")
-				if !allowed {
+				// after parsing the query; any other error (such as "Unsupported
+				// export format") must fail the test.
+				if !isExpectedContinuousQueryDryRunError(err) {
 					t.Fatalf("%s EXPORT DATA continuous dry-run failed with unexpected error: %v", name, err)
 				}
 				t.Logf("%s EXPORT DATA continuous dry-run note: %v", name, err)

@@ -9,7 +9,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -23,39 +25,59 @@ import (
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/testfakes/bqfake"
 )
 
+type memOffloadEntry struct {
+	data    []byte
+	version string
+}
+
 // memOffloadStore implements both offload.BlobStore and quarantinereplay.ObjectFetcher
 // for hermetic verification of the offload + Step-0 redaction + quarantine replay
 // pipeline during default unit test runs (`go test ./...`).
 type memOffloadStore struct {
 	mu      sync.Mutex
-	objects map[string][]byte
+	seq     int64
+	objects map[string]memOffloadEntry
 }
 
 func newMemOffloadStore() *memOffloadStore {
-	return &memOffloadStore{objects: make(map[string][]byte)}
+	return &memOffloadStore{objects: make(map[string]memOffloadEntry)}
 }
 
 func (m *memOffloadStore) WriteObject(_ context.Context, bucket, object string, _ string, data []byte) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	uri := "gs://" + bucket + "/" + object
-	if _, exists := m.objects[uri]; !exists {
-		m.objects[uri] = bytes.Clone(data)
+	if existing, exists := m.objects[uri]; exists {
+		return existing.version, nil
 	}
-	return "1", nil
+	m.seq++
+	ver := strconv.FormatInt(m.seq, 10)
+	m.objects[uri] = memOffloadEntry{
+		data:    bytes.Clone(data),
+		version: ver,
+	}
+	return ver, nil
 }
 
 func (m *memOffloadStore) Fetch(_ context.Context, uri string) ([]byte, error) {
+	var wantGen string
 	if idx := strings.IndexByte(uri, '?'); idx >= 0 {
+		query := uri[idx+1:]
 		uri = uri[:idx]
+		if after, ok := strings.CutPrefix(query, "generation="); ok {
+			wantGen = after
+		}
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	data, ok := m.objects[uri]
+	entry, ok := m.objects[uri]
 	if !ok {
 		return nil, fmt.Errorf("object %q not found", uri)
 	}
-	return bytes.Clone(data), nil
+	if wantGen != "" && wantGen != entry.version {
+		return nil, fmt.Errorf("object %q generation = %q, want %q", uri, entry.version, wantGen)
+	}
+	return bytes.Clone(entry.data), nil
 }
 
 func (m *memOffloadStore) Close() error { return nil }
@@ -112,12 +134,12 @@ func TestHermeticOffloadAndQuarantineReplay(t *testing.T) {
 	// 1. Verify Step-0 redaction happened BEFORE GCS upload on every stored object.
 	store.mu.Lock()
 	numObjects := len(store.objects)
-	for uri, data := range store.objects {
-		if strings.Contains(string(data), plantedSecret) {
+	for uri, entry := range store.objects {
+		if strings.Contains(string(entry.data), plantedSecret) {
 			t.Fatalf("object %s contains unredacted secret %q", uri, plantedSecret)
 		}
-		if !strings.Contains(string(data), "[REDACTED]") {
-			t.Errorf("object %s missing [REDACTED] marker: %s", uri, string(data))
+		if !strings.Contains(string(entry.data), "[REDACTED]") {
+			t.Errorf("object %s missing [REDACTED] marker: %s", uri, string(entry.data))
 		}
 	}
 	store.mu.Unlock()
@@ -159,7 +181,7 @@ func TestHermeticOffloadAndQuarantineReplay(t *testing.T) {
 	if len(qRows) != 2 {
 		t.Fatalf("otel_quarantine rows = %d, want 2 (1 span + 1 log)", len(qRows))
 	}
-	jsonlBuf, err := formatFakeQuarantineRowsAsJSONL(qRows)
+	jsonlBuf, err := formatFakeQuarantineRowsAsJSONL(store, qRows)
 	if err != nil {
 		t.Fatalf("formatFakeQuarantineRowsAsJSONL: %v", err)
 	}
@@ -284,6 +306,10 @@ func assertFakeRowPayloadRef(
 	if !strings.HasPrefix(uri, wantURIPrefix) {
 		return fmt.Errorf("object_ref.uri = %q, want prefix %q", uri, wantURIPrefix)
 	}
+	version := stringOrEmpty(objRef["version"])
+	if version == "" {
+		return fmt.Errorf("object_ref.version is empty")
+	}
 	if got := objRef["authorizer"]; got != wantAuthorizer {
 		return fmt.Errorf("object_ref.authorizer = %v, want %q", got, wantAuthorizer)
 	}
@@ -291,9 +317,12 @@ func assertFakeRowPayloadRef(
 	if details == "" {
 		return fmt.Errorf("object_ref.details is empty")
 	}
-	blob, err := store.Fetch(context.Background(), uri)
+	blob, err := store.Fetch(context.Background(), uri+"?generation="+version)
 	if err != nil {
 		return fmt.Errorf("store.Fetch(%q): %w", uri, err)
+	}
+	if gotBytes := fmt.Sprint(first["byte_size"]); gotBytes != strconv.Itoa(len(blob)) {
+		return fmt.Errorf("payload_refs[0].byte_size = %v, want %d", first["byte_size"], len(blob))
 	}
 	sum := sha256.Sum256(blob)
 	wantSHA := hex.EncodeToString(sum[:])
@@ -306,7 +335,7 @@ func assertFakeRowPayloadRef(
 	return nil
 }
 
-func formatFakeQuarantineRowsAsJSONL(rows []map[string]any) ([]byte, error) {
+func formatFakeQuarantineRowsAsJSONL(store *memOffloadStore, rows []map[string]any) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	for i, r := range rows {
@@ -326,13 +355,29 @@ func formatFakeQuarantineRowsAsJSONL(rows []map[string]any) ([]byte, error) {
 		if uri == "" {
 			return nil, fmt.Errorf("quarantine row %d has empty payload_ref.uri", i)
 		}
+		version := stringOrEmpty(pref["version"])
+		if version == "" {
+			return nil, fmt.Errorf("quarantine row %d has empty payload_ref.version", i)
+		}
 		details := stringOrEmpty(pref["details"])
 		if details == "" {
 			return nil, fmt.Errorf("quarantine row %d has empty payload_ref.details", i)
 		}
+		blob, err := store.Fetch(context.Background(), uri+"?generation="+version)
+		if err != nil {
+			return nil, fmt.Errorf("quarantine row %d store.Fetch(%s?generation=%s): %w", i, uri, version, err)
+		}
+		sum := sha256.Sum256(blob)
+		wantSHA := hex.EncodeToString(sum[:])
+		if len(blob) < 256 {
+			return nil, fmt.Errorf("quarantine row %d offloaded blob size = %d, want >= 256", i, len(blob))
+		}
+		if !strings.Contains(details, wantSHA) || !strings.Contains(details, `"content_type":"application/json"`) {
+			return nil, fmt.Errorf("quarantine row %d payload_ref.details = %s, want sha256=%s and content_type=application/json", i, details, wantSHA)
+		}
 		qr.PayloadRef = &quarantinereplay.ObjectRef{
 			URI:        uri,
-			Version:    stringOrEmpty(pref["version"]),
+			Version:    version,
 			Authorizer: stringOrEmpty(pref["authorizer"]),
 			Details:    json.RawMessage(details),
 		}
@@ -373,4 +418,65 @@ func stringOrEmpty(v any) string {
 		return s
 	}
 	return ""
+}
+
+// isExpectedContinuousQueryDryRunError reports whether err from a dry-run
+// Continuous Query EXPORT DATA ... CLOUD_PUBSUB job on an on-demand project
+// without an Enterprise/Enterprise Plus CONTINUOUS reservation or Pub/Sub
+// topic is an expected environment/reservation/topic-permission rejection
+// rather than a SQL syntax or EXPORT DATA option error (such as "Unsupported
+// export format").
+func isExpectedContinuousQueryDryRunError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "syntax error") ||
+		strings.Contains(msg, "unsupported export format") ||
+		strings.Contains(msg, "unrecognized name") ||
+		strings.Contains(msg, "table not found") {
+		return false
+	}
+	return strings.Contains(msg, "continuous query") ||
+		strings.Contains(msg, "continuous queries") ||
+		strings.Contains(msg, "reservation") ||
+		strings.Contains(msg, "enterprise") ||
+		strings.Contains(msg, "pubsub") ||
+		strings.Contains(msg, "cloud_pubsub")
+}
+
+// shouldDeleteDatasetOnCreate reports whether an integration test owns the
+// dataset and may register DeleteWithContents cleanup (true only when Dataset.Create
+// succeeded without error, never when Dataset.Create returned 409 AlreadyExists
+// or any other error).
+func shouldDeleteDatasetOnCreate(createErr error) bool {
+	return createErr == nil
+}
+
+func TestIsExpectedContinuousQueryDryRunError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil error", nil, false},
+		{"unsupported export format", errors.New("googleapi: Error 400: Unsupported export format: CLOUD_PUBSUB, invalid"), false},
+		{"syntax error mentioning continuous", errors.New("googleapi: Error 400: Syntax error: Unexpected identifier \"continuous\" at [1:1]"), false},
+		{"unrecognized column", errors.New("googleapi: Error 400: Unrecognized name: bad_col"), false},
+		{"enterprise reservation required", errors.New("googleapi: Error 400: Continuous queries require an Enterprise or Enterprise Plus reservation"), true},
+		{"pubsub permission denied", errors.New("googleapi: Error 403: Access Denied: Cloud_Pubsub topic permission denied"), true},
+	} {
+		if got := isExpectedContinuousQueryDryRunError(tc.err); got != tc.want {
+			t.Errorf("%s: isExpectedContinuousQueryDryRunError(%v) = %v, want %v", tc.name, tc.err, got, tc.want)
+		}
+	}
+}
+
+func TestShouldDeleteDatasetOnCreate(t *testing.T) {
+	if !shouldDeleteDatasetOnCreate(nil) {
+		t.Error("shouldDeleteDatasetOnCreate(nil) = false, want true")
+	}
+	if shouldDeleteDatasetOnCreate(errors.New("googleapi: Error 409: Already Exists: Dataset")) {
+		t.Error("shouldDeleteDatasetOnCreate(409 Already Exists) = true, want false")
+	}
 }

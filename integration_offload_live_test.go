@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	stdhttp "net/http"
 	"net/url"
 	"os"
@@ -30,8 +31,28 @@ import (
 	"google.golang.org/api/option"
 
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/googlehttp"
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/offload"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/quarantinereplay"
 )
+
+type recordingBlobStore struct {
+	inner   offload.BlobStore
+	onWrite func(uri string)
+}
+
+func (r *recordingBlobStore) WriteObject(ctx context.Context, bucket, object, contentType string, data []byte) (string, error) {
+	if r.onWrite != nil {
+		r.onWrite("gs://" + bucket + "/" + object)
+	}
+	return r.inner.WriteObject(ctx, bucket, object, contentType, data)
+}
+
+func (r *recordingBlobStore) Close() error {
+	if c, ok := r.inner.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
+}
 
 func TestLiveGCSOffloadAndQuarantineReplay(t *testing.T) {
 	t.Run("HermeticRoundTrip", TestHermeticOffloadAndQuarantineReplay)
@@ -76,14 +97,23 @@ func testLiveGCSAndBigQueryOffloadRoundTrip(t *testing.T) {
 	}
 	var uploadedURIs []string
 	var uriMu sync.Mutex
+	seenURI := make(map[string]bool)
 	recordURI := func(uri string) {
 		if uri == "" {
 			return
 		}
 		uriMu.Lock()
-		uploadedURIs = append(uploadedURIs, uri)
+		if !seenURI[uri] {
+			seenURI[uri] = true
+			uploadedURIs = append(uploadedURIs, uri)
+		}
 		uriMu.Unlock()
 	}
+
+	if _, err := admin.Dataset(dataset).Metadata(ctx); err == nil {
+		t.Fatalf("ephemeral dataset %s.%s already exists before test start", project, dataset)
+	}
+	ownsDataset := false
 
 	t.Cleanup(func() {
 		if err := admin.Close(); err != nil {
@@ -101,8 +131,10 @@ func testLiveGCSAndBigQueryOffloadRoundTrip(t *testing.T) {
 			deleteGCSObject(cleanupCtx, t, httpClient, uri)
 		}
 		listAndDeleteGCSPrefix(cleanupCtx, t, httpClient, bucket, prefix+"/")
-		if err := admin.Dataset(dataset).DeleteWithContents(cleanupCtx); err != nil {
-			t.Errorf("cleanup dataset %s.%s: %v", project, dataset, err)
+		if ownsDataset {
+			if err := admin.Dataset(dataset).DeleteWithContents(cleanupCtx); err != nil {
+				t.Errorf("cleanup dataset %s.%s: %v", project, dataset, err)
+			}
 		}
 	})
 
@@ -136,6 +168,9 @@ func testLiveGCSAndBigQueryOffloadRoundTrip(t *testing.T) {
 	if err := traces.start(ctx, nil); err != nil {
 		t.Fatalf("traces.start: %v", err)
 	}
+	ownsDataset = true
+	rawTraceStore := traces.offloader.Store()
+	traces.offloader.SetStore(&recordingBlobStore{inner: rawTraceStore, onWrite: recordURI})
 	defer func() { _ = traces.shutdown(context.Background()) }()
 
 	logs, err := newLogsExporter(settings, cfg)
@@ -145,7 +180,24 @@ func testLiveGCSAndBigQueryOffloadRoundTrip(t *testing.T) {
 	if err := logs.start(ctx, nil); err != nil {
 		t.Fatalf("logs.start: %v", err)
 	}
+	logs.offloader.SetStore(&recordingBlobStore{inner: logs.offloader.Store(), onWrite: recordURI})
 	defer func() { _ = logs.shutdown(context.Background()) }()
+
+	// Verify live GCS HTTP 412 Precondition Failed idempotent re-upload path
+	// (ifGenerationMatch=0 -> fetchExistingGeneration) at the GCSBlobStore boundary.
+	dupObject := prefix + "/spans/idempotent_precondition_check.txt"
+	dupPayload := []byte("idempotent-gcs-precondition-check-payload")
+	gen1, err := traces.offloader.Store().WriteObject(ctx, bucket, dupObject, "text/plain; charset=utf-8", dupPayload)
+	if err != nil {
+		t.Fatalf("first WriteObject(%s): %v", dupObject, err)
+	}
+	gen2, err := traces.offloader.Store().WriteObject(ctx, bucket, dupObject, "text/plain; charset=utf-8", dupPayload)
+	if err != nil {
+		t.Fatalf("second idempotent WriteObject(%s) (HTTP 412 fetchExistingGeneration path): %v", dupObject, err)
+	}
+	if gen1 == "" || gen1 != gen2 {
+		t.Fatalf("idempotent WriteObject generations = (%q, %q), want matching non-empty generation", gen1, gen2)
+	}
 
 	const plantedSecret = "sk-live-secret-token-9876543210abcdef"
 	td, ld := buildOffloadAndQuarantinePayloads(plantedSecret)
@@ -372,34 +424,56 @@ func testLiveGCSAndBigQueryOffloadRoundTrip(t *testing.T) {
 
 func listAndDeleteGCSPrefix(ctx context.Context, t *testing.T, httpClient *stdhttp.Client, bucket, prefix string) {
 	t.Helper()
-	listURL := fmt.Sprintf("https://storage.googleapis.com/storage/v1/b/%s/o?prefix=%s",
-		url.PathEscape(bucket), url.QueryEscape(prefix))
-	req, err := stdhttp.NewRequestWithContext(ctx, stdhttp.MethodGet, listURL, nil)
-	if err != nil {
-		t.Errorf("build GCS list request for gs://%s/%s: %v", bucket, prefix, err)
-		return
-	}
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		t.Errorf("list GCS prefix gs://%s/%s: %v", bucket, prefix, err)
-		return
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != stdhttp.StatusOK {
-		return
-	}
-	var payload struct {
-		Items []struct {
-			Name string `json:"name"`
-		} `json:"items"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return
-	}
-	for _, item := range payload.Items {
-		if item.Name != "" {
-			deleteGCSObject(ctx, t, httpClient, "gs://"+bucket+"/"+item.Name)
+	pageToken := ""
+	for {
+		listURL := fmt.Sprintf("https://storage.googleapis.com/storage/v1/b/%s/o?prefix=%s",
+			url.PathEscape(bucket), url.QueryEscape(prefix))
+		if pageToken != "" {
+			listURL += "&pageToken=" + url.QueryEscape(pageToken)
 		}
+		req, err := stdhttp.NewRequestWithContext(ctx, stdhttp.MethodGet, listURL, nil)
+		if err != nil {
+			t.Errorf("build GCS list request for gs://%s/%s: %v", bucket, prefix, err)
+			return
+		}
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			t.Errorf("list GCS prefix gs://%s/%s: %v", bucket, prefix, err)
+			return
+		}
+		if resp.StatusCode == stdhttp.StatusForbidden {
+			// Under prefix-scoped conditional roles/storage.objectUser, bucket-wide
+			// storage.objects.list may return 403; per-object deleteGCSObject via
+			// recordingBlobStore already deleted all uploaded objects above.
+			_ = resp.Body.Close()
+			return
+		}
+		if resp.StatusCode != stdhttp.StatusOK {
+			_ = resp.Body.Close()
+			t.Errorf("list GCS prefix gs://%s/%s returned HTTP %d", bucket, prefix, resp.StatusCode)
+			return
+		}
+		var payload struct {
+			NextPageToken string `json:"nextPageToken"`
+			Items         []struct {
+				Name string `json:"name"`
+			} `json:"items"`
+		}
+		decodeErr := json.NewDecoder(resp.Body).Decode(&payload)
+		_ = resp.Body.Close()
+		if decodeErr != nil {
+			t.Errorf("decode GCS list response for gs://%s/%s: %v", bucket, prefix, decodeErr)
+			return
+		}
+		for _, item := range payload.Items {
+			if item.Name != "" {
+				deleteGCSObject(ctx, t, httpClient, "gs://"+bucket+"/"+item.Name)
+			}
+		}
+		if payload.NextPageToken == "" {
+			return
+		}
+		pageToken = payload.NextPageToken
 	}
 }
 
