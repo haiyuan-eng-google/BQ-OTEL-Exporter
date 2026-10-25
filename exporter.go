@@ -516,6 +516,7 @@ func (e *signalExporter) start(ctx context.Context, host component.Host) (err er
 		clientCtx, clientCancel := context.WithTimeout(ctx, e.cfg.TimeoutSettings.Timeout)
 		defer clientCancel()
 
+		cleanupMark := len(e.authCleanup)
 		metadataOpts, metadataErr := e.metadataClientOptions(clientCtx)
 		if metadataErr != nil {
 			return metadataErr
@@ -523,10 +524,18 @@ func (e *signalExporter) start(ctx context.Context, host component.Host) (err er
 		admin, adminErr := newDestinationAdmin(
 			clientCtx, e.cfg.Project, e.cfg.Dataset, metadataOpts...)
 		if adminErr != nil {
+			for i := len(e.authCleanup) - 1; i >= cleanupMark; i-- {
+				e.authCleanup[i]()
+			}
+			e.authCleanup = e.authCleanup[:cleanupMark]
 			return fmt.Errorf("creating BigQuery metadata client: %w", adminErr)
 		}
 		defer func() {
 			closeErr := admin.Close()
+			for i := len(e.authCleanup) - 1; i >= cleanupMark; i-- {
+				e.authCleanup[i]()
+			}
+			e.authCleanup = e.authCleanup[:cleanupMark]
 			if closeErr == nil {
 				return
 			}

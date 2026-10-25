@@ -140,6 +140,20 @@ func (l *lazyCredentials) property(get func(*auth.Credentials, context.Context) 
 	})
 }
 
+func hasAuthOption(opts []option.ClientOption) bool {
+	for _, opt := range opts {
+		if typ := reflect.TypeOf(opt); typ != nil {
+			switch typ.Name() {
+			case "withoutAuthentication", "withAuthCredentials", "withTokenSource",
+				"withCredFile", "withCredentialsJSON", "withAuthCredentialsJSON",
+				"withCredentials", "withAPIKey":
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // NewClient creates an API client and returns its endpoint and pool cleanup.
 // With no options it also owns ADC token transport. Callers supplying options
 // must supply credentials with their own lifetime, or disable authentication.
@@ -152,13 +166,13 @@ func NewClient(ctx context.Context, scopes []string, opts ...option.ClientOption
 		}
 	}
 	closeAuth := func() {}
-	if len(opts) == 0 {
+	if !hasAuthOption(opts) {
 		creds, cleanup, err := Credentials(credentials.DetectOptions{Scopes: scopes, UseSelfSignedJWT: true}, nil)
 		if err != nil {
 			return nil, "", nil, err
 		}
 		closeAuth = cleanup
-		opts = []option.ClientOption{option.WithAuthCredentials(creds)}
+		opts = append([]option.ClientOption{option.WithAuthCredentials(creds)}, opts...)
 	}
 	base, err := newBase()
 	if err != nil {
