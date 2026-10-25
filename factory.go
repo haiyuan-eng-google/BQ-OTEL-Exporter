@@ -5,6 +5,7 @@ package bigqueryexporter // import "github.com/haiyuan-eng-google/BQ-OTEL-Export
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"go.opentelemetry.io/collector/component"
@@ -73,16 +74,25 @@ const (
 	defaultMaxElapsedTime = 900 * time.Second
 )
 
+// errUnexpectedConfigType is returned when an exporter constructor receives a
+// nil or non-*Config component.Config value.
+var errUnexpectedConfigType = errors.New("invalid config: expected *bigqueryexporter.Config")
+
 // NewFactory creates a factory for the BigQuery exporter supporting traces,
 // logs, and metrics.
 func NewFactory() exporter.Factory {
 	return exporter.NewFactory(
 		metadata.Type,
-		createDefaultConfig,
-		exporter.WithTraces(createTracesExporter, metadata.TracesStability),
-		exporter.WithLogs(createLogsExporter, metadata.LogsStability),
-		exporter.WithMetrics(createMetricsExporter, metadata.MetricsStability),
+		CreateDefaultConfig,
+		exporter.WithTraces(CreateTracesExporter, metadata.TracesStability),
+		exporter.WithLogs(CreateLogsExporter, metadata.LogsStability),
+		exporter.WithMetrics(CreateMetricsExporter, metadata.MetricsStability),
 	)
+}
+
+// CreateDefaultConfig returns the default configuration for the BigQuery exporter.
+func CreateDefaultConfig() component.Config {
+	return createDefaultConfig()
 }
 
 func createDefaultConfig() component.Config {
@@ -147,12 +157,18 @@ func createDefaultConfig() component.Config {
 	}
 }
 
-func createTracesExporter(
+// CreateTracesExporter creates a traces exporter based on the provided configuration.
+// It matches exporter.CreateTracesFunc so NewFactory and upstream Collector distribution
+// wrappers can wire it directly with their own exporter.Settings.
+func CreateTracesExporter(
 	ctx context.Context,
 	set exporter.Settings,
 	cfg component.Config,
 ) (exporter.Traces, error) {
-	c := cfg.(*Config)
+	c, ok := cfg.(*Config)
+	if !ok || c == nil {
+		return nil, errUnexpectedConfigType
+	}
 	exp, err := newTracesExporter(set.TelemetrySettings, c)
 	if err != nil {
 		return nil, err
@@ -173,12 +189,18 @@ func createTracesExporter(
 	)
 }
 
-func createLogsExporter(
+// CreateLogsExporter creates a logs exporter based on the provided configuration.
+// It matches exporter.CreateLogsFunc so NewFactory and upstream Collector distribution
+// wrappers can wire it directly with their own exporter.Settings.
+func CreateLogsExporter(
 	ctx context.Context,
 	set exporter.Settings,
 	cfg component.Config,
 ) (exporter.Logs, error) {
-	c := cfg.(*Config)
+	c, ok := cfg.(*Config)
+	if !ok || c == nil {
+		return nil, errUnexpectedConfigType
+	}
 	exp, err := newLogsExporter(set.TelemetrySettings, c)
 	if err != nil {
 		return nil, err
@@ -197,12 +219,18 @@ func createLogsExporter(
 	)
 }
 
-func createMetricsExporter(
+// CreateMetricsExporter creates a metrics exporter based on the provided configuration.
+// It matches exporter.CreateMetricsFunc so NewFactory and upstream Collector distribution
+// wrappers can wire it directly with their own exporter.Settings.
+func CreateMetricsExporter(
 	ctx context.Context,
 	set exporter.Settings,
 	cfg component.Config,
 ) (exporter.Metrics, error) {
-	c := cfg.(*Config)
+	c, ok := cfg.(*Config)
+	if !ok || c == nil {
+		return nil, errUnexpectedConfigType
+	}
 	exp, err := newMetricsExporter(set.TelemetrySettings, c)
 	if err != nil {
 		return nil, err

@@ -113,6 +113,11 @@ func TestReleaseWorkflowInstallsPrerequisitesAndResolvesManifestDigest(t *testin
 		"id: manifest_digest",
 		"docker buildx imagetools inspect",
 		"steps.manifest_digest.outputs.digest",
+		`syft "ghcr.io/haiyuan-eng-google/bq-otel-collector@${{ steps.manifest_digest.outputs.digest }}" -o spdx-json=dist/container-sbom.spdx.json`,
+		`cosign attach sbom --sbom dist/container-sbom.spdx.json "ghcr.io/haiyuan-eng-google/bq-otel-collector@${{ steps.manifest_digest.outputs.digest }}"`,
+		`cosign attest --predicate dist/container-sbom.spdx.json --type spdxjson --yes "ghcr.io/haiyuan-eng-google/bq-otel-collector@${{ steps.manifest_digest.outputs.digest }}"`,
+		`actions/attest-build-provenance@v4`,
+		`subject-path: "dist/checksums.txt"`,
 	} {
 		if !strings.Contains(text, needle) {
 			t.Errorf(".github/workflows/release.yml missing %q", needle)
@@ -122,12 +127,161 @@ func TestReleaseWorkflowInstallsPrerequisitesAndResolvesManifestDigest(t *testin
 		t.Error(".github/workflows/release.yml must not reference nonexistent steps.build.outputs.digest")
 	}
 
+	var wf struct {
+		Jobs struct {
+			Release struct {
+				Steps []struct {
+					Name string         `yaml:"name"`
+					Uses string         `yaml:"uses"`
+					Run  string         `yaml:"run"`
+					With map[string]any `yaml:"with"`
+				} `yaml:"steps"`
+			} `yaml:"release"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(raw, &wf); err != nil {
+		t.Fatalf("unmarshaling .github/workflows/release.yml: %v", err)
+	}
+	var hasContainerProvenance, hasBinaryProvenance, hasContainerSBOM bool
+	for _, step := range wf.Jobs.Release.Steps {
+		if step.Uses == "actions/attest-build-provenance@v4" {
+			if step.With["subject-name"] == "ghcr.io/haiyuan-eng-google/bq-otel-collector" &&
+				step.With["subject-digest"] == "${{ steps.manifest_digest.outputs.digest }}" {
+				hasContainerProvenance = true
+			}
+			if step.With["subject-path"] == "dist/checksums.txt" {
+				hasBinaryProvenance = true
+			}
+		}
+		if strings.Contains(step.Run, "dist/container-sbom.spdx.json") &&
+			strings.Contains(step.Run, "cosign attach sbom") &&
+			strings.Contains(step.Run, "cosign attest --predicate dist/container-sbom.spdx.json --type spdxjson") {
+			hasContainerSBOM = true
+		}
+	}
+	if !hasContainerProvenance {
+		t.Error(".github/workflows/release.yml missing container actions/attest-build-provenance@v4 step")
+	}
+	if !hasBinaryProvenance {
+		t.Error(".github/workflows/release.yml missing binary archive actions/attest-build-provenance@v4 step with subject-path: dist/checksums.txt")
+	}
+	if !hasContainerSBOM {
+		t.Error(".github/workflows/release.yml missing container SPDX SBOM generation and cosign attach/attest step")
+	}
+
 	ocbRaw, err := os.ReadFile("example/otelcol-builder-release.yaml")
 	if err != nil {
 		t.Fatalf("reading example/otelcol-builder-release.yaml: %v", err)
 	}
 	if !strings.Contains(string(ocbRaw), "replaces:") {
 		t.Error("example/otelcol-builder-release.yaml must include a replaces entry for the checked-out commit")
+	}
+}
+
+func TestMetadataYAMLDeclaresGoleakIgnoreMatchingGeneratedPackageTest(t *testing.T) {
+	var meta struct {
+		Tests struct {
+			SkipLifecycle bool `yaml:"skip_lifecycle"`
+			Goleak        struct {
+				Ignore struct {
+					Top []string `yaml:"top"`
+				} `yaml:"ignore"`
+			} `yaml:"goleak"`
+		} `yaml:"tests"`
+	}
+	if err := yaml.Unmarshal([]byte(readRepoText(t, "metadata.yaml")), &meta); err != nil {
+		t.Fatalf("unmarshaling metadata.yaml: %v", err)
+	}
+	const wantOpenCensusTop = "go.opencensus.io/stats/view.(*worker).start"
+	if !slices.Contains(meta.Tests.Goleak.Ignore.Top, wantOpenCensusTop) {
+		t.Errorf("metadata.yaml tests.goleak.ignore.top = %v, want %q", meta.Tests.Goleak.Ignore.Top, wantOpenCensusTop)
+	}
+
+	genTest := readRepoText(t, "generated_package_test.go")
+	if !strings.Contains(genTest, `goleak.IgnoreTopFunction("`+wantOpenCensusTop+`")`) {
+		t.Errorf("generated_package_test.go missing IgnoreTopFunction(%q)", wantOpenCensusTop)
+	}
+	if !strings.Contains(genTest, "integrationGoleakOptions()...") {
+		t.Error("generated_package_test.go must chain integrationGoleakOptions() for build-tag-isolated unit and live integration runs")
+	}
+}
+
+func TestOpenTelemetryRegistryEntryAndReleaseDocs(t *testing.T) {
+	var entry struct {
+		Title        string   `yaml:"title"`
+		RegistryType string   `yaml:"registryType"`
+		Language     string   `yaml:"language"`
+		Tags         []string `yaml:"tags"`
+		License      string   `yaml:"license"`
+		Description  string   `yaml:"description"`
+		Authors      []struct {
+			Name string `yaml:"name"`
+			URL  string `yaml:"url"`
+		} `yaml:"authors"`
+		URLs struct {
+			Repo string `yaml:"repo"`
+		} `yaml:"urls"`
+		OTVersion string `yaml:"otVersion"`
+	}
+	if err := yaml.Unmarshal([]byte(readRepoText(t, "docs/otel-registry-entry.yaml")), &entry); err != nil {
+		t.Fatalf("unmarshaling docs/otel-registry-entry.yaml: %v", err)
+	}
+	if entry.Title == "" {
+		t.Error("docs/otel-registry-entry.yaml missing title")
+	}
+	if entry.RegistryType != "exporter" {
+		t.Errorf("registryType = %q, want %q", entry.RegistryType, "exporter")
+	}
+	if entry.Language != "collector" {
+		t.Errorf("language = %q, want %q", entry.Language, "collector")
+	}
+	if entry.License != "Apache-2.0" {
+		t.Errorf("license = %q, want %q", entry.License, "Apache-2.0")
+	}
+	if strings.TrimSpace(entry.Description) == "" {
+		t.Error("docs/otel-registry-entry.yaml missing description")
+	}
+	if len(entry.Authors) == 0 || entry.Authors[0].Name == "" {
+		t.Errorf("authors = %#v, want at least one named author", entry.Authors)
+	}
+	if entry.URLs.Repo != "https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter" {
+		t.Errorf("urls.repo = %q, want https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter", entry.URLs.Repo)
+	}
+	if entry.OTVersion != "v0.1.0" {
+		t.Errorf("otVersion = %q, want %q", entry.OTVersion, "v0.1.0")
+	}
+	for _, wantTag := range []string{"go", "exporter", "collector", "bigquery", "google-cloud", "genai", "mcp"} {
+		if !slices.Contains(entry.Tags, wantTag) {
+			t.Errorf("tags %v missing %q", entry.Tags, wantTag)
+		}
+	}
+
+	provenance := readRepoText(t, "docs/provenance.md")
+	for _, want := range []string{
+		"Apache-2.0",
+		"Copyright 2026 Google LLC",
+		"CONTRIBUTING.md",
+		"v0alpha1",
+		"v0alpha2",
+		"v0.1.0",
+	} {
+		if !strings.Contains(provenance, want) {
+			t.Errorf("docs/provenance.md missing %q", want)
+		}
+	}
+
+	changelog := readRepoText(t, "CHANGELOG.md")
+	for _, want := range []string{
+		"v0.1.0",
+		"v0alpha2",
+		"v0alpha1",
+		"CreateTracesExporter",
+		"CreateLogsExporter",
+		"CreateMetricsExporter",
+	} {
+		if !strings.Contains(changelog, want) {
+			t.Errorf("CHANGELOG.md missing %q", want)
+		}
 	}
 }
 

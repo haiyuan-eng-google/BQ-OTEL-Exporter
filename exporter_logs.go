@@ -21,6 +21,9 @@ type logsExporter struct {
 }
 
 func newLogsExporter(set component.TelemetrySettings, cfg *Config) (*logsExporter, error) {
+	if cfg == nil {
+		return nil, errUnexpectedConfigType
+	}
 	tel, err := metadata.NewTelemetry(set.MeterProvider)
 	if err != nil {
 		return nil, err

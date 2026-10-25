@@ -1,0 +1,24 @@
+# OpenTelemetry Registry entry for open-telemetry/opentelemetry.io/data/registry/collector-exporter-bigquery.yml
+title: BigQuery Exporter
+registryType: exporter
+language: collector
+tags:
+  - go
+  - exporter
+  - collector
+  - bigquery
+  - google-cloud
+  - genai
+  - mcp
+license: Apache-2.0
+description: >-
+  Exports OpenTelemetry traces, logs, and metrics into documented Google Cloud
+  BigQuery relational tables via the BigQuery Storage Write API, with deduplication
+  views, GenAI and MCP analytics views, client-side redaction, and GCS payload
+  offloading.
+authors:
+  - name: Google LLC
+    url: https://github.com/haiyuan-eng-google
+urls:
+  repo: https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter
+otVersion: v0.1.0

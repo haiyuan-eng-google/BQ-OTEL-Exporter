@@ -18,6 +18,10 @@ tests:
     logs:
       table: otel_logs
   skip_lifecycle: true
+  goleak:
+    ignore:
+      top:
+        - "go.opencensus.io/stats/view.(*worker).start"
 
 # Delivery-critical self-telemetry.
 #
