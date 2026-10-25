@@ -4,6 +4,7 @@
 package testbench
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io/fs"
@@ -16,25 +17,45 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 	"google.golang.org/api/option"
 )
 
 func TestGeneratorAllSevenFrameworksAndMCP(t *testing.T) {
-	gen := NewGenerator(GeneratorConfig{
+	genCfg := GeneratorConfig{
 		PayloadBytes:   8192,
 		PlantSecrets:   true,
 		UniquePayloads: true,
-	})
+		Seed:           7,
+		BaseTime:       time.Date(2026, 2, 3, 4, 5, 6, 0, time.UTC),
+	}
+	gen := NewGenerator(genCfg)
+	gen2 := NewGenerator(genCfg)
 
 	// 28 spans = 7 frameworks * 4-span tree (invoke_agent, chat, execute_tool, mcp).
 	td := gen.TracesBatch(28)
+	td2 := gen2.TracesBatch(28)
 	if got := td.SpanCount(); got != 28 {
 		t.Fatalf("TracesBatch(28) SpanCount = %d, want 28", got)
+	}
+	traceBytes1, err := (&ptrace.ProtoMarshaler{}).MarshalTraces(td)
+	if err != nil {
+		t.Fatalf("MarshalTraces(td) error: %v", err)
+	}
+	traceBytes2, err := (&ptrace.ProtoMarshaler{}).MarshalTraces(td2)
+	if err != nil {
+		t.Fatalf("MarshalTraces(td2) error: %v", err)
+	}
+	if !bytes.Equal(traceBytes1, traceBytes2) {
+		t.Fatal("TracesBatch protobuf bytes differ across two fresh NewGenerator instances with identical config")
 	}
 
 	seenFrameworks := make(map[string]bool)
 	seenOps := make(map[string]int)
 	seenMCP := make(map[string]bool)
+	spanPairs := make(map[string]bool)
 	var secretSpans int
 
 	rss := td.ResourceSpans()
@@ -50,11 +71,33 @@ func TestGeneratorAllSevenFrameworksAndMCP(t *testing.T) {
 			spans := sss.At(j).Spans()
 			for k := 0; k < spans.Len(); k++ {
 				sp := spans.At(k)
+				spanPairs[sp.TraceID().String()+"/"+sp.SpanID().String()] = true
 				if op, ok := sp.Attributes().Get("gen_ai.operation.name"); ok {
 					seenOps[op.Str()]++
 				}
 				if mcpMethod, ok := sp.Attributes().Get("mcp.method.name"); ok {
-					seenMCP[mcpMethod.Str()] = true
+					m := mcpMethod.Str()
+					seenMCP[m] = true
+					if _, ok := sp.Attributes().Get("server.address"); !ok {
+						t.Errorf("MCP span (%s) missing server.address", m)
+					}
+					if _, ok := sp.Attributes().Get("jsonrpc.request.id"); !ok {
+						t.Errorf("MCP span (%s) missing jsonrpc.request.id", m)
+					}
+					switch m {
+					case "tools/call":
+						if _, ok := sp.Attributes().Get("gen_ai.tool.name"); !ok {
+							t.Error("MCP tools/call span missing gen_ai.tool.name")
+						}
+					case "resources/read":
+						if _, ok := sp.Attributes().Get("mcp.resource.uri"); !ok {
+							t.Error("MCP resources/read span missing mcp.resource.uri")
+						}
+					case "prompts/get":
+						if _, ok := sp.Attributes().Get("gen_ai.prompt.name"); !ok {
+							t.Error("MCP prompts/get span missing gen_ai.prompt.name")
+						}
+					}
 				}
 				if _, ok := sp.Attributes().Get("client.api_key"); ok {
 					secretSpans++
@@ -62,6 +105,9 @@ func TestGeneratorAllSevenFrameworksAndMCP(t *testing.T) {
 				if msg, ok := sp.Attributes().Get("gen_ai.input.messages"); ok {
 					if len(msg.Str()) != 8192 {
 						t.Fatalf("gen_ai.input.messages len = %d, want 8192", len(msg.Str()))
+					}
+					if !json.Valid([]byte(msg.Str())) {
+						t.Fatalf("gen_ai.input.messages is not valid JSON: %.120s", msg.Str())
 					}
 				}
 			}
@@ -74,21 +120,88 @@ func TestGeneratorAllSevenFrameworksAndMCP(t *testing.T) {
 	if seenOps["invoke_agent"] == 0 || seenOps["chat"] == 0 || seenOps["execute_tool"] == 0 {
 		t.Fatalf("missing expected gen_ai.operation.name values: %v", seenOps)
 	}
-	if len(seenMCP) == 0 {
-		t.Fatal("expected MCP child spans with mcp.method.name attribute")
+	for _, wantMethod := range []string{"tools/call", "resources/read", "prompts/get"} {
+		if !seenMCP[wantMethod] {
+			t.Fatalf("missing MCP method %q in %v", wantMethod, seenMCP)
+		}
 	}
 	if secretSpans == 0 {
 		t.Fatal("expected planted secret attributes when PlantSecrets=true")
 	}
 
 	ld := gen.LogsBatch(14)
+	ld2 := gen2.LogsBatch(14)
 	if got := ld.LogRecordCount(); got != 14 {
 		t.Fatalf("LogsBatch(14) LogRecordCount = %d, want 14", got)
 	}
+	logBytes1, err := (&plog.ProtoMarshaler{}).MarshalLogs(ld)
+	if err != nil {
+		t.Fatalf("MarshalLogs(ld) error: %v", err)
+	}
+	logBytes2, err := (&plog.ProtoMarshaler{}).MarshalLogs(ld2)
+	if err != nil {
+		t.Fatalf("MarshalLogs(ld2) error: %v", err)
+	}
+	if !bytes.Equal(logBytes1, logBytes2) {
+		t.Fatal("LogsBatch protobuf bytes differ across two fresh NewGenerator instances with identical config")
+	}
+	for i := 0; i < ld.ResourceLogs().Len(); i++ {
+		sls := ld.ResourceLogs().At(i).ScopeLogs()
+		for j := 0; j < sls.Len(); j++ {
+			lrs := sls.At(j).LogRecords()
+			for k := 0; k < lrs.Len(); k++ {
+				lr := lrs.At(k)
+				key := lr.TraceID().String() + "/" + lr.SpanID().String()
+				if !spanPairs[key] {
+					t.Fatalf("log record correlated pair %s not found in emitted TracesBatch(28)", key)
+				}
+			}
+		}
+	}
 
 	md := gen.MetricsBatch(10)
+	md2 := gen2.MetricsBatch(10)
 	if got := md.DataPointCount(); got != 10 {
 		t.Fatalf("MetricsBatch(10) DataPointCount = %d, want 10", got)
+	}
+	metricBytes1, err := (&pmetric.ProtoMarshaler{}).MarshalMetrics(md)
+	if err != nil {
+		t.Fatalf("MarshalMetrics(md) error: %v", err)
+	}
+	metricBytes2, err := (&pmetric.ProtoMarshaler{}).MarshalMetrics(md2)
+	if err != nil {
+		t.Fatalf("MarshalMetrics(md2) error: %v", err)
+	}
+	if !bytes.Equal(metricBytes1, metricBytes2) {
+		t.Fatal("MetricsBatch protobuf bytes differ across two fresh NewGenerator instances with identical config")
+	}
+	dps := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Histogram().DataPoints()
+	for i := 0; i < dps.Len(); i++ {
+		ex := dps.At(i).Exemplars().At(0)
+		key := ex.TraceID().String() + "/" + ex.SpanID().String()
+		if !spanPairs[key] {
+			t.Fatalf("metric exemplar correlated pair %s not found in emitted TracesBatch(28)", key)
+		}
+	}
+
+	// Verify payloadFor produces valid JSON across all UniquePayloads x PlantSecrets combinations.
+	for _, unique := range []bool{false, true} {
+		for _, secrets := range []bool{false, true} {
+			gCombo := NewGenerator(GeneratorConfig{
+				PayloadBytes:   1024,
+				UniquePayloads: unique,
+				PlantSecrets:   secrets,
+			})
+			for seq := uint64(0); seq < 16; seq++ {
+				p := gCombo.payloadFor(seq)
+				if len(p) != 1024 {
+					t.Fatalf("payloadFor(seq=%d, unique=%t, secrets=%t) len = %d, want 1024", seq, unique, secrets, len(p))
+				}
+				if !json.Valid([]byte(p)) {
+					t.Fatalf("payloadFor(seq=%d, unique=%t, secrets=%t) invalid JSON: %s", seq, unique, secrets, p)
+				}
+			}
+		}
 	}
 }
 
@@ -174,7 +287,7 @@ func TestRunBQFakeBackpressureAndLocalOffload(t *testing.T) {
 		Redaction:             true,
 		Backpressure:          true,
 		SimulateAckDelay:      15 * time.Millisecond,
-		SimulateThrottleEvery: 4,
+		SimulateThrottleEvery: 2,
 		PayloadBytes:          4096,
 		OffloadDir:            offloadDir,
 		OffloadThresholdBytes: 2048,
@@ -202,6 +315,9 @@ func TestRunBQFakeBackpressureAndLocalOffload(t *testing.T) {
 		}
 		if res.Telemetry.BackpressureLevel <= 0 {
 			t.Errorf("signal %s BackpressureLevel = %f, want > 0 under simulated ack delay and throttling", res.Signal, res.Telemetry.BackpressureLevel)
+		}
+		if res.Telemetry.Retries <= 0 {
+			t.Errorf("signal %s Retries = %d, want > 0 under SimulateThrottleEvery=%d", res.Signal, res.Telemetry.Retries, cfg.SimulateThrottleEvery)
 		}
 	}
 
@@ -242,6 +358,112 @@ func TestRunBQFakeBackpressureAndLocalOffload(t *testing.T) {
 	}
 	if redactedBlobs == 0 {
 		t.Fatalf("expected >= 1 offloaded file in %s to contain [REDACTED] placeholder, found 0 across %d files", offloadDir, totalBlobs)
+	}
+}
+
+func TestRunPerBatchCallTimeoutDoesNotExitWorker(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Batch 1 (seq == 1) and every 3rd batch receive a 120ms ack delay while
+	// per-batch CallTimeout is 40ms, so delayed batches fail with
+	// context.DeadlineExceeded while the parent ctx remains active and the single
+	// worker continues processing subsequent non-delayed batches.
+	cfg := RunnerConfig{
+		Mode:               ModeBQFake,
+		Signals:            []string{"traces"},
+		Duration:           350 * time.Millisecond,
+		BatchSize:          10,
+		Workers:            1,
+		StreamPoolSize:     1,
+		ConnectionPoolSize: 1,
+		SimulateAckDelay:   120 * time.Millisecond,
+		CallTimeout:        40 * time.Millisecond,
+	}
+	report, err := Run(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Run() error: %v", err)
+	}
+	if len(report.Results) != 1 {
+		t.Fatalf("len(report.Results) = %d, want 1", len(report.Results))
+	}
+	res := report.Results[0]
+	if res.BatchesFailed <= 0 {
+		t.Fatalf("BatchesFailed = %d, want > 0 when per-batch CallTimeout < SimulateAckDelay", res.BatchesFailed)
+	}
+	if res.BatchesSucceeded <= 0 {
+		t.Fatalf("BatchesSucceeded = %d, want > 0 (worker must continue after per-batch CallTimeout)", res.BatchesSucceeded)
+	}
+}
+
+func TestRunUniquePayloadsAndZeroAckErrors(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// 1. UniquePayloads=true generates fresh batches beyond 8 batches with 0 dedup hits.
+	offloadDir := t.TempDir()
+	uniqueCfg := RunnerConfig{
+		Mode:                  ModeBQFake,
+		Signals:               []string{"traces"},
+		Duration:              180 * time.Millisecond,
+		BatchSize:             4,
+		Workers:               2,
+		StreamPoolSize:        2,
+		ConnectionPoolSize:    2,
+		PayloadBytes:          1024,
+		UniquePayloads:        true,
+		OffloadDir:            offloadDir,
+		OffloadThresholdBytes: 512,
+	}
+	uniqueRep, err := Run(ctx, uniqueCfg)
+	if err != nil {
+		t.Fatalf("Run(UniquePayloads=true) error: %v", err)
+	}
+	if uniqueRep.Results[0].BatchesSucceeded <= 8 {
+		t.Fatalf("BatchesSucceeded = %d, want > 8", uniqueRep.Results[0].BatchesSucceeded)
+	}
+	if uniqueRep.Results[0].Telemetry.OffloadDedupHits != 0 {
+		t.Fatalf("OffloadDedupHits = %d, want 0 when UniquePayloads=true", uniqueRep.Results[0].Telemetry.OffloadDedupHits)
+	}
+
+	// 2. All-rejected run (payload exceeds 256 KiB limits.max_value_bytes without offload)
+	// must report AchievedRowsPerSec == 0 and return a non-nil error.
+	rejectCfg := RunnerConfig{
+		Mode:               ModeBQFake,
+		Signals:            []string{"traces"},
+		Duration:           120 * time.Millisecond,
+		BatchSize:          8,
+		Workers:            1,
+		StreamPoolSize:     1,
+		ConnectionPoolSize: 1,
+		PayloadBytes:       2 * 1024 * 1024,
+	}
+	rejectRep, err := Run(ctx, rejectCfg)
+	if err == nil {
+		t.Fatal("Run() with 100% rejected rows succeeded, want non-nil error")
+	}
+	if rejectRep == nil || len(rejectRep.Results) != 1 {
+		t.Fatalf("expected 1 result on rejected report, got %+v", rejectRep)
+	}
+	if rejectRep.Results[0].AchievedRowsPerSec != 0 {
+		t.Fatalf("AchievedRowsPerSec = %f, want 0 when AcknowledgedRows == 0", rejectRep.Results[0].AchievedRowsPerSec)
+	}
+	if rejectRep.Results[0].Telemetry.RejectedRows <= 0 {
+		t.Fatalf("RejectedRows = %d, want > 0", rejectRep.Results[0].Telemetry.RejectedRows)
+	}
+
+	// 3. Parent context cancellation during run must return a non-nil error.
+	shortCtx, cancelShort := context.WithTimeout(ctx, 40*time.Millisecond)
+	defer cancelShort()
+	if _, err := Run(shortCtx, RunnerConfig{
+		Mode:             ModeBQFake,
+		Signals:          []string{"traces"},
+		Duration:         2 * time.Second,
+		BatchSize:        20,
+		Workers:          1,
+		SimulateAckDelay: 100 * time.Millisecond,
+	}); err == nil {
+		t.Fatal("Run() with canceled parent context succeeded, want non-nil error")
 	}
 }
 
@@ -295,6 +517,16 @@ func TestRunStreamPoolSweepAndValidation(t *testing.T) {
 		{Mode: ModeBQFake, DatasetID: "prod_otel", EphemeralDataset: true},
 		{Mode: ModeBQFake, OffloadDir: "/tmp/a", OffloadGCSBucket: "bkt"},
 		{Mode: ModeBQFake, OffloadGCSBucket: "bkt"},
+		{Mode: ModeBQFake, Duration: -time.Second},
+		{Mode: ModeBQFake, BatchSize: -1},
+		{Mode: ModeBQFake, Workers: -1},
+		{Mode: ModeBQFake, StreamPoolSize: -1},
+		{Mode: ModeBQFake, ConnectionPoolSize: -1},
+		{Mode: ModeBQFake, PayloadBytes: -1},
+		{Mode: ModeBQFake, TargetRate: -1},
+		{Mode: ModeBQFake, SimulateThrottleEvery: -1},
+		{Mode: ModeBQFake, SimulateAckDelay: -time.Millisecond},
+		{Mode: ModeBQFake, CallTimeout: -time.Millisecond},
 	}
 	for _, tc := range invalidCases {
 		if err := tc.Normalize(); err == nil {

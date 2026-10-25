@@ -92,10 +92,12 @@ type RunnerConfig struct {
 	OffloadGCSBucket string `json:"offload_gcs_bucket,omitempty"`
 	// OffloadThresholdBytes sets the byte threshold for payload offload (default 4096 when OffloadDir or OffloadGCSBucket is set).
 	OffloadThresholdBytes int `json:"offload_threshold_bytes,omitempty"`
-	// SimulateAckDelay injects FaultDelayedAck into bqfake on every 3rd batch when > 0.
+	// SimulateAckDelay injects FaultDelayedAck into bqfake on batch 1 and every 3rd batch when > 0.
 	SimulateAckDelay time.Duration `json:"simulate_ack_delay,omitempty"`
 	// SimulateThrottleEvery injects FaultResourceExhausted into bqfake every N batches when > 0.
 	SimulateThrottleEvery int `json:"simulate_throttle_every,omitempty"`
+	// CallTimeout overrides the per-batch Consume* timeout when > 0.
+	CallTimeout time.Duration `json:"call_timeout,omitempty"`
 	// ProjectID is the target GCP project ("bench-project" in bqfake mode).
 	ProjectID string `json:"project_id"`
 	// DatasetID is the target BigQuery dataset ("otel_bench" in bqfake mode).
@@ -131,35 +133,68 @@ func (c *RunnerConfig) Normalize() error {
 			return fmt.Errorf("unsupported signal %q: must be traces, logs, or metrics", sig)
 		}
 	}
-	if c.Duration <= 0 {
+	if c.TargetRate < 0 {
+		return fmt.Errorf("target_rate %d must be >= 0", c.TargetRate)
+	}
+	if c.Duration < 0 {
+		return fmt.Errorf("duration %s must be > 0", c.Duration)
+	}
+	if c.Duration == 0 {
 		c.Duration = 2 * time.Second
 	}
-	if c.BatchSize <= 0 {
+	if c.BatchSize < 0 {
+		return fmt.Errorf("batch_size %d must be > 0", c.BatchSize)
+	}
+	if c.BatchSize == 0 {
 		c.BatchSize = 500
 	}
-	if c.Workers <= 0 {
+	if c.Workers < 0 {
+		return fmt.Errorf("workers %d must be > 0", c.Workers)
+	}
+	if c.Workers == 0 {
 		c.Workers = 4
 	}
-	if c.StreamPoolSize <= 0 {
+	if c.StreamPoolSize < 0 || c.StreamPoolSize > 16 {
+		return fmt.Errorf("stream_pool_size %d must be between 1 and 16", c.StreamPoolSize)
+	}
+	if c.StreamPoolSize == 0 {
 		c.StreamPoolSize = 4
 	}
-	if c.StreamPoolSize > 16 {
-		return fmt.Errorf("stream_pool_size %d exceeds maximum 16", c.StreamPoolSize)
+	if c.ConnectionPoolSize < 0 || c.ConnectionPoolSize > 16 {
+		return fmt.Errorf("connection_pool_size %d must be between 1 and 16", c.ConnectionPoolSize)
 	}
-	if c.ConnectionPoolSize <= 0 {
+	if c.ConnectionPoolSize == 0 {
 		c.ConnectionPoolSize = 4
 	}
-	if c.ConnectionPoolSize > 16 {
-		return fmt.Errorf("connection_pool_size %d exceeds maximum 16", c.ConnectionPoolSize)
+	if c.MaxInflightRequests < 0 {
+		return fmt.Errorf("max_inflight_requests %d must be > 0", c.MaxInflightRequests)
 	}
-	if c.MaxInflightRequests <= 0 {
+	if c.MaxInflightRequests == 0 {
 		c.MaxInflightRequests = 32
 	}
-	if c.MaxRequestBytes <= 0 {
+	if c.MaxRequestBytes < 0 {
+		return fmt.Errorf("max_request_bytes %d must be > 0", c.MaxRequestBytes)
+	}
+	if c.MaxRequestBytes == 0 {
 		c.MaxRequestBytes = 8 * 1024 * 1024
 	}
-	if c.PayloadBytes <= 0 {
+	if c.PayloadBytes < 0 {
+		return fmt.Errorf("payload_bytes %d must be > 0", c.PayloadBytes)
+	}
+	if c.PayloadBytes == 0 {
 		c.PayloadBytes = 1024
+	}
+	if c.OffloadThresholdBytes < 0 {
+		return fmt.Errorf("offload_threshold_bytes %d must be > 0", c.OffloadThresholdBytes)
+	}
+	if c.SimulateAckDelay < 0 {
+		return fmt.Errorf("simulate_ack_delay %s must be >= 0", c.SimulateAckDelay)
+	}
+	if c.SimulateThrottleEvery < 0 {
+		return fmt.Errorf("simulate_throttle_every %d must be >= 0", c.SimulateThrottleEvery)
+	}
+	if c.CallTimeout < 0 {
+		return fmt.Errorf("call_timeout %s must be >= 0", c.CallTimeout)
 	}
 	if c.OffloadDir != "" && c.OffloadGCSBucket != "" {
 		return errors.New("offload_dir and offload_gcs_bucket are mutually exclusive")
@@ -316,12 +351,23 @@ func Run(ctx context.Context, cfg RunnerConfig) (*BenchmarkReport, error) {
 		}()
 	}
 
+	var zeroAckErr error
 	for _, sig := range cfg.Signals {
 		res, err := runSingleSignal(ctx, cfg, sig)
 		if err != nil {
 			return nil, fmt.Errorf("benchmark signal %s: %w", sig, err)
 		}
 		report.Results = append(report.Results, res)
+		if ctx.Err() != nil {
+			return report, fmt.Errorf("benchmark signal %s interrupted before completion: %w", sig, ctx.Err())
+		}
+		if res.Telemetry.AcknowledgedRows == 0 && (res.Telemetry.RejectedRows > 0 || res.BatchesFailed > 0 || res.RecordsSubmitted > 0) && zeroAckErr == nil {
+			zeroAckErr = fmt.Errorf("benchmark signal %s acknowledged 0 rows (submitted=%d, rejected=%d, batches_failed=%d)",
+				sig, res.RecordsSubmitted, res.Telemetry.RejectedRows, res.BatchesFailed)
+		}
+	}
+	if zeroAckErr != nil {
+		return report, zeroAckErr
 	}
 	return report, nil
 }
@@ -505,6 +551,9 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 			expCfg.Quarantine.Enabled = true
 		}
 	}
+	if cfg.CallTimeout > 0 {
+		expCfg.TimeoutSettings.Timeout = cfg.CallTimeout
+	}
 
 	if err := expCfg.Validate(); err != nil {
 		return SignalResult{}, fmt.Errorf("validating exporter config: %w", err)
@@ -614,9 +663,11 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 		UniquePayloads: cfg.UniquePayloads,
 	})
 
-	// Pre-build a pool of batches per worker so the benchmark measures exporter
-	// pipeline (redaction, ProtoRows serialization, stream pool routing, AIMD
-	// backpressure, gRPC Write API I/O) rather than synthetic string building.
+	// Pre-build a pool of batches per worker when UniquePayloads is false so the
+	// benchmark measures exporter pipeline (redaction, ProtoRows serialization,
+	// stream pool routing, AIMD backpressure, gRPC Write API I/O) rather than
+	// synthetic string building. When UniquePayloads is true, workers generate
+	// fresh batches per dispatch so every record carries a distinct payload.
 	// In standard exporter mode, internal/redact.Redactor clones on write when a
 	// batch matches; in local-offload mode (localOffloader != nil), each worker
 	// clones the prebuilt batch before running Step-0 redaction and offload.
@@ -624,14 +675,16 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 	prebuiltTraces := make([]ptrace.Traces, prebuiltCount)
 	prebuiltLogs := make([]plog.Logs, prebuiltCount)
 	prebuiltMetrics := make([]pmetric.Metrics, prebuiltCount)
-	for i := 0; i < prebuiltCount; i++ {
-		switch signal {
-		case "traces":
-			prebuiltTraces[i] = gen.TracesBatch(cfg.BatchSize)
-		case "logs":
-			prebuiltLogs[i] = gen.LogsBatch(cfg.BatchSize)
-		case "metrics":
-			prebuiltMetrics[i] = gen.MetricsBatch(cfg.BatchSize)
+	if !cfg.UniquePayloads {
+		for i := 0; i < prebuiltCount; i++ {
+			switch signal {
+			case "traces":
+				prebuiltTraces[i] = gen.TracesBatch(cfg.BatchSize)
+			case "logs":
+				prebuiltLogs[i] = gen.LogsBatch(cfg.BatchSize)
+			case "metrics":
+				prebuiltMetrics[i] = gen.MetricsBatch(cfg.BatchSize)
+			}
 		}
 	}
 
@@ -714,10 +767,18 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 				var consumeErr error
 				switch signal {
 				case "traces":
-					td := prebuiltTraces[idx]
+					var td ptrace.Traces
+					if cfg.UniquePayloads {
+						td = gen.TracesBatch(cfg.BatchSize)
+					} else {
+						td = prebuiltTraces[idx]
+					}
 					if localOffloader != nil {
-						cloned := ptrace.NewTraces()
-						prebuiltTraces[idx].CopyTo(cloned)
+						cloned := td
+						if !cfg.UniquePayloads {
+							cloned = ptrace.NewTraces()
+							prebuiltTraces[idx].CopyTo(cloned)
+						}
 						// Step-0 redaction runs before content-addressed offload so
 						// cleartext secrets are never hashed or written to disk.
 						if localRedactor != nil {
@@ -732,10 +793,18 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 						consumeErr = tracesExp.ConsumeTraces(callCtx, td)
 					}
 				case "logs":
-					ld := prebuiltLogs[idx]
+					var ld plog.Logs
+					if cfg.UniquePayloads {
+						ld = gen.LogsBatch(cfg.BatchSize)
+					} else {
+						ld = prebuiltLogs[idx]
+					}
 					if localOffloader != nil {
-						cloned := plog.NewLogs()
-						prebuiltLogs[idx].CopyTo(cloned)
+						cloned := ld
+						if !cfg.UniquePayloads {
+							cloned = plog.NewLogs()
+							prebuiltLogs[idx].CopyTo(cloned)
+						}
 						if localRedactor != nil {
 							keys, vals := localRedactor.RedactLogs(cloned)
 							localRedactedKeys.Add(int64(keys))
@@ -748,7 +817,12 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 						consumeErr = logsExp.ConsumeLogs(callCtx, ld)
 					}
 				case "metrics":
-					md := prebuiltMetrics[idx]
+					var md pmetric.Metrics
+					if cfg.UniquePayloads {
+						md = gen.MetricsBatch(cfg.BatchSize)
+					} else {
+						md = prebuiltMetrics[idx]
+					}
 					consumeErr = metricsExp.ConsumeMetrics(callCtx, md)
 				}
 				cancelCall()
@@ -812,9 +886,6 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 
 	elapsedSec := elapsed.Seconds()
 	ackedRows := telem.AcknowledgedRows
-	if ackedRows <= 0 {
-		ackedRows = recordsSubmitted.Load()
-	}
 	rowsPerSec := float64(ackedRows) / elapsedSec
 	wireMBPerSec := (float64(telem.AppendBytesTotal) / (1024.0 * 1024.0)) / elapsedSec
 	var bytesPerRow float64
@@ -1129,10 +1200,10 @@ func FormatMarkdown(report *BenchmarkReport) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "### Benchmark Summary (`mode=%s`, Go `%s`, `%s/%s`, `%d` vCPU)\n\n",
 		report.Config.Mode, report.GoVersion, report.GOOS, report.GOARCH, report.NumCPU)
-	sb.WriteString("| Signal | Stream Pool | Redaction | Backpressure | Samples | Achieved Rows/s | Wire MiB/s | Bytes/Row | p50 (ms) | p95 (ms) | p99 (ms) | CPU Cores / 10k rows/s | Heap Alloc Snapshot (MiB) | Process Peak RSS (MiB) | Acked Rows | Redacted Values |\n")
-	sb.WriteString("|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+	sb.WriteString("| Signal | Stream Pool | Redaction | Backpressure | Samples | Achieved Rows/s | Wire MiB/s | Bytes/Row | p50 (ms) | p95 (ms) | p99 (ms) | CPU Cores / 10k rows/s | Heap Alloc Snapshot (MiB) | Process Peak RSS (MiB) | Acked Rows | Rejected Rows | Batches Failed | Redacted Values |\n")
+	sb.WriteString("|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, r := range report.Results {
-		fmt.Fprintf(&sb, "| `%s` | %d | `%t` | `%t` | %d | %.1f | %.2f | %.0f | %.2f | %.2f | %.2f | %.2f | %.2f | %.1f | %d | %d |\n",
+		fmt.Fprintf(&sb, "| `%s` | %d | `%t` | `%t` | %d | %.1f | %.2f | %.0f | %.2f | %.2f | %.2f | %.2f | %.2f | %.1f | %d | %d | %d | %d |\n",
 			r.Signal,
 			r.StreamPoolSize,
 			r.Redaction,
@@ -1148,6 +1219,8 @@ func FormatMarkdown(report *BenchmarkReport) string {
 			r.Memory.HeapAllocMB,
 			r.Memory.PeakRSSMB,
 			r.Telemetry.AcknowledgedRows,
+			r.Telemetry.RejectedRows,
+			r.BatchesFailed,
 			r.Telemetry.RedactedValuesTotal,
 		)
 	}

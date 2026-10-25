@@ -126,6 +126,10 @@ var mcpMethods = []struct {
 	{Method: "prompts/get", ServerName: "prompt-registry-mcp", ToolOrURI: "incident_root_cause_triage"},
 }
 
+// DefaultBaseTime is the deterministic reference UTC timestamp used by
+// Generator when GeneratorConfig.BaseTime is zero.
+var DefaultBaseTime = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
 // GeneratorConfig controls the shape and payload size of synthetic OTLP
 // traces, logs, and metrics produced by Generator.
 type GeneratorConfig struct {
@@ -141,15 +145,23 @@ type GeneratorConfig struct {
 	// header. When false, payloads cycle over a small 16-entry corpus to exercise
 	// SHA-256 deduplication in the GCS payload offloader.
 	UniquePayloads bool
+	// Seed initializes the deterministic per-signal sequence counters (default 0).
+	Seed uint64
+	// BaseTime sets the deterministic base timestamp for generated records.
+	// Defaults to DefaultBaseTime (2026-01-01T00:00:00Z) when zero.
+	BaseTime time.Time
 }
 
 // Generator builds deterministic, allocation-conscious OTLP trace, log, and
 // metric batches for throughput and latency benchmarking.
 type Generator struct {
-	cfg            GeneratorConfig
-	frameworks     []FrameworkSpec
-	payloadCorpus  []string
-	sequenceNumber atomic.Uint64
+	cfg           GeneratorConfig
+	baseTime      time.Time
+	frameworks    []FrameworkSpec
+	payloadCorpus []string
+	traceSeq      atomic.Uint64
+	logSeq        atomic.Uint64
+	metricSeq     atomic.Uint64
 }
 
 // NewGenerator constructs a workload Generator from cfg.
@@ -157,16 +169,26 @@ func NewGenerator(cfg GeneratorConfig) *Generator {
 	if cfg.PayloadBytes <= 0 {
 		cfg.PayloadBytes = 1024
 	}
+	baseTime := cfg.BaseTime.UTC()
+	if cfg.BaseTime.IsZero() {
+		baseTime = DefaultBaseTime
+	}
 	const corpusSize = 16
 	corpus := make([]string, corpusSize)
 	for i := range corpus {
 		corpus[i] = buildStructuredPayload(i, cfg.PayloadBytes)
 	}
-	return &Generator{
+	g := &Generator{
 		cfg:           cfg,
+		baseTime:      baseTime,
 		frameworks:    DefaultFrameworks(),
 		payloadCorpus: corpus,
 	}
+	initialSeq := cfg.Seed * 4
+	g.traceSeq.Store(initialSeq)
+	g.logSeq.Store(initialSeq)
+	g.metricSeq.Store(initialSeq)
+	return g
 }
 
 func buildStructuredPayload(seed int, targetBytes int) string {
@@ -177,10 +199,15 @@ func buildStructuredPayload(seed int, targetBytes int) string {
 	suffix := `"}]}`
 	padLen := targetBytes - len(prefix) - len(suffix)
 	if padLen <= 0 {
-		if targetBytes < len(prefix) {
-			return prefix[:targetBytes]
+		minJSON := fmt.Sprintf(`{"turn":%d}`, seed)
+		if targetBytes <= len(minJSON) {
+			return minJSON
 		}
-		return prefix + suffix
+		pad := strings.Repeat("x", targetBytes-len(prefix)-len(suffix))
+		if len(prefix)+len(suffix) <= targetBytes {
+			return prefix + pad + suffix
+		}
+		return minJSON
 	}
 	chunk := "OpenTelemetry GenAI semantic conventions v1.40 agent trajectory context block; "
 	repeats := (padLen / len(chunk)) + 1
@@ -190,24 +217,38 @@ func buildStructuredPayload(seed int, targetBytes int) string {
 
 func (g *Generator) payloadFor(seq uint64) string {
 	out := g.payloadCorpus[seq%uint64(len(g.payloadCorpus))]
+	plantSecret := g.cfg.PlantSecrets && seq%4 == 0
+	if !g.cfg.UniquePayloads && !plantSecret {
+		return out
+	}
+
+	var inject strings.Builder
 	if g.cfg.UniquePayloads {
-		tag := fmt.Sprintf(`{"seq":%012d,`, seq)
-		if len(out) <= len(tag) {
-			return tag
-		}
-		out = tag + out[len(tag):]
+		_, _ = fmt.Fprintf(&inject, "seq=%012d; ", seq)
 	}
-	if g.cfg.PlantSecrets && seq%4 == 0 {
-		secretToken := secretValueTokenFor(seq)
-		prefix := fmt.Sprintf(`{"turn":%d,"auth":%q,`, seq%16, secretToken)
+	if plantSecret {
+		_, _ = fmt.Fprintf(&inject, "auth=%s; ", secretValueTokenFor(seq))
+	}
+	tag := inject.String()
+
+	const marker = `"snippet":"`
+	idx := strings.Index(out, marker)
+	const suffixLen = len(`"}]}`)
+	if idx < 0 {
+		if g.cfg.UniquePayloads && plantSecret {
+			return fmt.Sprintf(`{"seq":"%012d","auth":%q}`, seq, secretValueTokenFor(seq))
+		}
 		if g.cfg.UniquePayloads {
-			prefix = fmt.Sprintf(`{"seq":%012d,"auth":%q,`, seq, secretToken)
+			return fmt.Sprintf(`{"seq":"%012d"}`, seq)
 		}
-		if len(out) > len(prefix) {
-			out = prefix + out[len(prefix):]
-		}
+		return fmt.Sprintf(`{"auth":%q}`, secretValueTokenFor(seq))
 	}
-	return out
+	bodyStart := idx + len(marker)
+	bodyEnd := len(out) - suffixLen
+	if bodyEnd-bodyStart >= len(tag) {
+		return out[:bodyStart] + tag + out[bodyStart+len(tag):]
+	}
+	return out[:bodyStart] + tag + out[bodyEnd:]
 }
 
 // TracesBatch generates a ptrace.Traces batch with exactly spanCount spans
@@ -222,8 +263,7 @@ func (g *Generator) TracesBatch(spanCount int) ptrace.Traces {
 		spanCount = 1
 	}
 	td := ptrace.NewTraces()
-	now := time.Now().UTC()
-	baseSeq := g.sequenceNumber.Add(uint64(spanCount)) - uint64(spanCount)
+	baseSeq := g.traceSeq.Add(uint64(spanCount)) - uint64(spanCount)
 
 	// Group spans by framework resource to mirror multi-service collector batches.
 	numFrameworks := len(g.frameworks)
@@ -262,7 +302,7 @@ func (g *Generator) TracesBatch(spanCount int) ptrace.Traces {
 		sp.TraceState().FromRaw("ot=p:8;r:62")
 		sp.SetFlags(1)
 
-		startTs := now.Add(time.Duration(idx) * 100 * time.Microsecond)
+		startTs := g.baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
 		endTs := startTs.Add(42 * time.Millisecond)
 		sp.SetStartTimestamp(pcommon.NewTimestampFromTime(startTs))
 		sp.SetEndTimestamp(pcommon.NewTimestampFromTime(endTs))
@@ -322,14 +362,20 @@ func (g *Generator) TracesBatch(spanCount int) ptrace.Traces {
 			attrs.PutStr("gen_ai.operation.name", "execute_tool")
 			attrs.PutStr("mcp.method.name", mcp.Method)
 			attrs.PutStr("mcp.server.name", mcp.ServerName)
+			attrs.PutStr("server.address", mcp.ServerName)
 			attrs.PutStr("mcp.session.id", fmt.Sprintf("mcp-sess-%08x", treeID%10000))
 			attrs.PutStr("mcp.protocol.version", "2025-06-18")
 			attrs.PutStr("rpc.system", "jsonrpc")
 			attrs.PutStr("rpc.jsonrpc.version", "2.0")
-			attrs.PutStr("rpc.jsonrpc.request_id", fmt.Sprintf("req-%d", seq))
-			if mcp.Method == "resources/read" {
+			reqID := fmt.Sprintf("req-%d", seq)
+			attrs.PutStr("rpc.jsonrpc.request_id", reqID)
+			attrs.PutStr("jsonrpc.request.id", reqID)
+			switch mcp.Method {
+			case "resources/read":
 				attrs.PutStr("mcp.resource.uri", mcp.ToolOrURI)
-			} else {
+			case "prompts/get":
+				attrs.PutStr("gen_ai.prompt.name", mcp.ToolOrURI)
+			default:
 				attrs.PutStr("gen_ai.tool.name", mcp.ToolOrURI)
 			}
 			attrs.PutStr("mcp.payload.content", g.payloadFor(seq))
@@ -355,8 +401,7 @@ func (g *Generator) LogsBatch(logCount int) plog.Logs {
 		logCount = 1
 	}
 	ld := plog.NewLogs()
-	now := time.Now().UTC()
-	baseSeq := g.sequenceNumber.Add(uint64(logCount)) - uint64(logCount)
+	baseSeq := g.logSeq.Add(uint64(logCount)) - uint64(logCount)
 
 	numFrameworks := len(g.frameworks)
 	lrByFramework := make([]plog.LogRecordSlice, numFrameworks)
@@ -389,7 +434,7 @@ func (g *Generator) LogsBatch(logCount int) plog.Logs {
 		}
 
 		lr := lrByFramework[fwIdx].AppendEmpty()
-		ts := now.Add(time.Duration(idx) * 100 * time.Microsecond)
+		ts := g.baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
 		lr.SetTimestamp(pcommon.NewTimestampFromTime(ts))
 		lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(ts.Add(time.Millisecond)))
 		lr.SetSeverityNumber(plog.SeverityNumberInfo)
@@ -431,9 +476,7 @@ func (g *Generator) MetricsBatch(pointCount int) pmetric.Metrics {
 		pointCount = 1
 	}
 	md := pmetric.NewMetrics()
-	now := time.Now().UTC()
-	startTs := now.Add(-10 * time.Second)
-	baseSeq := g.sequenceNumber.Add(uint64(pointCount)) - uint64(pointCount)
+	baseSeq := g.metricSeq.Add(uint64(pointCount)) - uint64(pointCount)
 
 	rm := md.ResourceMetrics().AppendEmpty()
 	resAttrs := rm.Resource().Attributes()
@@ -457,8 +500,9 @@ func (g *Generator) MetricsBatch(pointCount int) pmetric.Metrics {
 		seq := baseSeq + uint64(idx)
 		fw := g.frameworks[seq%uint64(len(g.frameworks))]
 		dp := hPoints.AppendEmpty()
-		dp.SetStartTimestamp(pcommon.NewTimestampFromTime(startTs))
-		dp.SetTimestamp(pcommon.NewTimestampFromTime(now.Add(time.Duration(idx) * 100 * time.Microsecond)))
+		pointTs := g.baseTime.Add(time.Duration(seq) * 100 * time.Microsecond)
+		dp.SetStartTimestamp(pcommon.NewTimestampFromTime(pointTs.Add(-10 * time.Second)))
+		dp.SetTimestamp(pcommon.NewTimestampFromTime(pointTs))
 		dp.SetCount(12)
 		dp.SetSum(float64(1420 + (seq % 500)))
 		dp.SetMin(64)
@@ -488,7 +532,7 @@ func (g *Generator) MetricsBatch(pointCount int) pmetric.Metrics {
 		}
 
 		ex := dp.Exemplars().AppendEmpty()
-		ex.SetTimestamp(pcommon.NewTimestampFromTime(now))
+		ex.SetTimestamp(pcommon.NewTimestampFromTime(pointTs))
 		ex.SetIntValue(int64(256 + (seq % 256)))
 		treeID := seq / 4
 		ex.SetTraceID(traceIDFromTree(treeID))
