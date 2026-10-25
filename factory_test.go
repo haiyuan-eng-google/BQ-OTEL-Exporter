@@ -5,6 +5,7 @@ package bigqueryexporter
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"testing"
 
@@ -73,26 +74,26 @@ func TestExportedCreateExporterConstructors(t *testing.T) {
 		{"wrong component.Config type", &wrongConfig{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := CreateTracesExporter(ctx, set, tc.cfg); err == nil {
-				t.Errorf("CreateTracesExporter(%s) succeeded, want error", tc.name)
+			if _, err := CreateTracesExporter(ctx, set, tc.cfg); !errors.Is(err, errUnexpectedConfigType) {
+				t.Errorf("CreateTracesExporter(%s) error = %v, want errUnexpectedConfigType", tc.name, err)
 			}
-			if _, err := CreateLogsExporter(ctx, set, tc.cfg); err == nil {
-				t.Errorf("CreateLogsExporter(%s) succeeded, want error", tc.name)
+			if _, err := CreateLogsExporter(ctx, set, tc.cfg); !errors.Is(err, errUnexpectedConfigType) {
+				t.Errorf("CreateLogsExporter(%s) error = %v, want errUnexpectedConfigType", tc.name, err)
 			}
-			if _, err := CreateMetricsExporter(ctx, set, tc.cfg); err == nil {
-				t.Errorf("CreateMetricsExporter(%s) succeeded, want error", tc.name)
+			if _, err := CreateMetricsExporter(ctx, set, tc.cfg); !errors.Is(err, errUnexpectedConfigType) {
+				t.Errorf("CreateMetricsExporter(%s) error = %v, want errUnexpectedConfigType", tc.name, err)
 			}
 		})
 	}
 
-	if _, err := newTracesExporter(set.TelemetrySettings, nil); err == nil {
-		t.Error("newTracesExporter(nil) succeeded, want error")
+	if _, err := newTracesExporter(set.TelemetrySettings, nil); !errors.Is(err, errUnexpectedConfigType) {
+		t.Errorf("newTracesExporter(nil) error = %v, want errUnexpectedConfigType", err)
 	}
-	if _, err := newLogsExporter(set.TelemetrySettings, nil); err == nil {
-		t.Error("newLogsExporter(nil) succeeded, want error")
+	if _, err := newLogsExporter(set.TelemetrySettings, nil); !errors.Is(err, errUnexpectedConfigType) {
+		t.Errorf("newLogsExporter(nil) error = %v, want errUnexpectedConfigType", err)
 	}
-	if _, err := newMetricsExporter(set.TelemetrySettings, nil); err == nil {
-		t.Error("newMetricsExporter(nil) succeeded, want error")
+	if _, err := newMetricsExporter(set.TelemetrySettings, nil); !errors.Is(err, errUnexpectedConfigType) {
+		t.Errorf("newMetricsExporter(nil) error = %v, want errUnexpectedConfigType", err)
 	}
 }
 

@@ -106,6 +106,7 @@ func TestReleaseWorkflowInstallsPrerequisitesAndResolvesManifestDigest(t *testin
 
 	collectorVersion, _ := collectorVersionsFromGoMod(t, "go.mod")
 	for _, needle := range []string{
+		`cosign-release: "v2.4.3"`,
 		"anchore/sbom-action/download-syft",
 		"go.opentelemetry.io/collector/cmd/builder@" + collectorVersion,
 		"ocb version",
@@ -113,9 +114,9 @@ func TestReleaseWorkflowInstallsPrerequisitesAndResolvesManifestDigest(t *testin
 		"id: manifest_digest",
 		"docker buildx imagetools inspect",
 		"steps.manifest_digest.outputs.digest",
-		`syft "ghcr.io/haiyuan-eng-google/bq-otel-collector@${{ steps.manifest_digest.outputs.digest }}" -o spdx-json=dist/container-sbom.spdx.json`,
-		`cosign attach sbom --sbom dist/container-sbom.spdx.json "ghcr.io/haiyuan-eng-google/bq-otel-collector@${{ steps.manifest_digest.outputs.digest }}"`,
-		`cosign attest --predicate dist/container-sbom.spdx.json --type spdxjson --yes "ghcr.io/haiyuan-eng-google/bq-otel-collector@${{ steps.manifest_digest.outputs.digest }}"`,
+		`syft "registry:ghcr.io/haiyuan-eng-google/bq-otel-collector@${DIGEST}" --platform linux/amd64 -o spdx-json=dist/container-sbom.spdx.json`,
+		`cosign attach sbom --sbom dist/container-sbom.spdx.json --type spdx "ghcr.io/haiyuan-eng-google/bq-otel-collector@${DIGEST}"`,
+		`cosign attest --predicate dist/container-sbom.spdx.json --type spdxjson --yes "ghcr.io/haiyuan-eng-google/bq-otel-collector@${DIGEST}"`,
 		`actions/attest-build-provenance@v4`,
 		`subject-path: "dist/checksums.txt"`,
 	} {
@@ -131,10 +132,12 @@ func TestReleaseWorkflowInstallsPrerequisitesAndResolvesManifestDigest(t *testin
 		Jobs struct {
 			Release struct {
 				Steps []struct {
-					Name string         `yaml:"name"`
-					Uses string         `yaml:"uses"`
-					Run  string         `yaml:"run"`
-					With map[string]any `yaml:"with"`
+					ID   string            `yaml:"id"`
+					Name string            `yaml:"name"`
+					Uses string            `yaml:"uses"`
+					Run  string            `yaml:"run"`
+					Env  map[string]string `yaml:"env"`
+					With map[string]any    `yaml:"with"`
 				} `yaml:"steps"`
 			} `yaml:"release"`
 		} `yaml:"jobs"`
@@ -142,31 +145,65 @@ func TestReleaseWorkflowInstallsPrerequisitesAndResolvesManifestDigest(t *testin
 	if err := yaml.Unmarshal(raw, &wf); err != nil {
 		t.Fatalf("unmarshaling .github/workflows/release.yml: %v", err)
 	}
-	var hasContainerProvenance, hasBinaryProvenance, hasContainerSBOM bool
-	for _, step := range wf.Jobs.Release.Steps {
+	buildIdx, manifestDigestIdx := -1, -1
+	containerProvenanceIdx, binaryProvenanceIdx, containerSBOMIdx := -1, -1, -1
+	for i, step := range wf.Jobs.Release.Steps {
+		if step.ID == "build" {
+			buildIdx = i
+		}
+		if step.ID == "manifest_digest" {
+			manifestDigestIdx = i
+		}
 		if step.Uses == "actions/attest-build-provenance@v4" {
 			if step.With["subject-name"] == "ghcr.io/haiyuan-eng-google/bq-otel-collector" &&
 				step.With["subject-digest"] == "${{ steps.manifest_digest.outputs.digest }}" {
-				hasContainerProvenance = true
+				containerProvenanceIdx = i
 			}
 			if step.With["subject-path"] == "dist/checksums.txt" {
-				hasBinaryProvenance = true
+				binaryProvenanceIdx = i
 			}
 		}
 		if strings.Contains(step.Run, "dist/container-sbom.spdx.json") &&
-			strings.Contains(step.Run, "cosign attach sbom") &&
+			strings.Contains(step.Run, "cosign attach sbom --sbom dist/container-sbom.spdx.json --type spdx") &&
 			strings.Contains(step.Run, "cosign attest --predicate dist/container-sbom.spdx.json --type spdxjson") {
-			hasContainerSBOM = true
+			containerSBOMIdx = i
+			if step.Env["DIGEST"] != "${{ steps.manifest_digest.outputs.digest }}" {
+				t.Errorf("container SBOM step env.DIGEST = %q, want ${{ steps.manifest_digest.outputs.digest }}", step.Env["DIGEST"])
+			}
+			if strings.Contains(step.Run, "steps.manifest_digest.outputs.digest") {
+				t.Error("container SBOM step run script must reference ${DIGEST} via env rather than interpolating steps.manifest_digest.outputs.digest directly")
+			}
 		}
 	}
-	if !hasContainerProvenance {
+	if buildIdx < 0 {
+		t.Error(".github/workflows/release.yml missing id: build GoReleaser step")
+	}
+	if manifestDigestIdx < 0 {
+		t.Error(".github/workflows/release.yml missing id: manifest_digest step")
+	}
+	if containerProvenanceIdx < 0 {
 		t.Error(".github/workflows/release.yml missing container actions/attest-build-provenance@v4 step")
 	}
-	if !hasBinaryProvenance {
+	if binaryProvenanceIdx < 0 {
 		t.Error(".github/workflows/release.yml missing binary archive actions/attest-build-provenance@v4 step with subject-path: dist/checksums.txt")
 	}
-	if !hasContainerSBOM {
+	if containerSBOMIdx < 0 {
 		t.Error(".github/workflows/release.yml missing container SPDX SBOM generation and cosign attach/attest step")
+	}
+	if buildIdx >= 0 && manifestDigestIdx >= 0 && buildIdx >= manifestDigestIdx {
+		t.Errorf("build step (%d) must precede manifest_digest step (%d)", buildIdx, manifestDigestIdx)
+	}
+	if manifestDigestIdx >= 0 && containerProvenanceIdx >= 0 && manifestDigestIdx >= containerProvenanceIdx {
+		t.Errorf("manifest_digest step (%d) must precede container provenance step (%d)", manifestDigestIdx, containerProvenanceIdx)
+	}
+	if manifestDigestIdx >= 0 && binaryProvenanceIdx >= 0 && manifestDigestIdx >= binaryProvenanceIdx {
+		t.Errorf("manifest_digest step (%d) must precede binary provenance step (%d)", manifestDigestIdx, binaryProvenanceIdx)
+	}
+	if containerProvenanceIdx >= 0 && containerSBOMIdx >= 0 && containerProvenanceIdx >= containerSBOMIdx {
+		t.Errorf("container provenance step (%d) must run before container SBOM step (%d)", containerProvenanceIdx, containerSBOMIdx)
+	}
+	if binaryProvenanceIdx >= 0 && containerSBOMIdx >= 0 && binaryProvenanceIdx >= containerSBOMIdx {
+		t.Errorf("binary provenance step (%d) must run before container SBOM step (%d)", binaryProvenanceIdx, containerSBOMIdx)
 	}
 
 	ocbRaw, err := os.ReadFile("example/otelcol-builder-release.yaml")
@@ -278,9 +315,48 @@ func TestOpenTelemetryRegistryEntryAndReleaseDocs(t *testing.T) {
 		"CreateTracesExporter",
 		"CreateLogsExporter",
 		"CreateMetricsExporter",
+		"[1, 16]",
+		"otel_sensitivity",
+		"sensitive_payload",
+		"sensitive_payload_mask",
 	} {
 		if !strings.Contains(changelog, want) {
 			t.Errorf("CHANGELOG.md missing %q", want)
+		}
+	}
+
+	knownCompanionViews := map[string]bool{
+		schema.SpansAsAllSpansViewName:      true,
+		schema.GenAISpansViewName:           true,
+		schema.GenAILogsViewName:            true,
+		schema.GenAIMetricsViewName:         true,
+		schema.GenAIMetricExemplarsViewName: true,
+		schema.GenAIModelCostsViewName:      true,
+		schema.GenAISessionsViewName:        true,
+		schema.GenAIToolUsageViewName:       true,
+		schema.GenAIAgentTrajectoryViewName: true,
+		schema.MCPSpansViewName:             true,
+		schema.MCPToolUsageViewName:         true,
+	}
+	viewIdentRe := regexp.MustCompile("`((?:v_gen_ai_|v_mcp_)[a-z0-9_]+)`")
+	for _, docPath := range []string{"CHANGELOG.md", "docs/provenance.md"} {
+		docText := readRepoText(t, docPath)
+		for _, bad := range []string{
+			"[1, 32]",
+			"v_gen_ai_conversation_turns",
+			"high_sensitivity_payload",
+			"medium_sensitivity_attributes",
+			"low_sensitivity_identity",
+			"#34809",
+		} {
+			if strings.Contains(docText, bad) {
+				t.Errorf("%s must not contain unverified or drifted identifier %q", docPath, bad)
+			}
+		}
+		for _, m := range viewIdentRe.FindAllStringSubmatch(docText, -1) {
+			if !knownCompanionViews[m[1]] {
+				t.Errorf("%s references unknown companion view %q", docPath, m[1])
+			}
 		}
 	}
 }

@@ -50,6 +50,8 @@ jobs:
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: "v2.4.3"
 
       - name: Install Syft
         uses: anchore/sbom-action/download-syft@v0
@@ -112,12 +114,6 @@ jobs:
             --certificate-identity-regexp="https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter/.github/workflows/release.yml@.*" \
             "ghcr.io/haiyuan-eng-google/bq-otel-collector@${DIGEST}"
 
-      - name: Generate and attach container SPDX SBOM
-        run: |
-          syft "ghcr.io/haiyuan-eng-google/bq-otel-collector@${{ steps.manifest_digest.outputs.digest }}" -o spdx-json=dist/container-sbom.spdx.json
-          cosign attach sbom --sbom dist/container-sbom.spdx.json "ghcr.io/haiyuan-eng-google/bq-otel-collector@${{ steps.manifest_digest.outputs.digest }}"
-          cosign attest --predicate dist/container-sbom.spdx.json --type spdxjson --yes "ghcr.io/haiyuan-eng-google/bq-otel-collector@${{ steps.manifest_digest.outputs.digest }}"
-
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v4
         with:
@@ -129,3 +125,11 @@ jobs:
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: "dist/checksums.txt"
+
+      - name: Generate and attach container SPDX SBOM
+        env:
+          DIGEST: ${{ steps.manifest_digest.outputs.digest }}
+        run: |
+          syft "registry:ghcr.io/haiyuan-eng-google/bq-otel-collector@${DIGEST}" --platform linux/amd64 -o spdx-json=dist/container-sbom.spdx.json
+          cosign attach sbom --sbom dist/container-sbom.spdx.json --type spdx "ghcr.io/haiyuan-eng-google/bq-otel-collector@${DIGEST}"
+          cosign attest --predicate dist/container-sbom.spdx.json --type spdxjson --yes "ghcr.io/haiyuan-eng-google/bq-otel-collector@${DIGEST}"
