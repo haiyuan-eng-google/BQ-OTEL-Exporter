@@ -85,6 +85,7 @@ type signalExporter struct {
 	tel    *metadata.Telemetry
 	host   component.Host
 
+	lifetimeCtx    context.Context
 	lifetimeCancel context.CancelFunc
 	authCleanup    []func()
 
@@ -280,7 +281,6 @@ func (e *signalExporter) authenticationOptions(
 		)
 
 	case e.cfg.Credentials.ImpersonateServiceAccount != "":
-		var sourceOpts []option.ClientOption
 		if e.lifetimeCancel != nil {
 			creds, closeAuth, err := googlehttp.Credentials(credentials.DetectOptions{
 				Scopes: []string{bigqueryapi.CloudPlatformScope}, UseSelfSignedJWT: true,
@@ -295,13 +295,22 @@ func (e *signalExporter) authenticationOptions(
 				return nil, err
 			}
 			e.authCleanup = append(e.authCleanup, base.CloseIdleConnections)
-			sourceOpts = append(sourceOpts, option.WithHTTPClient(client))
+			lifetime := e.lifetimeCtx
+			if lifetime == nil {
+				lifetime = ctx
+			}
+			lifetime, cancel := context.WithCancel(lifetime)
+			e.authCleanup = append(e.authCleanup, cancel)
+			opts = append(opts, option.WithAuthCredentials(googlehttp.ImpersonatedCredentials(
+				lifetime, creds, client, e.cfg.Credentials.ImpersonateServiceAccount,
+				e.cfg.Credentials.ImpersonateDelegates, scopes)))
+			break
 		}
 		ts, err := impersonate.CredentialsTokenSource(ctx, impersonate.CredentialsConfig{
 			TargetPrincipal: e.cfg.Credentials.ImpersonateServiceAccount,
 			Delegates:       e.cfg.Credentials.ImpersonateDelegates,
 			Scopes:          scopes,
-		}, sourceOpts...)
+		})
 		if err != nil {
 			return nil, fmt.Errorf("configuring impersonation of %s: %w",
 				e.cfg.Credentials.ImpersonateServiceAccount, err)
@@ -504,6 +513,7 @@ func (e *signalExporter) start(ctx context.Context, host component.Host) (err er
 	// both its client and stream constructor contexts for background work, so
 	// give them an exporter-owned lifetime that ends only during cleanup.
 	lifetimeCtx, lifetimeCancel := context.WithCancel(context.Background())
+	e.lifetimeCtx = lifetimeCtx
 	e.lifetimeCancel = lifetimeCancel
 	defer func() {
 		if err != nil {
