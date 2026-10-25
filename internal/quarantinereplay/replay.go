@@ -5,6 +5,10 @@
 // otel_quarantine table, filters them by signal, error_code, and time window,
 // reconstructs ptrace.Traces and plog.Logs from raw_payload (or payload_ref),
 // and replays them into a configurable Sink.
+//
+// Rows can also be read straight from the table (ReplayBigQuery) and
+// replayed to an OTLP/HTTP receiver (OTLPHTTPSink). A RateLimiter paces a
+// run, and a CheckpointConfig makes it resumable after a crash.
 package quarantinereplay // import "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/quarantinereplay"
 
 import (
@@ -15,12 +19,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"math"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -242,6 +251,15 @@ type ObjectFetcher func(ctx context.Context, uri string) ([]byte, error)
 type Options struct {
 	Filter        Filter
 	ObjectFetcher ObjectFetcher
+	// RateLimiter, when non-nil, paces the run: Replay waits for a token
+	// before it hands each reconstructed batch to the sink, so the sink
+	// receives at most the limiter's rate of records per second. Records
+	// that are filtered out, carry no payload, or fail to decode do not
+	// wait.
+	RateLimiter *RateLimiter
+	// Checkpoint, when non-nil, makes the run resumable after a crash. See
+	// CheckpointConfig.
+	Checkpoint *CheckpointConfig
 }
 
 // Summary counts the outcome of a Replay run.
@@ -255,101 +273,24 @@ type Summary struct {
 	SkippedNoPayload int
 	FailedUnmarshal  int
 	FailedExport     int
+	// SkippedCheckpointed counts records that an earlier run sharing
+	// Options.Checkpoint already handled. They are not part of TotalRead.
+	SkippedCheckpointed int
 }
 
 // Replay reads quarantine records from r (either JSONL/NDJSON or a JSON array),
 // filters them according to opts.Filter, reconstructs ptrace.Traces,
 // plog.Logs, or pmetric.Metrics, and forwards each record to sink.
+//
+// With opts.Checkpoint set, a record's position is its index among the
+// input's records, so a resumed run must read the same input.
 func Replay(ctx context.Context, r io.Reader, sink Sink, opts Options) (Summary, error) {
 	if sink == nil {
 		return Summary{}, errors.New("sink must not be nil")
 	}
-
-	var sum Summary
-	var errs []error
-	traceUnmarshaler := &ptrace.JSONUnmarshaler{}
-	logUnmarshaler := &plog.JSONUnmarshaler{}
-	metricUnmarshaler := &pmetric.JSONUnmarshaler{}
-
-	processRecord := func(i int, rec Record) {
-		sum.TotalRead++
-		if !opts.Filter.matchesSignalAndErrorCode(rec) {
-			sum.SkippedFiltered++
-			return
-		}
-		if !opts.Filter.Since.IsZero() || !opts.Filter.Until.IsZero() {
-			ts, ok := rec.ParsedIngestTime()
-			if !ok {
-				sum.FailedUnmarshal++
-				errs = append(errs, fmt.Errorf("record %d: unparseable ingest_time %v", i, rec.IngestTime))
-				return
-			}
-			if (!opts.Filter.Since.IsZero() && ts.Before(opts.Filter.Since)) ||
-				(!opts.Filter.Until.IsZero() && ts.After(opts.Filter.Until)) {
-				sum.SkippedFiltered++
-				return
-			}
-		}
-		sum.Matched++
-
-		payload, ok, fetchErr := resolvePayload(ctx, rec, opts.ObjectFetcher)
-		if fetchErr != nil {
-			sum.FailedUnmarshal++
-			errs = append(errs, fmt.Errorf("record %d: fetching payload_ref: %w", i, fetchErr))
-			return
-		}
-		if !ok {
-			sum.SkippedNoPayload++
-			return
-		}
-
-		switch CanonicalSignal(rec.Signal) {
-		case schema.SignalSpans:
-			td, uerr := traceUnmarshaler.UnmarshalTraces(payload)
-			if uerr != nil {
-				sum.FailedUnmarshal++
-				errs = append(errs, fmt.Errorf("record %d: unmarshaling traces: %w", i, uerr))
-				return
-			}
-			if eerr := sink.ExportTraces(ctx, td); eerr != nil {
-				sum.FailedExport++
-				errs = append(errs, fmt.Errorf("record %d: exporting traces: %w", i, eerr))
-				return
-			}
-			sum.ReplayedSpans++
-
-		case schema.SignalLogs:
-			ld, uerr := logUnmarshaler.UnmarshalLogs(payload)
-			if uerr != nil {
-				sum.FailedUnmarshal++
-				errs = append(errs, fmt.Errorf("record %d: unmarshaling logs: %w", i, uerr))
-				return
-			}
-			if eerr := sink.ExportLogs(ctx, ld); eerr != nil {
-				sum.FailedExport++
-				errs = append(errs, fmt.Errorf("record %d: exporting logs: %w", i, eerr))
-				return
-			}
-			sum.ReplayedLogs++
-
-		case schema.SignalMetrics:
-			md, uerr := metricUnmarshaler.UnmarshalMetrics(payload)
-			if uerr != nil {
-				sum.FailedUnmarshal++
-				errs = append(errs, fmt.Errorf("record %d: unmarshaling metrics: %w", i, uerr))
-				return
-			}
-			if eerr := sink.ExportMetrics(ctx, md); eerr != nil {
-				sum.FailedExport++
-				errs = append(errs, fmt.Errorf("record %d: exporting metrics: %w", i, eerr))
-				return
-			}
-			sum.ReplayedMetrics++
-
-		default:
-			sum.FailedUnmarshal++
-			errs = append(errs, fmt.Errorf("record %d: unsupported signal %q", i, rec.Signal))
-		}
+	rp, err := newReplayer(ctx, sink, opts, checkpointKindFile)
+	if err != nil {
+		return Summary{}, err
 	}
 
 	br := bufio.NewReader(r)
@@ -370,11 +311,13 @@ func Replay(ctx context.Context, r io.Reader, sink Sink, opts Options) (Summary,
 		}
 		for i, rec := range records {
 			if err := ctx.Err(); err != nil {
-				return sum, err
+				return rp.sum, err
 			}
-			processRecord(i, rec)
+			if err := rp.process(i, recordPosition{index: int64(i)}, rec); err != nil {
+				return rp.sum, rp.stop(err)
+			}
 		}
-		return sum, errors.Join(errs...)
+		return rp.sum, errors.Join(rp.errs...)
 	}
 
 	scanner := bufio.NewScanner(br)
@@ -382,7 +325,7 @@ func Replay(ctx context.Context, r io.Reader, sink Sink, opts Options) (Summary,
 	recordIdx := 0
 	for scanner.Scan() {
 		if err := ctx.Err(); err != nil {
-			return sum, err
+			return rp.sum, err
 		}
 		line := bytes.TrimSpace(scanner.Bytes())
 		if len(line) == 0 {
@@ -392,16 +335,533 @@ func Replay(ctx context.Context, r io.Reader, sink Sink, opts Options) (Summary,
 		dec.UseNumber()
 		var rec Record
 		if err := dec.Decode(&rec); err != nil {
-			return sum, fmt.Errorf("decoding quarantine JSONL record %d: %w", recordIdx, err)
+			return rp.sum, fmt.Errorf("decoding quarantine JSONL record %d: %w", recordIdx, err)
 		}
-		processRecord(recordIdx, rec)
+		if err := rp.process(recordIdx, recordPosition{index: int64(recordIdx)}, rec); err != nil {
+			return rp.sum, rp.stop(err)
+		}
 		recordIdx++
 	}
 	if err := scanner.Err(); err != nil {
-		return sum, fmt.Errorf("reading quarantine JSONL input: %w", err)
+		return rp.sum, fmt.Errorf("reading quarantine JSONL input: %w", err)
 	}
 
-	return sum, errors.Join(errs...)
+	return rp.sum, errors.Join(rp.errs...)
+}
+
+// replayer replays one record at a time and keeps the run's counts, errors,
+// and checkpoint.
+type replayer struct {
+	ctx               context.Context
+	sink              Sink
+	opts              Options
+	cp                *checkpointer
+	sum               Summary
+	errs              []error
+	traceUnmarshaler  ptrace.JSONUnmarshaler
+	logUnmarshaler    plog.JSONUnmarshaler
+	metricUnmarshaler pmetric.JSONUnmarshaler
+}
+
+func newReplayer(ctx context.Context, sink Sink, opts Options, kind string) (*replayer, error) {
+	rp := &replayer{ctx: ctx, sink: sink, opts: opts}
+	if opts.Checkpoint != nil {
+		cp, err := openCheckpoint(*opts.Checkpoint, kind, opts.Filter, sink)
+		if err != nil {
+			return nil, err
+		}
+		rp.cp = cp
+	}
+	return rp, nil
+}
+
+// recordPosition locates a record in its source for the checkpoint: its
+// index among a file's records, or its sort key in the BigQuery query.
+type recordPosition struct {
+	index        int64
+	ingestMicros int64
+	fingerprint  int64
+}
+
+// after reports whether p sorts after the BigQuery cursor c.
+func (p recordPosition) after(c bigQueryCursor) bool {
+	if p.ingestMicros != c.IngestTimeMicros {
+		return p.ingestMicros > c.IngestTimeMicros
+	}
+	return p.fingerprint > c.RowFingerprint
+}
+
+// process replays rec, the record numbered i at pos. A non-nil error means
+// the run must stop; failures of rec itself are counted and collected in
+// rp.errs instead.
+func (rp *replayer) process(i int, pos recordPosition, rec Record) error {
+	if rp.cp != nil && rp.cp.handled(pos) {
+		rp.sum.SkippedCheckpointed++
+		return nil
+	}
+	retry, err := rp.replayRecord(i, rec)
+	if err != nil {
+		return err
+	}
+	if rp.cp == nil {
+		return nil
+	}
+	if retry {
+		// Moving past the record would lose it, so stop here and leave
+		// it for the next run.
+		if err := rp.ctx.Err(); err != nil {
+			return err
+		}
+		return fmt.Errorf("record %d: replay stopped at a failure that may be transient; rerun with checkpoint %q to retry from this record", i, rp.cp.path)
+	}
+	return rp.cp.advance(pos)
+}
+
+// stop is what a run returns when process stops it: a context error alone,
+// as a canceled run always returns, and anything else after the record
+// errors collected so far.
+func (rp *replayer) stop(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return errors.Join(append(rp.errs, err)...)
+}
+
+// replayRecord counts rec in rp.sum and, when it passes the filters and
+// decodes, hands it to the sink. retry reports a failure that a later
+// attempt could fix: a payload_ref that could not be fetched or a batch the
+// sink did not take, unless the error is a PermanentError. A non-nil err
+// means the run stopped before rec could be replayed; rec is then not
+// counted at all.
+func (rp *replayer) replayRecord(i int, rec Record) (retry bool, err error) {
+	f := rp.opts.Filter
+	if !f.matchesSignalAndErrorCode(rec) {
+		rp.sum.TotalRead++
+		rp.sum.SkippedFiltered++
+		return false, nil
+	}
+	if !f.Since.IsZero() || !f.Until.IsZero() {
+		ts, ok := rec.ParsedIngestTime()
+		if !ok {
+			rp.sum.TotalRead++
+			rp.sum.FailedUnmarshal++
+			rp.errs = append(rp.errs, fmt.Errorf("record %d: unparseable ingest_time %v", i, rec.IngestTime))
+			return false, nil
+		}
+		if (!f.Since.IsZero() && ts.Before(f.Since)) ||
+			(!f.Until.IsZero() && ts.After(f.Until)) {
+			rp.sum.TotalRead++
+			rp.sum.SkippedFiltered++
+			return false, nil
+		}
+	}
+
+	payload, ok, fetchErr := resolvePayload(rp.ctx, rec, rp.opts.ObjectFetcher)
+	if fetchErr != nil {
+		rp.failUnmarshal(fmt.Errorf("record %d: fetching payload_ref: %w", i, fetchErr))
+		return !isPermanent(fetchErr), nil
+	}
+	if !ok {
+		rp.countMatched()
+		rp.sum.SkippedNoPayload++
+		return false, nil
+	}
+
+	var (
+		export   func() error
+		replayed *int
+		noun     string
+	)
+	switch CanonicalSignal(rec.Signal) {
+	case schema.SignalSpans:
+		td, uerr := rp.traceUnmarshaler.UnmarshalTraces(payload)
+		if uerr != nil {
+			rp.failUnmarshal(fmt.Errorf("record %d: unmarshaling traces: %w", i, uerr))
+			return false, nil
+		}
+		export = func() error { return rp.sink.ExportTraces(rp.ctx, td) }
+		replayed, noun = &rp.sum.ReplayedSpans, "traces"
+
+	case schema.SignalLogs:
+		ld, uerr := rp.logUnmarshaler.UnmarshalLogs(payload)
+		if uerr != nil {
+			rp.failUnmarshal(fmt.Errorf("record %d: unmarshaling logs: %w", i, uerr))
+			return false, nil
+		}
+		export = func() error { return rp.sink.ExportLogs(rp.ctx, ld) }
+		replayed, noun = &rp.sum.ReplayedLogs, "logs"
+
+	case schema.SignalMetrics:
+		md, uerr := rp.metricUnmarshaler.UnmarshalMetrics(payload)
+		if uerr != nil {
+			rp.failUnmarshal(fmt.Errorf("record %d: unmarshaling metrics: %w", i, uerr))
+			return false, nil
+		}
+		export = func() error { return rp.sink.ExportMetrics(rp.ctx, md) }
+		replayed, noun = &rp.sum.ReplayedMetrics, "metrics"
+
+	default:
+		rp.failUnmarshal(fmt.Errorf("record %d: unsupported signal %q", i, rec.Signal))
+		return false, nil
+	}
+
+	if rp.opts.RateLimiter != nil {
+		if err := rp.opts.RateLimiter.Wait(rp.ctx); err != nil {
+			return false, err
+		}
+	}
+	rp.countMatched()
+	if eerr := export(); eerr != nil {
+		rp.sum.FailedExport++
+		rp.errs = append(rp.errs, fmt.Errorf("record %d: exporting %s: %w", i, noun, eerr))
+		return !isPermanent(eerr), nil
+	}
+	*replayed++
+	return false, nil
+}
+
+// countMatched counts a record that passed the filters.
+func (rp *replayer) countMatched() {
+	rp.sum.TotalRead++
+	rp.sum.Matched++
+}
+
+// failUnmarshal counts a matched record whose payload could not be fetched
+// or decoded.
+func (rp *replayer) failUnmarshal(err error) {
+	rp.countMatched()
+	rp.sum.FailedUnmarshal++
+	rp.errs = append(rp.errs, err)
+}
+
+// PermanentError marks a failure that retrying the same record cannot fix,
+// such as an OTLP receiver rejecting a payload with HTTP 400, or an offloaded
+// payload object that no longer exists. A checkpointed run counts such a
+// record as failed and moves past it; any other fetch or export failure
+// stops a checkpointed run so that the next run retries the record.
+type PermanentError struct {
+	Err error
+}
+
+func (e *PermanentError) Error() string { return e.Err.Error() }
+
+func (e *PermanentError) Unwrap() error { return e.Err }
+
+func isPermanent(err error) bool {
+	var pe *PermanentError
+	return errors.As(err, &pe)
+}
+
+// RateLimiter is a token bucket that admits at most a fixed number of
+// records per second on average. The bucket holds up to one second's worth
+// of tokens (at least one) and starts with a single token, so a run never
+// opens with a burst, and the average rate over any window of a second or
+// more stays at or below the limit.
+type RateLimiter struct {
+	mu     sync.Mutex
+	rate   float64
+	burst  float64
+	tokens float64
+	last   time.Time
+	now    func() time.Time
+	sleep  func(context.Context, time.Duration) error
+}
+
+// NewRateLimiter returns a RateLimiter that admits perSecond records per
+// second.
+func NewRateLimiter(perSecond float64) (*RateLimiter, error) {
+	if !(perSecond > 0) || math.IsInf(perSecond, 0) {
+		return nil, fmt.Errorf("rate limit must be a positive, finite number of records per second, got %v", perSecond)
+	}
+	return newRateLimiter(perSecond, time.Now, sleepContext), nil
+}
+
+func newRateLimiter(perSecond float64, now func() time.Time, sleep func(context.Context, time.Duration) error) *RateLimiter {
+	return &RateLimiter{
+		rate:   perSecond,
+		burst:  math.Max(1, perSecond),
+		tokens: 1,
+		now:    now,
+		sleep:  sleep,
+	}
+}
+
+// Wait blocks until the bucket holds a token, then takes it. It returns the
+// context's error if ctx ends first.
+func (l *RateLimiter) Wait(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		l.mu.Lock()
+		now := l.now()
+		if l.last.IsZero() {
+			l.last = now
+		} else if elapsed := now.Sub(l.last); elapsed > 0 {
+			l.tokens = math.Min(l.burst, l.tokens+elapsed.Seconds()*l.rate)
+			l.last = now
+		}
+		if l.tokens >= 1 {
+			l.tokens--
+			l.mu.Unlock()
+			return nil
+		}
+		wait := time.Duration(math.Ceil((1 - l.tokens) / l.rate * float64(time.Second)))
+		l.mu.Unlock()
+		if err := l.sleep(ctx, wait); err != nil {
+			return err
+		}
+	}
+}
+
+func sleepContext(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+const (
+	checkpointVersion      = 1
+	checkpointKindFile     = "file"
+	checkpointKindBigQuery = "bigquery"
+)
+
+// CheckpointConfig makes a replay resumable. After every record it handles,
+// the run records its position in Path, replacing the file atomically: it
+// writes a temporary file in the same directory, syncs it, renames it over
+// Path, and syncs the directory. A run that finds Path skips the records an
+// earlier run handled, so after a crash only the record in flight can be
+// replayed twice (at-least-once delivery).
+//
+// A record counts as handled once it is replayed, filtered out, or fails in
+// a way a retry cannot fix (no payload, an unparseable payload or time, an
+// unsupported signal, or a PermanentError). Any other fetch or export
+// failure stops the run at that record, so the next run retries it.
+//
+// Before each update the run flushes a sink that supports it (see
+// JSONWriterSink.Sync), so the checkpoint never runs ahead of the output.
+type CheckpointConfig struct {
+	// Path is the checkpoint file.
+	Path string
+	// Source names the input, for example "file:/abs/path/quarantine.jsonl".
+	// ReplayBigQuery fills it in from the table when it is empty. A
+	// checkpoint written for another source or filter is refused rather
+	// than applied to records it does not describe.
+	Source string
+}
+
+// checkpointState is the checkpoint file's content.
+type checkpointState struct {
+	Version int    `json:"version"`
+	Kind    string `json:"kind"`
+	Source  string `json:"source"`
+	Filter  string `json:"filter"`
+	// Next is the index of the first record a file source has not handled.
+	Next int64 `json:"next,omitempty"`
+	// Cursor is the sort key of the last row a BigQuery source handled.
+	Cursor *bigQueryCursor `json:"cursor,omitempty"`
+	// Handled counts the records handled by every run sharing the file.
+	Handled   int64     `json:"handled"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// bigQueryCursor is the (ingest_time, row_fp) sort key of a quarantine row
+// read by ReplayBigQuery.
+type bigQueryCursor struct {
+	IngestTimeMicros int64 `json:"ingest_time_micros"`
+	RowFingerprint   int64 `json:"row_fingerprint"`
+}
+
+// checkpointer loads, advances, and saves a checkpoint.
+type checkpointer struct {
+	path  string
+	sink  Sink
+	state checkpointState
+}
+
+func openCheckpoint(cfg CheckpointConfig, kind string, f Filter, sink Sink) (*checkpointer, error) {
+	if strings.TrimSpace(cfg.Path) == "" {
+		return nil, errors.New("checkpoint path must not be empty")
+	}
+	want := checkpointState{
+		Version: checkpointVersion,
+		Kind:    kind,
+		Source:  cfg.Source,
+		Filter:  f.fingerprint(),
+	}
+	c := &checkpointer{path: cfg.Path, sink: sink, state: want}
+	data, err := os.ReadFile(cfg.Path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return c, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reading checkpoint %q: %w", cfg.Path, err)
+	}
+	var got checkpointState
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&got); err != nil {
+		return nil, fmt.Errorf("parsing checkpoint %q: %w", cfg.Path, err)
+	}
+	if got.Version != checkpointVersion {
+		return nil, fmt.Errorf("checkpoint %q has version %d, want %d", cfg.Path, got.Version, checkpointVersion)
+	}
+	if got.Kind != want.Kind || got.Source != want.Source || got.Filter != want.Filter {
+		return nil, fmt.Errorf(
+			"checkpoint %q was written for %s source %q with filter %s, but this run reads %s source %q with filter %s; remove it or choose another checkpoint file",
+			cfg.Path, got.Kind, got.Source, got.Filter, want.Kind, want.Source, want.Filter)
+	}
+	if got.Next < 0 || got.Handled < 0 {
+		return nil, fmt.Errorf("checkpoint %q holds a negative position", cfg.Path)
+	}
+	c.state = got
+	return c, nil
+}
+
+// handled reports whether an earlier run already handled the record at pos.
+func (c *checkpointer) handled(pos recordPosition) bool {
+	if c.state.Kind == checkpointKindBigQuery {
+		return c.state.Cursor != nil && !pos.after(*c.state.Cursor)
+	}
+	return pos.index < c.state.Next
+}
+
+// advance records the record at pos as handled and saves the checkpoint.
+func (c *checkpointer) advance(pos recordPosition) error {
+	if c.state.Kind == checkpointKindBigQuery {
+		if c.state.Cursor == nil || pos.after(*c.state.Cursor) {
+			c.state.Cursor = &bigQueryCursor{IngestTimeMicros: pos.ingestMicros, RowFingerprint: pos.fingerprint}
+		}
+	} else if pos.index >= c.state.Next {
+		c.state.Next = pos.index + 1
+	}
+	c.state.Handled++
+	if err := syncSink(c.sink); err != nil {
+		return fmt.Errorf("flushing replay output before updating checkpoint %q: %w", c.path, err)
+	}
+	return c.save()
+}
+
+// save replaces the checkpoint file atomically and durably.
+func (c *checkpointer) save() error {
+	c.state.UpdatedAt = time.Now().UTC()
+	data, err := json.MarshalIndent(c.state, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encoding checkpoint %q: %w", c.path, err)
+	}
+	data = append(data, '\n')
+	dir := filepath.Dir(c.path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(c.path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("creating temporary checkpoint file: %w", err)
+	}
+	tmpName := tmp.Name()
+	renamed := false
+	defer func() {
+		if !renamed {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("writing checkpoint %q: %w", c.path, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("syncing checkpoint %q: %w", c.path, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("closing checkpoint %q: %w", c.path, err)
+	}
+	if err := os.Rename(tmpName, c.path); err != nil {
+		return fmt.Errorf("replacing checkpoint %q: %w", c.path, err)
+	}
+	renamed = true
+	return syncDir(dir)
+}
+
+// syncDir syncs dir so that a rename inside it survives a power loss.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("opening checkpoint directory: %w", err)
+	}
+	serr := d.Sync()
+	cerr := d.Close()
+	if serr != nil && !ignorableSyncError(serr) {
+		return fmt.Errorf("syncing checkpoint directory: %w", serr)
+	}
+	if cerr != nil {
+		return fmt.Errorf("closing checkpoint directory: %w", cerr)
+	}
+	return nil
+}
+
+// ignorableSyncError reports whether err only says that the file cannot be
+// synced at all, as a pipe or a terminal cannot.
+func ignorableSyncError(err error) bool {
+	return errors.Is(err, syscall.EINVAL) || errors.Is(err, errors.ErrUnsupported)
+}
+
+// syncer is implemented by sinks and writers whose output can be flushed to
+// stable storage.
+type syncer interface {
+	Sync() error
+}
+
+func syncSink(s Sink) error {
+	if sy, ok := s.(syncer); ok {
+		return sy.Sync()
+	}
+	return nil
+}
+
+// fingerprint describes f canonically, so that equivalent spellings of a
+// filter (such as "traces,logs" and "logs,spans") compare equal, and a
+// checkpoint is never applied under a filter that selects other records.
+func (f Filter) fingerprint() string {
+	var signals []string
+	for _, part := range strings.Split(f.Signal, ",") {
+		token := strings.TrimSpace(part)
+		if token == "" {
+			continue
+		}
+		if canon := CanonicalSignal(token); canon != "" {
+			token = canon
+		}
+		signals = append(signals, token)
+	}
+	slices.Sort(signals)
+	signals = slices.Compact(signals)
+	var codes []string
+	for _, code := range f.ErrorCodes {
+		codes = append(codes, strings.TrimSpace(code))
+	}
+	slices.Sort(codes)
+	codes = slices.Compact(codes)
+	desc := struct {
+		Signals    []string `json:"signals,omitempty"`
+		ErrorCodes []string `json:"error_codes,omitempty"`
+		Since      string   `json:"since,omitempty"`
+		Until      string   `json:"until,omitempty"`
+	}{Signals: signals, ErrorCodes: codes}
+	if !f.Since.IsZero() {
+		desc.Since = f.Since.UTC().Format(time.RFC3339Nano)
+	}
+	if !f.Until.IsZero() {
+		desc.Until = f.Until.UTC().Format(time.RFC3339Nano)
+	}
+	b, err := json.Marshal(desc)
+	if err != nil {
+		// Marshaling strings and string slices cannot fail.
+		return fmt.Sprintf("%+v", desc)
+	}
+	return string(b)
 }
 
 func resolvePayload(ctx context.Context, rec Record, fetcher ObjectFetcher) ([]byte, bool, error) {
@@ -551,6 +1011,23 @@ func (s *JSONWriterSink) writeEnvelope(signal string, rawOTLP []byte) error {
 	return err
 }
 
+// Sync flushes the underlying writer to stable storage when it supports
+// Sync, as *os.File does. A checkpointed run calls it before recording
+// progress, so a crash cannot leave the checkpoint ahead of the output. A
+// writer that cannot be synced at all, such as a pipe, is not an error.
+func (s *JSONWriterSink) Sync() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sy, ok := s.w.(syncer)
+	if !ok {
+		return nil
+	}
+	if err := sy.Sync(); err != nil && !ignorableSyncError(err) {
+		return err
+	}
+	return nil
+}
+
 type nopSink struct{}
 
 // NewNopSink returns a Sink that discards all replayed batches (for dry runs).
@@ -618,7 +1095,7 @@ func NewGCSObjectFetcher(ctx context.Context, opts ...option.ClientOption) (Obje
 	fetcher := func(reqCtx context.Context, uri string) ([]byte, error) {
 		bucket, object, generation, perr := parseGSURI(uri)
 		if perr != nil {
-			return nil, perr
+			return nil, &PermanentError{Err: perr}
 		}
 		downloadURL := fmt.Sprintf(
 			"%s/storage/v1/b/%s/o/%s?alt=media",
@@ -639,7 +1116,13 @@ func NewGCSObjectFetcher(ctx context.Context, opts ...option.ClientOption) (Obje
 		}
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return nil, fmt.Errorf("GCS download %q returned HTTP %d", uri, resp.StatusCode)
+			err := fmt.Errorf("GCS download %q returned HTTP %d", uri, resp.StatusCode)
+			if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+				// The object is gone (for example, expired by a lifecycle
+				// rule); no retry can bring it back.
+				return nil, &PermanentError{Err: err}
+			}
+			return nil, err
 		}
 		return io.ReadAll(resp.Body)
 	}
