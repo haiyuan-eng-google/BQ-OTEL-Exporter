@@ -706,7 +706,7 @@ func assertIntegrationTrajectoryDryRunAndPartitionFilter(ctx context.Context, cl
 	}
 	lowerErr := strings.ToLower(rpfErr.Error())
 	if !strings.Contains(lowerErr, "partition") || !strings.Contains(lowerErr, "filter") {
-		return fmt.Errorf("dry-run SELECT over v_gen_ai_agent_trajectory_rpf error = %v, want partition filter rejection", rpfErr)
+		return fmt.Errorf("dry-run SELECT over v_gen_ai_agent_trajectory_rpf error = %w, want partition filter rejection", rpfErr)
 	}
 
 	// Prove that all three bounded-window TVF counterparts succeed against
