@@ -147,6 +147,64 @@ func TestAuthenticationOptionsRejectUnusableCredentialsFile(t *testing.T) {
 	}
 }
 
+// Exercise the startup errors checked by the collector's owner-only ADC smoke
+// check without a container runtime or a live destination.
+func TestSignalExporterADCStartupErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		contents string
+		mode     fs.FileMode
+		want     string
+	}{
+		{"owner reads placeholder", "{}\n", 0o600, "missing 'type' field in credentials"},
+		{"malformed JSON", "not a credential", 0o600, "parsing credentials JSON"},
+		{"unsupported type", `{"type":"unsupported"}`, 0o600, `unsupported credentials type "unsupported"`},
+		{"permission denied", "{}\n", 0, "permission denied"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.mode == 0 && os.Geteuid() == 0 {
+				t.Skip("root can read files regardless of mode bits")
+			}
+			path := writeCredentialsFile(t, tc.contents)
+			if err := os.Chmod(path, tc.mode); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", path)
+			cfg := validConfig()
+			e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+			t.Cleanup(func() { _ = e.shutdownStatus(context.Background(), false) })
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := e.start(ctx, nil)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("start = %v, want %q", err, tc.want)
+			}
+			if !strings.Contains(err.Error(), "creating BigQuery metadata client:") || ctx.Err() != nil {
+				t.Fatalf("expected prompt metadata credential failure, got %v (context: %v)", err, ctx.Err())
+			}
+			if tc.mode == 0 {
+				if !errors.Is(err, fs.ErrPermission) || !strings.Contains(err.Error(), "open "+path+": permission denied") {
+					t.Fatalf("start = %v, want the denied file-open error", err)
+				}
+			}
+			t.Logf("startup error: %v", err)
+		})
+	}
+}
+
+func TestSignalExporterWithoutAuthenticationDoesNotReadADC(t *testing.T) {
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", writeCredentialsFile(t, "{}\n"))
+	cfg := validConfig()
+	cfg.Endpoint.URL = "127.0.0.1:1"
+	cfg.Endpoint.Insecure = true
+	cfg.Endpoint.WithoutAuthentication = true
+	e := newTestSignalExporter(cfg, cfg.Traces.Table, schema.SpansTableSchema())
+	t.Cleanup(func() { _ = e.shutdownStatus(context.Background(), false) })
+	if err := e.start(context.Background(), nil); err != nil {
+		t.Fatalf("credential-free loopback startup read ADC: %v", err)
+	}
+}
+
 func TestCredentialsFileOptionReturnsAuthCredentialsJSON(t *testing.T) {
 	scopes := []string{"https://www.googleapis.com/auth/bigquery.insertdata"}
 	for _, tc := range []struct {

@@ -73,7 +73,7 @@ func TestSignalExporterClosesAuthTransports(t *testing.T) {
 		for _, source := range []string{"json", "file", "adc"} {
 			for _, failStart := range []bool{false, true} {
 				t.Run(fmt.Sprintf("%s/%s/failStart=%t", protocol, source, failStart), func(t *testing.T) {
-					server, closed := newTransportLifecycleServer(t, protocol, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					server, closed := newTransportLifecycleServer(t, protocol, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 						w.Header().Set("Content-Type", "application/json")
 						_, _ = fmt.Fprint(w, `{"access_token":"test-token","token_type":"Bearer","expires_in":3600}`)
 					}))

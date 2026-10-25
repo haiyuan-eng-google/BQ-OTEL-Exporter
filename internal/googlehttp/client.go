@@ -8,8 +8,11 @@ package googlehttp
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"os"
 	"reflect"
 	"sync"
 	"time"
@@ -30,8 +33,10 @@ func newBase() (*http.Transport, error) {
 }
 
 // Credentials creates credentials whose token requests use an owned pool.
-// The returned cleanup must run after all clients using the credentials close.
-func Credentials(detect credentials.DetectOptions) (*auth.Credentials, func(), error) {
+// The provided JSON is restricted to supported credential types and loaded
+// through the typed API. Nil JSON selects ADC. The returned cleanup must run
+// after all clients using the credentials close.
+func Credentials(detect credentials.DetectOptions, data []byte) (*auth.Credentials, func(), error) {
 	base, err := newBase()
 	if err != nil {
 		return nil, nil, err
@@ -61,10 +66,10 @@ func Credentials(detect credentials.DetectOptions) (*auth.Credentials, func(), e
 	detect.DisableAsyncRefresh = true
 	// Resolve ADC when the API constructor first asks for a credential
 	// property. Merely rendering client options must not consult ADC.
-	lazy := &lazyCredentials{detect: detect}
+	lazy := &lazyCredentials{detect: detect, data: data}
 	creds := auth.NewCredentials(&auth.CredentialsOptions{
 		TokenProvider:          auth.NewCachedTokenProvider(lazy, &auth.CachedTokenProviderOptions{DisableAsyncRefresh: true}),
-		JSON:                   detect.CredentialsJSON,
+		JSON:                   data,
 		ProjectIDProvider:      lazy.property((*auth.Credentials).ProjectID),
 		QuotaProjectIDProvider: lazy.property((*auth.Credentials).QuotaProjectID),
 		UniverseDomainProvider: lazy.property((*auth.Credentials).UniverseDomain),
@@ -75,12 +80,45 @@ func Credentials(detect credentials.DetectOptions) (*auth.Credentials, func(), e
 type lazyCredentials struct {
 	once   sync.Once
 	detect credentials.DetectOptions
+	data   []byte
 	creds  *auth.Credentials
 	err    error
 }
 
 func (l *lazyCredentials) load() (*auth.Credentials, error) {
-	l.once.Do(func() { l.creds, l.err = credentials.DetectDefault(&l.detect) })
+	l.once.Do(func() {
+		data := l.data
+		if len(data) == 0 {
+			if filename := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); filename != "" {
+				data, l.err = os.ReadFile(filename)
+				if l.err != nil {
+					return
+				}
+			} else {
+				l.creds, l.err = credentials.DetectDefault(&l.detect)
+				return
+			}
+		}
+		var header struct {
+			Type credentials.CredType `json:"type"`
+		}
+		if err := json.Unmarshal(data, &header); err != nil {
+			l.err = fmt.Errorf("parsing credentials JSON: %w", err)
+			return
+		}
+		switch header.Type {
+		case credentials.ServiceAccount, credentials.AuthorizedUser,
+			credentials.ExternalAccount, credentials.ExternalAccountAuthorizedUser,
+			credentials.ImpersonatedServiceAccount, credentials.GDCHServiceAccount:
+			l.creds, l.err = credentials.NewCredentialsFromJSON(header.Type, data, &l.detect)
+		case "":
+			// Preserve the startup diagnostic for an ADC file that can be read
+			// but is not a credential, including an empty JSON placeholder.
+			l.err = errors.New("google: missing 'type' field in credentials")
+		default:
+			l.err = fmt.Errorf("unsupported credentials type %q", header.Type)
+		}
+	})
 	return l.creds, l.err
 }
 
@@ -115,7 +153,7 @@ func NewClient(ctx context.Context, scopes []string, opts ...option.ClientOption
 	}
 	closeAuth := func() {}
 	if len(opts) == 0 {
-		creds, cleanup, err := Credentials(credentials.DetectOptions{Scopes: scopes, UseSelfSignedJWT: true})
+		creds, cleanup, err := Credentials(credentials.DetectOptions{Scopes: scopes, UseSelfSignedJWT: true}, nil)
 		if err != nil {
 			return nil, "", nil, err
 		}

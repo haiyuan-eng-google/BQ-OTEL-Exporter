@@ -285,7 +285,7 @@ func (e *signalExporter) authenticationOptions(
 			creds, closeAuth, err := googlehttp.Credentials(credentials.DetectOptions{
 				Scopes: []string{bigqueryapi.CloudPlatformScope}, UseSelfSignedJWT: true,
 				UniverseDomain: e.cfg.Credentials.UniverseDomain,
-			})
+			}, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -315,9 +315,9 @@ func (e *signalExporter) authenticationOptions(
 	// outside Start free of credential discovery and transport allocation.
 	if e.lifetimeCancel != nil && e.cfg.Credentials.ImpersonateServiceAccount == "" {
 		creds, closeAuth, err := googlehttp.Credentials(credentials.DetectOptions{
-			Scopes: scopes, CredentialsJSON: rawJSON, UseSelfSignedJWT: true,
+			Scopes: scopes, UseSelfSignedJWT: true,
 			UniverseDomain: e.cfg.Credentials.UniverseDomain,
-		})
+		}, rawJSON)
 		if err != nil {
 			return nil, err
 		}
