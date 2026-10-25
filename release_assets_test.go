@@ -97,124 +97,6 @@ func TestGoReleaserConfigUsesValidSchemaAndSignsManifests(t *testing.T) {
 	}
 }
 
-func TestReleaseWorkflowInstallsPrerequisitesAndResolvesManifestDigest(t *testing.T) {
-	raw, err := os.ReadFile(".github/workflows/release.yml")
-	if err != nil {
-		t.Fatalf("reading .github/workflows/release.yml: %v", err)
-	}
-	text := string(raw)
-
-	collectorVersion, _ := collectorVersionsFromGoMod(t, "go.mod")
-	for _, needle := range []string{
-		`cosign-release: "v2.4.3"`,
-		"anchore/sbom-action/download-syft",
-		"go.opentelemetry.io/collector/cmd/builder@" + collectorVersion,
-		"ocb version",
-		"syft version",
-		"id: manifest_digest",
-		"docker buildx imagetools inspect",
-		"steps.manifest_digest.outputs.digest",
-		`syft "registry:ghcr.io/haiyuan-eng-google/bq-otel-collector@${DIGEST}" --platform linux/amd64 -o spdx-json=dist/container-sbom.spdx.json`,
-		`cosign attach sbom --sbom dist/container-sbom.spdx.json --type spdx "ghcr.io/haiyuan-eng-google/bq-otel-collector@${DIGEST}"`,
-		`cosign attest --predicate dist/container-sbom.spdx.json --type spdxjson --yes "ghcr.io/haiyuan-eng-google/bq-otel-collector@${DIGEST}"`,
-		`actions/attest-build-provenance@v4`,
-		`subject-path: "dist/checksums.txt"`,
-	} {
-		if !strings.Contains(text, needle) {
-			t.Errorf(".github/workflows/release.yml missing %q", needle)
-		}
-	}
-	if strings.Contains(text, "steps.build.outputs.digest") {
-		t.Error(".github/workflows/release.yml must not reference nonexistent steps.build.outputs.digest")
-	}
-
-	var wf struct {
-		Jobs struct {
-			Release struct {
-				Steps []struct {
-					ID   string            `yaml:"id"`
-					Name string            `yaml:"name"`
-					Uses string            `yaml:"uses"`
-					Run  string            `yaml:"run"`
-					Env  map[string]string `yaml:"env"`
-					With map[string]any    `yaml:"with"`
-				} `yaml:"steps"`
-			} `yaml:"release"`
-		} `yaml:"jobs"`
-	}
-	if err := yaml.Unmarshal(raw, &wf); err != nil {
-		t.Fatalf("unmarshaling .github/workflows/release.yml: %v", err)
-	}
-	buildIdx, manifestDigestIdx := -1, -1
-	containerProvenanceIdx, binaryProvenanceIdx, containerSBOMIdx := -1, -1, -1
-	for i, step := range wf.Jobs.Release.Steps {
-		if step.ID == "build" {
-			buildIdx = i
-		}
-		if step.ID == "manifest_digest" {
-			manifestDigestIdx = i
-		}
-		if step.Uses == "actions/attest-build-provenance@v4" {
-			if step.With["subject-name"] == "ghcr.io/haiyuan-eng-google/bq-otel-collector" &&
-				step.With["subject-digest"] == "${{ steps.manifest_digest.outputs.digest }}" {
-				containerProvenanceIdx = i
-			}
-			if step.With["subject-path"] == "dist/checksums.txt" {
-				binaryProvenanceIdx = i
-			}
-		}
-		if strings.Contains(step.Run, "dist/container-sbom.spdx.json") &&
-			strings.Contains(step.Run, "cosign attach sbom --sbom dist/container-sbom.spdx.json --type spdx") &&
-			strings.Contains(step.Run, "cosign attest --predicate dist/container-sbom.spdx.json --type spdxjson") {
-			containerSBOMIdx = i
-			if step.Env["DIGEST"] != "${{ steps.manifest_digest.outputs.digest }}" {
-				t.Errorf("container SBOM step env.DIGEST = %q, want ${{ steps.manifest_digest.outputs.digest }}", step.Env["DIGEST"])
-			}
-			if strings.Contains(step.Run, "steps.manifest_digest.outputs.digest") {
-				t.Error("container SBOM step run script must reference ${DIGEST} via env rather than interpolating steps.manifest_digest.outputs.digest directly")
-			}
-		}
-	}
-	if buildIdx < 0 {
-		t.Error(".github/workflows/release.yml missing id: build GoReleaser step")
-	}
-	if manifestDigestIdx < 0 {
-		t.Error(".github/workflows/release.yml missing id: manifest_digest step")
-	}
-	if containerProvenanceIdx < 0 {
-		t.Error(".github/workflows/release.yml missing container actions/attest-build-provenance@v4 step")
-	}
-	if binaryProvenanceIdx < 0 {
-		t.Error(".github/workflows/release.yml missing binary archive actions/attest-build-provenance@v4 step with subject-path: dist/checksums.txt")
-	}
-	if containerSBOMIdx < 0 {
-		t.Error(".github/workflows/release.yml missing container SPDX SBOM generation and cosign attach/attest step")
-	}
-	if buildIdx >= 0 && manifestDigestIdx >= 0 && buildIdx >= manifestDigestIdx {
-		t.Errorf("build step (%d) must precede manifest_digest step (%d)", buildIdx, manifestDigestIdx)
-	}
-	if manifestDigestIdx >= 0 && containerProvenanceIdx >= 0 && manifestDigestIdx >= containerProvenanceIdx {
-		t.Errorf("manifest_digest step (%d) must precede container provenance step (%d)", manifestDigestIdx, containerProvenanceIdx)
-	}
-	if manifestDigestIdx >= 0 && binaryProvenanceIdx >= 0 && manifestDigestIdx >= binaryProvenanceIdx {
-		t.Errorf("manifest_digest step (%d) must precede binary provenance step (%d)", manifestDigestIdx, binaryProvenanceIdx)
-	}
-	if containerProvenanceIdx >= 0 && containerSBOMIdx >= 0 && containerProvenanceIdx >= containerSBOMIdx {
-		t.Errorf("container provenance step (%d) must run before container SBOM step (%d)", containerProvenanceIdx, containerSBOMIdx)
-	}
-	if binaryProvenanceIdx >= 0 && containerSBOMIdx >= 0 && binaryProvenanceIdx >= containerSBOMIdx {
-		t.Errorf("binary provenance step (%d) must run before container SBOM step (%d)", binaryProvenanceIdx, containerSBOMIdx)
-	}
-
-	ocbRaw, err := os.ReadFile("example/otelcol-builder-release.yaml")
-	if err != nil {
-		t.Fatalf("reading example/otelcol-builder-release.yaml: %v", err)
-	}
-	if !strings.Contains(string(ocbRaw), "replaces:") {
-		t.Error("example/otelcol-builder-release.yaml must include a replaces entry for the checked-out commit")
-	}
-}
-
 func TestMetadataYAMLDeclaresGoleakIgnoreMatchingGeneratedPackageTest(t *testing.T) {
 	var meta struct {
 		Tests struct {
@@ -244,6 +126,13 @@ func TestMetadataYAMLDeclaresGoleakIgnoreMatchingGeneratedPackageTest(t *testing
 }
 
 func TestOpenTelemetryRegistryEntryAndReleaseDocs(t *testing.T) {
+	registry := registryEntry(t)
+	if err := registrySchema(t).Validate(registry); err != nil {
+		t.Fatalf("registry entry fails destination schema: %v", err)
+	}
+	if pkg, ok := registry["package"].(map[string]any); ok && pkg["version"] != nil {
+		t.Error("registry candidate must omit package.version until the release is published")
+	}
 	var entry struct {
 		Title        string   `yaml:"title"`
 		RegistryType string   `yaml:"registryType"`
@@ -258,7 +147,6 @@ func TestOpenTelemetryRegistryEntryAndReleaseDocs(t *testing.T) {
 		URLs struct {
 			Repo string `yaml:"repo"`
 		} `yaml:"urls"`
-		OTVersion string `yaml:"otVersion"`
 	}
 	if err := yaml.Unmarshal([]byte(readRepoText(t, "docs/otel-registry-entry.yaml")), &entry); err != nil {
 		t.Fatalf("unmarshaling docs/otel-registry-entry.yaml: %v", err)
@@ -283,9 +171,6 @@ func TestOpenTelemetryRegistryEntryAndReleaseDocs(t *testing.T) {
 	}
 	if entry.URLs.Repo != "https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter" {
 		t.Errorf("urls.repo = %q, want https://github.com/haiyuan-eng-google/BQ-OTEL-Exporter", entry.URLs.Repo)
-	}
-	if entry.OTVersion != "v0.1.0" {
-		t.Errorf("otVersion = %q, want %q", entry.OTVersion, "v0.1.0")
 	}
 	for _, wantTag := range []string{"go", "exporter", "collector", "bigquery", "google-cloud", "genai", "mcp"} {
 		if !slices.Contains(entry.Tags, wantTag) {

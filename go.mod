@@ -7,7 +7,9 @@ toolchain go1.27.3
 require (
 	cloud.google.com/go/auth v0.24.1-0.20261001053825-dbc26066f70a
 	cloud.google.com/go/bigquery v1.85.0
+	github.com/dlclark/regexp2 v1.11.5
 	github.com/googleapis/gax-go/v2 v2.27.0
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
 	go.opentelemetry.io/collector/component v1.69.0
 	go.opentelemetry.io/collector/component/componentstatus v0.163.0
 	go.opentelemetry.io/collector/component/componenttest v0.163.0
