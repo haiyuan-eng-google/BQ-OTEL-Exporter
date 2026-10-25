@@ -69,7 +69,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs.StringVar(&cfg.OffloadDir, "offload-dir", "", "Optional local directory sink to benchmark SHA-256 content-addressed offload")
 	fs.StringVar(&cfg.OffloadGCSBucket, "offload-gcs-bucket", "", "Optional GCS bucket name for native exporter payload offloading (live mode)")
 	fs.IntVar(&cfg.OffloadThresholdBytes, "offload-threshold-bytes", 4096, "Byte threshold when --offload-dir or --offload-gcs-bucket is enabled")
-	fs.DurationVar(&cfg.SimulateAckDelay, "simulate-ack-delay", 0, "Inject FaultDelayedAck into bqfake on every 3rd batch")
+	fs.DurationVar(&cfg.SimulateAckDelay, "simulate-ack-delay", 0, "Inject FaultDelayedAck into bqfake on batch 1 and every 3rd batch")
 	fs.IntVar(&cfg.SimulateThrottleEvery, "simulate-throttle-every", 0, "Inject FaultResourceExhausted into bqfake every N batches")
 	fs.StringVar(&cfg.ProjectID, "project", "", "GCP project ID (required when --mode=live)")
 	fs.StringVar(&cfg.DatasetID, "dataset", "", "BigQuery dataset ID (required when --mode=live and --ephemeral-dataset=false; must be empty when --ephemeral-dataset=true)")

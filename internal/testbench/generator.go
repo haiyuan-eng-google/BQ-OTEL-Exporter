@@ -198,16 +198,16 @@ func buildStructuredPayload(seed int, targetBytes int) string {
 	)
 	suffix := `"}]}`
 	padLen := targetBytes - len(prefix) - len(suffix)
-	if padLen <= 0 {
-		minJSON := fmt.Sprintf(`{"turn":%d}`, seed)
-		if targetBytes <= len(minJSON) {
-			return minJSON
+	if padLen == 0 {
+		return prefix + suffix
+	}
+	if padLen < 0 {
+		shortPrefix := fmt.Sprintf(`{"turn":%d,"s":"`, seed)
+		const shortSuffix = `"}`
+		if targetBytes >= len(shortPrefix)+len(shortSuffix) {
+			return shortPrefix + strings.Repeat("x", targetBytes-len(shortPrefix)-len(shortSuffix)) + shortSuffix
 		}
-		pad := strings.Repeat("x", targetBytes-len(prefix)-len(suffix))
-		if len(prefix)+len(suffix) <= targetBytes {
-			return prefix + pad + suffix
-		}
-		return minJSON
+		return fmt.Sprintf(`{"turn":%d}`, seed)
 	}
 	chunk := "OpenTelemetry GenAI semantic conventions v1.40 agent trajectory context block; "
 	repeats := (padLen / len(chunk)) + 1
@@ -234,7 +234,7 @@ func (g *Generator) payloadFor(seq uint64) string {
 	const marker = `"snippet":"`
 	idx := strings.Index(out, marker)
 	const suffixLen = len(`"}]}`)
-	if idx < 0 {
+	if idx < 0 || len(out) < idx+len(marker)+suffixLen {
 		if g.cfg.UniquePayloads && plantSecret {
 			return fmt.Sprintf(`{"seq":"%012d","auth":%q}`, seq, secretValueTokenFor(seq))
 		}

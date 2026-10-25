@@ -54,6 +54,25 @@ func TestCLIRunBQFakeAndJSONOut(t *testing.T) {
 	if len(report.Results) != 2 {
 		t.Fatalf("len(report.Results) = %d, want 2", len(report.Results))
 	}
+
+	// Regression check for small -payload-bytes values (e.g. 64 bytes in [11, 105])
+	// with -unique-payloads and -redaction enabled.
+	stdout.Reset()
+	stderr.Reset()
+	if err := run(ctx, []string{
+		"-mode=bqfake",
+		"-signals=traces,logs",
+		"-duration=100ms",
+		"-batch-size=20",
+		"-workers=1",
+		"-stream-pool-size=1",
+		"-payload-bytes=64",
+		"-unique-payloads=true",
+		"-redaction=true",
+		"-format=json",
+	}, &stdout, &stderr); err != nil {
+		t.Fatalf("run(-payload-bytes=64) unexpected error: %v (stderr: %s)", err, stderr.String())
+	}
 }
 
 func TestCLISweepAndFlagValidation(t *testing.T) {

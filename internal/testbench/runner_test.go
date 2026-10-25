@@ -184,7 +184,9 @@ func TestGeneratorAllSevenFrameworksAndMCP(t *testing.T) {
 		}
 	}
 
-	// Verify payloadFor produces valid JSON across all UniquePayloads x PlantSecrets combinations.
+	// Verify payloadFor produces valid JSON across all UniquePayloads x PlantSecrets
+	// combinations at 1024 B and across every small PayloadBytes value in 1..128
+	// (covering compact JSON fallbacks and exact prefix+suffix boundary sizes).
 	for _, unique := range []bool{false, true} {
 		for _, secrets := range []bool{false, true} {
 			gCombo := NewGenerator(GeneratorConfig{
@@ -199,6 +201,58 @@ func TestGeneratorAllSevenFrameworksAndMCP(t *testing.T) {
 				}
 				if !json.Valid([]byte(p)) {
 					t.Fatalf("payloadFor(seq=%d, unique=%t, secrets=%t) invalid JSON: %s", seq, unique, secrets, p)
+				}
+			}
+
+			for payloadBytes := 1; payloadBytes <= 128; payloadBytes++ {
+				gSmall := NewGenerator(GeneratorConfig{
+					PayloadBytes:   payloadBytes,
+					UniquePayloads: unique,
+					PlantSecrets:   secrets,
+					Seed:           3,
+				})
+				for seq := uint64(0); seq < 16; seq++ {
+					p := gSmall.payloadFor(seq)
+					if !json.Valid([]byte(p)) {
+						t.Fatalf("payloadFor(payloadBytes=%d, seq=%d, unique=%t, secrets=%t) invalid JSON: %s",
+							payloadBytes, seq, unique, secrets, p)
+					}
+					if !unique && !secrets && payloadBytes >= 18 && len(p) != payloadBytes {
+						t.Fatalf("payloadFor(payloadBytes=%d, seq=%d, unique=false, secrets=false) len = %d, want %d",
+							payloadBytes, seq, len(p), payloadBytes)
+					}
+				}
+				smallTraces := gSmall.TracesBatch(8)
+				for i := 0; i < smallTraces.ResourceSpans().Len(); i++ {
+					sss := smallTraces.ResourceSpans().At(i).ScopeSpans()
+					for j := 0; j < sss.Len(); j++ {
+						spans := sss.At(j).Spans()
+						for k := 0; k < spans.Len(); k++ {
+							sp := spans.At(k)
+							for _, key := range []string{"gen_ai.input.messages", "gen_ai.output.messages", "gen_ai.tool.call.result", "mcp.payload.content"} {
+								if v, ok := sp.Attributes().Get(key); ok && !json.Valid([]byte(v.Str())) {
+									t.Fatalf("TracesBatch(payloadBytes=%d, unique=%t, secrets=%t) attr %s invalid JSON: %s",
+										payloadBytes, unique, secrets, key, v.Str())
+								}
+							}
+						}
+					}
+				}
+				smallLogs := gSmall.LogsBatch(4)
+				for i := 0; i < smallLogs.ResourceLogs().Len(); i++ {
+					sls := smallLogs.ResourceLogs().At(i).ScopeLogs()
+					for j := 0; j < sls.Len(); j++ {
+						lrs := sls.At(j).LogRecords()
+						for k := 0; k < lrs.Len(); k++ {
+							if v, ok := lrs.At(k).Body().Map().Get("content"); ok && !json.Valid([]byte(v.Str())) {
+								t.Fatalf("LogsBatch(payloadBytes=%d, unique=%t, secrets=%t) body.content invalid JSON: %s",
+									payloadBytes, unique, secrets, v.Str())
+							}
+						}
+					}
+				}
+				if got := gSmall.MetricsBatch(4).DataPointCount(); got != 4 {
+					t.Fatalf("MetricsBatch(4) DataPointCount = %d, want 4", got)
 				}
 			}
 		}
