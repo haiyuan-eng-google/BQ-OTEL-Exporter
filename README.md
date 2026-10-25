@@ -26,7 +26,7 @@ sample, downsample, or interpret telemetry.
 > **Status: `v0.1.0` (development stability).** The write path, schema provisioning,
 > deduplication views, Step-0 redaction, GCS payload offload, and AIMD backpressure
 > have been validated against both the in-process `bqfake` Storage Write API server
-> and live BigQuery (`13,104`–`21,944` spans/s live, `14,386`–`34,695` spans/s in-process).
+> and live BigQuery (`15,206`–`24,066` spans/s and `18,486`–`26,604` logs/s live, `16,794`–`41,527` spans/s and `19,772`–`45,401` logs/s in-process).
 > See [`docs/benchmarks/v0.1.0-performance-envelope.md`](docs/benchmarks/v0.1.0-performance-envelope.md)
 > for reproducible benchmark measurements and [`docs/cost-estimation.md`](docs/cost-estimation.md)
 > for BigQuery + GCS FinOps cost modeling.
@@ -943,11 +943,13 @@ deadline, every sender returns at its deadline, only eight requests reach the
 stream, and the next append recovers on a new stream without a restart. The
 `cmd/bq-otel-testbench` load harness (`make bench-envelope`) validates both
 in-process `bqfake` pipeline scaling (`write.stream_pool_size` `1..16`, reaching
-`33,288` spans/s, `37,522` logs/s, and `34,832` metric points/s at
-`stream_pool_size: 4`) and live BigQuery Storage Write API throughput (`13,104`
-spans/s at `stream_pool_size: 1` scaling to `21,944` spans/s / `61.53 MB/s` wire
-at `stream_pool_size: 4`, `p50 = 118.5 ms`, `1.30` vCPU cores per `10,000`
-spans/s, `123 MB` peak RSS). Full tables and reproduction commands are recorded in
+`40,454` spans/s, `40,967` logs/s, and `35,459` metric points/s at
+`stream_pool_size: 4`, and peaking at `41,527` spans/s and `45,401` logs/s) and
+live BigQuery Storage Write API throughput (`15,206` spans/s at
+`stream_pool_size: 1` scaling to `24,066` spans/s / `67.48 MiB/s` wire and
+`26,604` logs/s / `57.26 MiB/s` wire at `stream_pool_size: 4`, `p50 = 110.6–120.7 ms`,
+`1.23–1.45` vCPU cores per `10,000` rows/s, `137.5 MiB` process peak RSS). Full
+tables and reproduction commands are recorded in
 [`docs/benchmarks/v0.1.0-performance-envelope.md`](docs/benchmarks/v0.1.0-performance-envelope.md),
 and monthly TCO formulas are documented in
 [`docs/cost-estimation.md`](docs/cost-estimation.md).
@@ -995,7 +997,7 @@ authorization result.
 | Milestone | Contents |
 | --------- | -------- |
 | **M1** | Write path on the Storage Write API default stream; `v0alpha2` schema for traces, logs, metrics (`otel_metrics`), companion and GenAI rollup views, and opt-in `otel_quarantine`; request sizing and the error matrix. **Complete and benchmarked (`docs/benchmarks/v0.1.0-performance-envelope.md`).** |
-| **M2** | Measured `v0.1.0` performance envelope (`cmd/bq-otel-testbench`); dedup views exercised; crash-replay and in-process subset-retry tests; delivery-critical telemetry proven under fault injection. **Complete.** |
+| **M2** | Measured `v0.1.0` performance envelope (`cmd/bq-otel-testbench`) across `write.stream_pool_size` `1..16`, Step-0 redaction, AIMD backpressure, and GCS/local payload offload; `otel_*_dedup` view verification; delivery-critical self-telemetry proven under fault injection. *(Crash-replay and in-process subset-retry tests tracked separately.)* |
 | **M3** | Optional `auto_create` (including `companion_views`, `search_indexes`, additive schema evolution, and `quarantine`), startup validation, performance envelope (`docs/benchmarks/v0.1.0-performance-envelope.md`), and enterprise cost model (`docs/cost-estimation.md`). **Complete.** |
 
 ## Contributing

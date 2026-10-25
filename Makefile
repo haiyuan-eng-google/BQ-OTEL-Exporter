@@ -162,8 +162,12 @@ fuzz:
 # Runs the synthetic OpenTelemetry GenAI & MCP load testbench across stream
 # pool sizes 1, 2, 4, 8, and 16 against the in-process bqfake Storage Write API
 # server (or live BigQuery when BENCH_MODE=live and BQ_PROJECT is set).
+# BENCH_DATASET is intentionally separate from BQ_DATASET so an ambient
+# BQ_DATASET is never passed to -ephemeral-dataset teardown.
 BENCH_MODE     ?= bqfake
 BENCH_DURATION ?= 1s
+BENCH_WORKERS  ?= 8
+BENCH_DATASET  ?=
 .PHONY: bench-envelope
 bench-envelope:
 	$(GOCMD) run ./cmd/bq-otel-testbench \
@@ -172,9 +176,9 @@ bench-envelope:
 		-stream-pool-sweep=1,2,4,8,16 \
 		-duration=$(BENCH_DURATION) \
 		-batch-size=500 \
-		-workers=4 \
+		-workers=$(BENCH_WORKERS) \
 		-project="$(BQ_PROJECT)" \
-		-dataset="$(BQ_DATASET)" \
-		-ephemeral-dataset=$(if $(BQ_PROJECT),true,false) \
+		-dataset="$(BENCH_DATASET)" \
+		-ephemeral-dataset=$(if $(and $(filter live,$(BENCH_MODE)),$(BQ_PROJECT),$(if $(BENCH_DATASET),,true)),true,false) \
 		-format=markdown
 

@@ -6,9 +6,17 @@ package testbench
 import (
 	"context"
 	"encoding/json"
+	"io/fs"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"google.golang.org/api/option"
 )
 
 func TestGeneratorAllSevenFrameworksAndMCP(t *testing.T) {
@@ -163,6 +171,7 @@ func TestRunBQFakeBackpressureAndLocalOffload(t *testing.T) {
 		Workers:               2,
 		StreamPoolSize:        2,
 		ConnectionPoolSize:    2,
+		Redaction:             true,
 		Backpressure:          true,
 		SimulateAckDelay:      15 * time.Millisecond,
 		SimulateThrottleEvery: 4,
@@ -185,9 +194,37 @@ func TestRunBQFakeBackpressureAndLocalOffload(t *testing.T) {
 		if res.Telemetry.OffloadDedupHits <= 0 {
 			t.Errorf("signal %s OffloadDedupHits = %d, want > 0", res.Signal, res.Telemetry.OffloadDedupHits)
 		}
+		if res.Telemetry.RedactedValuesTotal <= 0 {
+			t.Errorf("signal %s RedactedValuesTotal = %d, want > 0 when Redaction=true with local offload", res.Signal, res.Telemetry.RedactedValuesTotal)
+		}
 		if len(res.Telemetry.BackpressureEvents) == 0 {
 			t.Errorf("signal %s expected BackpressureEvents to be recorded", res.Signal)
 		}
+		if res.Telemetry.BackpressureLevel <= 0 {
+			t.Errorf("signal %s BackpressureLevel = %f, want > 0 under simulated ack delay and throttling", res.Signal, res.Telemetry.BackpressureLevel)
+		}
+	}
+
+	// Verify Step-0 redaction ran before local-dir offload so no cleartext
+	// secret patterns ever reached disk.
+	err = filepath.WalkDir(offloadDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() {
+			return walkErr
+		}
+		raw, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		content := string(raw)
+		for _, forbidden := range []string{"sk-proj-", "ya29.", "AKIA", "secret-key-"} {
+			if strings.Contains(content, forbidden) {
+				t.Errorf("offloaded file %s contains unredacted secret substring %q", path, forbidden)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking offloadDir: %v", err)
 	}
 }
 
@@ -213,16 +250,102 @@ func TestRunStreamPoolSweepAndValidation(t *testing.T) {
 		t.Fatalf("unexpected stream pool sizes: %d, %d", report.Results[0].StreamPoolSize, report.Results[1].StreamPoolSize)
 	}
 
+	// Verify Normalize auto-generates otel_bench_<timestamp> when EphemeralDataset=true
+	// and DatasetID is empty, and allows subsequent Normalize calls on the generated config.
+	ephemeralCfg := RunnerConfig{
+		Mode:             ModeLive,
+		ProjectID:        "test-project",
+		EphemeralDataset: true,
+	}
+	if err := ephemeralCfg.Normalize(); err != nil {
+		t.Fatalf("Normalize(ephemeralCfg) unexpected error: %v", err)
+	}
+	if !strings.HasPrefix(ephemeralCfg.DatasetID, "otel_bench_") {
+		t.Fatalf("ephemeralCfg.DatasetID = %q, want prefix otel_bench_", ephemeralCfg.DatasetID)
+	}
+	if err := ephemeralCfg.Normalize(); err != nil {
+		t.Fatalf("second Normalize(ephemeralCfg) unexpected error: %v", err)
+	}
+
 	invalidCases := []RunnerConfig{
 		{Mode: "invalid"},
 		{Mode: ModeBQFake, Signals: []string{"profiles"}},
 		{Mode: ModeBQFake, StreamPoolSize: 32},
 		{Mode: ModeBQFake, ConnectionPoolSize: 32},
 		{Mode: ModeLive, ProjectID: ""},
+		{Mode: ModeLive, ProjectID: "test-project", DatasetID: ""},
+		{Mode: ModeLive, ProjectID: "test-project", DatasetID: "prod_otel", EphemeralDataset: true},
+		{Mode: ModeBQFake, DatasetID: "prod_otel", EphemeralDataset: true},
+		{Mode: ModeBQFake, OffloadDir: "/tmp/a", OffloadGCSBucket: "bkt"},
 	}
 	for _, tc := range invalidCases {
 		if err := tc.Normalize(); err == nil {
 			t.Errorf("Normalize(%+v) succeeded, want error", tc)
 		}
+	}
+}
+
+func TestDeleteDatasetWithContentsAndDatasetExistsHTTP(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var (
+		getCalls    atomic.Int32
+		deleteCalls atomic.Int32
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			getCalls.Add(1)
+			if strings.HasSuffix(r.URL.Path, "/datasets/existing_ds") {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"datasetReference":{"projectId":"test-proj","datasetId":"existing_ds"}}`))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"code":404,"message":"Not found"}}`))
+		case http.MethodDelete:
+			deleteCalls.Add(1)
+			if r.URL.Query().Get("deleteContents") != "true" {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer srv.Close()
+
+	opts := []option.ClientOption{
+		option.WithEndpoint(srv.URL),
+		option.WithoutAuthentication(),
+	}
+
+	exists, err := datasetExists(ctx, "test-proj", "existing_ds", opts...)
+	if err != nil {
+		t.Fatalf("datasetExists(existing_ds) error: %v", err)
+	}
+	if !exists {
+		t.Fatal("datasetExists(existing_ds) = false, want true")
+	}
+
+	exists, err = datasetExists(ctx, "test-proj", "otel_bench_absent", opts...)
+	if err != nil {
+		t.Fatalf("datasetExists(otel_bench_absent) error: %v", err)
+	}
+	if exists {
+		t.Fatal("datasetExists(otel_bench_absent) = true, want false")
+	}
+
+	if err := DeleteDatasetWithContents(ctx, "test-proj", "otel_bench_absent", opts...); err != nil {
+		t.Fatalf("DeleteDatasetWithContents error: %v", err)
+	}
+	if getCalls.Load() != 2 {
+		t.Fatalf("getCalls = %d, want 2", getCalls.Load())
+	}
+	if deleteCalls.Load() != 1 {
+		t.Fatalf("deleteCalls = %d, want 1", deleteCalls.Load())
 	}
 }

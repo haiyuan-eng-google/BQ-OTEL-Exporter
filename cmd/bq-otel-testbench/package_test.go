@@ -4,6 +4,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"testing"
 
@@ -11,9 +12,14 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	_ = os.Setenv("GOOGLE_API_USE_CLIENT_CERTIFICATE", "false")
-	_ = os.Unsetenv("GOOGLE_API_CERTIFICATE_CONFIG")
-	_ = os.Unsetenv("GOOGLE_APPLICATION_CREDENTIALS")
+	if err := os.Setenv("GOOGLE_API_USE_CLIENT_CERTIFICATE", "false"); err != nil {
+		panic(fmt.Sprintf("setting GOOGLE_API_USE_CLIENT_CERTIFICATE: %v", err))
+	}
+	for _, k := range []string{"GOOGLE_API_CERTIFICATE_CONFIG", "GOOGLE_APPLICATION_CREDENTIALS"} {
+		if err := os.Unsetenv(k); err != nil {
+			panic(fmt.Sprintf("unsetting %s: %v", k, err))
+		}
+	}
 	goleak.VerifyTestMain(
 		m,
 		goleak.IgnoreTopFunction("go.opencensus.io/stats/view.(*worker).start"),

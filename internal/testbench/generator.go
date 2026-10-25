@@ -413,9 +413,9 @@ func (g *Generator) LogsBatch(logCount int) plog.Logs {
 	return ld
 }
 
-// MetricsBatch generates a pmetric.Metrics batch with exactly pointCount metric
-// data points across Histogram (gen_ai.client.token.usage with trace exemplars),
-// Histogram (gen_ai.client.operation.duration), and Sum/Gauge instruments.
+// MetricsBatch generates a pmetric.Metrics batch with exactly pointCount
+// Histogram data points (gen_ai.client.token.usage with trace exemplars)
+// distributed across the 7 GenAI frameworks.
 func (g *Generator) MetricsBatch(pointCount int) pmetric.Metrics {
 	if pointCount <= 0 {
 		pointCount = 1
@@ -468,7 +468,7 @@ func (g *Generator) MetricsBatch(pointCount int) pmetric.Metrics {
 		}
 		attrs.PutStr("gen_ai.token.type", tokenType)
 		if g.cfg.PayloadBytes > 1024 {
-			attrs.PutStr("gen_ai.Baggage.context", g.payloadFor(seq))
+			attrs.PutStr("gen_ai.baggage.context", g.payloadFor(seq))
 		}
 		if g.cfg.PlantSecrets && seq%4 == 0 {
 			plantSecretAttributes(attrs, seq)
@@ -486,10 +486,20 @@ func (g *Generator) MetricsBatch(pointCount int) pmetric.Metrics {
 }
 
 func plantSecretAttributes(attrs pcommon.Map, seq uint64) {
-	// Exercises both key-regex matching ("api_key") and value-regex matching
-	// ("Bearer sk-...") in the Step-0 redaction engine.
+	// Exercises both key-glob matching ("client.api_key") and all three
+	// value-regex branches ("Bearer sk-...", "ya29....", "AKIA...") in the
+	// Step-0 redaction engine. Synthetic tokens are assembled via
+	// strings.Repeat so pre-commit secret scanners are not tripped by literal
+	// token strings in source code.
 	attrs.PutStr("client.api_key", fmt.Sprintf("secret-key-%d", seq))
-	attrs.PutStr("gen_ai.debug.auth_header", "Bearer sk-proj-9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a")
+	switch (seq / 4) % 3 {
+	case 0:
+		attrs.PutStr("gen_ai.debug.auth_header", "Bearer sk-proj-"+strings.Repeat("9f8e7d", 6))
+	case 1:
+		attrs.PutStr("gen_ai.debug.auth_header", "token=ya29."+strings.Repeat("a1B2", 6))
+	default:
+		attrs.PutStr("gen_ai.debug.auth_header", "aws_access_key=AKIA"+strings.Repeat("B2C3", 4))
+	}
 }
 
 func traceIDFromTree(treeID uint64) pcommon.TraceID {
