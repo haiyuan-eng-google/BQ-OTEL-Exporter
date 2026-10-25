@@ -542,10 +542,9 @@ func genAIAgentTrajectoryTVF(t testing.TB, rawViewSpans []map[string]any, startT
 		inTreeWindow bool
 	}
 	type hopRow struct {
-		span         map[string]any
-		topParentID  string
-		chain        []chainNode
-		treeStartIdx int
+		span        map[string]any
+		topParentID string
+		chain       []chainNode
 	}
 
 	// hop0: 1-hop parent lookup in spans; in_tree_window records whether p is in [-24h, +1h].
