@@ -240,6 +240,54 @@ threshold and concurrency window; clean acknowledgements after
 `recovery_interval` step them back up toward the configured ceiling. The writer
 never retries internally: `exporterhelper` remains the single retry owner.
 
+## Partition pruning, `allow_unprunable_views`, and bounded-window TVFs
+
+Eight of the eleven companion views (`v_gen_ai_spans`, `v_gen_ai_metrics`,
+`v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_gen_ai_tool_usage`,
+`v_mcp_spans`, `v_mcp_tool_usage`, and the three `*_dedup` views) preserve
+static partition pruning when queried with a filter on `start_time`,
+`timestamp`, `usage_hour`, or `session_start_date`.
+
+Three companion views join `otel_spans_dedup` on a per-row correlation window or
+recursive self-join:
+
+- `v_gen_ai_logs`: joins `otel_logs_dedup l` to `otel_spans_dedup s` on
+  `s.start_time BETWEEN TIMESTAMP_SUB(l.timestamp, INTERVAL 24 HOUR) AND TIMESTAMP_ADD(l.timestamp, INTERVAL 1 HOUR)`.
+- `v_gen_ai_metric_exemplars`: joins `v_gen_ai_metrics m` to
+  `otel_spans_dedup s` on
+  `s.start_time BETWEEN TIMESTAMP_SUB(m.timestamp, INTERVAL 24 HOUR) AND TIMESTAMP_ADD(m.timestamp, INTERVAL 1 HOUR)`.
+- `v_gen_ai_agent_trajectory`: recursively traverses parent-child span trees
+  (`WITH RECURSIVE trajectory`) over `v_gen_ai_spans`.
+
+When `require_partition_filter = true` is enabled on `otel_spans`, BigQuery's
+static partition-filter validator cannot push an outer `WHERE` predicate
+through the per-row join window or recursive CTE, and rejects queries over those
+three views. By default, both the exporter (`auto_create.allow_unprunable_views: false`)
+and the Terraform module (`allow_unprunable_views = false`) skip creating those
+three views when `otel_spans` requires a partition filter.
+
+For deployments that enforce `require_partition_filter = true`, three
+bounded-window Table-Valued Functions (TVFs) provide identical output schemas
+with explicit `(start_ts TIMESTAMP, end_ts TIMESTAMP)` bounds pushed directly
+into the base deduplication views:
+
+| Unprunable View | Partition-Prunable TVF (`(start_ts TIMESTAMP, end_ts TIMESTAMP)`) | Pushed Partition Bounds |
+| --- | --- | --- |
+| `v_gen_ai_logs` | `tvf_gen_ai_logs(start_ts, end_ts)` | `otel_logs_dedup.timestamp BETWEEN start_ts AND end_ts` and `otel_spans_dedup.start_time BETWEEN start_ts - 24h AND end_ts + 1h` |
+| `v_gen_ai_metric_exemplars` | `tvf_gen_ai_metric_exemplars(start_ts, end_ts)` | `v_gen_ai_metrics.timestamp BETWEEN start_ts AND end_ts` and `otel_spans_dedup.start_time BETWEEN start_ts - 24h AND end_ts + 1h` |
+| `v_gen_ai_agent_trajectory` | `tvf_gen_ai_agent_trajectory(start_ts, end_ts)` | `v_gen_ai_spans.start_time BETWEEN start_ts AND end_ts` inside the anchor `spans` CTE |
+
+Example query on a partition-filter-enforced dataset:
+
+```sql
+SELECT trace_id, span_id, depth, agent_path, step_index, is_token_leaf
+FROM `my-project.otel.tvf_gen_ai_agent_trajectory`(
+  TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 6 HOUR),
+  CURRENT_TIMESTAMP()
+)
+WHERE service_name = 'checkout-agent';
+```
+
 ## What was rejected and why
 
 - **Typed wrappers around every attribute value.** An earlier pre-alpha revision

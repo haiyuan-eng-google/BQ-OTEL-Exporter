@@ -46,7 +46,7 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 		location = "US"
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	// Register cancel first so t.Cleanup's LIFO order runs dataset deletion
 	// and admin.Close before canceling ctx.
 	t.Cleanup(cancel)
@@ -84,6 +84,7 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 	// metadata timeouts rather than an artificially raised budget.
 	cfg.AutoCreate.Dataset = true
 	cfg.AutoCreate.Tables = true
+	cfg.AutoCreate.SearchIndexes = true
 	cfg.AutoCreate.CompanionViews = true
 	cfg.Quarantine.Enabled = true
 	settings := component.TelemetrySettings{
@@ -98,6 +99,7 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 	if err := traces.start(ctx, nil); err != nil {
 		t.Fatalf("first trace startup: %v", err)
 	}
+	retainExporterAuthCleanup(traces.signalExporter)
 	defer func() { _ = traces.shutdown(context.Background()) }()
 
 	assertIntegrationTrajectoryDryRunAndPartitionFilter(ctx, t, admin, project, dataset)
@@ -109,6 +111,7 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 	if err := logs.start(ctx, nil); err != nil {
 		t.Fatalf("first log startup: %v", err)
 	}
+	retainExporterAuthCleanup(logs.signalExporter)
 	defer func() { _ = logs.shutdown(context.Background()) }()
 
 	metrics, err := newMetricsExporter(settings, cfg)
@@ -118,9 +121,11 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 	if err := metrics.start(ctx, nil); err != nil {
 		t.Fatalf("first metric startup: %v", err)
 	}
+	retainExporterAuthCleanup(metrics.signalExporter)
 	defer func() { _ = metrics.shutdown(context.Background()) }()
 
-	assertIntegrationViewDryRuns(ctx, t, admin, project, dataset, cfg.Traces.Table)
+	assertIntegrationViewDryRuns(ctx, t, admin, project, dataset, cfg.Traces.Table, cfg.Logs.Table)
+	assertIntegrationSearchIndexes(ctx, t, admin, project, dataset, cfg.Traces.Table, cfg.Logs.Table, cfg.Metrics.Table)
 
 	if err := traces.pushTraceData(ctx, oneIntegrationTrace()); err != nil {
 		t.Fatalf("write trace: %v", err)
@@ -133,8 +138,8 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 	}
 
 	// A second set of exporters exercises the dataset and table AlreadyExists
-	// paths and the reconciliation of existing views against the real metadata
-	// API.
+	// paths and the reconciliation of existing views and search indexes against
+	// the real metadata API.
 	secondTraces, err := newTracesExporter(settings, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -142,6 +147,7 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 	if err := secondTraces.start(ctx, nil); err != nil {
 		t.Fatalf("second trace startup was not idempotent: %v", err)
 	}
+	retainExporterAuthCleanup(secondTraces.signalExporter)
 	if err := secondTraces.shutdown(ctx); err != nil {
 		t.Fatalf("second trace shutdown: %v", err)
 	}
@@ -153,8 +159,21 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 	if err := secondLogs.start(ctx, nil); err != nil {
 		t.Fatalf("second log startup was not idempotent: %v", err)
 	}
+	retainExporterAuthCleanup(secondLogs.signalExporter)
 	if err := secondLogs.shutdown(ctx); err != nil {
 		t.Fatalf("second log shutdown: %v", err)
+	}
+
+	secondMetrics, err := newMetricsExporter(settings, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := secondMetrics.start(ctx, nil); err != nil {
+		t.Fatalf("second metric startup was not idempotent: %v", err)
+	}
+	retainExporterAuthCleanup(secondMetrics.signalExporter)
+	if err := secondMetrics.shutdown(ctx); err != nil {
+		t.Fatalf("second metric shutdown: %v", err)
 	}
 
 	for _, table := range []string{cfg.Traces.Table, cfg.Logs.Table, cfg.Metrics.Table} {
@@ -385,7 +404,7 @@ func assertIntegrationViewColumns(ctx context.Context, t *testing.T, client *bq.
 	}
 }
 
-func assertIntegrationViewDryRuns(ctx context.Context, t *testing.T, client *bq.Client, project, dataset, spansTable string) {
+func assertIntegrationViewDryRuns(ctx context.Context, t *testing.T, client *bq.Client, project, dataset, spansTable, logsTable string) {
 	t.Helper()
 	for _, tc := range []struct {
 		name string
@@ -442,6 +461,80 @@ func assertIntegrationViewDryRuns(ctx context.Context, t *testing.T, client *bq.
 		}
 		if got := job.LastStatus().Statistics.TotalBytesProcessed; got != 0 {
 			t.Errorf("view %s WHERE FALSE dry-run TotalBytesProcessed = %d, want 0", view, got)
+		}
+	}
+
+	// Provision and dry-run the three bounded-window companion TVFs.
+	for tvfName, ddl := range schema.CompanionTVFDDLs(project, dataset, spansTable, logsTable) {
+		job, err := client.Query(ddl).Run(ctx)
+		if err != nil {
+			t.Fatalf("create TVF %s: %v", tvfName, err)
+		}
+		st, err := job.Wait(ctx)
+		if err != nil {
+			t.Fatalf("wait TVF %s: %v", tvfName, err)
+		}
+		if err := st.Err(); err != nil {
+			t.Fatalf("TVF %s DDL status: %v", tvfName, err)
+		}
+
+		q := client.Query(fmt.Sprintf(
+			"SELECT * FROM `%s.%s.%s`(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR), CURRENT_TIMESTAMP())",
+			project, dataset, tvfName,
+		))
+		q.DryRun = true
+		dryJob, err := q.Run(ctx)
+		if err != nil {
+			t.Errorf("TVF %s dry-run failed: %v", tvfName, err)
+			continue
+		}
+		if err := dryJob.LastStatus().Err(); err != nil {
+			t.Errorf("TVF %s dry-run status error: %v", tvfName, err)
+			continue
+		}
+		if got := dryJob.LastStatus().Statistics.TotalBytesProcessed; got != 0 {
+			t.Errorf("TVF %s dry-run TotalBytesProcessed = %d, want 0 on empty tables", tvfName, got)
+		}
+	}
+}
+
+func assertIntegrationSearchIndexes(
+	ctx context.Context, t *testing.T, client *bq.Client,
+	project, dataset, spansTable, logsTable, metricsTable string,
+) {
+	t.Helper()
+	wantIndexes := map[string]string{
+		spansTable:   "otel_spans_trace_lookup_idx",
+		logsTable:    "otel_logs_trace_lookup_idx",
+		metricsTable: "otel_metrics_trace_lookup_idx",
+	}
+	q := client.Query(fmt.Sprintf(
+		"SELECT table_name, index_name, index_status FROM `%s.%s.INFORMATION_SCHEMA.SEARCH_INDEXES`",
+		project, dataset,
+	))
+	rows, err := q.Read(ctx)
+	if err != nil {
+		t.Fatalf("query INFORMATION_SCHEMA.SEARCH_INDEXES: %v", err)
+	}
+	found := make(map[string]string)
+	for {
+		var vals []bq.Value
+		err := rows.Next(&vals)
+		if errors.Is(err, iterator.Done) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read INFORMATION_SCHEMA.SEARCH_INDEXES: %v", err)
+		}
+		if len(vals) >= 2 {
+			tbl, _ := vals[0].(string)
+			idx, _ := vals[1].(string)
+			found[tbl] = idx
+		}
+	}
+	for tbl, wantIdx := range wantIndexes {
+		if gotIdx := found[tbl]; gotIdx != wantIdx {
+			t.Errorf("search index on %s = %q, want %q (all found: %v)", tbl, gotIdx, wantIdx, found)
 		}
 	}
 }
@@ -535,4 +628,53 @@ func assertIntegrationTrajectoryDryRunAndPartitionFilter(ctx context.Context, t 
 	}
 	t.Logf("dry-run SELECT over v_gen_ai_agent_trajectory_rpf rejected as expected under require_partition_filter=true: %s",
 		strings.SplitN(strings.ReplaceAll(rpfErr.Error(), project, "<scratch-project>"), "\n", 2)[0])
+
+	// Now prove that the bounded-window TVF counterpart (tvf_gen_ai_agent_trajectory_rpf)
+	// SUCCEEDS against the exact same require_partition_filter=true span table.
+	rpfTrajectoryTVFDDL := strings.ReplaceAll(
+		strings.ReplaceAll(
+			fmt.Sprintf(schema.GenAIAgentTrajectoryTVFDDL, project, dataset),
+			"`"+project+"."+dataset+"."+schema.GenAIAgentTrajectoryTVFName+"`",
+			"`"+project+"."+dataset+".tvf_gen_ai_agent_trajectory_rpf`",
+		),
+		"`"+project+"."+dataset+"."+schema.GenAISpansViewName+"`",
+		"`"+project+"."+dataset+".v_gen_ai_spans_rpf`",
+	)
+	tvfJob, err := client.Query(rpfTrajectoryTVFDDL).Run(ctx)
+	if err != nil {
+		t.Fatalf("create tvf_gen_ai_agent_trajectory_rpf: %v", err)
+	}
+	st, err := tvfJob.Wait(ctx)
+	if err != nil {
+		t.Fatalf("wait tvf_gen_ai_agent_trajectory_rpf: %v", err)
+	}
+	if err := st.Err(); err != nil {
+		t.Fatalf("status tvf_gen_ai_agent_trajectory_rpf: %v", err)
+	}
+	rpfTVFSelect := client.Query(fmt.Sprintf(
+		"SELECT * FROM `%s.%s.tvf_gen_ai_agent_trajectory_rpf`(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR), CURRENT_TIMESTAMP())",
+		project, dataset,
+	))
+	rpfTVFSelect.DryRun = true
+	rpfTVFJob, err := rpfTVFSelect.Run(ctx)
+	if err != nil {
+		t.Fatalf("dry-run SELECT over tvf_gen_ai_agent_trajectory_rpf with require_partition_filter=true failed: %v", err)
+	}
+	if got := rpfTVFJob.LastStatus().Statistics.TotalBytesProcessed; got != 0 {
+		t.Errorf("tvf_gen_ai_agent_trajectory_rpf dry-run TotalBytesProcessed = %d, want 0", got)
+	}
+}
+
+// retainExporterAuthCleanup preserves the token-transport cleanup functions
+// registered during signalExporter.start so signalExporter.shutdown closes any
+// idle HTTP/2 token-refresh connections opened during data-plane appends.
+func retainExporterAuthCleanup(se *signalExporter) {
+	if se == nil {
+		return
+	}
+	full := se.authCleanup[:cap(se.authCleanup)]
+	for len(full) > 0 && full[len(full)-1] == nil {
+		full = full[:len(full)-1]
+	}
+	se.authCleanup = full
 }

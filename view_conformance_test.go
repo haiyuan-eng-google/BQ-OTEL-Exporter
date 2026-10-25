@@ -3217,3 +3217,35 @@ func TestCompareExemplarSpanCandidateOrdersNullsAsBigQuery(t *testing.T) {
 		}
 	}
 }
+
+func TestTerraformBoundedWindowTVFsMatchSchemaContract(t *testing.T) {
+	raw, err := os.ReadFile("deploy/terraform/main.tf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tf := string(raw)
+	replacer := strings.NewReplacer(
+		"${var.project_id}", confProject,
+		"${google_bigquery_dataset.otel.dataset_id}", confDataset,
+		"${google_bigquery_table.otel_spans_dedup.table_id}", confSpans+"_dedup",
+		"${google_bigquery_table.otel_logs_dedup.table_id}", confLogs+"_dedup",
+		"${google_bigquery_table.v_gen_ai_spans.table_id}", schema.GenAISpansViewName,
+		"${google_bigquery_table.v_gen_ai_metrics.table_id}", schema.GenAIMetricsViewName,
+	)
+	tf = replacer.Replace(tf)
+
+	wantQueries := schema.CompanionTVFQueries(confProject, confDataset, confSpans, confLogs)
+	for tvfName, wantQuery := range wantQueries {
+		re := regexp.MustCompile(`(?s)resource "google_bigquery_routine" "` + regexp.QuoteMeta(tvfName) + `" \{.*?definition_body\s*=\s*<<-?EOT\n(.*?)\n\s*EOT`)
+		m := re.FindStringSubmatch(tf)
+		if m == nil {
+			t.Fatalf("deploy/terraform/main.tf missing google_bigquery_routine %q", tvfName)
+		}
+		gotTokens := strings.Fields(stripSQLComments(m[1]))
+		wantTokens := strings.Fields(stripSQLComments(wantQuery))
+		if !slices.Equal(gotTokens, wantTokens) {
+			t.Errorf("Terraform routine %s definition_body drifted from schema.CompanionTVFQueries:\ngot:\n%s\nwant:\n%s",
+				tvfName, strings.Join(gotTokens, " "), strings.Join(wantTokens, " "))
+		}
+	}
+}

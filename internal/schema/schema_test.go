@@ -2034,3 +2034,106 @@ func isDDLKeyword(s string) bool {
 	}
 	return false
 }
+
+func TestBoundedWindowTVFDDLsAndStaticPartitionBounds(t *testing.T) {
+	const (
+		project = "test-proj"
+		dataset = "test_ds"
+		spans   = "otel_spans"
+		logs    = "otel_logs"
+	)
+
+	ddls := CompanionTVFDDLs(project, dataset, spans, logs)
+	queries := CompanionTVFQueries(project, dataset, spans, logs)
+	if len(ddls) != 3 || len(queries) != 3 {
+		t.Fatalf("got %d DDLs and %d queries, want 3 of each", len(ddls), len(queries))
+	}
+
+	cases := []struct {
+		tvfName        string
+		viewQuery      string
+		wantSubstrs    []string
+		unwantedSubstr string
+	}{
+		{
+			tvfName:   GenAILogsTVFName,
+			viewQuery: fmt.Sprintf(GenAILogsViewQuery, project, dataset, logs, spans),
+			wantSubstrs: []string{
+				"CREATE OR REPLACE TABLE FUNCTION `test-proj.test_ds.tvf_gen_ai_logs`(start_ts TIMESTAMP, end_ts TIMESTAMP) AS (",
+				"FROM `test-proj.test_ds.otel_logs_dedup` l",
+				"FROM `test-proj.test_ds.otel_spans_dedup`",
+				"WHERE start_time >= TIMESTAMP_SUB(start_ts, INTERVAL 24 HOUR)",
+				"AND start_time <= TIMESTAMP_ADD(end_ts, INTERVAL 1 HOUR)",
+				"WHERE l.timestamp >= start_ts",
+				"AND l.timestamp <= end_ts",
+				"LIKE 'gen_ai.%'",
+			},
+			unwantedSubstr: "gen_ai.%%",
+		},
+		{
+			tvfName:   GenAIMetricExemplarsTVFName,
+			viewQuery: fmt.Sprintf(GenAIMetricExemplarsViewQuery, project, dataset, spans),
+			wantSubstrs: []string{
+				"CREATE OR REPLACE TABLE FUNCTION `test-proj.test_ds.tvf_gen_ai_metric_exemplars`(start_ts TIMESTAMP, end_ts TIMESTAMP) AS (",
+				"FROM `test-proj.test_ds.v_gen_ai_metrics` m",
+				"FROM `test-proj.test_ds.otel_spans_dedup`",
+				"WHERE start_time >= TIMESTAMP_SUB(start_ts, INTERVAL 24 HOUR)",
+				"AND start_time <= TIMESTAMP_ADD(end_ts, INTERVAL 1 HOUR)",
+				"WHERE m.timestamp >= start_ts",
+				"AND m.timestamp <= end_ts",
+			},
+		},
+		{
+			tvfName:   GenAIAgentTrajectoryTVFName,
+			viewQuery: fmt.Sprintf(GenAIAgentTrajectoryViewQuery, project, dataset),
+			wantSubstrs: []string{
+				"CREATE OR REPLACE TABLE FUNCTION `test-proj.test_ds.tvf_gen_ai_agent_trajectory`(start_ts TIMESTAMP, end_ts TIMESTAMP) AS (",
+				"FROM `test-proj.test_ds.v_gen_ai_spans`",
+				"WHERE start_time >= start_ts",
+				"AND start_time <= end_ts",
+			},
+			unwantedSubstr: "WITH RECURSIVE",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.tvfName, func(t *testing.T) {
+			ddl, ok := ddls[tc.tvfName]
+			if !ok {
+				t.Fatalf("missing DDL for %s", tc.tvfName)
+			}
+			query, ok := queries[tc.tvfName]
+			if !ok {
+				t.Fatalf("missing query for %s", tc.tvfName)
+			}
+			for _, want := range tc.wantSubstrs {
+				if !strings.Contains(ddl, want) {
+					t.Errorf("%s DDL missing %q:\n%s", tc.tvfName, want, ddl)
+				}
+			}
+			if tc.unwantedSubstr != "" && strings.Contains(ddl, tc.unwantedSubstr) {
+				t.Errorf("%s DDL contains unwanted %q", tc.tvfName, tc.unwantedSubstr)
+			}
+			if strings.Contains(ddl, "%!") {
+				t.Errorf("%s DDL has fmt.Sprintf formatting error:\n%s", tc.tvfName, ddl)
+			}
+
+			// The outer SELECT projection of the TVF must match its companion view 1-to-1.
+			tvfSelect, _, ok := strings.Cut(query, "\nFROM ")
+			if !ok {
+				t.Fatalf("%s query has no outer FROM clause", tc.tvfName)
+			}
+			viewSelect, _, ok := strings.Cut(strings.TrimSpace(tc.viewQuery), "\nFROM ")
+			if !ok {
+				t.Fatalf("%s view query has no outer FROM clause", tc.tvfName)
+			}
+			if strings.HasPrefix(tvfSelect, "WITH") {
+				_, tvfSelect, _ = strings.Cut(tvfSelect, "\nSELECT\n")
+				_, viewSelect, _ = strings.Cut(viewSelect, "\nSELECT\n")
+			}
+			if tvfSelect != viewSelect {
+				t.Errorf("%s outer SELECT projection drifted from companion view:\ngot:\n%s\nwant:\n%s", tc.tvfName, tvfSelect, viewSelect)
+			}
+		})
+	}
+}

@@ -51,5 +51,6 @@ jobs:
           REQUIRE_LIVE_BQ: "1"
           BQ_PROJECT: ${{ vars.BQ_PROJECT }}
           BQ_LOCATION: ${{ vars.BQ_LOCATION || 'US' }}
+          BQ_OFFLOAD_BUCKET: ${{ vars.BQ_OFFLOAD_BUCKET }}
         run: |
           go test -v -race -tags=integration -count=1 -timeout=10m ./...
