@@ -164,6 +164,9 @@ func (c *RunnerConfig) Normalize() error {
 	if c.OffloadDir != "" && c.OffloadGCSBucket != "" {
 		return errors.New("offload_dir and offload_gcs_bucket are mutually exclusive")
 	}
+	if c.Mode != ModeLive && strings.TrimSpace(c.OffloadGCSBucket) != "" {
+		return errors.New("offload_gcs_bucket requires mode \"live\"")
+	}
 	if (c.OffloadDir != "" || c.OffloadGCSBucket != "") && c.OffloadThresholdBytes <= 0 {
 		c.OffloadThresholdBytes = 4096
 	}
@@ -614,8 +617,9 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 	// Pre-build a pool of batches per worker so the benchmark measures exporter
 	// pipeline (redaction, ProtoRows serialization, stream pool routing, AIMD
 	// backpressure, gRPC Write API I/O) rather than synthetic string building.
-	// When Redaction is enabled, each consume call clones a fresh pdata batch so
-	// Step-0 in-place mutation re-runs on every batch.
+	// In standard exporter mode, internal/redact.Redactor clones on write when a
+	// batch matches; in local-offload mode (localOffloader != nil), each worker
+	// clones the prebuilt batch before running Step-0 redaction and offload.
 	const prebuiltCount = 8
 	prebuiltTraces := make([]ptrace.Traces, prebuiltCount)
 	prebuiltLogs := make([]plog.Logs, prebuiltCount)
@@ -645,9 +649,9 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 		latenciesMs      = make([]float64, 0, 1024)
 	)
 
-	targetTable := fmt.Sprintf("projects/%s/datasets/%s/tables/otel_%s", cfg.ProjectID, cfg.DatasetID, signal)
+	targetTable := "otel_" + signal
 	if signal == "traces" {
-		targetTable = fmt.Sprintf("projects/%s/datasets/%s/tables/otel_spans", cfg.ProjectID, cfg.DatasetID)
+		targetTable = "otel_spans"
 	}
 
 	runCtx, cancelRun := context.WithTimeout(ctx, cfg.Duration)
@@ -695,7 +699,7 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 							Mode:  bqfake.FaultResourceExhausted,
 							Table: targetTable,
 						})
-					} else if cfg.SimulateAckDelay > 0 && seq%3 == 0 {
+					} else if cfg.SimulateAckDelay > 0 && (seq == 1 || seq%3 == 0) {
 						fakeSrv.EnqueueFault(bqfake.Fault{
 							Mode:  bqfake.FaultDelayedAck,
 							Delay: cfg.SimulateAckDelay,
@@ -751,7 +755,7 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 				elapsedMs := float64(time.Since(t0).Microseconds()) / 1000.0
 
 				if consumeErr != nil {
-					if errors.Is(consumeErr, context.DeadlineExceeded) || errors.Is(consumeErr, context.Canceled) {
+					if ctx.Err() != nil && (errors.Is(consumeErr, context.DeadlineExceeded) || errors.Is(consumeErr, context.Canceled)) {
 						return
 					}
 					batchesFailed.Add(1)

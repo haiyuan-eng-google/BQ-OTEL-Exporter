@@ -206,11 +206,19 @@ func TestRunBQFakeBackpressureAndLocalOffload(t *testing.T) {
 	}
 
 	// Verify Step-0 redaction ran before local-dir offload so no cleartext
-	// secret patterns ever reached disk.
+	// secret patterns ever reached disk, and at least one offloaded blob on
+	// disk contains the "[REDACTED]" mask replacement (non-vacuous proof that
+	// planted secrets inside >= OffloadThresholdBytes payloads were redacted
+	// prior to offload).
+	var (
+		totalBlobs    int
+		redactedBlobs int
+	)
 	err = filepath.WalkDir(offloadDir, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil || d.IsDir() {
 			return walkErr
 		}
+		totalBlobs++
 		raw, readErr := os.ReadFile(path)
 		if readErr != nil {
 			return readErr
@@ -221,10 +229,19 @@ func TestRunBQFakeBackpressureAndLocalOffload(t *testing.T) {
 				t.Errorf("offloaded file %s contains unredacted secret substring %q", path, forbidden)
 			}
 		}
+		if strings.Contains(content, "[REDACTED]") {
+			redactedBlobs++
+		}
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("walking offloadDir: %v", err)
+	}
+	if totalBlobs == 0 {
+		t.Fatal("expected offloaded files on disk in offloadDir, found 0")
+	}
+	if redactedBlobs == 0 {
+		t.Fatalf("expected >= 1 offloaded file in %s to contain [REDACTED] placeholder, found 0 across %d files", offloadDir, totalBlobs)
 	}
 }
 
@@ -277,6 +294,7 @@ func TestRunStreamPoolSweepAndValidation(t *testing.T) {
 		{Mode: ModeLive, ProjectID: "test-project", DatasetID: "prod_otel", EphemeralDataset: true},
 		{Mode: ModeBQFake, DatasetID: "prod_otel", EphemeralDataset: true},
 		{Mode: ModeBQFake, OffloadDir: "/tmp/a", OffloadGCSBucket: "bkt"},
+		{Mode: ModeBQFake, OffloadGCSBucket: "bkt"},
 	}
 	for _, tc := range invalidCases {
 		if err := tc.Normalize(); err == nil {
@@ -297,9 +315,20 @@ func TestDeleteDatasetWithContentsAndDatasetExistsHTTP(t *testing.T) {
 		switch r.Method {
 		case http.MethodGet:
 			getCalls.Add(1)
-			if strings.HasSuffix(r.URL.Path, "/datasets/existing_ds") {
+			switch {
+			case strings.HasSuffix(r.URL.Path, "/datasets/existing_ds"):
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = w.Write([]byte(`{"datasetReference":{"projectId":"test-proj","datasetId":"existing_ds"}}`))
+				return
+			case strings.HasSuffix(r.URL.Path, "/datasets/forbidden_ds"):
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(`{"error":{"code":403,"message":"Access Denied"}}`))
+				return
+			case strings.HasSuffix(r.URL.Path, "/datasets/error_ds"):
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"error":{"code":500,"message":"Internal Server Error"}}`))
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -339,11 +368,21 @@ func TestDeleteDatasetWithContentsAndDatasetExistsHTTP(t *testing.T) {
 		t.Fatal("datasetExists(otel_bench_absent) = true, want false")
 	}
 
+	// Verify datasetExists fails closed on non-404 HTTP errors (403 Forbidden and 500 Internal Server Error).
+	if _, err := datasetExists(ctx, "test-proj", "forbidden_ds", opts...); err == nil {
+		t.Fatal("datasetExists(forbidden_ds) succeeded, want non-nil error (fail closed)")
+	}
+	ctx500, cancel500 := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel500()
+	if _, err := datasetExists(ctx500, "test-proj", "error_ds", opts...); err == nil {
+		t.Fatal("datasetExists(error_ds) succeeded, want non-nil error (fail closed)")
+	}
+
 	if err := DeleteDatasetWithContents(ctx, "test-proj", "otel_bench_absent", opts...); err != nil {
 		t.Fatalf("DeleteDatasetWithContents error: %v", err)
 	}
-	if getCalls.Load() != 2 {
-		t.Fatalf("getCalls = %d, want 2", getCalls.Load())
+	if getCalls.Load() < 4 {
+		t.Fatalf("getCalls = %d, want >= 4", getCalls.Load())
 	}
 	if deleteCalls.Load() != 1 {
 		t.Fatalf("deleteCalls = %d, want 1", deleteCalls.Load())

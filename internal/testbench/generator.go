@@ -189,15 +189,25 @@ func buildStructuredPayload(seed int, targetBytes int) string {
 }
 
 func (g *Generator) payloadFor(seq uint64) string {
-	base := g.payloadCorpus[seq%uint64(len(g.payloadCorpus))]
-	if !g.cfg.UniquePayloads {
-		return base
+	out := g.payloadCorpus[seq%uint64(len(g.payloadCorpus))]
+	if g.cfg.UniquePayloads {
+		tag := fmt.Sprintf(`{"seq":%012d,`, seq)
+		if len(out) <= len(tag) {
+			return tag
+		}
+		out = tag + out[len(tag):]
 	}
-	tag := fmt.Sprintf(`{"seq":%012d,`, seq)
-	if len(base) <= len(tag) {
-		return tag
+	if g.cfg.PlantSecrets && seq%4 == 0 {
+		secretToken := secretValueTokenFor(seq)
+		prefix := fmt.Sprintf(`{"turn":%d,"auth":%q,`, seq%16, secretToken)
+		if g.cfg.UniquePayloads {
+			prefix = fmt.Sprintf(`{"seq":%012d,"auth":%q,`, seq, secretToken)
+		}
+		if len(out) > len(prefix) {
+			out = prefix + out[len(prefix):]
+		}
 	}
-	return tag + base[len(tag):]
+	return out
 }
 
 // TracesBatch generates a ptrace.Traces batch with exactly spanCount spans
@@ -332,7 +342,7 @@ func (g *Generator) TracesBatch(spanCount int) ptrace.Traces {
 		ev.Attributes().PutInt("chunk.index", int64(stepInTree))
 
 		if g.cfg.PlantSecrets && seq%4 == 0 {
-			plantSecretAttributes(attrs, seq)
+			plantSecretKeyAttribute(attrs, seq)
 		}
 	}
 	return td
@@ -407,7 +417,7 @@ func (g *Generator) LogsBatch(logCount int) plog.Logs {
 		attrs.PutStr("event.name", evName)
 
 		if g.cfg.PlantSecrets && seq%4 == 0 {
-			plantSecretAttributes(attrs, seq)
+			plantSecretKeyAttribute(attrs, seq)
 		}
 	}
 	return ld
@@ -471,7 +481,10 @@ func (g *Generator) MetricsBatch(pointCount int) pmetric.Metrics {
 			attrs.PutStr("gen_ai.baggage.context", g.payloadFor(seq))
 		}
 		if g.cfg.PlantSecrets && seq%4 == 0 {
-			plantSecretAttributes(attrs, seq)
+			plantSecretKeyAttribute(attrs, seq)
+			if g.cfg.PayloadBytes <= 1024 {
+				attrs.PutStr("gen_ai.debug.auth_header", secretValueTokenFor(seq))
+			}
 		}
 
 		ex := dp.Exemplars().AppendEmpty()
@@ -485,20 +498,23 @@ func (g *Generator) MetricsBatch(pointCount int) pmetric.Metrics {
 	return md
 }
 
-func plantSecretAttributes(attrs pcommon.Map, seq uint64) {
-	// Exercises both key-glob matching ("client.api_key") and all three
-	// value-regex branches ("Bearer sk-...", "ya29....", "AKIA...") in the
-	// Step-0 redaction engine. Synthetic tokens are assembled via
-	// strings.Repeat so pre-commit secret scanners are not tripped by literal
-	// token strings in source code.
+func plantSecretKeyAttribute(attrs pcommon.Map, seq uint64) {
+	// Exercises key-glob matching ("client.api_key") in the Step-0 redaction engine.
 	attrs.PutStr("client.api_key", fmt.Sprintf("secret-key-%d", seq))
+}
+
+func secretValueTokenFor(seq uint64) string {
+	// Rotates across all three default RE2 value-regex branches ("Bearer sk-...",
+	// "ya29....", "AKIA...") in the Step-0 redaction engine. Synthetic tokens are
+	// assembled via strings.Repeat so pre-commit secret scanners are not tripped
+	// by literal token strings in source code.
 	switch (seq / 4) % 3 {
 	case 0:
-		attrs.PutStr("gen_ai.debug.auth_header", "Bearer sk-proj-"+strings.Repeat("9f8e7d", 6))
+		return "Bearer sk-proj-" + strings.Repeat("9f8e7d", 6)
 	case 1:
-		attrs.PutStr("gen_ai.debug.auth_header", "token=ya29."+strings.Repeat("a1B2", 6))
+		return "token=ya29." + strings.Repeat("a1B2", 6)
 	default:
-		attrs.PutStr("gen_ai.debug.auth_header", "aws_access_key=AKIA"+strings.Repeat("B2C3", 4))
+		return "aws_access_key=AKIA" + strings.Repeat("B2C3", 4)
 	}
 }
 

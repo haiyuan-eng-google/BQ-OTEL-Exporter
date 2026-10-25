@@ -23,10 +23,14 @@ This component has exactly one job: **reliable transport with a stable,
 documented schema.** It is not an analytics product. It does not aggregate,
 sample, downsample, or interpret telemetry.
 
-> **Status: `v0.1.0` (development stability).** The write path, schema provisioning,
-> deduplication views, Step-0 redaction, GCS payload offload, and AIMD backpressure
-> have been validated against both the in-process `bqfake` Storage Write API server
-> and live BigQuery (`15,206`–`24,066` spans/s and `18,486`–`26,604` logs/s live, `16,794`–`41,527` spans/s and `19,772`–`45,401` logs/s in-process).
+> **Status: pre-`v0.1.0` (development stability).** The write path, schema provisioning,
+> Step-0 redaction, and GCS payload offload have been benchmarked against both the
+> in-process `bqfake` Storage Write API server and live BigQuery (`15,206`–`24,066` spans/s
+> and `18,486`–`26,604` logs/s live across `stream_pool_size=1..8`, `9,430`–`24,066` spans/s
+> and `12,217`–`26,604` logs/s across `stream_pool_size=1..16`; `16,794`–`41,527` spans/s
+> and `19,772`–`45,401` logs/s in-process), AIMD backpressure has been benchmarked under
+> fault injection in `bqfake`, and the deduplication views are exercised by the live
+> integration test suite (`-tags=integration`).
 > See [`docs/benchmarks/v0.1.0-performance-envelope.md`](docs/benchmarks/v0.1.0-performance-envelope.md)
 > for reproducible benchmark measurements and [`docs/cost-estimation.md`](docs/cost-estimation.md)
 > for BigQuery + GCS FinOps cost modeling.
@@ -998,7 +1002,7 @@ authorization result.
 | --------- | -------- |
 | **M1** | Write path on the Storage Write API default stream; `v0alpha2` schema for traces, logs, metrics (`otel_metrics`), companion and GenAI rollup views, and opt-in `otel_quarantine`; request sizing and the error matrix. **Complete and benchmarked (`docs/benchmarks/v0.1.0-performance-envelope.md`).** |
 | **M2** | Measured `v0.1.0` performance envelope (`cmd/bq-otel-testbench`) across `write.stream_pool_size` `1..16`, Step-0 redaction, AIMD backpressure, and GCS/local payload offload; `otel_*_dedup` view verification; delivery-critical self-telemetry proven under fault injection. *(Crash-replay and in-process subset-retry tests tracked separately.)* |
-| **M3** | Optional `auto_create` (including `companion_views`, `search_indexes`, additive schema evolution, and `quarantine`), startup validation, performance envelope (`docs/benchmarks/v0.1.0-performance-envelope.md`), and enterprise cost model (`docs/cost-estimation.md`). **Complete.** |
+| **M3** | Optional `auto_create` (including `companion_views`, `search_indexes`, additive schema evolution, and `quarantine`), startup validation, performance envelope (`docs/benchmarks/v0.1.0-performance-envelope.md`), and enterprise cost model (`docs/cost-estimation.md`). **Complete** *(security guide tracked separately)*. |
 
 ## Contributing
 
