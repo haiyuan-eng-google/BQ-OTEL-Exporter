@@ -29,9 +29,11 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"go.yaml.in/yaml/v3"
 )
@@ -411,6 +413,7 @@ func (c *checker) goFiles() {
 		if path.Dir(name) == "." && !test {
 			factories += c.exportedFuncs(name, f)
 		}
+		c.libraryRefs(name, f)
 	}
 	switch {
 	case len(directives) == 0:
@@ -504,6 +507,77 @@ func isFactorySignature(t *ast.FuncType, local string) bool {
 	}
 	x, ok := sel.X.(*ast.Ident)
 	return ok && x.Name == local && sel.Sel.Name == "Factory"
+}
+
+var libraryExports = sync.OnceValues(func() (map[string]bool, error) {
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		return nil, errors.New("cannot locate internal/contribcheck source directory")
+	}
+	rootDir := filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+	entries, err := os.ReadDir(rootDir)
+	if err != nil {
+		return nil, err
+	}
+	exports := make(map[string]bool)
+	fset := token.NewFileSet()
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.Type().IsRegular() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, filepath.Join(rootDir, name), nil, 0)
+		if err != nil {
+			return nil, err
+		}
+		for _, decl := range f.Decls {
+			switch d := decl.(type) {
+			case *ast.FuncDecl:
+				if d.Recv == nil && d.Name.IsExported() {
+					exports[d.Name.Name] = true
+				}
+			case *ast.GenDecl:
+				for _, spec := range d.Specs {
+					switch s := spec.(type) {
+					case *ast.TypeSpec:
+						if s.Name.IsExported() {
+							exports[s.Name.Name] = true
+						}
+					case *ast.ValueSpec:
+						for _, id := range s.Names {
+							if id.IsExported() {
+								exports[id.Name] = true
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return exports, nil
+})
+
+func (c *checker) libraryRefs(name string, f *ast.File) {
+	local := importName(f, LibraryPath)
+	if local == "" || local == "_" || local == "." {
+		return
+	}
+	exports, err := libraryExports()
+	if err != nil {
+		c.report("api", name, "reading %s exports: %v", LibraryPath, err)
+		return
+	}
+	ast.Inspect(f, func(n ast.Node) bool {
+		sel, ok := n.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		id, ok := sel.X.(*ast.Ident)
+		if ok && id.Name == local && !exports[sel.Sel.Name] {
+			c.report("api", name, "%s.%s is not an exported symbol of %s", local, sel.Sel.Name, LibraryPath)
+		}
+		return true
+	})
 }
 
 func (c *checker) goMod() {

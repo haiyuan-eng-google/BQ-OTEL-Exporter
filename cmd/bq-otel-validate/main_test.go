@@ -62,6 +62,22 @@ func startFake(t *testing.T) *fakeBigQuery {
 		if !ok {
 			t.Fatalf("bqfake has no table %s", id)
 		}
+		md, _, err := schema.DestinationMetadata(ts, testProject, testDataset, id)
+		if id == "otel_quarantine" {
+			md, err = schema.QuarantineDestinationMetadata()
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if md.TimePartitioning != nil {
+			tbl.TimePartitioning = &bigqueryapi.TimePartitioning{
+				Type:  string(md.TimePartitioning.Type),
+				Field: md.TimePartitioning.Field,
+			}
+		}
+		if md.Clustering != nil {
+			tbl.Clustering = &bigqueryapi.Clustering{Fields: md.Clustering.Fields}
+		}
 		f.objects[id] = tbl
 	}
 	for _, v := range viewNames {
@@ -238,6 +254,32 @@ func TestNonConformantDataset(t *testing.T) {
 		}
 	}
 	f.verify(t, 0)
+
+	// An IAM-only run when tables do not exist must fail (exit 1, conforms=false)
+	// rather than reporting conformant with skipped checks.
+	f.edit(func() {
+		for _, id := range []string{"otel_spans", "otel_logs", "otel_metrics", "otel_quarantine"} {
+			delete(f.objects, id)
+		}
+	})
+	code, stdout, stderr = runCommand(t, "-project="+testProject, "-dataset="+testDataset, "-checks=iam", "-format=json")
+	if code != 1 || stderr != "" {
+		t.Fatalf("IAM-only missing tables: exit %d, stderr %q, want exit 1:\n%s", code, stderr, stdout)
+	}
+	var iamReport struct {
+		Conforms bool `json:"conforms"`
+		Summary  struct {
+			Pass int `json:"pass"`
+			Fail int `json:"fail"`
+			Skip int `json:"skip"`
+		} `json:"summary"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &iamReport); err != nil {
+		t.Fatalf("IAM-only JSON decode: %v\n%s", err, stdout)
+	}
+	if iamReport.Conforms || iamReport.Summary.Fail != 4 || iamReport.Summary.Skip != 0 {
+		t.Errorf("IAM-only report = %+v, want conforms=false fail=4 skip=0", iamReport)
+	}
 }
 
 func TestCustomTableNames(t *testing.T) {

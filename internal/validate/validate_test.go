@@ -120,7 +120,8 @@ func newFake(t *testing.T) *fakeBigQuery {
 }
 
 // addTable adds a table with the given schema, converted to its REST form by
-// bqfake the way the exporter's tests seed tables.
+// bqfake the way the exporter's tests seed tables, and sets its expected time
+// partitioning and clustering from internal/schema.
 func (f *fakeBigQuery) addTable(id string, ts *storagepb.TableSchema) {
 	f.t.Helper()
 	if err := f.write.SeedTable(testProject, testDataset, id, ts); err != nil {
@@ -130,7 +131,38 @@ func (f *fakeBigQuery) addTable(id string, ts *storagepb.TableSchema) {
 	if !ok {
 		f.t.Fatalf("bqfake has no table %s", id)
 	}
+	applyTableLayout(tbl, ts)
 	f.edit(func() { f.objects[id] = tbl })
+}
+
+func applyTableLayout(tbl *bigqueryapi.Table, ts *storagepb.TableSchema) {
+	var md *bq.TableMetadata
+	switch ts {
+	case nil:
+		return
+	default:
+		switch {
+		case len(ts.GetFields()) > 0 && ts.GetFields()[0].GetName() == "ingest_time":
+			md = mustQuarantineDestinationMetadata()
+		case len(ts.GetFields()) > 0 && ts.GetFields()[0].GetName() == "trace_id":
+			md = mustDestinationMetadata(ts, testProject, testDataset, DefaultTracesTable)
+		case len(ts.GetFields()) > 1 && ts.GetFields()[1].GetName() == "metric_name":
+			md = mustDestinationMetadata(ts, testProject, testDataset, DefaultMetricsTable)
+		default:
+			md = mustDestinationMetadata(ts, testProject, testDataset, DefaultLogsTable)
+		}
+	}
+	if md.TimePartitioning != nil {
+		tbl.TimePartitioning = &bigqueryapi.TimePartitioning{
+			Type:  string(md.TimePartitioning.Type),
+			Field: md.TimePartitioning.Field,
+		}
+	}
+	if md.Clustering != nil {
+		tbl.Clustering = &bigqueryapi.Clustering{
+			Fields: slices.Clone(md.Clustering.Fields),
+		}
+	}
 }
 
 func (f *fakeBigQuery) addView(id string) {
@@ -651,6 +683,38 @@ func TestRunSchemaMismatch(t *testing.T) {
 		r := f.run(f.config())
 		expectCheck(t, r, CategorySchema, "metrics table", StatusFail, "unreadable table schema: destination table reports no columns")
 	})
+	t.Run("missing partitioning and clustering", func(t *testing.T) {
+		f := newFake(t)
+		f.edit(func() {
+			tbl := f.objects[DefaultTracesTable]
+			tbl.TimePartitioning = nil
+			tbl.Clustering = nil
+		})
+		r := f.run(f.config())
+		expectCheck(t, r, CategorySchema, "traces table", StatusFail,
+			"time partitioning is missing, want HOUR partitioning on start_time",
+			"clustering is missing, want (service_name, trace_id, name)",
+			"SpansDDL and SpansDedupViewDDL")
+		if r.Conforms {
+			t.Error("Conforms = true, want false when partitioning and clustering are missing")
+		}
+	})
+	t.Run("wrong partitioning and clustering", func(t *testing.T) {
+		f := newFake(t)
+		f.edit(func() {
+			tbl := f.objects[DefaultTracesTable]
+			tbl.TimePartitioning = &bigqueryapi.TimePartitioning{Type: "DAY", Field: "receive_time"}
+			tbl.Clustering = &bigqueryapi.Clustering{Fields: []string{"span_id"}}
+		})
+		r := f.run(f.config())
+		expectCheck(t, r, CategorySchema, "traces table", StatusFail,
+			"time partitioning has type DAY, want HOUR",
+			"time partitioning is on receive_time, want start_time",
+			"clustering is (span_id), want (service_name, trace_id, name)")
+		if r.Conforms {
+			t.Error("Conforms = true, want false when partitioning and clustering are wrong")
+		}
+	})
 }
 
 func TestRunTableProblems(t *testing.T) {
@@ -691,7 +755,7 @@ func TestRunRequirePartitionFilter(t *testing.T) {
 	}{
 		{"on the table", func(tbl *bigqueryapi.Table) { tbl.RequirePartitionFilter = true }},
 		{"on its time partitioning", func(tbl *bigqueryapi.Table) {
-			tbl.TimePartitioning = &bigqueryapi.TimePartitioning{Type: "DAY", Field: "start_time", RequirePartitionFilter: true}
+			tbl.TimePartitioning = &bigqueryapi.TimePartitioning{Type: "HOUR", Field: "start_time", RequirePartitionFilter: true}
 		}},
 	} {
 		t.Run(tc.name+", unprunable views skipped", func(t *testing.T) {
@@ -923,7 +987,36 @@ func TestRunTablePermissions(t *testing.T) {
 		f := newFake(t)
 		f.edit(func() { f.iamFailures[DefaultMetricsTable] = notFound(DefaultMetricsTable) })
 		r := f.run(f.config())
-		expectCheck(t, r, CategoryIAM, "metrics table permissions", StatusSkip, "not checked: table not found")
+		expectCheck(t, r, CategoryIAM, "metrics table permissions", StatusFail, "cannot test permissions: table not found")
+		if r.Conforms {
+			t.Error("Conforms = true when testIamPermissions returned 404")
+		}
+	})
+	t.Run("iam-only with missing tables fails", func(t *testing.T) {
+		f := newFake(t)
+		f.edit(func() {
+			for _, id := range []string{DefaultTracesTable, DefaultLogsTable, DefaultMetricsTable, DefaultQuarantineTable} {
+				delete(f.objects, id)
+			}
+		})
+		cfg := f.config()
+		cfg.Checks = []Category{CategoryIAM}
+		r := f.run(cfg)
+		if r.Conforms || r.Summary.Fail != 4 || r.Summary.Skip != 0 {
+			t.Errorf("Conforms = %v, Summary = %+v, want 4 failures and 0 skips:%s", r.Conforms, r.Summary, listChecks(r))
+		}
+		expectCheck(t, r, CategoryIAM, "traces table permissions", StatusFail, "cannot test permissions: table not found")
+	})
+	t.Run("iam-only with testIamPermissions 404 fails", func(t *testing.T) {
+		f := newFake(t)
+		f.edit(func() { f.iamFailures[DefaultTracesTable] = notFound(DefaultTracesTable) })
+		cfg := f.config()
+		cfg.Checks = []Category{CategoryIAM}
+		r := f.run(cfg)
+		if r.Conforms || r.Summary.Fail != 1 {
+			t.Errorf("Conforms = %v, Summary = %+v, want 1 failure:%s", r.Conforms, r.Summary, listChecks(r))
+		}
+		expectCheck(t, r, CategoryIAM, "traces table permissions", StatusFail, "cannot test permissions: table not found")
 	})
 }
 

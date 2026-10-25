@@ -46,12 +46,13 @@ var (
 )
 
 // quarantineQueryTemplate selects the quarantine rows a replay reads,
-// ordered by (ingest_time, row_fp). row_fp fingerprints the row's content,
-// so rows that share an ingest_time (every row of one quarantined batch
-// does) still sort in a stable order and a checkpoint can name the last one
-// it handled. The verbs are the backquoted table, the partition-pruning
-// WHERE conditions, and the optional resume condition.
-const quarantineQueryTemplate = "WITH quarantined AS (\n" +
+// ordered by (ingest_time, row_fp, row_ord). row_fp fingerprints the row's
+// content, and row_ord is the 0-based ordinal within rows that share
+// (ingest_time, row_fp), so identical rows at the same microsecond have
+// distinct sort keys and a checkpoint can resume after a specific duplicate.
+// The verbs are the backquoted table, the partition-pruning WHERE conditions,
+// and the optional resume condition.
+const quarantineQueryTemplate = "WITH fingerprinted AS (\n" +
 	"  SELECT\n" +
 	"    ingest_time,\n" +
 	"    signal,\n" +
@@ -68,13 +69,19 @@ const quarantineQueryTemplate = "WITH quarantined AS (\n" +
 	"      payload_ref.uri AS payload_ref_uri, payload_ref.version AS payload_ref_version))) AS row_fp\n" +
 	"  FROM `%s`\n" +
 	"  WHERE %s\n" +
+	"),\n" +
+	"quarantined AS (\n" +
+	"  SELECT\n" +
+	"    *,\n" +
+	"    ROW_NUMBER() OVER (PARTITION BY ingest_time, row_fp) - 1 AS row_ord\n" +
+	"  FROM fingerprinted\n" +
 	")\n" +
 	"SELECT\n" +
 	"  UNIX_MICROS(ingest_time) AS ingest_time_us,\n" +
 	"  signal, error_code, error_message, service_name, trace_id, span_id, raw_payload,\n" +
-	"  payload_ref_uri, payload_ref_version, row_fp\n" +
+	"  payload_ref_uri, payload_ref_version, row_fp, row_ord\n" +
 	"FROM quarantined%s\n" +
-	"ORDER BY ingest_time, row_fp"
+	"ORDER BY ingest_time, row_fp, row_ord"
 
 // BigQuerySource names the quarantine table that ReplayBigQuery reads.
 type BigQuerySource struct {
@@ -240,10 +247,11 @@ func quarantineQuery(table string, f Filter, cursor *bigQueryCursor) (string, []
 	}
 	resume := ""
 	if cursor != nil {
-		resume = "\nWHERE ingest_time > @cursor_time OR (ingest_time = @cursor_time AND row_fp > @cursor_fp)"
+		resume = "\nWHERE ingest_time > @cursor_time OR (ingest_time = @cursor_time AND (row_fp > @cursor_fp OR (row_fp = @cursor_fp AND row_ord > @cursor_ord)))"
 		params = append(params,
 			timestampParam("cursor_time", time.UnixMicro(cursor.IngestTimeMicros)),
-			int64Param("cursor_fp", cursor.RowFingerprint))
+			int64Param("cursor_fp", cursor.RowFingerprint),
+			int64Param("cursor_ord", cursor.DuplicateOrdinal))
 	}
 	return fmt.Sprintf(quarantineQueryTemplate, table, strings.Join(where, "\n    AND "), resume), params
 }
@@ -344,11 +352,15 @@ type queryRows struct {
 	pageSize int64
 	req      *bigqueryapi.QueryRequest
 
-	started bool
-	job     *bigqueryapi.JobReference
-	fields  []*bigqueryapi.TableFieldSchema
-	page    []*bigqueryapi.TableRow
-	token   string
+	started    bool
+	job        *bigqueryapi.JobReference
+	fields     []*bigqueryapi.TableFieldSchema
+	page       []*bigqueryapi.TableRow
+	token      string
+	hasPrev    bool
+	prevIngest int64
+	prevFP     int64
+	seqOrd     int64
 }
 
 // next returns the next result row, or io.EOF after the last one.
@@ -363,7 +375,22 @@ func (q *queryRows) next(ctx context.Context) (quarantineRow, error) {
 	}
 	row := q.page[0]
 	q.page = q.page[1:]
-	return decodeQuarantineRow(q.fields, row)
+	out, hasRowOrd, err := decodeQuarantineRow(q.fields, row)
+	if err != nil {
+		return quarantineRow{}, err
+	}
+	if !hasRowOrd {
+		if q.hasPrev && out.pos.ingestMicros == q.prevIngest && out.pos.fingerprint == q.prevFP {
+			q.seqOrd++
+		} else {
+			q.seqOrd = 0
+		}
+		out.pos.ordinal = q.seqOrd
+	}
+	q.prevIngest = out.pos.ingestMicros
+	q.prevFP = out.pos.fingerprint
+	q.hasPrev = true
+	return out, nil
 }
 
 // fetch starts the query, or fetches the page after the current one.
@@ -440,22 +467,22 @@ func queryError(project, table string, err error) error {
 
 // decodeQuarantineRow converts one REST result row into a Record and its
 // sort key.
-func decodeQuarantineRow(fields []*bigqueryapi.TableFieldSchema, row *bigqueryapi.TableRow) (quarantineRow, error) {
+func decodeQuarantineRow(fields []*bigqueryapi.TableFieldSchema, row *bigqueryapi.TableRow) (quarantineRow, bool, error) {
 	if row == nil || len(row.F) != len(fields) {
 		cells := 0
 		if row != nil {
 			cells = len(row.F)
 		}
-		return quarantineRow{}, fmt.Errorf("BigQuery returned a row with %d cells for %d columns", cells, len(fields))
+		return quarantineRow{}, false, fmt.Errorf("BigQuery returned a row with %d cells for %d columns", cells, len(fields))
 	}
 	var (
-		out               quarantineRow
-		haveTime, haveKey bool
-		uri, version      string
+		out                        quarantineRow
+		haveTime, haveKey, haveOrd bool
+		uri, version               string
 	)
 	for i, field := range fields {
 		if field == nil {
-			return quarantineRow{}, errors.New("BigQuery returned a result schema with an empty column")
+			return quarantineRow{}, false, errors.New("BigQuery returned a result schema with an empty column")
 		}
 		var value string
 		switch v := row.F[i].V.(type) {
@@ -463,13 +490,13 @@ func decodeQuarantineRow(fields []*bigqueryapi.TableFieldSchema, row *bigqueryap
 		case string:
 			value = v
 		default:
-			return quarantineRow{}, fmt.Errorf("column %s holds an unexpected %T value", field.Name, v)
+			return quarantineRow{}, false, fmt.Errorf("column %s holds an unexpected %T value", field.Name, v)
 		}
 		switch field.Name {
 		case "ingest_time_us":
 			us, err := strconv.ParseInt(value, 10, 64)
 			if err != nil {
-				return quarantineRow{}, fmt.Errorf("column ingest_time_us: %w", err)
+				return quarantineRow{}, false, fmt.Errorf("column ingest_time_us: %w", err)
 			}
 			out.rec.IngestTime = time.UnixMicro(us).UTC().Format(time.RFC3339Nano)
 			out.pos.ingestMicros = us
@@ -477,10 +504,17 @@ func decodeQuarantineRow(fields []*bigqueryapi.TableFieldSchema, row *bigqueryap
 		case "row_fp":
 			fp, err := strconv.ParseInt(value, 10, 64)
 			if err != nil {
-				return quarantineRow{}, fmt.Errorf("column row_fp: %w", err)
+				return quarantineRow{}, false, fmt.Errorf("column row_fp: %w", err)
 			}
 			out.pos.fingerprint = fp
 			haveKey = true
+		case "row_ord":
+			ord, err := strconv.ParseInt(value, 10, 64)
+			if err != nil {
+				return quarantineRow{}, false, fmt.Errorf("column row_ord: %w", err)
+			}
+			out.pos.ordinal = ord
+			haveOrd = true
 		case "signal":
 			out.rec.Signal = value
 		case "error_code":
@@ -502,10 +536,10 @@ func decodeQuarantineRow(fields []*bigqueryapi.TableFieldSchema, row *bigqueryap
 		}
 	}
 	if !haveTime || !haveKey {
-		return quarantineRow{}, errors.New("BigQuery result rows lack the ingest_time_us or row_fp column")
+		return quarantineRow{}, false, errors.New("BigQuery result rows lack the ingest_time_us or row_fp column")
 	}
 	if uri != "" {
 		out.rec.PayloadRef = &ObjectRef{URI: uri, Version: version}
 	}
-	return out, nil
+	return out, haveOrd, nil
 }

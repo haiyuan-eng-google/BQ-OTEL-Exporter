@@ -134,14 +134,25 @@ type Config struct {
 	// means DefaultMaxWorkers.
 	MaxWorkers int
 
+	// Redact enables client-side redaction (the exporter's
+	// redaction.enabled, which defaults to false). Setting any of the
+	// other redaction fields also enables redaction.
+	//
 	// BlockedKeys are attribute keys masked in addition to
-	// redact.DefaultBlockedKeys, matched case-insensitively; '*' is a glob.
+	// redact.DefaultBlockedKeys (unless DisableDefaultKeys is true),
+	// matched case-insensitively; '*' is a glob.
+	// DisableDefaultKeys disables redact.DefaultBlockedKeys so only
+	// BlockedKeys apply (the exporter's redaction.disable_default_keys).
 	// BlockedValuePatterns are RE2 expressions whose matches are masked
-	// inside string values, and RedactLogBody applies both to log bodies.
-	// Use the deployment's redaction settings so backfilled rows look like
-	// exported ones.
+	// inside string values, MaskReplacement is the replacement text
+	// (defaulting to redact.DefaultMaskReplacement), and RedactLogBody
+	// applies value patterns to log bodies. Use the deployment's redaction
+	// settings so backfilled rows look like exported ones.
+	Redact               bool
 	BlockedKeys          []string
+	DisableDefaultKeys   bool
 	BlockedValuePatterns []string
+	MaskReplacement      string
 	RedactLogBody        bool
 	// LogNameAttribute and InsertIDAttribute are the exporter's
 	// logs.log_name_attribute and logs.insert_id_attribute. Use the
@@ -260,7 +271,7 @@ func (c *Config) normalize() error {
 	if c.RetryMaxBackoff < c.RetryBackoff {
 		c.RetryMaxBackoff = c.RetryBackoff
 	}
-	if _, err := redact.New(c.redactConfig()); err != nil {
+	if _, err := c.redactor(); err != nil {
 		return fmt.Errorf("redaction: %w", err)
 	}
 	if c.Now == nil {
@@ -269,13 +280,34 @@ func (c *Config) normalize() error {
 	return nil
 }
 
-func (c *Config) redactConfig() redact.Config {
-	return redact.Config{
-		BlockedKeys:          append(redact.DefaultBlockedKeys(), c.BlockedKeys...),
-		BlockedValuePatterns: c.BlockedValuePatterns,
-		MaskReplacement:      redact.DefaultMaskReplacement,
-		RedactLogBody:        c.RedactLogBody,
+func (c *Config) redactionEnabled() bool {
+	return c.Redact ||
+		len(c.BlockedKeys) > 0 ||
+		c.DisableDefaultKeys ||
+		len(c.BlockedValuePatterns) > 0 ||
+		c.MaskReplacement != "" ||
+		c.RedactLogBody
+}
+
+func (c *Config) redactor() (*redact.Redactor, error) {
+	if !c.redactionEnabled() {
+		return nil, nil
 	}
+	var keys []string
+	if !c.DisableDefaultKeys {
+		keys = append(keys, redact.DefaultBlockedKeys()...)
+	}
+	keys = append(keys, c.BlockedKeys...)
+	mask := c.MaskReplacement
+	if mask == "" {
+		mask = redact.DefaultMaskReplacement
+	}
+	return redact.New(redact.Config{
+		BlockedKeys:          keys,
+		BlockedValuePatterns: c.BlockedValuePatterns,
+		MaskReplacement:      mask,
+		RedactLogBody:        c.RedactLogBody,
+	})
 }
 
 func (c *Config) signals() []string {
@@ -501,7 +533,7 @@ func Run(ctx context.Context, cfg Config) (*Report, error) {
 		return nil, err
 	}
 	bucket, prefix, _ := ParseSource(cfg.Source)
-	rd, err := redact.New(cfg.redactConfig())
+	rd, err := cfg.redactor()
 	if err != nil {
 		return nil, fmt.Errorf("redaction: %w", err)
 	}
@@ -718,12 +750,13 @@ func (s *signalStats) reject(reason string, n int64) {
 
 // objectStats counts one object. Only its own worker touches it.
 type objectStats struct {
-	url         string
-	lines       int64
-	malformed   int64
-	otherSignal int64
-	signals     map[string]*signalStats
-	failures    []Failure
+	url          string
+	lines        int64
+	malformed    int64
+	otherSignal  int64
+	signals      map[string]*signalStats
+	failures     []Failure
+	failureCount int
 }
 
 func (st *objectStats) signal(name string) *signalStats {
@@ -736,7 +769,10 @@ func (st *objectStats) signal(name string) *signalStats {
 }
 
 func (st *objectStats) fail(line int64, err error) {
-	st.failures = append(st.failures, Failure{Object: st.url, Line: line, Error: err.Error()})
+	st.failureCount++
+	if len(st.failures) < maxListedFailures {
+		st.failures = append(st.failures, Failure{Object: st.url, Line: line, Error: err.Error()})
+	}
 }
 
 func (r *run) object(ctx context.Context, obj Object) {
@@ -781,9 +817,9 @@ func (r *run) merge(st *objectStats, err error) {
 		}
 		appended += s.appended
 	}
-	if len(st.failures) > 0 {
+	if st.failureCount > 0 {
 		rep.FailedObjects++
-		rep.FailureCount += len(st.failures)
+		rep.FailureCount += st.failureCount
 		room := max(0, maxListedFailures-len(rep.Failures))
 		rep.Failures = append(rep.Failures, st.failures[:min(room, len(st.failures))]...)
 	}
@@ -792,7 +828,7 @@ func (r *run) merge(st *objectStats, err error) {
 			Object:   st.url,
 			Lines:    st.lines,
 			Appended: appended,
-			Failures: len(st.failures),
+			Failures: st.failureCount,
 			Err:      err,
 		})
 	}
@@ -1120,10 +1156,17 @@ func (r *run) appendRows(ctx context.Context, sk *sink, rows [][]byte) (acked, r
 				rest = append(rest, row)
 			}
 		}
-		if len(rest) == 0 {
+		pending = rest
+		if v := out.Verdict; out.Err != nil && v.Class == bqi.Permanent {
+			if v.StreamRecreate && !rebuilt && len(pending) > 0 {
+				rebuilt = true
+				continue
+			}
+			return acked, refused, &PermanentError{Table: sk.table, Label: v.Label, Err: out.Err}
+		}
+		if len(pending) == 0 {
 			return acked, refused, nil
 		}
-		pending = rest
 		if out.Err == nil && len(invalid) > 0 {
 			continue
 		}
@@ -1133,16 +1176,6 @@ func (r *run) appendRows(ctx context.Context, sk *sink, rows [][]byte) (acked, r
 		cause := out.Err
 		if cause == nil {
 			cause = errors.New("the service acknowledged only part of the batch")
-		}
-		if v := out.Verdict; out.Err != nil && v.Class == bqi.Permanent && len(invalid) == 0 {
-			if v.StreamRecreate && !rebuilt {
-				rebuilt = true
-				continue
-			}
-			return acked, refused, &PermanentError{Table: sk.table, Label: v.Label, Err: out.Err}
-		}
-		if len(invalid) > 0 {
-			continue
 		}
 		attempts++
 		if attempts >= r.cfg.MaxAttempts {

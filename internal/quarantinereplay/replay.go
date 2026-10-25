@@ -381,6 +381,7 @@ type recordPosition struct {
 	index        int64
 	ingestMicros int64
 	fingerprint  int64
+	ordinal      int64
 }
 
 // after reports whether p sorts after the BigQuery cursor c.
@@ -388,7 +389,10 @@ func (p recordPosition) after(c bigQueryCursor) bool {
 	if p.ingestMicros != c.IngestTimeMicros {
 		return p.ingestMicros > c.IngestTimeMicros
 	}
-	return p.fingerprint > c.RowFingerprint
+	if p.fingerprint != c.RowFingerprint {
+		return p.fingerprint > c.RowFingerprint
+	}
+	return p.ordinal > c.DuplicateOrdinal
 }
 
 // process replays rec, the record numbered i at pos. A non-nil error means
@@ -606,12 +610,23 @@ func (l *RateLimiter) Wait(ctx context.Context) error {
 			l.mu.Unlock()
 			return nil
 		}
-		wait := time.Duration(math.Ceil((1 - l.tokens) / l.rate * float64(time.Second)))
+		wait := rateLimitWait(1-l.tokens, l.rate)
 		l.mu.Unlock()
 		if err := l.sleep(ctx, wait); err != nil {
 			return err
 		}
 	}
+}
+
+func rateLimitWait(deficit, rate float64) time.Duration {
+	if deficit <= 0 {
+		return 0
+	}
+	ns := math.Ceil(deficit / rate * float64(time.Second))
+	if ns >= float64(math.MaxInt64) || math.IsInf(ns, 1) || math.IsNaN(ns) {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Duration(ns)
 }
 
 func sleepContext(ctx context.Context, d time.Duration) error {
@@ -670,18 +685,48 @@ type checkpointState struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// bigQueryCursor is the (ingest_time, row_fp) sort key of a quarantine row
-// read by ReplayBigQuery.
+// bigQueryCursor is the (ingest_time, row_fp, row_ord) sort key of a
+// quarantine row read by ReplayBigQuery.
 type bigQueryCursor struct {
 	IngestTimeMicros int64 `json:"ingest_time_micros"`
 	RowFingerprint   int64 `json:"row_fingerprint"`
+	DuplicateOrdinal int64 `json:"duplicate_ordinal,omitempty"`
 }
+
+// checkpointTempFile is the temporary file seam checkpointer.save uses.
+type checkpointTempFile interface {
+	Name() string
+	Write([]byte) (int, error)
+	Sync() error
+	Close() error
+}
+
+// checkpointFS holds the filesystem operations checkpointer.save uses so
+// tests can observe durability ordering and inject faults.
+type checkpointFS struct {
+	createTemp func(dir, pattern string) (checkpointTempFile, error)
+	rename     func(oldpath, newpath string) error
+	remove     func(name string) error
+	syncDir    func(dir string) error
+}
+
+var defaultCheckpointFS = checkpointFS{
+	createTemp: func(dir, pattern string) (checkpointTempFile, error) {
+		return os.CreateTemp(dir, pattern)
+	},
+	rename:  os.Rename,
+	remove:  os.Remove,
+	syncDir: syncDir,
+}
+
+var checkpointHooks = defaultCheckpointFS
 
 // checkpointer loads, advances, and saves a checkpoint.
 type checkpointer struct {
 	path  string
 	sink  Sink
 	state checkpointState
+	fs    checkpointFS
 }
 
 func openCheckpoint(cfg CheckpointConfig, kind string, f Filter, sink Sink) (*checkpointer, error) {
@@ -694,7 +739,7 @@ func openCheckpoint(cfg CheckpointConfig, kind string, f Filter, sink Sink) (*ch
 		Source:  cfg.Source,
 		Filter:  f.fingerprint(),
 	}
-	c := &checkpointer{path: cfg.Path, sink: sink, state: want}
+	c := &checkpointer{path: cfg.Path, sink: sink, state: want, fs: checkpointHooks}
 	data, err := os.ReadFile(cfg.Path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return c, nil
@@ -716,7 +761,7 @@ func openCheckpoint(cfg CheckpointConfig, kind string, f Filter, sink Sink) (*ch
 			"checkpoint %q was written for %s source %q with filter %s, but this run reads %s source %q with filter %s; remove it or choose another checkpoint file",
 			cfg.Path, got.Kind, got.Source, got.Filter, want.Kind, want.Source, want.Filter)
 	}
-	if got.Next < 0 || got.Handled < 0 {
+	if got.Next < 0 || got.Handled < 0 || (got.Cursor != nil && got.Cursor.DuplicateOrdinal < 0) {
 		return nil, fmt.Errorf("checkpoint %q holds a negative position", cfg.Path)
 	}
 	c.state = got
@@ -735,7 +780,11 @@ func (c *checkpointer) handled(pos recordPosition) bool {
 func (c *checkpointer) advance(pos recordPosition) error {
 	if c.state.Kind == checkpointKindBigQuery {
 		if c.state.Cursor == nil || pos.after(*c.state.Cursor) {
-			c.state.Cursor = &bigQueryCursor{IngestTimeMicros: pos.ingestMicros, RowFingerprint: pos.fingerprint}
+			c.state.Cursor = &bigQueryCursor{
+				IngestTimeMicros: pos.ingestMicros,
+				RowFingerprint:   pos.fingerprint,
+				DuplicateOrdinal: pos.ordinal,
+			}
 		}
 	} else if pos.index >= c.state.Next {
 		c.state.Next = pos.index + 1
@@ -756,7 +805,7 @@ func (c *checkpointer) save() error {
 	}
 	data = append(data, '\n')
 	dir := filepath.Dir(c.path)
-	tmp, err := os.CreateTemp(dir, "."+filepath.Base(c.path)+".tmp-*")
+	tmp, err := c.fs.createTemp(dir, "."+filepath.Base(c.path)+".tmp-*")
 	if err != nil {
 		return fmt.Errorf("creating temporary checkpoint file: %w", err)
 	}
@@ -764,7 +813,7 @@ func (c *checkpointer) save() error {
 	renamed := false
 	defer func() {
 		if !renamed {
-			_ = os.Remove(tmpName)
+			_ = c.fs.remove(tmpName)
 		}
 	}()
 	if _, err := tmp.Write(data); err != nil {
@@ -778,11 +827,11 @@ func (c *checkpointer) save() error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("closing checkpoint %q: %w", c.path, err)
 	}
-	if err := os.Rename(tmpName, c.path); err != nil {
+	if err := c.fs.rename(tmpName, c.path); err != nil {
 		return fmt.Errorf("replacing checkpoint %q: %w", c.path, err)
 	}
 	renamed = true
-	return syncDir(dir)
+	return c.fs.syncDir(dir)
 }
 
 // syncDir syncs dir so that a rename inside it survives a power loss.
@@ -805,7 +854,7 @@ func syncDir(dir string) error {
 // ignorableSyncError reports whether err only says that the file cannot be
 // synced at all, as a pipe or a terminal cannot.
 func ignorableSyncError(err error) bool {
-	return errors.Is(err, syscall.EINVAL) || errors.Is(err, errors.ErrUnsupported)
+	return errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOTSUP) || errors.Is(err, errors.ErrUnsupported)
 }
 
 // syncer is implemented by sinks and writers whose output can be flushed to
@@ -1021,6 +1070,15 @@ func (s *JSONWriterSink) Sync() error {
 	sy, ok := s.w.(syncer)
 	if !ok {
 		return nil
+	}
+	if st, ok := s.w.(interface{ Stat() (fs.FileInfo, error) }); ok {
+		fi, err := st.Stat()
+		if err != nil {
+			return err
+		}
+		if !fi.Mode().IsRegular() {
+			return nil
+		}
 	}
 	if err := sy.Sync(); err != nil && !ignorableSyncError(err) {
 		return err

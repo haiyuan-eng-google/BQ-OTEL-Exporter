@@ -474,6 +474,7 @@ func TestCheckTreeMutations(t *testing.T) {
 		{"exported function", appendTo("factory.go", "\nfunc Extra() {}\n"), []string{"factory.go: api"}},
 		{"NewFactory signature", edit("factory.go", "func NewFactory() exporter.Factory {", "func NewFactory() any {"), []string{"factory.go: api"}},
 		{"no NewFactory", edit("factory.go", "func NewFactory() exporter.Factory {", "func newFactory() exporter.Factory {"), []string{".: api"}},
+		{"unexported library symbol", edit("factory.go", "bqotel.NewFactory()", "bqotel.UndefinedFactory()"), []string{"factory.go: api"}},
 		{"module path", edit("go.mod", "module "+ModulePath+"\n", "module example.com/bigqueryexporter\n"), []string{"go.mod: go.mod"}},
 		{"go directive", edit("go.mod", "\ngo 1.26.0\n", "\ngo 1.26.5\n"), []string{"go.mod: go.mod"}},
 		{"toolchain directive", edit("go.mod", "\ngo 1.26.0\n", "\ngo 1.26.0\n\ntoolchain go1.27.3\n"), []string{"go.mod: go.mod"}},

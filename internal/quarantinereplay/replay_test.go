@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"math"
 	"net/http"
@@ -21,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -702,6 +704,252 @@ func TestJSONWriterSinkSync(t *testing.T) {
 	if err := sink.Sync(); err == nil {
 		t.Error("syncing a closed file succeeded")
 	}
+
+	// On Darwin/BSD, calling Sync on a pipe returns syscall.EBADF rather than
+	// syscall.EINVAL. JSONWriterSink checks Stat().Mode().IsRegular() first so
+	// pipes and character devices never reach Sync().
+	pipeWriter := &fakeModeWriter{mode: fs.ModeNamedPipe, syncErr: syscall.EBADF}
+	if err := NewJSONWriterSink(pipeWriter).Sync(); err != nil || pipeWriter.synced {
+		t.Errorf("syncing a named pipe writer = %v (synced=%v), want nil without calling Sync", err, pipeWriter.synced)
+	}
+	closedWriter := &fakeModeWriter{statErr: fs.ErrClosed, syncErr: nil}
+	if err := NewJSONWriterSink(closedWriter).Sync(); !errors.Is(err, fs.ErrClosed) {
+		t.Errorf("syncing a writer whose Stat fails = %v, want fs.ErrClosed", err)
+	}
+}
+
+type fakeModeWriter struct {
+	bytes.Buffer
+	mode    fs.FileMode
+	statErr error
+	syncErr error
+	synced  bool
+}
+
+type fakeFileInfo struct {
+	fs.FileInfo
+	mode fs.FileMode
+}
+
+func (fi fakeFileInfo) Mode() fs.FileMode { return fi.mode }
+
+func (w *fakeModeWriter) Stat() (fs.FileInfo, error) {
+	if w.statErr != nil {
+		return nil, w.statErr
+	}
+	return fakeFileInfo{mode: w.mode}, nil
+}
+
+func (w *fakeModeWriter) Sync() error {
+	w.synced = true
+	return w.syncErr
+}
+
+type hookedTempFile struct {
+	checkpointTempFile
+	record   func(op string)
+	writeErr error
+	syncErr  error
+	closeErr error
+}
+
+func (f *hookedTempFile) Write(p []byte) (int, error) {
+	if f.record != nil {
+		f.record("tmp.Write")
+	}
+	if f.writeErr != nil {
+		return 0, f.writeErr
+	}
+	return f.checkpointTempFile.Write(p)
+}
+
+func (f *hookedTempFile) Sync() error {
+	if f.record != nil {
+		f.record("tmp.Sync")
+	}
+	if f.syncErr != nil {
+		return f.syncErr
+	}
+	return f.checkpointTempFile.Sync()
+}
+
+func (f *hookedTempFile) Close() error {
+	if f.record != nil {
+		f.record("tmp.Close")
+	}
+	cerr := f.checkpointTempFile.Close()
+	if f.closeErr != nil {
+		return f.closeErr
+	}
+	return cerr
+}
+
+type recordingSyncSink struct {
+	recordingSink
+	onSync func() error
+}
+
+func (s *recordingSyncSink) Sync() error {
+	if s.onSync != nil {
+		return s.onSync()
+	}
+	return nil
+}
+
+func TestCheckpointDurabilityAndAtomicity(t *testing.T) {
+	prevHooks := checkpointHooks
+	t.Cleanup(func() { checkpointHooks = prevHooks })
+
+	dir := t.TempDir()
+	ckptPath := filepath.Join(dir, "durable.ckpt")
+	opts := Options{Checkpoint: &CheckpointConfig{Path: ckptPath, Source: "file:quarantine.jsonl"}}
+	input := spanRecordsJSONL(t, "OVERSIZE_ROW", "OVERSIZE_ROW")
+
+	var ops []string
+	var preRenameDiskNext int64 = -1
+	checkpointHooks = checkpointFS{
+		createTemp: func(d, pattern string) (checkpointTempFile, error) {
+			ops = append(ops, "createTemp")
+			tf, err := defaultCheckpointFS.createTemp(d, pattern)
+			if err != nil {
+				return nil, err
+			}
+			return &hookedTempFile{
+				checkpointTempFile: tf,
+				record:             func(op string) { ops = append(ops, op) },
+			}, nil
+		},
+		rename: func(oldpath, newpath string) error {
+			ops = append(ops, "rename")
+			// Before rename replaces newpath, newpath on disk must still hold the
+			// previous record's checkpoint (or not exist on the very first save),
+			// proving save() never overwrites newpath in place.
+			if raw, err := os.ReadFile(newpath); err == nil {
+				var st checkpointState
+				if jerr := json.Unmarshal(raw, &st); jerr != nil {
+					t.Errorf("checkpoint on disk before rename is corrupt: %v", jerr)
+				}
+				preRenameDiskNext = st.Next
+			}
+			return defaultCheckpointFS.rename(oldpath, newpath)
+		},
+		remove: func(name string) error {
+			ops = append(ops, "remove")
+			return defaultCheckpointFS.remove(name)
+		},
+		syncDir: func(d string) error {
+			ops = append(ops, "syncDir")
+			return defaultCheckpointFS.syncDir(d)
+		},
+	}
+
+	sink := &recordingSyncSink{
+		onSync: func() error {
+			ops = append(ops, "sink.Sync")
+			return nil
+		},
+	}
+	if _, err := Replay(context.Background(), strings.NewReader(input), sink, opts); err != nil {
+		t.Fatalf("Replay() error = %v", err)
+	}
+	wantOps := []string{
+		"sink.Sync", "createTemp", "tmp.Write", "tmp.Sync", "tmp.Close", "rename", "syncDir",
+		"sink.Sync", "createTemp", "tmp.Write", "tmp.Sync", "tmp.Close", "rename", "syncDir",
+	}
+	if !slices.Equal(ops, wantOps) {
+		t.Fatalf("checkpoint durability operations = %v, want %v", ops, wantOps)
+	}
+	if preRenameDiskNext != 1 {
+		t.Errorf("before the second rename, checkpoint on disk had Next=%d, want 1 (atomic temp+rename)", preRenameDiskNext)
+	}
+
+	// Fault injection on the 2nd record across every durability step must leave
+	// the 1st record's checkpoint intact on disk and clean up temporary files.
+	for _, faultStep := range []string{"sink.Sync", "tmp.Write", "tmp.Sync", "tmp.Close", "rename", "syncDir"} {
+		t.Run("fault at "+faultStep, func(t *testing.T) {
+			subDir := t.TempDir()
+			subCkpt := filepath.Join(subDir, "replay.ckpt")
+			subOpts := Options{Checkpoint: &CheckpointConfig{Path: subCkpt, Source: "file:quarantine.jsonl"}}
+			saveCall := 0
+			boom := errors.New("injected " + faultStep + " failure")
+
+			checkpointHooks = checkpointFS{
+				createTemp: func(d, pattern string) (checkpointTempFile, error) {
+					saveCall++
+					tf, err := defaultCheckpointFS.createTemp(d, pattern)
+					if err != nil {
+						return nil, err
+					}
+					ht := &hookedTempFile{checkpointTempFile: tf}
+					if saveCall == 2 {
+						switch faultStep {
+						case "tmp.Write":
+							ht.writeErr = boom
+						case "tmp.Sync":
+							ht.syncErr = boom
+						case "tmp.Close":
+							ht.closeErr = boom
+						}
+					}
+					return ht, nil
+				},
+				rename: func(oldpath, newpath string) error {
+					if saveCall == 2 && faultStep == "rename" {
+						return boom
+					}
+					return defaultCheckpointFS.rename(oldpath, newpath)
+				},
+				remove: defaultCheckpointFS.remove,
+				syncDir: func(d string) error {
+					if saveCall == 2 && faultStep == "syncDir" {
+						return boom
+					}
+					return defaultCheckpointFS.syncDir(d)
+				},
+			}
+			syncCalls := 0
+			flakySink := &recordingSyncSink{
+				onSync: func() error {
+					syncCalls++
+					if syncCalls == 2 && faultStep == "sink.Sync" {
+						return boom
+					}
+					return nil
+				},
+			}
+			_, err := Replay(context.Background(), strings.NewReader(input), flakySink, subOpts)
+			if !errors.Is(err, boom) {
+				t.Fatalf("Replay() error = %v, want %v", err, boom)
+			}
+			assertDirHolds(t, subDir, "replay.ckpt")
+			st := readCheckpointFile(t, subCkpt)
+			wantNext := int64(1)
+			if faultStep == "syncDir" {
+				// syncDir fails after rename has already atomically replaced the file.
+				wantNext = 2
+			}
+			if st.Next != wantNext {
+				t.Fatalf("after %s failure, checkpoint Next = %d, want %d", faultStep, st.Next, wantNext)
+			}
+
+			// Restore normal hooks and verify a resumed run completes cleanly.
+			checkpointHooks = defaultCheckpointFS
+			resumed := &recordingSink{}
+			sum, err := Replay(context.Background(), strings.NewReader(input), resumed, subOpts)
+			if err != nil {
+				t.Fatalf("resumed Replay() error = %v", err)
+			}
+			if faultStep == "syncDir" {
+				if sum.SkippedCheckpointed != 2 || len(resumed.names) != 0 {
+					t.Errorf("resumed after syncDir failure: sum=%+v names=%v", sum, resumed.names)
+				}
+			} else {
+				if sum.SkippedCheckpointed != 1 || !slices.Equal(resumed.names, []string{"span-1"}) {
+					t.Errorf("resumed after %s failure: sum=%+v names=%v, want span-1", faultStep, sum, resumed.names)
+				}
+			}
+		})
+	}
 }
 
 // fakeClock drives a RateLimiter without real sleeps.
@@ -778,6 +1026,30 @@ func TestRateLimiter(t *testing.T) {
 		if _, err := NewRateLimiter(bad); err == nil {
 			t.Errorf("NewRateLimiter(%v) succeeded", bad)
 		}
+	}
+
+	// An extremely small positive rate must clamp wait to math.MaxInt64 rather
+	// than overflowing int64 to a negative time.Duration and busy-looping.
+	sleepCalls := 0
+	var gotWait time.Duration
+	tinyCtx, tinyCancel := context.WithCancel(ctx)
+	tiny := newRateLimiter(1e-300, clk.Now, func(c context.Context, d time.Duration) error {
+		sleepCalls++
+		gotWait = d
+		if d <= 0 {
+			t.Fatalf("Wait computed non-positive duration %v (int64 overflow)", d)
+		}
+		tinyCancel()
+		return c.Err()
+	})
+	if err := tiny.Wait(tinyCtx); err != nil {
+		t.Fatalf("first Wait on 1e-300 rate failed: %v", err)
+	}
+	if err := tiny.Wait(tinyCtx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("second Wait on 1e-300 rate = %v, want context.Canceled", err)
+	}
+	if sleepCalls != 1 || gotWait != time.Duration(math.MaxInt64) {
+		t.Errorf("sleepCalls = %d, gotWait = %v; want 1 call with math.MaxInt64", sleepCalls, gotWait)
 	}
 }
 
@@ -1020,6 +1292,46 @@ func TestOTLPHTTPSink(t *testing.T) {
 			script:    []scriptedResponse{{status: 200, header: protoHeader, body: mustMarshal(t, warning.MarshalProto)}},
 			wantCalls: 1,
 		},
+		{
+			name:          "200 HTML proxy page is not treated as delivered",
+			signal:        "traces",
+			script:        []scriptedResponse{{status: 200, header: map[string]string{"Content-Type": "text/html; charset=utf-8"}, body: []byte("<html>Sign in</html>")}},
+			wantErr:       []string{`unexpected Content-Type "text/html; charset=utf-8"`, "Sign in"},
+			wantPermanent: false,
+			wantCalls:     1,
+		},
+		{
+			name:          "200 truncated JSON body is not treated as delivered",
+			signal:        "traces",
+			script:        []scriptedResponse{{status: 200, header: map[string]string{"Content-Type": "application/json"}, body: []byte(`{"partialSuccess":`)}},
+			wantErr:       []string{"decoding 200 OK response"},
+			wantPermanent: false,
+			wantCalls:     1,
+		},
+		{
+			name:          "200 malformed protobuf body is not treated as delivered",
+			signal:        "logs",
+			script:        []scriptedResponse{{status: 200, header: protoHeader, body: []byte{0x0a, 0xff, 0x01}}},
+			wantErr:       []string{"decoding 200 OK response"},
+			wantPermanent: false,
+			wantCalls:     1,
+		},
+		{
+			name:          "200 oversized body is rejected as ambiguous delivery",
+			signal:        "metrics",
+			script:        []scriptedResponse{{status: 200, header: map[string]string{"Content-Type": "application/json"}, body: bytes.Repeat([]byte(" "), otlpMaxResponseBytes+1)}},
+			wantErr:       []string{"response body exceeds 1048576 bytes"},
+			wantPermanent: false,
+			wantCalls:     1,
+		},
+		{
+			name:          "202 Accepted is rejected as unexpected status",
+			signal:        "traces",
+			script:        []scriptedResponse{{status: 202, header: map[string]string{"Content-Type": "application/json"}, body: []byte(`{}`)}},
+			wantErr:       []string{"unexpected status 202 Accepted"},
+			wantPermanent: false,
+			wantCalls:     1,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1166,13 +1478,14 @@ func TestOTLPRetryDelays(t *testing.T) {
 // quarantineResultColumns are the columns the replay query selects.
 var quarantineResultColumns = []string{
 	"ingest_time_us", "signal", "error_code", "error_message", "service_name",
-	"trace_id", "span_id", "raw_payload", "payload_ref_uri", "payload_ref_version", "row_fp",
+	"trace_id", "span_id", "raw_payload", "payload_ref_uri", "payload_ref_version", "row_fp", "row_ord",
 }
 
 // fakeQuarantineRow is one row the fake BigQuery returns.
 type fakeQuarantineRow struct {
 	ingest  time.Time
 	fp      int64
+	ord     int64
 	signal  string
 	code    string
 	payload string
@@ -1180,7 +1493,13 @@ type fakeQuarantineRow struct {
 
 func (r fakeQuarantineRow) after(c bigQueryCursor) bool {
 	us := r.ingest.UnixMicro()
-	return us > c.IngestTimeMicros || (us == c.IngestTimeMicros && r.fp > c.RowFingerprint)
+	if us != c.IngestTimeMicros {
+		return us > c.IngestTimeMicros
+	}
+	if r.fp != c.RowFingerprint {
+		return r.fp > c.RowFingerprint
+	}
+	return r.ord > c.DuplicateOrdinal
 }
 
 func (r fakeQuarantineRow) json() map[string]any {
@@ -1192,7 +1511,8 @@ func (r fakeQuarantineRow) json() map[string]any {
 	}
 	return map[string]any{"f": []any{
 		cell(strconv.FormatInt(r.ingest.UnixMicro(), 10)), cell(r.signal), cell(r.code), cell("rejected"),
-		cell("checkout"), cell(""), cell(""), cell(r.payload), cell(""), cell(""), cell(strconv.FormatInt(r.fp, 10)),
+		cell("checkout"), cell(""), cell(""), cell(r.payload), cell(""), cell(""),
+		cell(strconv.FormatInt(r.fp, 10)), cell(strconv.FormatInt(r.ord, 10)),
 	}}
 }
 
@@ -1236,7 +1556,15 @@ func (f *fakeQuarantineBigQuery) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		}
 		cursor, resume := cursorParams(req)
 		f.selected = nil
+		type rowKey struct {
+			us int64
+			fp int64
+		}
+		ords := map[rowKey]int64{}
 		for _, row := range f.rows {
+			k := rowKey{us: row.ingest.UnixMicro(), fp: row.fp}
+			row.ord = ords[k]
+			ords[k]++
 			if !resume || row.after(cursor) {
 				f.selected = append(f.selected, row)
 			}
@@ -1264,7 +1592,7 @@ func (f *fakeQuarantineBigQuery) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		fields := make([]any, len(quarantineResultColumns))
 		for i, name := range quarantineResultColumns {
 			typ := "STRING"
-			if name == "ingest_time_us" || name == "row_fp" {
+			if name == "ingest_time_us" || name == "row_fp" || name == "row_ord" {
 				typ = "INTEGER"
 			}
 			fields[i] = map[string]any{"name": name, "type": typ}
@@ -1303,6 +1631,10 @@ func cursorParams(req *bigqueryapi.QueryRequest) (bigQueryCursor, bool) {
 		case "cursor_fp":
 			if fp, err := strconv.ParseInt(p.ParameterValue.Value, 10, 64); err == nil {
 				c.RowFingerprint, haveFP = fp, true
+			}
+		case "cursor_ord":
+			if ord, err := strconv.ParseInt(p.ParameterValue.Value, 10, 64); err == nil {
+				c.DuplicateOrdinal = ord
 			}
 		}
 	}
@@ -1459,14 +1791,14 @@ func TestReplayBigQueryCheckpointResume(t *testing.T) {
 	req := fake.requests[len(fake.requests)-1]
 	for _, want := range []string{
 		"FROM `proj.ds.dead_letters`",
-		"WHERE ingest_time > @cursor_time OR (ingest_time = @cursor_time AND row_fp > @cursor_fp)\nORDER BY",
+		"WHERE ingest_time > @cursor_time OR (ingest_time = @cursor_time AND (row_fp > @cursor_fp OR (row_fp = @cursor_fp AND row_ord > @cursor_ord)))\nORDER BY ingest_time, row_fp, row_ord",
 	} {
 		if !strings.Contains(req.Query, want) {
 			t.Errorf("resume query lacks %q:\n%s", want, req.Query)
 		}
 	}
 	params := queryParamValues(req)
-	if params["since"] != "TIMESTAMP 2026-10-11 10:00:00+00:00" || params["cursor_time"] != "TIMESTAMP 2026-10-11 10:00:00+00:00" || params["cursor_fp"] != "INT64 -9" {
+	if params["since"] != "TIMESTAMP 2026-10-11 10:00:00+00:00" || params["cursor_time"] != "TIMESTAMP 2026-10-11 10:00:00+00:00" || params["cursor_fp"] != "INT64 -9" || params["cursor_ord"] != "INT64 0" {
 		t.Errorf("resume parameters = %v, want the partition bound raised to the cursor", params)
 	}
 	st = readCheckpointFile(t, opts.Checkpoint.Path)
@@ -1474,6 +1806,73 @@ func TestReplayBigQueryCheckpointResume(t *testing.T) {
 		t.Errorf("final checkpoint = %+v (cursor %+v), want cursor %+v", st, st.Cursor, want)
 	}
 	assertDirHolds(t, dir, "bq.ckpt")
+}
+
+func TestReplayBigQueryDuplicateRowsWithCheckpoint(t *testing.T) {
+	base := time.Date(2026, 10, 11, 10, 0, 0, 0, time.UTC)
+	dupPayload := sampleSpanJSON(t, "dup-span")
+	fake := &fakeQuarantineBigQuery{rows: []fakeQuarantineRow{
+		{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: dupPayload},
+		{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: dupPayload},
+		{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: dupPayload},
+	}}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	src := BigQuerySource{Project: "proj", Dataset: "ds", Table: "dead_letters"}
+
+	// 1. Uninterrupted checkpointed run over three identical rows must replay all three.
+	dir1 := t.TempDir()
+	opts1 := Options{Checkpoint: &CheckpointConfig{Path: filepath.Join(dir1, "uninterrupted.ckpt")}}
+	sink1 := &recordingSink{}
+	sum1, err := ReplayBigQuery(context.Background(), src, sink1, opts1, bigQueryTestOptions(srv)...)
+	if err != nil {
+		t.Fatalf("uninterrupted ReplayBigQuery: %v", err)
+	}
+	if want := (Summary{TotalRead: 3, Matched: 3, ReplayedSpans: 3}); sum1 != want {
+		t.Errorf("uninterrupted summary = %+v, want %+v", sum1, want)
+	}
+	if len(sink1.names) != 3 {
+		t.Errorf("uninterrupted replayed %d spans, want 3", len(sink1.names))
+	}
+	st1 := readCheckpointFile(t, opts1.Checkpoint.Path)
+	if want := (bigQueryCursor{IngestTimeMicros: base.UnixMicro(), RowFingerprint: 77, DuplicateOrdinal: 2}); st1.Cursor == nil || *st1.Cursor != want || st1.Handled != 3 {
+		t.Errorf("uninterrupted checkpoint = %+v (cursor %+v), want cursor %+v", st1, st1.Cursor, want)
+	}
+
+	// 2. Interrupted run failing transiently on the 2nd duplicate, followed by a resume,
+	// must deliver all three duplicate rows across the two runs without dropping any.
+	dir2 := t.TempDir()
+	opts2 := Options{Checkpoint: &CheckpointConfig{Path: filepath.Join(dir2, "interrupted.ckpt")}}
+	flaky := &recordingSink{fail: func(call int) error {
+		if call == 2 {
+			return errors.New("transient OTLP timeout")
+		}
+		return nil
+	}}
+	_, err = ReplayBigQuery(context.Background(), src, flaky, opts2, bigQueryTestOptions(srv)...)
+	if err == nil || !strings.Contains(err.Error(), "transient OTLP timeout") {
+		t.Fatalf("first interrupted run = %v, want transient OTLP timeout", err)
+	}
+	st2 := readCheckpointFile(t, opts2.Checkpoint.Path)
+	if want := (bigQueryCursor{IngestTimeMicros: base.UnixMicro(), RowFingerprint: 77, DuplicateOrdinal: 0}); st2.Cursor == nil || *st2.Cursor != want || st2.Handled != 1 {
+		t.Fatalf("checkpoint after 1st duplicate = %+v (cursor %+v), want %+v", st2, st2.Cursor, want)
+	}
+
+	resumed := &recordingSink{}
+	sum2, err := ReplayBigQuery(context.Background(), src, resumed, opts2, bigQueryTestOptions(srv)...)
+	if err != nil {
+		t.Fatalf("resumed duplicate run: %v", err)
+	}
+	if want := (Summary{TotalRead: 2, Matched: 2, ReplayedSpans: 2}); sum2 != want {
+		t.Errorf("resumed duplicate summary = %+v, want %+v", sum2, want)
+	}
+	if total := len(flaky.names) + len(resumed.names); total != 3 {
+		t.Errorf("total replayed duplicates across both runs = %d, want 3", total)
+	}
+	st2 = readCheckpointFile(t, opts2.Checkpoint.Path)
+	if want := (bigQueryCursor{IngestTimeMicros: base.UnixMicro(), RowFingerprint: 77, DuplicateOrdinal: 2}); st2.Cursor == nil || *st2.Cursor != want || st2.Handled != 3 {
+		t.Errorf("final duplicate checkpoint = %+v (cursor %+v), want %+v", st2, st2.Cursor, want)
+	}
 }
 
 func TestReplayBigQueryErrors(t *testing.T) {

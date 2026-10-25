@@ -279,6 +279,23 @@ func TestRedactionAndLogIdentityFlags(t *testing.T) {
 	if got := column(rows, "insert_id"); !slices.Equal(got, []string{"rec-42"}) {
 		t.Errorf("insert_id = %q, want the -insert-id-attribute value", got)
 	}
+
+	// Verify -redact, -redact-disable-default-keys, and -redact-mask-replacement.
+	e2 := startEnv(t)
+	e2.gcs.put("exports/2025-03-14.jsonl", jsonl(spansLine))
+	code, stdout, stderr = runCommand(t, withRequired(
+		"-redact",
+		"-redact-disable-default-keys",
+		"-redact-keys=x-session",
+		"-redact-mask-replacement=<MASKED>",
+	)...)
+	if code != 0 {
+		t.Fatalf("exit %d, stderr %q, stdout:\n%s", code, stderr, stdout)
+	}
+	spans2 := fmt.Sprint(e2.bq.Rows("otel_spans"))
+	if strings.Contains(spans2, "session-cleartext") || !strings.Contains(spans2, "<MASKED>") {
+		t.Errorf("custom mask replacement not applied to x-session: %s", spans2)
+	}
 }
 
 func TestSignalTableAndBatchFlags(t *testing.T) {

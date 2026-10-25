@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
+	"cloud.google.com/go/bigquery/storage/managedwriter"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -30,6 +31,7 @@ import (
 	"google.golang.org/api/option"
 
 	bqi "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/bigquery"
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/protoenc"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/redact"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/testfakes/bqfake"
@@ -622,6 +624,72 @@ func TestRunRedactsBeforeAppending(t *testing.T) {
 	}
 }
 
+func TestRunRedactionParityWithLiveExporter(t *testing.T) {
+	makeArchive := func(t *testing.T) []byte {
+		t.Helper()
+		td, spans := newSpans(1, "parity", spanStart)
+		attrs := spans.At(0).Attributes()
+		attrs.PutStr("authorization", "Bearer live-default-must-survive")
+		attrs.PutStr("x-custom-header", "custom-header-cleartext")
+		return jsonl(tracesJSON(t, td))
+	}
+
+	t.Run("default config keeps built-in keys like live exporter", func(t *testing.T) {
+		e := newTestEnv(t)
+		e.gcs.put("exports/default.jsonl", makeArchive(t))
+		rep := mustRun(t, e.config())
+		if !rep.Complete() {
+			t.Fatalf("Complete() = false: %+v", rep.Failures)
+		}
+		dump := fmt.Sprint(e.bq.Rows(DefaultTracesTable))
+		if !strings.Contains(dump, "Bearer live-default-must-survive") {
+			t.Errorf("default backfill redacted authorization when Redact=false: %s", dump)
+		}
+		if !strings.Contains(dump, "custom-header-cleartext") {
+			t.Errorf("default backfill redacted x-custom-header: %s", dump)
+		}
+	})
+
+	t.Run("Redact=true enables default blocked keys", func(t *testing.T) {
+		e := newTestEnv(t)
+		e.gcs.put("exports/enabled.jsonl", makeArchive(t))
+		cfg := e.config()
+		cfg.Redact = true
+		rep := mustRun(t, cfg)
+		if !rep.Complete() {
+			t.Fatalf("Complete() = false: %+v", rep.Failures)
+		}
+		dump := fmt.Sprint(e.bq.Rows(DefaultTracesTable))
+		if strings.Contains(dump, "Bearer live-default-must-survive") {
+			t.Errorf("Redact=true left authorization in the clear: %s", dump)
+		}
+		if !strings.Contains(dump, "custom-header-cleartext") {
+			t.Errorf("Redact=true without BlockedKeys masked x-custom-header: %s", dump)
+		}
+	})
+
+	t.Run("DisableDefaultKeys and custom MaskReplacement", func(t *testing.T) {
+		e := newTestEnv(t)
+		e.gcs.put("exports/custom.jsonl", makeArchive(t))
+		cfg := e.config()
+		cfg.Redact = true
+		cfg.DisableDefaultKeys = true
+		cfg.BlockedKeys = []string{"x-custom-header"}
+		cfg.MaskReplacement = "<CUSTOM_MASK>"
+		rep := mustRun(t, cfg)
+		if !rep.Complete() {
+			t.Fatalf("Complete() = false: %+v", rep.Failures)
+		}
+		dump := fmt.Sprint(e.bq.Rows(DefaultTracesTable))
+		if !strings.Contains(dump, "Bearer live-default-must-survive") {
+			t.Errorf("DisableDefaultKeys=true still redacted authorization: %s", dump)
+		}
+		if strings.Contains(dump, "custom-header-cleartext") || !strings.Contains(dump, "<CUSTOM_MASK>") {
+			t.Errorf("custom BlockedKeys + MaskReplacement not applied: %s", dump)
+		}
+	})
+}
+
 func TestRunSignalSkipsOtherSignals(t *testing.T) {
 	e := newTestEnv(t)
 	e.gcs.put("exports/mixed.jsonl", jsonl(
@@ -863,6 +931,72 @@ func TestRunStopsOnPermanentAppendFailure(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("split batch with row errors and permanent failure aborts", func(t *testing.T) {
+		e := newTestEnv(t)
+		cfg := e.config()
+		if err := cfg.normalize(); err != nil {
+			t.Fatal(err)
+		}
+		lifetimeCtx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		client, err := managedwriter.NewClient(lifetimeCtx, cfg.Project, cfg.WriteClientOptions...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = client.Close() }()
+		ts, label := tableSchema(SignalTraces)
+		enc, err := protoenc.New(ts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sk := &sink{
+			table: DefaultTracesTable,
+			enc:   enc,
+			writer: bqi.NewWriter(lifetimeCtx, client, bqi.WriterOptions{
+				Project:             cfg.Project,
+				Dataset:             cfg.Dataset,
+				Table:               DefaultTracesTable,
+				Signal:              label,
+				Descriptor:          enc.Descriptor(),
+				MaxRequestBytes:     64,
+				MaxInflightRequests: maxInflightRequests,
+				MaxInflightBytes:    maxInflightBytes,
+				StreamPoolSize:      1,
+				TraceID:             writeTraceID,
+			}),
+		}
+		defer func() { _ = sk.writer.Close() }()
+
+		// Build 2 rows of 128 bytes each (> 64-byte MaxRequestBytes) so a single
+		// Append call splits into two sub-requests.
+		row := bytes.Repeat([]byte{0x08, 0x01}, 64)
+		batch := [][]byte{row, row}
+		e.bq.EnqueueFault(
+			bqfake.Fault{
+				Mode:      bqfake.FaultRowErrors,
+				Table:     DefaultTracesTable,
+				RowErrors: []*storagepb.RowError{{Index: 0, Code: storagepb.RowError_FIELDS_ERROR, Message: "bad row"}},
+			},
+			bqfake.Fault{
+				Mode:  bqfake.FaultPermissionDenied,
+				Table: DefaultTracesTable,
+			},
+		)
+		r := &run{cfg: cfg}
+		acked, refused, err := r.appendRows(context.Background(), sk, batch)
+
+		var permanent *PermanentError
+		if !errors.As(err, &permanent) || permanent.Label != bqi.LabelPermission || permanent.Table != DefaultTracesTable {
+			t.Fatalf("appendRows error = %v, want *PermanentError labeled %s", err, bqi.LabelPermission)
+		}
+		if acked != 0 || refused != 1 {
+			t.Errorf("acked=%d refused=%d, want acked=0 refused=1", acked, refused)
+		}
+		if got := e.requests(); got != 2 {
+			t.Errorf("%d append requests, want 2 (no retry after permanent failure)", got)
+		}
+	})
 }
 
 func TestRunRebuildsStreamOnce(t *testing.T) {
@@ -1024,6 +1158,27 @@ func TestRunCapsListedFailures(t *testing.T) {
 	}
 	if last := rep.Failures[len(rep.Failures)-1]; last.Line != maxListedFailures {
 		t.Errorf("the last listed failure is line %d, want line %d", last.Line, maxListedFailures)
+	}
+
+	// Verify that readObject itself caps per-object failure slice growth at
+	// maxListedFailures even on an archive with 100,000 malformed lines.
+	const hugeLines = 100_000
+	huge := bytes.Repeat([]byte("garbage\n"), hugeLines)
+	r := &run{
+		cfg:    Config{MaxLineBytes: DefaultMaxLineBytes},
+		bucket: testBucket,
+		store:  &memStore{objects: map[string][]byte{"exports/huge.jsonl": huge}},
+	}
+	st := &objectStats{
+		url:     "gs://" + testBucket + "/exports/huge.jsonl",
+		signals: map[string]*signalStats{},
+	}
+	if err := r.readObject(context.Background(), Object{Name: "exports/huge.jsonl", Size: int64(len(huge))}, st); err != nil {
+		t.Fatalf("readObject(huge): %v", err)
+	}
+	if len(st.failures) != maxListedFailures || st.failureCount != hugeLines || st.malformed != hugeLines {
+		t.Errorf("len(st.failures)=%d st.failureCount=%d st.malformed=%d, want %d, %d, %d",
+			len(st.failures), st.failureCount, st.malformed, maxListedFailures, hugeLines, hugeLines)
 	}
 }
 

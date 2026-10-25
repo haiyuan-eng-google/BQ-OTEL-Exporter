@@ -76,23 +76,26 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 
 	var valuePatterns patterns
 	var (
-		source            = fs.String("source-gcs-prefix", "", "gs://bucket/prefix whose .jsonl and .jsonl.gz objects are appended; end it with / to select one folder (required)")
-		project           = fs.String("project", "", "BigQuery project that holds -dataset (required)")
-		dataset           = fs.String("dataset", "", "BigQuery dataset the exporter writes to (required)")
-		signalName        = fs.String("signal", backfill.SignalAuto, "Signal to append: traces, logs, metrics, or auto for every signal found")
-		batchSize         = fs.Int("batch-size", backfill.DefaultBatchSize, "Rows per append")
-		maxWorkers        = fs.Int("max-workers", backfill.DefaultMaxWorkers, "Objects read and appended at once")
-		tracesTable       = fs.String("traces-table", backfill.DefaultTracesTable, "Span table (the exporter's traces.table)")
-		logsTable         = fs.String("logs-table", backfill.DefaultLogsTable, "Log table (the exporter's logs.table)")
-		metricsTable      = fs.String("metrics-table", backfill.DefaultMetricsTable, "Metric table (the exporter's metrics.table)")
-		redactKeys        = fs.String("redact-keys", "", "Comma-separated attribute keys masked in addition to the defaults (the exporter's redaction.blocked_keys)")
-		redactLogBody     = fs.Bool("redact-log-body", false, "Apply the value patterns to log bodies (the exporter's redaction.redact_log_body)")
-		logNameAttribute  = fs.String("log-name-attribute", "", "The exporter's logs.log_name_attribute")
-		insertIDAttribute = fs.String("insert-id-attribute", "", "The exporter's logs.insert_id_attribute")
-		maxAttempts       = fs.Int("max-attempts", backfill.DefaultMaxAttempts, "Attempts at one append or one Cloud Storage request before the object fails")
-		maxLineBytes      = fs.Int("max-line-bytes", backfill.DefaultMaxLineBytes, "Longest line read; a longer line is reported and skipped")
-		format            = fs.String("format", "text", "Report format: text or json")
-		progress          = fs.Bool("progress", true, "Print a line to stderr as each object finishes")
+		source                   = fs.String("source-gcs-prefix", "", "gs://bucket/prefix whose .jsonl and .jsonl.gz objects are appended; end it with / to select one folder (required)")
+		project                  = fs.String("project", "", "BigQuery project that holds -dataset (required)")
+		dataset                  = fs.String("dataset", "", "BigQuery dataset the exporter writes to (required)")
+		signalName               = fs.String("signal", backfill.SignalAuto, "Signal to append: traces, logs, metrics, or auto for every signal found")
+		batchSize                = fs.Int("batch-size", backfill.DefaultBatchSize, "Rows per append")
+		maxWorkers               = fs.Int("max-workers", backfill.DefaultMaxWorkers, "Objects read and appended at once")
+		tracesTable              = fs.String("traces-table", backfill.DefaultTracesTable, "Span table (the exporter's traces.table)")
+		logsTable                = fs.String("logs-table", backfill.DefaultLogsTable, "Log table (the exporter's logs.table)")
+		metricsTable             = fs.String("metrics-table", backfill.DefaultMetricsTable, "Metric table (the exporter's metrics.table)")
+		redactEnabled            = fs.Bool("redact", false, "Enable client-side redaction (the exporter's redaction.enabled); also enabled when any other -redact-* flag is set")
+		redactKeys               = fs.String("redact-keys", "", "Comma-separated attribute keys masked in addition to the defaults (the exporter's redaction.blocked_keys)")
+		redactDisableDefaultKeys = fs.Bool("redact-disable-default-keys", false, "Disable the built-in blocked key list so only -redact-keys apply (the exporter's redaction.disable_default_keys)")
+		redactMaskReplacement    = fs.String("redact-mask-replacement", "", "Replacement text for redacted values (the exporter's redaction.mask_replacement; defaults to [REDACTED])")
+		redactLogBody            = fs.Bool("redact-log-body", false, "Apply the value patterns to log bodies (the exporter's redaction.redact_log_body)")
+		logNameAttribute         = fs.String("log-name-attribute", "", "The exporter's logs.log_name_attribute")
+		insertIDAttribute        = fs.String("insert-id-attribute", "", "The exporter's logs.insert_id_attribute")
+		maxAttempts              = fs.Int("max-attempts", backfill.DefaultMaxAttempts, "Attempts at one append or one Cloud Storage request before the object fails")
+		maxLineBytes             = fs.Int("max-line-bytes", backfill.DefaultMaxLineBytes, "Longest line read; a longer line is reported and skipped")
+		format                   = fs.String("format", "text", "Report format: text or json")
+		progress                 = fs.Bool("progress", true, "Print a line to stderr as each object finishes")
 	)
 	fs.Var(&valuePatterns, "redact-value-pattern", "RE2 expression whose matches are masked inside string values (the exporter's redaction.blocked_value_patterns); repeat for more")
 
@@ -139,8 +142,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		MetricsTable:         *metricsTable,
 		BatchSize:            *batchSize,
 		MaxWorkers:           *maxWorkers,
+		Redact:               *redactEnabled,
 		BlockedKeys:          keys,
+		DisableDefaultKeys:   *redactDisableDefaultKeys,
 		BlockedValuePatterns: valuePatterns,
+		MaskReplacement:      *redactMaskReplacement,
 		RedactLogBody:        *redactLogBody,
 		LogNameAttribute:     *logNameAttribute,
 		InsertIDAttribute:    *insertIDAttribute,

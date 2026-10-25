@@ -226,13 +226,14 @@ func ParseCategories(s string) ([]Category, error) {
 
 // tableSpec is one table Run checks, with its metadata once read.
 type tableSpec struct {
-	label  string // "traces table"
-	signal Signal // empty for the quarantine table
-	id     string
-	want   *storagepb.TableSchema
-	ddl    string // the internal/schema constants that create it
-	md     *bq.TableMetadata
-	err    error
+	label      string // "traces table"
+	signal     Signal // empty for the quarantine table
+	id         string
+	want       *storagepb.TableSchema
+	wantLayout *bq.TableMetadata
+	ddl        string // the internal/schema constants that create it
+	md         *bq.TableMetadata
+	err        error
 }
 
 // companionView describes how to dry-run one companion view.
@@ -375,23 +376,65 @@ type validator struct {
 	checks map[Category][]Check
 }
 
+func mustDestinationMetadata(s *storagepb.TableSchema, project, dataset, table string) *bq.TableMetadata {
+	md, _, err := schema.DestinationMetadata(s, project, dataset, table)
+	if err != nil {
+		panic(err)
+	}
+	return md
+}
+
+func mustQuarantineDestinationMetadata() *bq.TableMetadata {
+	md, err := schema.QuarantineDestinationMetadata()
+	if err != nil {
+		panic(err)
+	}
+	return md
+}
+
 func (v *validator) tableSpecs() []*tableSpec {
 	var out []*tableSpec
 	if v.signal(SignalTraces) {
-		out = append(out, &tableSpec{label: "traces table", signal: SignalTraces, id: v.cfg.TracesTable,
-			want: schema.SpansTableSchema(), ddl: "SpansDDL and SpansDedupViewDDL"})
+		want := schema.SpansTableSchema()
+		out = append(out, &tableSpec{
+			label:      "traces table",
+			signal:     SignalTraces,
+			id:         v.cfg.TracesTable,
+			want:       want,
+			wantLayout: mustDestinationMetadata(want, v.cfg.Project, v.cfg.Dataset, DefaultTracesTable),
+			ddl:        "SpansDDL and SpansDedupViewDDL",
+		})
 	}
 	if v.signal(SignalLogs) {
-		out = append(out, &tableSpec{label: "logs table", signal: SignalLogs, id: v.cfg.LogsTable,
-			want: schema.LogsTableSchema(), ddl: "LogsDDL and LogsDedupViewDDL"})
+		want := schema.LogsTableSchema()
+		out = append(out, &tableSpec{
+			label:      "logs table",
+			signal:     SignalLogs,
+			id:         v.cfg.LogsTable,
+			want:       want,
+			wantLayout: mustDestinationMetadata(want, v.cfg.Project, v.cfg.Dataset, DefaultLogsTable),
+			ddl:        "LogsDDL and LogsDedupViewDDL",
+		})
 	}
 	if v.signal(SignalMetrics) {
-		out = append(out, &tableSpec{label: "metrics table", signal: SignalMetrics, id: v.cfg.MetricsTable,
-			want: schema.MetricsTableSchema(), ddl: "MetricsDDL and MetricsDedupViewDDL"})
+		want := schema.MetricsTableSchema()
+		out = append(out, &tableSpec{
+			label:      "metrics table",
+			signal:     SignalMetrics,
+			id:         v.cfg.MetricsTable,
+			want:       want,
+			wantLayout: mustDestinationMetadata(want, v.cfg.Project, v.cfg.Dataset, DefaultMetricsTable),
+			ddl:        "MetricsDDL and MetricsDedupViewDDL",
+		})
 	}
 	if !v.cfg.SkipQuarantine {
-		out = append(out, &tableSpec{label: "quarantine table", id: v.cfg.QuarantineTable,
-			want: schema.QuarantineTableSchema(), ddl: "QuarantineDDL"})
+		out = append(out, &tableSpec{
+			label:      "quarantine table",
+			id:         v.cfg.QuarantineTable,
+			want:       schema.QuarantineTableSchema(),
+			wantLayout: mustQuarantineDestinationMetadata(),
+			ddl:        "QuarantineDDL",
+		})
 	}
 	return out
 }
@@ -501,7 +544,8 @@ func (v *validator) checkTableSchema(t *tableSpec) {
 		add(StatusFail, "unreadable table schema: "+err.Error(), v.migrateRemediation(t))
 		return
 	}
-	if diffs := schema.CompatibilityDifferences(t.want, have); len(diffs) > 0 {
+	diffs := append(schema.CompatibilityDifferences(t.want, have), layoutDifferences(t.wantLayout, t.md)...)
+	if len(diffs) > 0 {
 		add(StatusFail, fmt.Sprintf("does not match schema %s: %s", schema.Version, summarize(diffs, 10)),
 			v.migrateRemediation(t))
 		return
@@ -511,6 +555,42 @@ func (v *validator) checkTableSchema(t *tableSpec) {
 		detail += "; queries must filter on its partitioning column (require_partition_filter)"
 	}
 	add(StatusPass, detail, "")
+}
+
+func layoutDifferences(want, got *bq.TableMetadata) []string {
+	if want == nil || got == nil {
+		return nil
+	}
+	var diffs []string
+	if wp := want.TimePartitioning; wp != nil {
+		gp := got.TimePartitioning
+		if gp == nil {
+			diffs = append(diffs, fmt.Sprintf("time partitioning is missing, want %s partitioning on %s", wp.Type, wp.Field))
+		} else {
+			if gp.Type != wp.Type {
+				diffs = append(diffs, fmt.Sprintf("time partitioning has type %s, want %s", gp.Type, wp.Type))
+			}
+			if gp.Field != wp.Field {
+				gotField := gp.Field
+				if gotField == "" {
+					gotField = "_PARTITIONTIME"
+				}
+				diffs = append(diffs, fmt.Sprintf("time partitioning is on %s, want %s", gotField, wp.Field))
+			}
+		}
+	}
+	if wc := want.Clustering; wc != nil && len(wc.Fields) > 0 {
+		var gotFields []string
+		if got.Clustering != nil {
+			gotFields = got.Clustering.Fields
+		}
+		if len(gotFields) == 0 {
+			diffs = append(diffs, fmt.Sprintf("clustering is missing, want (%s)", strings.Join(wc.Fields, ", ")))
+		} else if !slices.Equal(gotFields, wc.Fields) {
+			diffs = append(diffs, fmt.Sprintf("clustering is (%s), want (%s)", strings.Join(gotFields, ", "), strings.Join(wc.Fields, ", ")))
+		}
+	}
+	return diffs
 }
 
 // summarize joins at most limit items and counts the rest.
@@ -687,7 +767,13 @@ func (v *validator) checkTablePermissions(ctx context.Context, t *tableSpec) {
 	id := v.qualify(t.id)
 	name := t.label + " permissions"
 	if t.err != nil && describe(t.err).code == http.StatusNotFound {
-		v.add(Check{Category: CategoryIAM, Name: name, Resource: id, Status: StatusSkip, Detail: "not checked: table not found"})
+		if v.enabled(CategorySchema) {
+			v.add(Check{Category: CategoryIAM, Name: name, Resource: id, Status: StatusSkip, Detail: "not checked: table not found"})
+		} else {
+			v.add(Check{Category: CategoryIAM, Name: name, Resource: id, Status: StatusFail,
+				Detail:      "cannot test permissions: table not found",
+				Remediation: v.createTableRemediation(t)})
+		}
 		return
 	}
 	want := []string{permTablesGet, permTablesUpdateData}
@@ -695,7 +781,9 @@ func (v *validator) checkTablePermissions(ctx context.Context, t *tableSpec) {
 	if err != nil {
 		e := describe(err)
 		if e.code == http.StatusNotFound {
-			v.add(Check{Category: CategoryIAM, Name: name, Resource: id, Status: StatusSkip, Detail: "not checked: table not found"})
+			v.add(Check{Category: CategoryIAM, Name: name, Resource: id, Status: StatusFail,
+				Detail:      "cannot test permissions: table not found",
+				Remediation: v.createTableRemediation(t)})
 			return
 		}
 		v.add(Check{Category: CategoryIAM, Name: name, Resource: id, Status: StatusFail,

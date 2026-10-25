@@ -228,19 +228,34 @@ func (s *OTLPHTTPSink) post(ctx context.Context, path string, body []byte, unit 
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, otlpMaxResponseBytes))
 		_ = resp.Body.Close()
 	}()
-	respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, otlpMaxResponseBytes))
+	respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, otlpMaxResponseBytes+1))
 	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 	isJSON := mediaType == "application/json"
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		// The receiver took the batch. A body that cannot be read or
-		// decoded leaves nothing to report: sending the batch again would
-		// only duplicate it.
-		if readErr != nil || len(respBody) == 0 {
+		if resp.StatusCode != http.StatusOK && (resp.StatusCode != http.StatusNoContent || len(respBody) > 0) {
+			return false, 0, fmt.Errorf("POST %s%s: unexpected status %s%s", s.display, path, resp.Status, errorDetail(respBody, mediaType))
+		}
+		if readErr != nil {
+			return false, 0, fmt.Errorf("POST %s%s: reading %s response body: %w", s.display, path, resp.Status, readErr)
+		}
+		if len(respBody) > otlpMaxResponseBytes {
+			return false, 0, fmt.Errorf("POST %s%s: %s response body exceeds %d bytes", s.display, path, resp.Status, otlpMaxResponseBytes)
+		}
+		if len(respBody) == 0 {
+			if mediaType != "" && mediaType != otlpProtobufContentType && !isJSON {
+				return false, 0, fmt.Errorf("POST %s%s: %s: unexpected Content-Type %q", s.display, path, resp.Status, resp.Header.Get("Content-Type"))
+			}
 			return false, 0, nil
 		}
+		if mediaType != otlpProtobufContentType && !isJSON {
+			return false, 0, fmt.Errorf("POST %s%s: %s: unexpected Content-Type %q%s", s.display, path, resp.Status, resp.Header.Get("Content-Type"), errorDetail(respBody, mediaType))
+		}
 		rejected, message, perr := partial(respBody, isJSON)
-		if perr == nil && rejected > 0 {
+		if perr != nil {
+			return false, 0, fmt.Errorf("POST %s%s: decoding %s response: %w", s.display, path, resp.Status, perr)
+		}
+		if rejected > 0 {
 			return false, 0, &PermanentError{Err: fmt.Errorf("POST %s%s: the receiver rejected %d %s: %s",
 				s.display, path, rejected, unit, quoteDetail(message))}
 		}
