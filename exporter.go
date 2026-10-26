@@ -12,6 +12,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/auth/credentials"
@@ -111,6 +112,12 @@ type signalExporter struct {
 	// misbuilt security control fails the component instead of being
 	// silently skipped.
 	startErr error
+
+	// createdDataset records whether ensureDataset created the destination
+	// dataset during start (true only when admin.CreateDataset returned nil;
+	// false when DatasetMetadata succeeded or CreateDataset returned 409
+	// AlreadyExists or any other error).
+	createdDataset atomic.Bool
 }
 
 func newSignalExporter(

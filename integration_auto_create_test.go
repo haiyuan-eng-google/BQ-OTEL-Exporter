@@ -67,9 +67,6 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 		}
 		closeHTTP()
 	})
-	if err := createOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup); err != nil {
-		t.Fatalf("create dataset %s.%s: %v", project, dataset, err)
-	}
 
 	cfg := validConfig()
 	cfg.Project = project
@@ -92,8 +89,21 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if !traces.createdDataset.Load() {
+			return
+		}
+		cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanCancel()
+		if err := admin.Dataset(dataset).DeleteWithContents(cleanCtx); err != nil {
+			t.Errorf("delete ephemeral dataset %s: %v", dataset, err)
+		}
+	})
 	if err := traces.start(ctx, nil); err != nil {
 		t.Fatalf("first trace startup: %v", err)
+	}
+	if !traces.createdDataset.Load() {
+		t.Fatalf("first trace startup did not cold-create dataset %s.%s (createdDataset=false)", project, dataset)
 	}
 	defer func() { _ = traces.shutdown(context.Background()) }()
 
@@ -143,6 +153,9 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 	}
 	if err := secondTraces.start(ctx, nil); err != nil {
 		t.Fatalf("second trace startup was not idempotent: %v", err)
+	}
+	if secondTraces.createdDataset.Load() {
+		t.Fatalf("second trace startup against existing dataset %s.%s set createdDataset=true, want false", project, dataset)
 	}
 	if err := secondTraces.shutdown(ctx); err != nil {
 		t.Fatalf("second trace shutdown: %v", err)

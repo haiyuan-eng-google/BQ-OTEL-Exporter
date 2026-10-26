@@ -434,9 +434,13 @@ func (e *signalExporter) ensureDataset(ctx context.Context, admin destinationAdm
 		if len(e.cfg.Labels) > 0 {
 			dsMD.Labels = maps.Clone(e.cfg.Labels)
 		}
-		if err := admin.CreateDataset(ctx, dsMD); err != nil && !isAlreadyExists(err) {
-			return fmt.Errorf("creating destination dataset %s.%s: %w", e.cfg.Project, e.cfg.Dataset, err)
+		if err := admin.CreateDataset(ctx, dsMD); err != nil {
+			if !isAlreadyExists(err) {
+				return fmt.Errorf("creating destination dataset %s.%s: %w", e.cfg.Project, e.cfg.Dataset, err)
+			}
+			return nil
 		}
+		e.createdDataset.Store(true)
 		return nil
 	default:
 		e.logger.Warn("dataset metadata is unreadable; deferring authorization to the real append",

@@ -28,6 +28,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.uber.org/zap"
 	bigqueryapi "google.golang.org/api/bigquery/v2"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
@@ -445,49 +446,104 @@ func stringOrEmpty(v any) string {
 	return ""
 }
 
+// isAllowedContinuousQueryDryRunReason reports whether a BigQuery ErrorProto or
+// googleapi.ErrorItem Reason can represent an expected Continuous Query
+// edition/reservation or Pub/Sub topic permission gate on an on-demand test
+// project. Backend/service failures, rate/quota/resource limits, missing
+// datasets/tables, and empty reasons are never eligible for test skip.
+func isAllowedContinuousQueryDryRunReason(reason string) bool {
+	switch reason {
+	case "invalid", "invalidQuery", "billingTierLimitExceeded", "accessDenied":
+		return true
+	default:
+		return false
+	}
+}
+
 // isExpectedContinuousQueryDryRunError reports whether err from a dry-run
 // Continuous Query EXPORT DATA ... CLOUD_PUBSUB job on an on-demand project
 // without an Enterprise/Enterprise Plus CONTINUOUS reservation or Pub/Sub
 // topic is an expected environment/reservation/topic-permission rejection
-// rather than a SQL syntax, EXPORT DATA option, missing table/dataset, or
-// transient 5xx service error.
+// rather than a SQL syntax/construct error, EXPORT DATA option error, missing
+// table/dataset, project-level bigquery.jobs.create denial, or 5xx/backend error.
 func isExpectedContinuousQueryDryRunError(err error) bool {
 	if err == nil {
 		return false
 	}
 	code := extractHTTPStatusCode(err)
 	// Only HTTP 400 (edition/reservation capability check) and HTTP 403
-	// (accessDenied/permissionDenied on Pub/Sub topic or CONTINUOUS assignment)
-	// can qualify as expected environment capability rejections; 404, 5xx, and
-	// unknown errors must always fail the test.
+	// (accessDenied on Pub/Sub topic or CONTINUOUS assignment) can qualify as
+	// expected environment capability rejections; 404, 5xx, and unknown errors
+	// must always fail the test.
 	if code != http.StatusBadRequest && code != http.StatusForbidden {
 		return false
 	}
-	msg := strings.ToLower(primaryErrorMessage(err))
+	var apiErr *googleapi.Error
+	if errors.As(err, &apiErr) && len(apiErr.Errors) > 0 {
+		for _, item := range apiErr.Errors {
+			if !isAllowedContinuousQueryDryRunReason(item.Reason) {
+				return false
+			}
+		}
+	}
+	rawMsg := primaryErrorMessage(err)
+	if idx := strings.LastIndex(rawMsg, ","); idx >= 0 {
+		if trailingReason := strings.TrimSpace(rawMsg[idx+1:]); trailingReason != "" && !strings.Contains(trailingReason, " ") {
+			if !isAllowedContinuousQueryDryRunReason(trailingReason) {
+				return false
+			}
+		}
+	}
+	msg := strings.ToLower(rawMsg)
 	for _, reject := range []string{
 		"syntax error",
-		"order by",
-		"unsupported",
-		"invalid value for option",
 		"unrecognized",
+		"invalid value for option",
+		"unsupported",
+		"do not support",
+		"does not support",
+		"is not supported in this query",
+		"not supported in continuous",
+		"group by",
+		"order by",
+		"join",
+		"window",
+		"aggregate",
+		"subquery",
 		"not found",
 		"dataset",
 		"table",
 		"column",
+		"bigquery.jobs.create",
+		"bigquery.tables",
+		"bigquery.datasets",
+		"bigquery.routines",
+		"internal error",
+		"backend error",
+		"service unavailable",
+		"rate limit",
+		"quota exceeded",
+		"resources exceeded",
 	} {
 		if strings.Contains(msg, reject) {
 			return false
 		}
 	}
 	hasReservationOrEditionGate := (strings.Contains(msg, "continuous queries") || strings.Contains(msg, "continuous query")) &&
-		(strings.Contains(msg, "reservation") ||
-			strings.Contains(msg, "assignment") ||
-			strings.Contains(msg, "edition") ||
-			strings.Contains(msg, "enterprise") ||
-			strings.Contains(msg, "not enabled") ||
-			strings.Contains(msg, "not supported in this"))
-	hasPubSubPermGate := (strings.Contains(msg, "access denied") || strings.Contains(msg, "permission denied") || strings.Contains(msg, "permission")) &&
-		(strings.Contains(msg, "pubsub") || strings.Contains(msg, "topic"))
+		(strings.Contains(msg, "require the project to have a continuous assignment") ||
+			strings.Contains(msg, "continuous assignment to a reservation") ||
+			strings.Contains(msg, "require an enterprise or enterprise plus reservation") ||
+			strings.Contains(msg, "continuous query reservation") ||
+			strings.Contains(msg, "are not enabled") ||
+			strings.Contains(msg, "is not enabled") ||
+			strings.Contains(msg, "not supported in standard edition") ||
+			strings.Contains(msg, "without an enterprise") ||
+			strings.Contains(msg, "billing tier"))
+	hasPubSubPermGate := (code == http.StatusForbidden || strings.Contains(msg, "access denied") || strings.Contains(msg, "permission denied")) &&
+		(strings.Contains(msg, "permission") || strings.Contains(msg, "access denied")) &&
+		(strings.Contains(msg, "pubsub.topics") ||
+			strings.Contains(msg, "cloud_pubsub") ||
+			strings.Contains(msg, "/topics/"))
 	return hasReservationOrEditionGate || hasPubSubPermGate
 }
 
@@ -536,9 +592,34 @@ func validateContinuousExportDryRunJob(job *bigqueryapi.Job, err error) (skipRea
 		return "", errors.New("Jobs.Insert returned job with nil Status")
 	}
 	if job.Status.ErrorResult != nil {
+		if !isAllowedContinuousQueryDryRunReason(job.Status.ErrorResult.Reason) {
+			return "", fmt.Errorf("job.Status.ErrorResult = %s: %s", job.Status.ErrorResult.Reason, job.Status.ErrorResult.Message)
+		}
+		for i, item := range job.Status.Errors {
+			if item != nil && !isAllowedContinuousQueryDryRunReason(item.Reason) {
+				return "", fmt.Errorf("job.Status.Errors[%d] = %s: %s", i, item.Reason, item.Message)
+			}
+		}
+		code := http.StatusBadRequest
+		if job.Status.ErrorResult.Reason == "accessDenied" {
+			code = http.StatusForbidden
+		}
+		errItems := []googleapi.ErrorItem{{
+			Reason:  job.Status.ErrorResult.Reason,
+			Message: job.Status.ErrorResult.Message,
+		}}
+		for _, item := range job.Status.Errors {
+			if item != nil {
+				errItems = append(errItems, googleapi.ErrorItem{
+					Reason:  item.Reason,
+					Message: item.Message,
+				})
+			}
+		}
 		statusErr := &googleapi.Error{
-			Code:    http.StatusBadRequest,
-			Message: fmt.Sprintf("%s: %s", job.Status.ErrorResult.Reason, job.Status.ErrorResult.Message),
+			Code:    code,
+			Message: job.Status.ErrorResult.Message,
+			Errors:  errItems,
 		}
 		if isExpectedContinuousQueryDryRunError(statusErr) {
 			return statusErr.Error(), nil
@@ -604,8 +685,27 @@ func TestIsExpectedContinuousQueryDryRunError(t *testing.T) {
 		{"probe 2: 400 invalidQuery continuous queries do not support ORDER BY", errors.New("googleapi: Error 400: Continuous queries do not support ORDER BY, invalidQuery"), false},
 		{"probe 3: 400 invalidQuery invalid value for option format CLOUD_PUBSUB", errors.New("googleapi: Error 400: Invalid value for option 'format': CLOUD_PUBSUB, invalidQuery"), false},
 		{"probe 4: 404 notFound dataset my-enterprise-proj:otel_cq_it", errors.New("googleapi: Error 404: Not found: Dataset my-enterprise-proj:otel_cq_it, notFound"), false},
+		{"repro b: 400 invalidQuery GROUP BY is not supported in this query", errors.New("googleapi: Error 400: Continuous queries: GROUP BY is not supported in this query, invalidQuery"), false},
+		{"repro c: 400 invalidQuery do not support JOIN in Enterprise edition", errors.New("googleapi: Error 400: Continuous queries do not support JOIN in Enterprise edition, invalidQuery"), false},
+		{"repro d: 403 bigquery.jobs.create on project named my-pubsub-proj", errors.New("googleapi: Error 403: Access Denied: Project my-pubsub-proj: User does not have bigquery.jobs.create permission in project my-pubsub-proj"), false},
+		{"structured googleapi.Error with backendError reason", &googleapi.Error{
+			Code:    http.StatusBadRequest,
+			Message: "Continuous queries require the project to have a CONTINUOUS assignment to a reservation.",
+			Errors:  []googleapi.ErrorItem{{Reason: "backendError", Message: "backend failure"}},
+		}, false},
+		{"structured googleapi.Error with invalidQuery reason on reservation gate", &googleapi.Error{
+			Code:    http.StatusBadRequest,
+			Message: "Continuous queries require the project to have a CONTINUOUS assignment to a reservation. No such reservation was found in region US.",
+			Errors:  []googleapi.ErrorItem{{Reason: "invalidQuery", Message: "Continuous queries require the project to have a CONTINUOUS assignment to a reservation."}},
+		}, true},
+		{"structured googleapi.Error with live BigQuery invalid reason on reservation gate", &googleapi.Error{
+			Code:    http.StatusBadRequest,
+			Message: "Continuous queries require the project to have a CONTINUOUS assignment to a reservation. No such reservation was found in region US.",
+			Errors:  []googleapi.ErrorItem{{Reason: "invalid", Message: "Continuous queries require the project to have a CONTINUOUS assignment to a reservation. No such reservation was found in region US."}},
+		}, true},
 		{"enterprise reservation required", errors.New("googleapi: Error 400: Continuous queries require an Enterprise or Enterprise Plus reservation"), true},
 		{"pubsub permission denied", errors.New("googleapi: Error 403: Access Denied: Cloud_Pubsub topic permission denied"), true},
+		{"pubsub.topics permission denied", errors.New("googleapi: Error 403: Access Denied: User does not have pubsub.topics.publish permission on /topics/otel-alerts"), true},
 	} {
 		if got := isExpectedContinuousQueryDryRunError(tc.err); got != tc.want {
 			t.Errorf("%s: isExpectedContinuousQueryDryRunError(%v) = %v, want %v", tc.name, tc.err, got, tc.want)
@@ -623,7 +723,39 @@ func TestIsExpectedContinuousQueryDryRunError(t *testing.T) {
 		Statistics: &bigqueryapi.JobStatistics{},
 	}
 	if skipReason, fatalErr := validateContinuousExportDryRunJob(jobWithErrResult, nil); fatalErr == nil || skipReason != "" {
-		t.Fatalf("validateContinuousExportDryRunJob(Status.ErrorResult invalidQuery) = (skip=%q, err=%v), want non-nil fatalErr", skipReason, fatalErr)
+		t.Fatalf("validateContinuousExportDryRunJob(Status.ErrorResult invalidQuery ORDER BY) = (skip=%q, err=%v), want non-nil fatalErr", skipReason, fatalErr)
+	}
+	// Repro a: HTTP 200 *bigqueryapi.Job with Reason: "backendError" and reservation text must fail, never skip.
+	jobBackendErr := &bigqueryapi.Job{
+		Status: &bigqueryapi.JobStatus{
+			ErrorResult: &bigqueryapi.ErrorProto{
+				Reason:  "backendError",
+				Message: "Internal error while checking continuous query reservation",
+			},
+		},
+		Statistics: &bigqueryapi.JobStatistics{},
+	}
+	if skipReason, fatalErr := validateContinuousExportDryRunJob(jobBackendErr, nil); fatalErr == nil || skipReason != "" {
+		t.Fatalf("validateContinuousExportDryRunJob(Status.ErrorResult backendError) = (skip=%q, err=%v), want non-nil fatalErr", skipReason, fatalErr)
+	}
+	// Secondary job.Status.Errors item with disallowed Reason must also fail even if ErrorResult.Reason is invalidQuery.
+	jobSecondaryBackendErr := &bigqueryapi.Job{
+		Status: &bigqueryapi.JobStatus{
+			ErrorResult: &bigqueryapi.ErrorProto{
+				Reason:  "invalidQuery",
+				Message: "Continuous queries require the project to have a CONTINUOUS assignment to a reservation.",
+			},
+			Errors: []*bigqueryapi.ErrorProto{
+				{
+					Reason:  "backendError",
+					Message: "Sub-request backendError",
+				},
+			},
+		},
+		Statistics: &bigqueryapi.JobStatistics{},
+	}
+	if skipReason, fatalErr := validateContinuousExportDryRunJob(jobSecondaryBackendErr, nil); fatalErr == nil || skipReason != "" {
+		t.Fatalf("validateContinuousExportDryRunJob(Status.Errors backendError) = (skip=%q, err=%v), want non-nil fatalErr", skipReason, fatalErr)
 	}
 	jobNilStats := &bigqueryapi.Job{
 		Status: &bigqueryapi.JobStatus{},
@@ -698,6 +830,105 @@ func TestEphemeralDatasetOwnershipFake409NeverDeletes(t *testing.T) {
 	}
 	if got := deleteCalls.Load(); got != 0 {
 		t.Fatalf("DELETE /datasets calls after 409 = %d, want 0 (must never delete pre-existing dataset)", got)
+	}
+
+	// Also verify signalExporter.ensureDataset ownership tracking (createdDataset)
+	// across: (1) pre-existing 200 OK DatasetMetadata, (2) 404 DatasetMetadata +
+	// concurrent 409 CreateDataset, and (3) 404 DatasetMetadata + 200 OK CreateDataset.
+	var mode atomic.Int32 // 1 = existing 200, 2 = 404 then 409, 3 = 404 then 200
+	var ensureDeleteCalls atomic.Int32
+	ensureSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch mode.Load() {
+		case 1:
+			if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/datasets/") {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"datasetReference":{"projectId":"test-proj","datasetId":"ds"},"location":"US"}`))
+				return
+			}
+		case 2:
+			if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/datasets/") {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"error":{"code":404,"message":"Not found: Dataset test-proj:ds","errors":[{"reason":"notFound"}]}}`))
+				return
+			}
+			if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/datasets") {
+				w.WriteHeader(http.StatusConflict)
+				_, _ = w.Write([]byte(`{"error":{"code":409,"message":"Already Exists: Dataset test-proj:ds","errors":[{"reason":"duplicate"}]}}`))
+				return
+			}
+		case 3:
+			if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/datasets/") {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"error":{"code":404,"message":"Not found: Dataset test-proj:ds","errors":[{"reason":"notFound"}]}}`))
+				return
+			}
+			if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/datasets") {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"datasetReference":{"projectId":"test-proj","datasetId":"ds"},"location":"US"}`))
+				return
+			}
+		}
+		if r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/datasets/") {
+			ensureDeleteCalls.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ensureSrv.Close()
+
+	ensureClient, err := bq.NewClient(ctx, "test-proj",
+		option.WithEndpoint(ensureSrv.URL),
+		option.WithoutAuthentication(),
+	)
+	if err != nil {
+		t.Fatalf("bq.NewClient(ensureSrv): %v", err)
+	}
+	defer func() { _ = ensureClient.Close() }()
+
+	destAdmin := &bigQueryDestinationAdmin{
+		client:   ensureClient,
+		httpBase: &http.Transport{},
+		dataset:  ensureClient.Dataset("ds"),
+	}
+	cfg := createDefaultConfig().(*Config)
+	cfg.Project = "test-proj"
+	cfg.Dataset = "ds"
+	cfg.Location = "US"
+	cfg.AutoCreate.Dataset = true
+
+	// Case 1: Pre-existing 200 OK DatasetMetadata -> createdDataset must remain false.
+	mode.Store(1)
+	seExisting := &signalExporter{cfg: cfg, logger: zap.NewNop()}
+	if err := seExisting.ensureDataset(ctx, destAdmin); err != nil {
+		t.Fatalf("ensureDataset(existing 200 OK) error: %v", err)
+	}
+	if seExisting.createdDataset.Load() {
+		t.Fatal("ensureDataset(existing 200 OK) set createdDataset=true, want false")
+	}
+
+	// Case 2: 404 DatasetMetadata + 409 AlreadyExists CreateDataset -> createdDataset must remain false.
+	mode.Store(2)
+	se409 := &signalExporter{cfg: cfg, logger: zap.NewNop()}
+	if err := se409.ensureDataset(ctx, destAdmin); err != nil {
+		t.Fatalf("ensureDataset(404 then 409) error: %v", err)
+	}
+	if se409.createdDataset.Load() {
+		t.Fatal("ensureDataset(404 then 409) set createdDataset=true, want false")
+	}
+	if ensureDeleteCalls.Load() != 0 {
+		t.Fatalf("DELETE /datasets calls after 200/409 = %d, want 0", ensureDeleteCalls.Load())
+	}
+
+	// Case 3: 404 DatasetMetadata + 200 OK CreateDataset -> createdDataset must be true.
+	mode.Store(3)
+	seCreated := &signalExporter{cfg: cfg, logger: zap.NewNop()}
+	if err := seCreated.ensureDataset(ctx, destAdmin); err != nil {
+		t.Fatalf("ensureDataset(404 then 200 OK) error: %v", err)
+	}
+	if !seCreated.createdDataset.Load() {
+		t.Fatal("ensureDataset(404 then 200 OK) set createdDataset=false, want true")
 	}
 }
 

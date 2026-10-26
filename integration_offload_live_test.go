@@ -135,7 +135,7 @@ func testLiveGCSAndBigQueryOffloadRoundTrip(t *testing.T) {
 	cfg.Project = project
 	cfg.Dataset = dataset
 	cfg.Location = location
-	cfg.AutoCreate.Dataset = true
+	cfg.AutoCreate.Dataset = false
 	cfg.AutoCreate.Tables = true
 	cfg.Quarantine.Enabled = true
 	cfg.Quarantine.MaxRawPayloadBytes = 256
