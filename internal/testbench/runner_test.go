@@ -430,7 +430,7 @@ func TestGeneratorAllSevenFrameworksAndMCP(t *testing.T) {
 							hi = bounds[bIdx]
 						}
 						switch {
-						case bIdx == firstNonEmpty && bIdx == lastNonEmpty:
+						case bIdx == firstNonEmpty && firstNonEmpty == lastNonEmpty:
 							if c == 1 {
 								impliedMinSum += dp.Min()
 								impliedMaxSum += dp.Max()

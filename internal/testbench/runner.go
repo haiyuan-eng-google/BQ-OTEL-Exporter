@@ -704,7 +704,7 @@ func createEphemeralDataset(ctx context.Context, projectID, datasetID, location 
 	defer cancelVerify()
 	verifyClient, closeVerify, verifyClientErr := newBigQueryClient(verifyCtx, projectID, opts...)
 	if verifyClientErr != nil {
-		return fmt.Errorf("creating ephemeral dataset %s.%s (ambiguous create outcome; verify whether dataset %s.%s was left behind: %v): %w",
+		return fmt.Errorf("creating ephemeral dataset %s.%s (ambiguous create outcome; verify whether dataset %s.%s was left behind: %w): %w",
 			projectID, datasetID, projectID, datasetID, verifyClientErr, createErr)
 	}
 	defer closeVerify()
@@ -715,7 +715,7 @@ func createEphemeralDataset(ctx context.Context, projectID, datasetID, location 
 		if errors.As(metaErr, &metaAPIErr) && metaAPIErr.Code == http.StatusNotFound {
 			return fmt.Errorf("creating ephemeral dataset %s.%s: %w", projectID, datasetID, createErr)
 		}
-		return fmt.Errorf("creating ephemeral dataset %s.%s (ambiguous create outcome; verify whether dataset %s.%s was left behind: %v): %w",
+		return fmt.Errorf("creating ephemeral dataset %s.%s (ambiguous create outcome; verify whether dataset %s.%s was left behind: %w): %w",
 			projectID, datasetID, projectID, datasetID, metaErr, createErr)
 	}
 	if md != nil && md.Labels[ephemeralOwnerLabelKey] == ownerToken {
