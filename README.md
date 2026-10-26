@@ -31,9 +31,10 @@ sample, downsample, or interpret telemetry.
 > (`10,404` spans/s, `9,594` logs/s, and `9,185` metric points/s at `stream_pool_size=4`,
 > `1.24`–`1.66` vCPU cores per `10,000` rows/s, `86.8 MiB` process peak RSS); AIMD
 > backpressure and content-addressed payload offload (`--offload-dir`, `99.92%` SHA-256
-> deduplication hit rate) have been benchmarked under fault injection in `bqfake`; and
-> live GCS payload offload and the deduplication views are exercised by the live
-> integration test suite (`-tags=integration`).
+> deduplication hit rate) have been benchmarked under fault injection in `bqfake` (with
+> offload unit-tested in `internal/offload`); and live `auto_create` provisioning, timeout
+> recovery, and the deduplication views are exercised by the live integration test suite
+> (`-tags=integration`).
 > See [`docs/benchmarks/v0.1.0-performance-envelope.md`](docs/benchmarks/v0.1.0-performance-envelope.md)
 > for reproducible benchmark measurements and [`docs/cost-estimation.md`](docs/cost-estimation.md)
 > for BigQuery + GCS FinOps cost modeling.
@@ -1004,7 +1005,7 @@ authorization result.
 | Milestone | Contents |
 | --------- | -------- |
 | **M1** | Write path on the Storage Write API default stream; `v0alpha2` schema for traces, logs, metrics (`otel_metrics`), companion and GenAI rollup views, and opt-in `otel_quarantine`; request sizing and the error matrix. **Complete and benchmarked (`docs/benchmarks/v0.1.0-performance-envelope.md`).** |
-| **M2** | Measured `v0.1.0` performance envelope (`cmd/bq-otel-testbench`) across `write.stream_pool_size` `1..16`, Step-0 redaction, AIMD backpressure, and content-addressed payload offload (`--offload-dir` in `bqfake`; live GCS offload verified via `-tags=integration`); `otel_*_dedup` view verification; delivery-critical self-telemetry proven under fault injection. *(Crash-replay and in-process subset-retry tests tracked separately.)* |
+| **M2** | Measured `v0.1.0` performance envelope (`cmd/bq-otel-testbench`) across `write.stream_pool_size` `1..16`, Step-0 redaction, AIMD backpressure, and content-addressed payload offload (`--offload-dir` benchmarked under fault injection in `bqfake` and unit-tested in `internal/offload`); live `auto_create` provisioning, timeout recovery, and `otel_*_dedup` view verification (`-tags=integration`); delivery-critical self-telemetry proven under fault injection. *(Crash-replay and in-process subset-retry tests tracked separately.)* |
 | **M3** | Optional `auto_create` (including `companion_views`, `search_indexes`, additive schema evolution, and `quarantine`), startup validation, performance envelope (`docs/benchmarks/v0.1.0-performance-envelope.md`), and enterprise cost model (`docs/cost-estimation.md`). **Complete** *(security guide tracked separately)*. |
 
 ## Contributing

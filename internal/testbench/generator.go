@@ -343,11 +343,12 @@ func (g *Generator) TracesBatch(spanCount int) ptrace.Traces {
 		if fw.Framework == "crewai" {
 			// CrewAI uses OpenInference span attributes (openinference.span.kind,
 			// crew_tasks, llm.*, tool.name) without gen_ai.operation.name,
-			// gen_ai.system, or gen_ai.provider.name (testdata/otlp/manifest.yaml:
-			// spans_outside_gen_ai_view: true). All 4 spans in a CrewAI tree
-			// intentionally land in otel_spans and otel_spans_dedup outside
-			// v_gen_ai_spans and v_gen_ai_agent_trajectory, while step 3 (the MCP
-			// child span) is selected by v_mcp_spans with also_in_gen_ai_view = FALSE.
+			// gen_ai.system, or gen_ai.provider.name (testdata/otlp/manifest.yaml
+			// lines 13-15 and testdata/otlp/crewai/traces.json). All 4 spans in a
+			// CrewAI tree intentionally land in otel_spans and otel_spans_dedup
+			// outside v_gen_ai_spans and v_gen_ai_agent_trajectory, while step 3
+			// (the MCP child span) is selected by v_mcp_spans with
+			// also_in_gen_ai_view = FALSE.
 			switch stepInTree {
 			case 0:
 				sp.SetName("Crew.kickoff")
@@ -458,10 +459,11 @@ func (g *Generator) TracesBatch(spanCount int) ptrace.Traces {
 
 // LogsBatch generates a plog.Logs batch with exactly logCount GenAI event log
 // records distributed across the 7 GenAI frameworks, correlated 1-to-1 with
-// the 4-span agent execution trees emitted by TracesBatch. Unlike raw fixture
-// captures in testdata/otlp/manifest.yaml (where crewai and aws_bedrock omit
-// log files and anthropic_agent_sdk emits non-gen_ai.* claude_code.api_request
-// logs), LogsBatch attaches synthetic gen_ai.* bridge attributes across all 7
+// the 4-span agent execution trees emitted by TracesBatch. Unlike the golden
+// fixtures in testdata/otlp/manifest.yaml (where langgraph and crewai declare
+// signals: [traces, metrics] and omit logs_file, and anthropic_agent_sdk emits
+// non-gen_ai.* claude_code.api_request logs with logs_outside_gen_ai_view: true),
+// LogsBatch attaches synthetic gen_ai.* bridge attributes across all 7
 // framework resources so every framework participates uniformly in v_gen_ai_logs
 // cross-signal join and throughput benchmarking.
 func (g *Generator) LogsBatch(logCount int) plog.Logs {
@@ -561,11 +563,12 @@ func (g *Generator) LogsBatch(logCount int) plog.Logs {
 // MetricsBatch generates a pmetric.Metrics batch with exactly pointCount
 // Histogram data points (gen_ai.client.token.usage and
 // gen_ai.client.operation.duration with trace exemplars) distributed across
-// the 7 GenAI frameworks and correlated 1-to-1 with TracesBatch. For frameworks
-// whose golden fixtures in testdata/otlp/manifest.yaml are trace-only (crewai,
-// aws_bedrock), MetricsBatch synthesizes standard gen_ai.client.* histograms
-// with trace exemplars so all 7 framework resources exercise v_gen_ai_metrics
-// and v_gen_ai_metric_exemplars uniformly.
+// the 7 GenAI frameworks and correlated 1-to-1 with TracesBatch. Consistent
+// with testdata/otlp/manifest.yaml (where all 7 frameworks include metrics.json
+// and crewai/metrics.json models a synthetic GenAI metrics bridge), MetricsBatch
+// synthesizes standard gen_ai.client.* histograms with trace exemplars so all 7
+// framework resources exercise v_gen_ai_metrics and v_gen_ai_metric_exemplars
+// uniformly.
 func (g *Generator) MetricsBatch(pointCount int) pmetric.Metrics {
 	if pointCount <= 0 {
 		pointCount = 1

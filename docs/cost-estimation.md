@@ -5,7 +5,7 @@ This guide provides a component-by-component Total Cost of Ownership (TCO) model
 1. **BigQuery Storage Write API Ingestion** (`AppendRows` committed streams)
 2. **BigQuery Table Storage** (Logical vs. Physical compressed storage with partitioning, clustering, and TTL)
 3. **Google Cloud Storage (GCS) Payload Offloading** (`payload_refs` `ObjectRef` + SHA-256 content-addressed deduplication)
-4. **BigQuery Query & Semantic View Compute** (On-demand TB scanned vs. Edition slots, Partition/Cluster pruning, Materialized Marts, and Continuous Queries)
+4. **BigQuery Query & Semantic View Compute** (On-demand TB scanned vs. Edition slots, Partition/Cluster pruning, Scheduled Rollup Tables, and Continuous Queries)
 5. **OpenTelemetry Collector Compute** (CPU and RAM sizing from the `v0.1.0` benchmark envelope plus Cloud Run / GKE Autopilot minimum instance increments)
 
 ---
@@ -45,7 +45,7 @@ To keep capacity planning transparent, this guide distinguishes between **measur
     * **Tier 3 (`10M turns/day`)**: `40M spans/day` (`463.0 spans/s` avg, `~4,630–25,000 spans/s` burst) / `80M combined rows/day` (`925.9 rows/s` avg).
   * **BigQuery Physical Compression Ratio**: **`6:1` baseline** (typical Capacitor + Zstandard compression range `4:1`–`8:1` on repetitive JSON telemetry; high-entropy UUIDs or base64 blobs compress closer to `2:1`–`3:1`).
   * **Production Offload Deduplication Hit Rate**: **`80%` illustrative assumption** for production fleets that repeat system instructions, tool schemas, and RAG context headers across turns (`0%` worst-case if every offloaded payload is unique; `99.9%` best-case on static templates).
-  * **Mart Scan Reduction & Continuous Query Slot Sizing**: The `99.96%` query scan reduction in Section 5.3 assumes `20` dashboard refreshes/hour over a 7-day window reading pre-aggregated `INT64`/`FLOAT64` columns from incremental Dataform marts (`deploy/dataform/`) instead of scanning raw `JSON` attributes on every dashboard load; the `50` / `100` / `250` Continuous Query slot figures in Section 5.4 are illustrative capacity-planning starting points that should be validated against your query complexity.
+  * **Scheduled Rollup Scan Reduction & Continuous Query Slot Sizing**: The `99.96%` query scan reduction in Section 5.3 assumes `20` dashboard refreshes/hour over a 7-day window reading pre-aggregated `INT64`/`FLOAT64` columns from a scheduled incremental hourly rollup table materializing `v_gen_ai_model_costs` instead of scanning raw `JSON` attributes on every dashboard load; the `50` / `100` / `250` Continuous Query slot figures in Section 5.4 are illustrative capacity-planning starting points that should be validated against your query complexity.
 
 ---
 
@@ -162,15 +162,15 @@ In `v_gen_ai_spans` and `v_gen_ai_logs`, `JSON_VALUE(attributes, ...)` expressio
 * **Lightweight Metadata Query** (`SELECT trace_id, span_id, service_name, name, duration_nano, status.code FROM otel_spans WHERE start_time >= ...`): scans only **`~140 B / row`** (`~4.8%` of a `2,895 B` span row).
 * **Full Semantic View Query** (`SELECT * FROM v_gen_ai_spans WHERE start_time >= ...`): scans `attributes`, `resource.attributes`, and `instrumentation_scope` (**`~2,450 B / row`** on `1 KiB` inline spans, or **`~720 B / row`** when large payloads are offloaded to GCS).
 
-### 5.3 Pre-Aggregated Hourly Mart Pattern (`deploy/dataform/`, Illustrative `99.96%` Scan Reduction)
+### 5.3 Scheduled Incremental Hourly Rollup Pattern (Materializing `v_gen_ai_model_costs`, Illustrative `99.96%` Scan Reduction)
 
-Logical companion views such as `v_gen_ai_agent_trajectory`, `v_gen_ai_model_costs`, and `v_gen_ai_sessions` are unmaterialized SQL views over `v_gen_ai_spans` (`otel_spans_dedup`). For high-frequency operational dashboards (e.g., `20` panel refreshes/hour across a 7-day lookback window = `14,400` queries/month), use the incremental Dataform marts in `deploy/dataform/` (`mart_gen_ai_cost_hourly.sqlx`, `mart_agent_loop_summary.sqlx`, `mart_tool_reliability.sqlx`):
+Logical companion views such as `v_gen_ai_agent_trajectory`, `v_gen_ai_model_costs`, and `v_gen_ai_sessions` are unmaterialized SQL views over `v_gen_ai_spans` (`otel_spans_dedup`). Just as `README.md` (*Materializing the dedup view*) recommends a scheduled `MERGE` bounded to a recent partition window, high-frequency operational dashboards (e.g., `20` panel refreshes/hour across a 7-day lookback window = `14,400` queries/month) should materialize `v_gen_ai_model_costs` into a scheduled incremental hourly rollup table:
 
 * **Querying raw `v_gen_ai_spans` directly** (Tier 2: `4M spans/day` $\times 7\text{ days} \times 2{,}450\text{ B/span} \approx 63.9\text{ GiB/query}$):
   $$14{,}400\text{ queries/mo} \times 63.9\text{ GiB} = 898.6\text{ TiB/mo} \implies \mathbf{\$5{,}610/\text{mo}}\text{ (On-Demand)}$$
-* **Querying an incremental hourly summary mart (`mart_gen_ai_cost_hourly` / `mart_gen_ai_hourly`)** partitioned by `DATE(usage_hour)` and grouped by `(TIMESTAMP_TRUNC(start_time, HOUR) AS usage_hour, service_name, gen_ai_system, gen_ai_request_model, gen_ai_operation_name)` (`~5,000 rows/day` $\times 120\text{ B/row} \approx 4.2\text{ MiB}$ for 7 days):
-  * 720 hourly incremental rollup runs/month scanning only the latest 1-hour partition of `v_gen_ai_spans` (`WHERE start_time >= TIMESTAMP_SUB(...)`): `720` $\times$ `0.38 GiB` = `0.27 TiB/mo`
-  * 14,400 dashboard queries/month scanning `4.2 MiB` from the pre-aggregated mart: `0.06 TiB/mo`
+* **Querying a scheduled incremental hourly rollup table materializing `v_gen_ai_model_costs`** partitioned by `DATE(usage_hour)` and grouped/clustered on the `v_gen_ai_model_costs` dimensions `(usage_hour, service_name, gen_ai_agent_name, provider, model)` (`~5,000 rows/day` $\times 120\text{ B/row} \approx 4.2\text{ MiB}$ for 7 days):
+  * 720 hourly incremental rollup runs/month scanning only the latest 1-hour partition of `v_gen_ai_spans` (`WHERE usage_hour >= TIMESTAMP_SUB(...)`): `720` $\times$ `0.38 GiB` = `0.27 TiB/mo`
+  * 14,400 dashboard queries/month scanning `4.2 MiB` from the pre-aggregated hourly rollup table: `0.06 TiB/mo`
   * **Total monthly bytes scanned**: **`0.33 TiB/mo`** (within the **1 TiB/month free tier** $\rightarrow$ **`$0.00/mo`**, an illustrative **`99.96%` reduction** in scanned bytes).
 
 ### 5.4 Continuous Queries & Edition Slot Sizing (Illustrative Capacity Model)
@@ -209,14 +209,14 @@ From [`docs/benchmarks/v0.1.0-performance-envelope.md`](benchmarks/v0.1.0-perfor
 
 ## 7. End-to-End Monthly TCO Summary Table
 
-The table below combines all five cost components for a **30-day BigQuery Physical Storage window (`6:1` compression assumption)** plus the **hourly pre-aggregated mart pattern** (`mart_gen_ai_hourly`, On-Demand query billing):
+The table below combines all five cost components for a **30-day BigQuery Physical Storage window (`6:1` compression assumption)** plus the **scheduled incremental hourly rollup pattern** (materializing `v_gen_ai_model_costs` under On-Demand query billing):
 
 | Cost Component | Tier 1 (`100K turns/day`, `1 KiB` Inline) | Tier 2 (`1M turns/day`, `1 KiB` Inline) | Tier 2 (`1M turns/day`, `16 KiB` Inline) | Tier 2 (`1M turns/day`, `16 KiB` Offloaded, `80%` Dedup) | Tier 3 (`10M turns/day`, `1 KiB` Inline) | Tier 3 (`10M turns/day`, `16 KiB` Inline) | Tier 3 (`10M turns/day`, `16 KiB` Offloaded, `80%` Dedup) |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | **1. BigQuery Storage Write API** (`$0.025/GiB` after `2,048 GiB` free) | `$0.00` (`52.7 GiB`) | `$0.00` (`526.7 GiB`) | `$26.34` (`3,101.7 GiB`) | `$0.00` (`414.9 GiB`) | `$80.48` (`5,267.2 GiB`) | `$724.22` (`31,017.0 GiB`) | `$52.53` (`4,149.0 GiB`) |
 | **2. BigQuery Physical Storage** (`30d` + `14d` fail-safe, `6:1` compressed) | `$0.12` (`12.9 GiB`) | `$4.75` (`128.8 GiB`) | `$29.93` (`758.2 GiB`) | `$3.66` (`101.4 GiB`) | `$51.10` (`1,287.5 GiB`) | `$302.88` (`7,581.9 GiB`) | `$40.17` (`1,014.2 GiB`) |
 | **3. GCS Payload Offload** (Standard `30d` + Class A ops at `80%` dedup) | `$0.00` | `$0.00` | `$0.00` | `$194.28` (`$14.28` storage + `$180.00` ops) | `$0.00` | `$0.00` | `$1,942.82` (`$142.82` storage + `$1,800.00` ops) |
-| **4. BigQuery Queries** (Hourly Mart Rollup + 14.4k Dashboard Queries, On-Demand) | `$0.00` (`< 1 TiB` free tier) | `$0.00` (`0.33 TiB` < `1 TiB` free tier) | `$5.13` (`1.82 TiB` scanned) | `$0.00` (`0.24 TiB` < `1 TiB` free tier) | `$10.50` (`2.68 TiB` scanned) | `$107.50` (`18.20 TiB` scanned) | `$8.75` (`2.40 TiB` scanned) |
+| **4. BigQuery Queries** (Hourly Rollup Table + 14.4k Dashboard Queries, On-Demand) | `$0.00` (`< 1 TiB` free tier) | `$0.00` (`0.33 TiB` < `1 TiB` free tier) | `$5.13` (`1.82 TiB` scanned) | `$0.00` (`0.24 TiB` < `1 TiB` free tier) | `$10.50` (`2.68 TiB` scanned) | `$107.50` (`18.20 TiB` scanned) | `$8.75` (`2.40 TiB` scanned) |
 | **5. Collector Compute** (GKE Autopilot / Cloud Run HA Replicas) | `$14.65` (`2x 0.25 vCPU`) | `$58.60` (`2x 1 vCPU`) | `$58.60` (`2x 1 vCPU`) | `$58.60` (`2x 1 vCPU`) | `$234.40` (`4x 2 vCPU`) | `$234.40` (`4x 2 vCPU`) | `$234.40` (`4x 2 vCPU`) |
 | **Total Monthly TCO** | **`$14.77 / mo`** | **`$63.35 / mo`** | **`$120.00 / mo`** | **`$256.54 / mo`** *(or **`$120.00 / mo`** inline when `min_bytes: 65536`)* | **`$376.48 / mo`** | **`$1,369.00 / mo`** | **`$2,278.67 / mo`** *(or **`$1,369.00 / mo`** inline when `min_bytes: 65536`)* |
 | **Unit Cost per `1,000` Agent Turns** | **`$0.0049`** | **`$0.0021`** | **`$0.0040`** | **`$0.0086`** | **`$0.0013`** | **`$0.0046`** | **`$0.0076`** |
