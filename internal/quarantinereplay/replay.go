@@ -382,6 +382,13 @@ type recordPosition struct {
 	ingestMicros int64
 	fingerprint  int64
 	ordinal      int64
+	// canonicalKey is the row's canonical JSON content key (row_key),
+	// written into v2 BigQuery cursors so the resume position is
+	// unambiguous even when the underlying ROW_NUMBER() ordering
+	// changes. It is not used for ordering itself (row_key is already
+	// reflected in the deterministic ordinal), but it ties a cursor to the
+	// canonical ordering it was written under.
+	canonicalKey string
 }
 
 // after reports whether p sorts after the BigQuery cursor c.
@@ -644,6 +651,13 @@ const (
 	checkpointVersion      = 1
 	checkpointKindFile     = "file"
 	checkpointKindBigQuery = "bigquery"
+	// cursorOrderVersionCanonical is the row-ordering version a BigQuery
+	// cursor is written with. Version 1 (or 0, the zero value for a legacy
+	// checkpoint that predates the field) used an unordered ROW_NUMBER()
+	// assignment whose duplicate_ordinal may not match the canonical
+	// row_key ordering the current query uses. Version 2 cursors carry the
+	// canonical row_key so the resume position is unambiguous.
+	cursorOrderVersionCanonical = 2
 )
 
 // CheckpointConfig makes a replay resumable. After every record it handles,
@@ -686,11 +700,24 @@ type checkpointState struct {
 }
 
 // bigQueryCursor is the (ingest_time, row_fp, row_ord) sort key of a
-// quarantine row read by ReplayBigQuery.
+// quarantine row read by ReplayBigQuery. CursorOrderVersion records the
+// row-ordering version the cursor was written under: version 2 (or later)
+// cursors carry CanonicalRowKey and use the canonical row_key ordering, so
+// their DuplicateOrdinal is unambiguous; legacy version 0 or 1 cursors (the
+// zero value or an explicit value less than 2, or an empty CanonicalRowKey)
+// were written under an unordered ROW_NUMBER() assignment and are rewound to
+// replay their whole (ingest_time, row_fp) group at-least-once before any
+// delivery.
 type bigQueryCursor struct {
 	IngestTimeMicros int64 `json:"ingest_time_micros"`
 	RowFingerprint   int64 `json:"row_fingerprint"`
 	DuplicateOrdinal int64 `json:"duplicate_ordinal,omitempty"`
+	// CursorOrderVersion is the row-ordering version this cursor was
+	// written under (currently cursorOrderVersionCanonical = 2). A
+	// cursor with a version less than 2 or an empty CanonicalRowKey is
+	// treated as legacy and rewound.
+	CursorOrderVersion int    `json:"cursor_order_version,omitempty"`
+	CanonicalRowKey    string `json:"canonical_row_key,omitempty"`
 }
 
 // checkpointTempFile is the temporary file seam checkpointer.save uses.
@@ -764,6 +791,21 @@ func openCheckpoint(cfg CheckpointConfig, kind string, f Filter, sink Sink) (*ch
 	if got.Next < 0 || got.Handled < 0 || (got.Cursor != nil && got.Cursor.DuplicateOrdinal < 0) {
 		return nil, fmt.Errorf("checkpoint %q holds a negative position", cfg.Path)
 	}
+	// A BigQuery cursor written with an earlier row-ordering version (before
+	// canonical row_key ordering was introduced) has CursorOrderVersion < 2
+	// or an empty CanonicalRowKey. Its DuplicateOrdinal was assigned by an
+	// unordered ROW_NUMBER(), so resuming after it can skip undelivered rows
+	// in the same (ingest_time, row_fp) group. Rewind it to replay the
+	// whole group under the current canonical ordering at-least-once.
+	// The rewind sets DuplicateOrdinal to -1 so every row in the group
+	// sorts after the cursor and the query's `row_ord > @cursor_ord`
+	// condition admits row_ord 0 onward.
+	if got.Kind == checkpointKindBigQuery && got.Cursor != nil &&
+		(got.Cursor.CursorOrderVersion < cursorOrderVersionCanonical || got.Cursor.CanonicalRowKey == "") {
+		got.Cursor.DuplicateOrdinal = -1
+		got.Cursor.CursorOrderVersion = cursorOrderVersionCanonical
+		got.Cursor.CanonicalRowKey = ""
+	}
 	c.state = got
 	return c, nil
 }
@@ -781,9 +823,11 @@ func (c *checkpointer) advance(pos recordPosition) error {
 	if c.state.Kind == checkpointKindBigQuery {
 		if c.state.Cursor == nil || pos.after(*c.state.Cursor) {
 			c.state.Cursor = &bigQueryCursor{
-				IngestTimeMicros: pos.ingestMicros,
-				RowFingerprint:   pos.fingerprint,
-				DuplicateOrdinal: pos.ordinal,
+				IngestTimeMicros:   pos.ingestMicros,
+				RowFingerprint:     pos.fingerprint,
+				DuplicateOrdinal:   pos.ordinal,
+				CursorOrderVersion: cursorOrderVersionCanonical,
+				CanonicalRowKey:    pos.canonicalKey,
 			}
 		}
 	} else if pos.index >= c.state.Next {

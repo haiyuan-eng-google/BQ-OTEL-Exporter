@@ -87,7 +87,7 @@ const quarantineQueryTemplate = "WITH canonical AS (\n" +
 	"SELECT\n" +
 	"  UNIX_MICROS(ingest_time) AS ingest_time_us,\n" +
 	"  signal, error_code, error_message, service_name, trace_id, span_id, raw_payload,\n" +
-	"  payload_ref_uri, payload_ref_version, row_fp, row_ord\n" +
+	"  payload_ref_uri, payload_ref_version, row_fp, row_ord, row_key\n" +
 	"FROM quarantined%s\n" +
 	"ORDER BY ingest_time, row_fp, row_ord, row_key"
 
@@ -545,6 +545,8 @@ func decodeQuarantineRow(fields []*bigqueryapi.TableFieldSchema, row *bigqueryap
 			uri = value
 		case "payload_ref_version":
 			version = value
+		case "row_key":
+			out.pos.canonicalKey = value
 		}
 	}
 	if !haveTime || !haveKey {

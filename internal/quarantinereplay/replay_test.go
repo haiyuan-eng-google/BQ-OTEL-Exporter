@@ -539,6 +539,28 @@ func assertDirHolds(t *testing.T, dir string, want ...string) {
 	}
 }
 
+// assertCursor checks that the checkpoint's BigQuery cursor matches the
+// expected (ingest_time, row_fp, row_ord) and that it was written with the
+// canonical row-ordering version. CanonicalRowKey is not compared because it
+// depends on the row's content columns.
+func assertCursor(t *testing.T, st checkpointState, wantIngestMicros, wantFP, wantOrd int64, wantHandled int64) {
+	t.Helper()
+	if st.Cursor == nil {
+		t.Fatalf("cursor is nil, want ingest=%d fp=%d ord=%d", wantIngestMicros, wantFP, wantOrd)
+	}
+	if st.Cursor.IngestTimeMicros != wantIngestMicros || st.Cursor.RowFingerprint != wantFP || st.Cursor.DuplicateOrdinal != wantOrd {
+		t.Errorf("cursor = {ingest=%d fp=%d ord=%d}, want {ingest=%d fp=%d ord=%d}",
+			st.Cursor.IngestTimeMicros, st.Cursor.RowFingerprint, st.Cursor.DuplicateOrdinal,
+			wantIngestMicros, wantFP, wantOrd)
+	}
+	if st.Cursor.CursorOrderVersion != cursorOrderVersionCanonical {
+		t.Errorf("cursor order version = %d, want %d", st.Cursor.CursorOrderVersion, cursorOrderVersionCanonical)
+	}
+	if st.Handled != wantHandled {
+		t.Errorf("handled = %d, want %d", st.Handled, wantHandled)
+	}
+}
+
 func TestReplayCheckpointResumesAfterCrash(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &CheckpointConfig{Path: filepath.Join(dir, "replay.ckpt"), Source: "file:/data/quarantine.jsonl"}
@@ -1625,7 +1647,7 @@ func TestOTLPRetryDelays(t *testing.T) {
 // quarantineResultColumns are the columns the replay query selects.
 var quarantineResultColumns = []string{
 	"ingest_time_us", "signal", "error_code", "error_message", "service_name",
-	"trace_id", "span_id", "raw_payload", "payload_ref_uri", "payload_ref_version", "row_fp", "row_ord",
+	"trace_id", "span_id", "raw_payload", "payload_ref_uri", "payload_ref_version", "row_fp", "row_ord", "row_key",
 }
 
 // fakeQuarantineRow is one row the fake BigQuery returns.
@@ -1672,7 +1694,7 @@ func (r fakeQuarantineRow) json() map[string]any {
 	return map[string]any{"f": []any{
 		cell(strconv.FormatInt(r.ingest.UnixMicro(), 10)), cell(r.signal), cell(r.code), cell("rejected"),
 		cell("checkout"), cell(""), cell(""), cell(r.payload), cell(""), cell(""),
-		cell(strconv.FormatInt(r.fp, 10)), cell(strconv.FormatInt(r.ord, 10)),
+		cell(strconv.FormatInt(r.fp, 10)), cell(strconv.FormatInt(r.ord, 10)), cell(r.canonicalKey()),
 	}}
 }
 
@@ -1950,10 +1972,10 @@ func TestReplayBigQueryCheckpointResume(t *testing.T) {
 		t.Fatalf("first run returned %v, want a stop at the transient failure", err)
 	}
 	st := readCheckpointFile(t, opts.Checkpoint.Path)
-	wantCursor := bigQueryCursor{IngestTimeMicros: base.UnixMicro(), RowFingerprint: -9}
-	if st.Kind != checkpointKindBigQuery || st.Source != "bigquery:proj.ds.dead_letters" || st.Cursor == nil || *st.Cursor != wantCursor || st.Handled != 1 {
-		t.Fatalf("checkpoint = %+v (cursor %+v), want cursor %+v after one row", st, st.Cursor, wantCursor)
+	if st.Kind != checkpointKindBigQuery || st.Source != "bigquery:proj.ds.dead_letters" {
+		t.Fatalf("checkpoint = %+v, want kind=%s source=%q", st, checkpointKindBigQuery, "bigquery:proj.ds.dead_letters")
 	}
+	assertCursor(t, st, base.UnixMicro(), -9, 0, 1)
 
 	// The rerun asks BigQuery only for the rows after the cursor.
 	resumed := &recordingSink{}
@@ -1981,9 +2003,7 @@ func TestReplayBigQueryCheckpointResume(t *testing.T) {
 		t.Errorf("resume parameters = %v, want the partition bound raised to the cursor", params)
 	}
 	st = readCheckpointFile(t, opts.Checkpoint.Path)
-	if want := (bigQueryCursor{IngestTimeMicros: base.Add(time.Second).UnixMicro(), RowFingerprint: -1}); st.Cursor == nil || *st.Cursor != want || st.Handled != 3 {
-		t.Errorf("final checkpoint = %+v (cursor %+v), want cursor %+v", st, st.Cursor, want)
-	}
+	assertCursor(t, st, base.Add(time.Second).UnixMicro(), -1, 0, 3)
 	assertDirHolds(t, dir, "bq.ckpt")
 }
 
@@ -2014,9 +2034,7 @@ func TestReplayBigQueryDuplicateRowsWithCheckpoint(t *testing.T) {
 		t.Errorf("uninterrupted replayed %d spans, want 3", len(sink1.names))
 	}
 	st1 := readCheckpointFile(t, opts1.Checkpoint.Path)
-	if want := (bigQueryCursor{IngestTimeMicros: base.UnixMicro(), RowFingerprint: 77, DuplicateOrdinal: 2}); st1.Cursor == nil || *st1.Cursor != want || st1.Handled != 3 {
-		t.Errorf("uninterrupted checkpoint = %+v (cursor %+v), want cursor %+v", st1, st1.Cursor, want)
-	}
+	assertCursor(t, st1, base.UnixMicro(), 77, 2, 3)
 
 	// 2. Interrupted run failing transiently on the 2nd duplicate, followed by a resume,
 	// must deliver all three duplicate rows across the two runs without dropping any.
@@ -2033,9 +2051,7 @@ func TestReplayBigQueryDuplicateRowsWithCheckpoint(t *testing.T) {
 		t.Fatalf("first interrupted run = %v, want transient OTLP timeout", err)
 	}
 	st2 := readCheckpointFile(t, opts2.Checkpoint.Path)
-	if want := (bigQueryCursor{IngestTimeMicros: base.UnixMicro(), RowFingerprint: 77, DuplicateOrdinal: 0}); st2.Cursor == nil || *st2.Cursor != want || st2.Handled != 1 {
-		t.Fatalf("checkpoint after 1st duplicate = %+v (cursor %+v), want %+v", st2, st2.Cursor, want)
-	}
+	assertCursor(t, st2, base.UnixMicro(), 77, 0, 1)
 
 	resumed := &recordingSink{}
 	sum2, err := ReplayBigQuery(context.Background(), src, resumed, opts2, bigQueryTestOptions(srv)...)
@@ -2049,9 +2065,7 @@ func TestReplayBigQueryDuplicateRowsWithCheckpoint(t *testing.T) {
 		t.Errorf("total replayed duplicates across both runs = %d, want 3", total)
 	}
 	st2 = readCheckpointFile(t, opts2.Checkpoint.Path)
-	if want := (bigQueryCursor{IngestTimeMicros: base.UnixMicro(), RowFingerprint: 77, DuplicateOrdinal: 2}); st2.Cursor == nil || *st2.Cursor != want || st2.Handled != 3 {
-		t.Errorf("final duplicate checkpoint = %+v (cursor %+v), want %+v", st2, st2.Cursor, want)
-	}
+	assertCursor(t, st2, base.UnixMicro(), 77, 2, 3)
 
 	// 3. Two distinct rows sharing (ingest_time, row_fp) must receive a
 	// deterministic row_ord across restarts even when the underlying table scan
@@ -2097,6 +2111,140 @@ func TestReplayBigQueryDuplicateRowsWithCheckpoint(t *testing.T) {
 	if !slices.Equal(resumedCollision.names, []string{"collision-span-B"}) {
 		t.Errorf("resumed collision run exported %v, want [collision-span-B] (must not re-export collision-span-A or drop collision-span-B)", resumedCollision.names)
 	}
+}
+
+// TestReplayBigQueryLegacyCursorRewind tests that a legacy v1 BigQuery
+// checkpoint (written before canonical row_key ordering, with
+// CursorOrderVersion 0 and no CanonicalRowKey) is detected and rewound so the
+// whole (ingest_time, row_fp) group is replayed at-least-once, instead of
+// skipping rows whose row_ord changed under the new ordering.
+//
+// Scenario: two distinct rows A and B share (ingest_time, row_fp). Under the
+// old unordered ROW_NUMBER(), B got ordinal 0 and A got ordinal 1. The first
+// run delivered B (ordinal 0) and failed on A, saving duplicate_ordinal=0.
+// Under the new canonical ordering A gets ordinal 0 and B gets ordinal 1, so
+// the old cursor's duplicate_ordinal=0 would mean "skip A, re-export B" —
+// silent data loss of A. The rewind sets duplicate_ordinal=-1 so both rows
+// are replayed.
+func TestReplayBigQueryLegacyCursorRewind(t *testing.T) {
+	base := time.Date(2026, 10, 11, 10, 0, 0, 0, time.UTC)
+	spanA := sampleSpanJSON(t, "legacy-span-A")
+	spanB := sampleSpanJSON(t, "legacy-span-B")
+	fake := &fakeQuarantineBigQuery{rows: []fakeQuarantineRow{
+		{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: spanA},
+		{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: spanB},
+	}}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	src := BigQuerySource{Project: "proj", Dataset: "ds", Table: "dead_letters"}
+	dir := t.TempDir()
+	ckptPath := filepath.Join(dir, "legacy.ckpt")
+
+	// Write a legacy v1 checkpoint: the old writer delivered row B
+	// (ordinal 0 under the old unordered ROW_NUMBER()) and failed on A,
+	// saving duplicate_ordinal=0 with no cursor_order_version or
+	// canonical_row_key fields.
+	legacy := checkpointState{
+		Version: checkpointVersion,
+		Kind:    checkpointKindBigQuery,
+		Source:  "bigquery:proj.ds.dead_letters",
+		Filter:  (Filter{}).fingerprint(),
+		Cursor: &bigQueryCursor{
+			IngestTimeMicros: base.UnixMicro(),
+			RowFingerprint:   77,
+			DuplicateOrdinal: 0,
+			// CursorOrderVersion is 0 (zero value), CanonicalRowKey is "".
+		},
+		Handled: 1,
+	}
+	data, err := json.MarshalIndent(legacy, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data, '\n')
+	if err := os.WriteFile(ckptPath, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Resuming under the new code must rewind the legacy cursor and
+	// replay both rows (A and B) at-least-once, not skip A.
+	opts := Options{Checkpoint: &CheckpointConfig{Path: ckptPath, Source: "bigquery:proj.ds.dead_letters"}}
+	sink := &recordingSink{}
+	sum, err := ReplayBigQuery(context.Background(), src, sink, opts, bigQueryTestOptions(srv)...)
+	if err != nil {
+		t.Fatalf("resumed legacy run: %v", err)
+	}
+	// Both rows should be replayed (at-least-once), not just B.
+	if want := (Summary{TotalRead: 2, Matched: 2, ReplayedSpans: 2}); sum != want {
+		t.Errorf("legacy resume summary = %+v, want %+v (rewind must replay the whole group)", sum, want)
+	}
+	if len(sink.names) != 2 {
+		t.Errorf("legacy resume replayed %d spans, want 2 (both A and B)", len(sink.names))
+	}
+	// The resumed checkpoint must now be a v2 cursor at the last row.
+	st := readCheckpointFile(t, ckptPath)
+	assertCursor(t, st, base.UnixMicro(), 77, 1, 3) // 1 legacy + 2 replayed
+}
+
+// TestReplayBigQueryV2CursorResume tests that a v2 BigQuery cursor (written
+// with CursorOrderVersion=2 and CanonicalRowKey) resumes correctly after
+// the last handled row, without rewinding.
+func TestReplayBigQueryV2CursorResume(t *testing.T) {
+	base := time.Date(2026, 10, 11, 10, 0, 0, 0, time.UTC)
+	spanA := sampleSpanJSON(t, "v2-span-A")
+	spanB := sampleSpanJSON(t, "v2-span-B")
+	spanC := sampleSpanJSON(t, "v2-span-C")
+	fake := &fakeQuarantineBigQuery{rows: []fakeQuarantineRow{
+		{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: spanA},
+		{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: spanB},
+		{ingest: base.Add(time.Second), fp: 88, signal: "spans", code: "OVERSIZE_ROW", payload: spanC},
+	}}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	src := BigQuerySource{Project: "proj", Dataset: "ds", Table: "dead_letters"}
+	dir := t.TempDir()
+	ckptPath := filepath.Join(dir, "v2.ckpt")
+
+	// Simulate a first run that delivered A (ordinal 0) and stopped on
+	// a transient failure at B. The checkpoint is a v2 cursor at A.
+	v2Cursor := checkpointState{
+		Version: checkpointVersion,
+		Kind:    checkpointKindBigQuery,
+		Source:  "bigquery:proj.ds.dead_letters",
+		Filter:  (Filter{}).fingerprint(),
+		Cursor: &bigQueryCursor{
+			IngestTimeMicros:   base.UnixMicro(),
+			RowFingerprint:     77,
+			DuplicateOrdinal:   0,
+			CursorOrderVersion: cursorOrderVersionCanonical,
+			CanonicalRowKey:    `{"signal":"spans","error_code":"OVERSIZE_ROW","raw_payload":"` + spanA + `"}`,
+		},
+		Handled: 1,
+	}
+	data, err := json.MarshalIndent(v2Cursor, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data, '\n')
+	if err := os.WriteFile(ckptPath, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Resuming must skip A (already handled) and replay B and C.
+	opts := Options{Checkpoint: &CheckpointConfig{Path: ckptPath, Source: "bigquery:proj.ds.dead_letters"}}
+	sink := &recordingSink{}
+	sum, err := ReplayBigQuery(context.Background(), src, sink, opts, bigQueryTestOptions(srv)...)
+	if err != nil {
+		t.Fatalf("resumed v2 run: %v", err)
+	}
+	if want := (Summary{TotalRead: 2, Matched: 2, ReplayedSpans: 2}); sum != want {
+		t.Errorf("v2 resume summary = %+v, want %+v (only B and C, not A)", sum, want)
+	}
+	if !slices.Equal(sink.names, []string{"v2-span-B", "v2-span-C"}) {
+		t.Errorf("v2 resume replayed %v, want [v2-span-B, v2-span-C] (A must be skipped)", sink.names)
+	}
+	st := readCheckpointFile(t, ckptPath)
+	assertCursor(t, st, base.Add(time.Second).UnixMicro(), 88, 0, 3) // 1 prior + 2 replayed
 }
 
 func TestReplayBigQueryErrors(t *testing.T) {

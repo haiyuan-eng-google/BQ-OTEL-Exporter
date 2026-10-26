@@ -223,9 +223,9 @@ func (f *fakeBigQuery) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 	f.queries = append(f.queries, req.Query)
 	var fields []map[string]string
-	for _, name := range []string{"ingest_time_us", "signal", "error_code", "raw_payload", "row_fp"} {
+	for _, name := range []string{"ingest_time_us", "signal", "error_code", "raw_payload", "row_fp", "row_ord", "row_key"} {
 		typ := "STRING"
-		if name == "ingest_time_us" || name == "row_fp" {
+		if name == "ingest_time_us" || name == "row_fp" || name == "row_ord" {
 			typ = "INTEGER"
 		}
 		fields = append(fields, map[string]string{"name": name, "type": typ})
@@ -276,9 +276,11 @@ func (rc *traceReceiver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func TestCLIBigQueryToOTLP(t *testing.T) {
 	micros := strconv.FormatInt(time.Date(2026, 10, 11, 10, 0, 0, 0, time.UTC).UnixMicro(), 10)
+	spanKey := `{"signal":"spans","error_code":"OVERSIZE_ROW","raw_payload":"` + spanPayload(t, "from-bigquery") + `"}`
+	logKey := `{"signal":"logs","error_code":"ROW_ERROR","raw_payload":""}`
 	bq := &fakeBigQuery{rows: [][]any{
-		{micros, "spans", "OVERSIZE_ROW", spanPayload(t, "from-bigquery"), "42"},
-		{micros, "logs", "ROW_ERROR", "", "43"},
+		{micros, "spans", "OVERSIZE_ROW", spanPayload(t, "from-bigquery"), "42", "0", spanKey},
+		{micros, "logs", "ROW_ERROR", "", "43", "0", logKey},
 	}}
 	bqSrv := httptest.NewServer(bq)
 	defer bqSrv.Close()
