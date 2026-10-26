@@ -45,18 +45,19 @@ before filing.
 ## Design of the wrapper
 
 - **The configuration is a type alias.** `type Config = bqotel.Config` keeps
-  every key, default, and validation rule in one place, the library. In
-  scratch, a local struct that embedded the library configuration with
-  `mapstructure:",squash"` failed the test that mdatagen v0.163.0 generates,
-  with `exporter default config must define sending_queue`.
+  every key, default, and validation rule in one place, the library. In an
+  author-reported scratch run (2026-10-25, outside CI), a local struct that
+  embedded the library configuration with `mapstructure:",squash"` failed the
+  test that mdatagen v0.163.0 generates, with
+  `exporter default config must define sending_queue`.
 - **metadata.yaml declares the sending queue default.**
   `sending_queue.support: has_overrides` with `num_consumers: 8` and batching
   off repeats the library default: `createDefaultConfig` in this repository's
   `factory.go` sets `queue.NumConsumers = defaultMaxInflightRequests`, which
   is 8. The wrapper's `createDefaultConfig` assigns
-  `metadata.NewDefaultSendingQueueConfig()`. In scratch, the generated
-  `TestComponentDefaultQueueBatchSender` failed with the queue-batch feature
-  gate enabled until it did.
+  `metadata.NewDefaultSendingQueueConfig()`. In an author-reported scratch run
+  (2026-10-25, outside CI), the generated `TestComponentDefaultQueueBatchSender`
+  failed with the queue-batch feature gate enabled until it did.
 - **Pull request 1 refuses to create exporters.** Every create function
   returns `errNotImplemented`, so a pipeline that names the exporter fails at
   startup instead of accepting telemetry and dropping it.
@@ -67,8 +68,9 @@ before filing.
   because `Start` needs Google Cloud credentials and a reachable BigQuery API.
 - **goleak ignores the opencensus stats worker**,
   `go.opencensus.io/stats/view.(*worker).start`. The metadata.yaml of
-  `exporter/googlecloudexporter` carries the same entry. In scratch, the
-  generated package test failed goleak without it.
+  `exporter/googlecloudexporter` carries the same entry. In an author-reported
+  scratch run (2026-10-25, outside CI), the generated package test failed goleak
+  without it.
 - **`//go:generate make mdatagen` is in `doc.go`**, as in the `doc.go` example
   in `docs/new-components.md` (lines 174-183). `check-stability-mod`
   (Makefile.Common:310) looks for that string in a component's Go files, and
@@ -83,11 +85,12 @@ contrib root `go.mod` and of `exporter/googlecloudexporter/go.mod`. The gotidy
 recipe passes the root directive to `go mod tidy -compat` (Makefile:169, with
 `GO_COMPAT_VERSION` at Makefile.Common:20).
 
-This library's `go.mod` declares `go 1.26.5`. In scratch, `go mod tidy` on
-each staged tree, with a local `replace` to this repository, raised the
-wrapper's go line from 1.26.0 to 1.26.5 and changed no direct requirement. In
-this repository's build list, no module except the library declares a go
-directive above 1.26.0 (`go list -m -f '{{.GoVersion}}' all`, Go 1.27.3).
+This library's `go.mod` declares `go 1.26.5`. In an author-reported scratch
+run (2026-10-25, outside CI), `go mod tidy` on each staged tree, with a local
+`replace` to this repository, raised the wrapper's go line from 1.26.0 to
+1.26.5 and changed no direct requirement. In this repository's build list, no
+module except the library declares a go directive above 1.26.0
+(`go list -m -f '{{.GoVersion}}' all`, Go 1.27.3).
 Before tagging `v0.1.0`, choose one of these:
 
 - Lower the library's go directive to 1.26.0, so that gotidy leaves the
@@ -142,11 +145,12 @@ here is not a gate that passed: the gates run only in a contrib checkout.
 
 ### Files the pull requests carry but this page does not stage
 
-In scratch, mdatagen v0.163.0 wrote `documentation.md`,
-`generated_component_test.go`, `generated_package_test.go`,
-`internal/metadata/generated_status.go`, and the README status section. The
-gotidy recipe deletes and rewrites `go.sum`. Commit what the tools write in
-the checkout instead of copying generated files from here.
+In an author-reported scratch run (2026-10-25, outside CI), mdatagen v0.163.0
+wrote `documentation.md`, `generated_component_test.go`,
+`generated_package_test.go`, `internal/metadata/generated_status.go`, and the
+README status section. The gotidy recipe deletes and rewrites `go.sum`. Commit
+what the tools write in the checkout instead of copying generated files from
+here.
 
 ## Pull request 1: component structure
 
@@ -570,11 +574,12 @@ subtext: |
 change_logs: [user]
 ```
 
-In scratch, chloggen v0.30.0 `validate` rejected this entry with the pinned
-`.chloggen/config.yaml`: `exporter/bigquery is not a valid 'component'`. It
-passed once `exporter/bigquery` was added to the `components` list of that
-file and `<donation-issue>` was replaced by a number. The list is regenerated
-by `make generate-chloggen-components` (Makefile:474-475:
+In an author-reported scratch run (2026-10-25, outside CI), chloggen v0.30.0
+`validate` rejected this entry with the pinned `.chloggen/config.yaml`:
+`exporter/bigquery is not a valid 'component'`. It passed once
+`exporter/bigquery` was added to the `components` list of that file and
+`<donation-issue>` was replaced by a number. The list is regenerated by
+`make generate-chloggen-components` (Makefile:474-475:
 `$(GITHUBGEN) $(GITHUBGEN_ARGS) chloggen-components`). Whether `make gengithub`
 also refreshes it was not checked.
 
@@ -584,26 +589,31 @@ also refreshes it was not checked.
 repository root before submitting the first pull request. The first fifteen
 rows are the gates that the v0.1.0 milestone issue names; the last row is in
 the contrib list but not in the issue. "Static precondition verified locally"
-means `contribcheck` checks a precondition of the gate on the staged trees. It
-does not mean the gate ran. No gate was run in a contrib checkout.
+means `contribcheck` checks a static precondition of the gate on the staged
+trees during `go test ./internal/contribcheck/`. It does not mean the upstream
+tool or gate ran in CI (where `CONTRIBCHECK_MDATAGEN` and upstream tools are
+unset). Any "In an author-reported scratch run (2026-10-25, not run in CI)"
+note in the last column records a one-off workstation check outside this
+repository and is not re-verified by `go test ./...`. No gate was run in a
+full contrib checkout.
 
 | Gate | Recipe source | Recipe excerpt | Status | Local coverage, or why it needs a checkout |
 | --- | --- | --- | --- | --- |
-| `make checkdoc` | `Makefile:663` | `$(CHECKFILE) --project-path $(CURDIR) --component-rel-path $(COMP_REL_PATH) --module-name $(MOD_NAME) --file-name "README.md"` | static precondition verified locally | `README.md` exists and starts with the status section. `COMP_REL_PATH` is `cmd/otelcontribcol/components.go` (Makefile:12), and the comment above the target (Makefile:660) says it checks the READMEs of the default components of that collector. The component joins it in pull request 3. In scratch, checkfile v0.30.0 exited 0 on all three trees with a hand-written `components.go` that imports the component, and panicked when `README.md` was deleted from the pull request 3 tree. |
-| `make checkmetadata` | `Makefile:668` | `$(CHECKFILE) --project-path $(CURDIR) --component-rel-path $(COMP_REL_PATH) --module-name $(MOD_NAME) --file-name "metadata.yaml"` | static precondition verified locally | `metadata.yaml` exists and decodes strictly into the keys `contribcheck` models, with the checks listed above. Same `components.go` caveat as checkdoc (comment at Makefile:665). In scratch, checkfile v0.30.0 exited 0 on all three trees and mdatagen v0.163.0 accepted each `metadata.yaml`. |
-| `make checkapi` | `Makefile:672` | `$(CHECKAPI) -folder . -config .checkapi.yaml` | static precondition verified locally | The package root exports only `NewFactory() exporter.Factory`, the exporter entry of `.checkapi.yaml:61-64`. In scratch, checkapi v0.30.0 exited 0 on all three trees; on the pull request 3 tree it reported an added exported function and a `NewFactory` that returns `any`. With `component_api_strict: true` it failed (see Risks). |
-| `make goporto` | `Makefile:261` | `$(PORTO) -w --include-internal --skip-dirs "^cmd$$" ./` | static precondition verified locally | Each non-test Go file that is not generated has `package <name> // import "<module path>"`. In scratch, porto v0.7.0 changed nothing on all three trees under a root `go.mod`, as in a checkout, and `porto -l` listed a file of the pull request 3 tree whose import comment was removed. |
+| `make checkdoc` | `Makefile:663` | `$(CHECKFILE) --project-path $(CURDIR) --component-rel-path $(COMP_REL_PATH) --module-name $(MOD_NAME) --file-name "README.md"` | static precondition verified locally | `README.md` exists and starts with the status section. `COMP_REL_PATH` is `cmd/otelcontribcol/components.go` (Makefile:12), and the comment above the target (Makefile:660) says it checks the READMEs of the default components of that collector. The component joins it in pull request 3. In an author-reported scratch run (2026-10-25, not run in CI), checkfile v0.30.0 exited 0 on all three trees with a hand-written `components.go` that imports the component, and panicked when `README.md` was deleted from the pull request 3 tree. |
+| `make checkmetadata` | `Makefile:668` | `$(CHECKFILE) --project-path $(CURDIR) --component-rel-path $(COMP_REL_PATH) --module-name $(MOD_NAME) --file-name "metadata.yaml"` | static precondition verified locally | `metadata.yaml` exists and decodes strictly into the keys `contribcheck` models, with the checks listed above. Same `components.go` caveat as checkdoc (comment at Makefile:665). In an author-reported scratch run (2026-10-25, not run in CI), checkfile v0.30.0 exited 0 on all three trees and mdatagen v0.163.0 accepted each `metadata.yaml`. |
+| `make checkapi` | `Makefile:672` | `$(CHECKAPI) -folder . -config .checkapi.yaml` | static precondition verified locally | The package root exports only `NewFactory() exporter.Factory`, the exporter entry of `.checkapi.yaml:61-64`. In an author-reported scratch run (2026-10-25, not run in CI), checkapi v0.30.0 exited 0 on all three trees; on the pull request 3 tree it reported an added exported function and a `NewFactory` that returns `any`. With `component_api_strict: true` it failed (see Risks). |
+| `make goporto` | `Makefile:261` | `$(PORTO) -w --include-internal --skip-dirs "^cmd$$" ./` | static precondition verified locally | Each non-test Go file that is not generated has `package <name> // import "<module path>"`. In an author-reported scratch run (2026-10-25, not run in CI), porto v0.7.0 changed nothing on all three trees under a root `go.mod`, as in a checkout, and `porto -l` listed a file of the pull request 3 tree whose import comment was removed. |
 | `make crosslink` | `Makefile:767` | `$(CROSSLINK) --root=$(shell pwd) --prune` | requires upstream checkout | It runs on the repository root. `docs/new-components.md` line 143 says it adds a `replace` directive to the `go.mod` of every intra-repository dependant. The staged `go.mod` files carry no `replace`; commit what crosslink writes. |
 | `make tidylist` | `Makefile:157` | `$(CROSSLINK) tidylist` | requires upstream checkout | It runs in `internal/tidylist` with `--validate`, `--allow-circular allow-circular.txt`, two `--skip` flags, and `tidylist.txt` (Makefile:155-162). Both files are outside the component. |
-| `make gotidy` | `Makefile:169` | `$(GOCMD) mod tidy -compat=$(GO_COMPAT_VERSION)` | static precondition verified locally | `go.mod` declares the module path and `go 1.26.0`, requires the library at `v0.1.0`, and has no `replace` and no `toolchain` line; the recipe runs `go get toolchain@none` (Makefile:170). In scratch, `go mod tidy` with a local `replace` kept every direct requirement and raised the go line to 1.26.5 (see the go directive decision). The recipe loops over `internal/tidylist/tidylist.txt`, so the module must be listed there first. |
+| `make gotidy` | `Makefile:169` | `$(GOCMD) mod tidy -compat=$(GO_COMPAT_VERSION)` | static precondition verified locally | `go.mod` declares the module path and `go 1.26.0`, requires the library at `v0.1.0`, and has no `replace` and no `toolchain` line; the recipe runs `go get toolchain@none` (Makefile:170). In an author-reported scratch run (2026-10-25, not run in CI), `go mod tidy` with a local `replace` kept every direct requirement and raised the go line to 1.26.5 (see the go directive decision). The recipe loops over `internal/tidylist/tidylist.txt`, so the module must be listed there first. |
 | `make genotelcontribcol` | `Makefile:501` | `$(BUILDER) --skip-compilation --config cmd/otelcontribcol/builder-config-replaced.yaml` | requires upstream checkout | It runs `./internal/buildscripts/ocb-add-replaces.sh otelcontribcol` first (Makefile:499) and reads the builder config of `cmd/otelcontribcol`. The component enters that config in pull request 3 (`docs/new-components.md` line 219). |
-| `make generate` | `Makefile.Common:320` | `$(MAKE) for-all CMD="$(GOCMD) generate ./..."` | static precondition verified locally | `doc.go` holds the only `//go:generate make mdatagen`. In a component directory the target runs `go generate ./...`, `fmt`, and `gci` (Makefile.Common:327-329). In scratch, `mdatagen metadata.yaml` (v0.163.0) exited 0 on all three trees and left each staged README unchanged; `go vet` and `go test -race` then passed with 100% statement coverage of the component package. |
+| `make generate` | `Makefile.Common:320` | `$(MAKE) for-all CMD="$(GOCMD) generate ./..."` | static precondition verified locally | `doc.go` holds the only `//go:generate make mdatagen`. In a component directory the target runs `go generate ./...`, `fmt`, and `gci` (Makefile.Common:327-329). In an author-reported scratch run (2026-10-25, not run in CI), `mdatagen metadata.yaml` (v0.163.0) exited 0 on all three trees and left each staged README unchanged; `go vet` and `go test -race` then passed with 100% statement coverage of the component package. |
 | `make multimod-verify` | `Makefile:751` | `$(MULTIMOD) verify` | requires upstream checkout | It runs on the repository root, whose `versions.yaml` pull request 1 changes (diff above). |
 | `make generate-gh-issue-templates` | `Makefile:790` | `$(GITHUBGEN) issue-templates` | requires upstream checkout | `docs/new-components.md` line 167 says it adds the component to the dropdown list in the issue templates, which are in `.github`. |
 | `make gengithub` | `Makefile:446` | `$(GITHUBGEN) $(GITHUBGEN_ARGS)` | requires upstream checkout | `GITHUBGEN_ARGS ?= -skipgithub` (Makefile:441). The comment above the target (Makefile:443) says it updates CODEOWNERS and the issue template component lists in `.github`. |
 | `make genlabels` | `Makefile:127` | `@echo "# This file is auto-generated. Do not edit manually." > .github/component_labels.txt` | requires upstream checkout | It writes `.github/component_labels.txt`. |
 | `make gencodecov` | `Makefile:455` | `cd $(SRC_ROOT)/cmd/codecovgen && go run . --base-prefix github.com/open-telemetry/opentelemetry-collector-contrib` | requires upstream checkout | It runs `cmd/codecovgen` with `--dir $(SRC_ROOT)`, the repository root. |
-| `make addlicense` | `Makefile.Common:124` | `ADDLICENSE_CMD := $(ADDLICENSE) -s=only -y "" -c "The OpenTelemetry Authors"` | static precondition verified locally | Each Go file that is not generated starts with `// Copyright The OpenTelemetry Authors`, `// SPDX-License-Identifier: Apache-2.0`, and a blank line. The target (Makefile.Common:244-254) applies `ADDLICENSE_CMD` to the `*.go` and `*.sh` files that `ALL_SRC_AND_SHELL_CMD` lists (Makefile.Common:127). In scratch, addlicense v1.2.0 changed nothing on all three trees, `-check` passed, and it rewrote the `config.go` of the pull request 3 tree after its header was removed. |
+| `make addlicense` | `Makefile.Common:124` | `ADDLICENSE_CMD := $(ADDLICENSE) -s=only -y "" -c "The OpenTelemetry Authors"` | static precondition verified locally | Each Go file that is not generated starts with `// Copyright The OpenTelemetry Authors`, `// SPDX-License-Identifier: Apache-2.0`, and a blank line. The target (Makefile.Common:244-254) applies `ADDLICENSE_CMD` to the `*.go` and `*.sh` files that `ALL_SRC_AND_SHELL_CMD` lists (Makefile.Common:127). In an author-reported scratch run (2026-10-25, not run in CI), addlicense v1.2.0 changed nothing on all three trees, `-check` passed, and it rewrote the `config.go` of the pull request 3 tree after its header was removed. |
 | `make genoteltestbedcol` | `Makefile:519` | `$(BUILDER) --skip-compilation --config cmd/oteltestbedcol/builder-config-replaced.yaml` | requires upstream checkout | It reads the builder config of `cmd/oteltestbedcol`. Not in the milestone issue; `docs/new-components.md` line 204 lists it. |
 
 ## Pull request 2: implementation
@@ -892,12 +902,12 @@ request 2 changes `go.mod` and the generated tests.
 ## Risks
 
 - **checkapi passes only because the component API check is not strict.**
-  `.checkapi.yaml` sets `component_api: true` (line 98). In scratch, checkapi
-  v0.30.0 with `component_api_strict: true` failed with
-  `cannot find the config struct`: the type alias is not a struct of the
-  component package. Reviewers may ask for a local struct, but a local struct
-  that embeds the library configuration with `squash` failed the generated
-  sending queue test (see the design notes).
+  `.checkapi.yaml` sets `component_api: true` (line 98). In an author-reported
+  scratch run (2026-10-25, outside CI), checkapi v0.30.0 with
+  `component_api_strict: true` failed with `cannot find the config struct`: the
+  type alias is not a struct of the component package. Reviewers may ask for a
+  local struct, but a local struct that embeds the library configuration with
+  `squash` failed the generated sending queue test (see the design notes).
 - **Collector module versions.** The staged `go.mod` files require the
   collector modules at the versions this library uses (v1.69.0 and v0.163.0).
   Contrib modules at the pinned commit require pseudo-versions, for example

@@ -50,12 +50,15 @@ var (
 // canonical JSON representation of the row's content columns, row_fp
 // fingerprints row_key, row_ord is the 0-based ordinal within rows that
 // share (ingest_time, row_fp) ordered by row_key, group_size is the total
-// cardinality of the (ingest_time, row_fp) group, and prefix_sha256 is the
+// cardinality of the (ingest_time, row_fp) group, prefix_sha256 is the
 // lowercase hex SHA-256 digest of the length-delimited row_key prefix
-// 0..row_ord, so both identical duplicate rows and distinct rows sharing
+// 0..row_ord, and group_sha256 is the lowercase hex SHA-256 digest of the
+// length-delimited row_key sequence across all ordinals 0..group_size-1 in the
+// group, so both identical duplicate rows and distinct rows sharing
 // (ingest_time, row_fp) have deterministic sort keys across queries and a
-// checkpoint can verify that neither the boundary group's cardinality nor its
-// handled prefix changed before skipping 0..row_ord.
+// checkpoint can verify that the boundary group's cardinality, handled prefix,
+// and full ordered row_key sequence are all unchanged before skipping
+// 0..row_ord.
 // The verbs are the backquoted table, the partition-pruning WHERE conditions,
 // and the optional resume condition.
 const quarantineQueryTemplate = "WITH canonical AS (\n" +
@@ -87,13 +90,14 @@ const quarantineQueryTemplate = "WITH canonical AS (\n" +
 	"    *,\n" +
 	"    ROW_NUMBER() OVER (PARTITION BY ingest_time, row_fp ORDER BY row_key) - 1 AS row_ord,\n" +
 	"    COUNT(*) OVER (PARTITION BY ingest_time, row_fp) AS group_size,\n" +
-	"    TO_HEX(SHA256(STRING_AGG(CONCAT(CAST(BYTE_LENGTH(row_key) AS STRING), ':', row_key), '') OVER (PARTITION BY ingest_time, row_fp ORDER BY row_key ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW))) AS prefix_sha256\n" +
+	"    TO_HEX(SHA256(STRING_AGG(CONCAT(CAST(BYTE_LENGTH(row_key) AS STRING), ':', row_key), '') OVER (PARTITION BY ingest_time, row_fp ORDER BY row_key ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW))) AS prefix_sha256,\n" +
+	"    TO_HEX(SHA256(STRING_AGG(CONCAT(CAST(BYTE_LENGTH(row_key) AS STRING), ':', row_key), '') OVER (PARTITION BY ingest_time, row_fp ORDER BY row_key ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING))) AS group_sha256\n" +
 	"  FROM fingerprinted\n" +
 	")\n" +
 	"SELECT\n" +
 	"  UNIX_MICROS(ingest_time) AS ingest_time_us,\n" +
 	"  signal, error_code, error_message, service_name, trace_id, span_id, raw_payload,\n" +
-	"  payload_ref_uri, payload_ref_version, row_fp, row_ord, row_key, group_size, prefix_sha256\n" +
+	"  payload_ref_uri, payload_ref_version, row_fp, row_ord, row_key, group_size, prefix_sha256, group_sha256\n" +
 	"FROM quarantined%s\n" +
 	"ORDER BY ingest_time, row_fp, row_ord, row_key"
 
@@ -155,17 +159,23 @@ func (s BigQuerySource) Validate() error {
 // row_fp is FARM_FINGERPRINT(row_key), and row_ord is the 0-based ordinal
 // within (ingest_time, row_fp) ordered by row_key. With opts.Checkpoint set,
 // a resumed run passes the last handled row's (ingest_time, row_fp, row_ord,
-// canonical_row_key) cursor to the query, which raises the partition bound and
-// skips the handled rows on the server when the saved canonical_row_key still
-// sits at row_ord in the cursor's (ingest_time, row_fp) group; rows skipped on
-// the server are not counted in SkippedCheckpointed. If the checkpoint holds a
-// legacy (cursor_order_version 0 or 1) or empty-key cursor, or if the cursor's
-// (ingest_time, row_fp) group changed so the saved key can no longer be
-// reconciled with the saved ordinal, ReplayBigQuery rewinds and replays the
-// whole current (ingest_time, row_fp) group at least once while keeping
-// earlier groups excluded and later groups proceeding once. Both byte-for-byte
+// canonical_row_key, group_count, prefix_sha256, group_sha256) cursor to the
+// query, which raises the partition bound and skips the handled rows on the
+// server when the saved canonical_row_key still sits at row_ord in the cursor's
+// (ingest_time, row_fp) group and the group's total cardinality, handled
+// 0..row_ord prefix digest, and full 0..group_count-1 ordered row_key digest
+// all match; rows skipped on the server are not counted in
+// SkippedCheckpointed. If the checkpoint holds a legacy (cursor_order_version 0
+// or 1) or empty-key cursor, or if the cursor's (ingest_time, row_fp) group
+// changed so its saved (canonical_row_key, group_count, prefix_sha256,
+// group_sha256) no longer matches, ReplayBigQuery rewinds and replays the whole
+// current (ingest_time, row_fp) group at least once while keeping earlier
+// groups excluded and later groups proceeding once. Both byte-for-byte
 // duplicate rows and distinct rows that share an (ingest_time, row_fp) pair
-// receive deterministic ordinals and are preserved across crash-resume runs.
+// receive deterministic ordinals and are preserved across crash-resume runs
+// (subject to the absence of unique row IDs in otel_quarantine if an
+// already-delivered duplicate is deleted and replaced by a byte-identical row
+// in the same microsecond bucket).
 //
 // The query runs in src.Project over the BigQuery REST API, using an HTTP
 // client from internal/googlehttp built with clientOpts (Application
@@ -290,14 +300,15 @@ func quarantineQuery(table string, f Filter, cursor *bigQueryCursor) (string, []
 	}
 	resume := ""
 	if cursor != nil {
-		resume = "\nWHERE ingest_time > @cursor_time OR (ingest_time = @cursor_time AND (row_fp > @cursor_fp OR (row_fp = @cursor_fp AND (row_ord > @cursor_ord OR NOT EXISTS (SELECT 1 FROM quarantined WHERE ingest_time = @cursor_time AND row_fp = @cursor_fp AND row_ord = @cursor_ord AND row_key = @cursor_key AND group_size = @cursor_group_count AND prefix_sha256 = @cursor_prefix_sha256)))))"
+		resume = "\nWHERE ingest_time > @cursor_time OR (ingest_time = @cursor_time AND (row_fp > @cursor_fp OR (row_fp = @cursor_fp AND (row_ord > @cursor_ord OR NOT EXISTS (SELECT 1 FROM quarantined WHERE ingest_time = @cursor_time AND row_fp = @cursor_fp AND row_ord = @cursor_ord AND row_key = @cursor_key AND group_size = @cursor_group_count AND prefix_sha256 = @cursor_prefix_sha256 AND group_sha256 = @cursor_group_sha256)))))"
 		params = append(params,
 			timestampParam("cursor_time", time.UnixMicro(cursor.IngestTimeMicros)),
 			int64Param("cursor_fp", cursor.RowFingerprint),
 			int64Param("cursor_ord", cursor.DuplicateOrdinal),
 			stringParam("cursor_key", cursor.CanonicalRowKey),
 			int64Param("cursor_group_count", int64(cursor.GroupCount)),
-			stringParam("cursor_prefix_sha256", cursor.PrefixSHA256))
+			stringParam("cursor_prefix_sha256", cursor.PrefixSHA256),
+			stringParam("cursor_group_sha256", cursor.GroupSHA256))
 	}
 	return fmt.Sprintf(quarantineQueryTemplate, table, strings.Join(where, "\n    AND "), resume), params
 }
@@ -460,10 +471,11 @@ func (q *queryRows) readNext(ctx context.Context) (quarantineRow, error) {
 // reconcileBoundaryGroup buffers the cursor's entire (ingest_time, row_fp)
 // boundary group (beginning with first) across result pages and reports whether
 // the group's total cardinality matches cursor.GroupCount, the row at
-// cursor.DuplicateOrdinal still has canonicalKey == cursor.CanonicalRowKey, and
-// the SHA-256 digest of the handled prefix 0..cursor.DuplicateOrdinal matches
-// cursor.PrefixSHA256. All inspected rows are pushed back onto q.buffered in
-// order so the caller can process them next.
+// cursor.DuplicateOrdinal still has canonicalKey == cursor.CanonicalRowKey, the
+// SHA-256 digest of the handled prefix 0..cursor.DuplicateOrdinal matches
+// cursor.PrefixSHA256, and the SHA-256 digest of the full ordered group
+// 0..cursor.GroupCount-1 matches cursor.GroupSHA256. All inspected rows are
+// pushed back onto q.buffered in order so the caller can process them next.
 func (q *queryRows) reconcileBoundaryGroup(ctx context.Context, first quarantineRow, cursor bigQueryCursor) (bool, error) {
 	seen := []quarantineRow{first}
 	var tail []quarantineRow
@@ -490,23 +502,32 @@ func (q *queryRows) reconcileBoundaryGroup(ctx context.Context, first quarantine
 		}
 		keys[i] = seen[i].pos.canonicalKey
 	}
-	for i := range seen {
-		if seen[i].pos.groupSize <= 0 || seen[i].pos.groupSize != len(seen) {
-			seen[i].pos.groupSize = len(seen)
-		}
-		if contiguous {
-			seen[i].pos.prefixSHA256 = prefixDigest(keys[:i+1])
-		}
+	fullGroupSHA := ""
+	if contiguous {
+		fullGroupSHA = prefixDigest(keys)
 	}
 	matched := contiguous &&
 		cursor.DuplicateOrdinal >= 0 &&
 		cursor.CanonicalRowKey != "" &&
 		cursor.GroupCount > 0 &&
 		cursor.PrefixSHA256 != "" &&
+		cursor.GroupSHA256 != "" &&
 		len(seen) == cursor.GroupCount &&
 		int(cursor.DuplicateOrdinal) < len(seen) &&
 		seen[cursor.DuplicateOrdinal].pos.canonicalKey == cursor.CanonicalRowKey &&
-		seen[cursor.DuplicateOrdinal].pos.prefixSHA256 == cursor.PrefixSHA256
+		prefixDigest(keys[:int(cursor.DuplicateOrdinal)+1]) == cursor.PrefixSHA256 &&
+		(seen[cursor.DuplicateOrdinal].pos.prefixSHA256 == "" || seen[cursor.DuplicateOrdinal].pos.prefixSHA256 == cursor.PrefixSHA256) &&
+		fullGroupSHA == cursor.GroupSHA256 &&
+		(seen[cursor.DuplicateOrdinal].pos.groupSHA256 == "" || seen[cursor.DuplicateOrdinal].pos.groupSHA256 == cursor.GroupSHA256)
+	for i := range seen {
+		if seen[i].pos.groupSize <= 0 || seen[i].pos.groupSize != len(seen) {
+			seen[i].pos.groupSize = len(seen)
+		}
+		if contiguous {
+			seen[i].pos.prefixSHA256 = prefixDigest(keys[:i+1])
+			seen[i].pos.groupSHA256 = fullGroupSHA
+		}
+	}
 	q.buffered = append(append(seen, tail...), q.buffered...)
 	return matched, nil
 }
@@ -663,6 +684,8 @@ func decodeQuarantineRow(fields []*bigqueryapi.TableFieldSchema, row *bigqueryap
 			}
 		case "prefix_sha256":
 			out.pos.prefixSHA256 = value
+		case "group_sha256":
+			out.pos.groupSHA256 = value
 		}
 	}
 	if !haveTime || !haveKey {

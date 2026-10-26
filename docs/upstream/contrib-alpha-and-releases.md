@@ -260,8 +260,9 @@ change_logs: [user]
 
 The `chloggen validate` result in
 [contrib-pr-staging.md](contrib-pr-staging.md#changelog-entry) applies here
-too: in scratch, all three entries passed together once `exporter/bigquery`
-was in the components list and the issue number was filled in.
+too: in an author-reported scratch run (2026-10-25, outside CI), all three
+entries passed together once `exporter/bigquery` was in the components list and
+the issue number was filled in.
 
 ### Gates
 
