@@ -46,13 +46,15 @@ var (
 )
 
 // quarantineQueryTemplate selects the quarantine rows a replay reads,
-// ordered by (ingest_time, row_fp, row_ord). row_fp fingerprints the row's
-// content, and row_ord is the 0-based ordinal within rows that share
-// (ingest_time, row_fp), so identical rows at the same microsecond have
-// distinct sort keys and a checkpoint can resume after a specific duplicate.
+// ordered by (ingest_time, row_fp, row_ord, row_key). row_key is the
+// canonical JSON representation of the row's content columns, row_fp
+// fingerprints row_key, and row_ord is the 0-based ordinal within rows that
+// share (ingest_time, row_fp) ordered by row_key, so both identical duplicate
+// rows and distinct rows sharing (ingest_time, row_fp) have deterministic sort
+// keys across queries and a checkpoint can resume after a specific row.
 // The verbs are the backquoted table, the partition-pruning WHERE conditions,
 // and the optional resume condition.
-const quarantineQueryTemplate = "WITH fingerprinted AS (\n" +
+const quarantineQueryTemplate = "WITH canonical AS (\n" +
 	"  SELECT\n" +
 	"    ingest_time,\n" +
 	"    signal,\n" +
@@ -64,16 +66,22 @@ const quarantineQueryTemplate = "WITH fingerprinted AS (\n" +
 	"    raw_payload,\n" +
 	"    payload_ref.uri AS payload_ref_uri,\n" +
 	"    payload_ref.version AS payload_ref_version,\n" +
-	"    FARM_FINGERPRINT(TO_JSON_STRING(STRUCT(\n" +
+	"    TO_JSON_STRING(STRUCT(\n" +
 	"      signal, error_code, error_message, service_name, trace_id, span_id, raw_payload,\n" +
-	"      payload_ref.uri AS payload_ref_uri, payload_ref.version AS payload_ref_version))) AS row_fp\n" +
+	"      payload_ref.uri AS payload_ref_uri, payload_ref.version AS payload_ref_version)) AS row_key\n" +
 	"  FROM `%s`\n" +
 	"  WHERE %s\n" +
+	"),\n" +
+	"fingerprinted AS (\n" +
+	"  SELECT\n" +
+	"    *,\n" +
+	"    FARM_FINGERPRINT(row_key) AS row_fp\n" +
+	"  FROM canonical\n" +
 	"),\n" +
 	"quarantined AS (\n" +
 	"  SELECT\n" +
 	"    *,\n" +
-	"    ROW_NUMBER() OVER (PARTITION BY ingest_time, row_fp) - 1 AS row_ord\n" +
+	"    ROW_NUMBER() OVER (PARTITION BY ingest_time, row_fp ORDER BY row_key) - 1 AS row_ord\n" +
 	"  FROM fingerprinted\n" +
 	")\n" +
 	"SELECT\n" +
@@ -81,7 +89,7 @@ const quarantineQueryTemplate = "WITH fingerprinted AS (\n" +
 	"  signal, error_code, error_message, service_name, trace_id, span_id, raw_payload,\n" +
 	"  payload_ref_uri, payload_ref_version, row_fp, row_ord\n" +
 	"FROM quarantined%s\n" +
-	"ORDER BY ingest_time, row_fp, row_ord"
+	"ORDER BY ingest_time, row_fp, row_ord, row_key"
 
 // BigQuerySource names the quarantine table that ReplayBigQuery reads.
 type BigQuerySource struct {
@@ -136,12 +144,16 @@ func (s BigQuerySource) Validate() error {
 // partition that is left. The signal and error_code filters are pushed into
 // the query too, and opts.Filter still runs on every row returned.
 //
-// Rows are read in (ingest_time, content fingerprint) order. With
-// opts.Checkpoint set, a resumed run passes the last handled row's key to
-// the query, which raises the partition bound and skips the handled rows on
-// the server; they are therefore not counted in SkippedCheckpointed. Rows
-// with identical content and ingest_time share a key, so a resumed run
-// replays only one of a set of such duplicates if it stopped between them.
+// Rows are read in (ingest_time, row_fp, row_ord, row_key) order, where
+// row_key is the canonical JSON representation of the row's content columns,
+// row_fp is FARM_FINGERPRINT(row_key), and row_ord is the 0-based ordinal
+// within (ingest_time, row_fp) ordered by row_key. With opts.Checkpoint set,
+// a resumed run passes the last handled row's (ingest_time, row_fp, row_ord)
+// cursor to the query, which raises the partition bound and skips the handled
+// rows on the server; they are therefore not counted in SkippedCheckpointed.
+// Both byte-for-byte duplicate rows and distinct rows that share an
+// (ingest_time, row_fp) pair receive deterministic ordinals and are preserved
+// across crash-resume runs.
 //
 // The query runs in src.Project over the BigQuery REST API, using an HTTP
 // client from internal/googlehttp built with clientOpts (Application

@@ -135,8 +135,10 @@ type Config struct {
 	MaxWorkers int
 
 	// Redact enables client-side redaction (the exporter's
-	// redaction.enabled, which defaults to false). Setting any of the
-	// other redaction fields also enables redaction.
+	// redaction.enabled, which defaults to false). Like the live exporter,
+	// Redact is authoritative: when Redact is false, redaction stays
+	// disabled even if other redaction fields (such as MaskReplacement or
+	// BlockedKeys copied from a deployment config) are populated.
 	//
 	// BlockedKeys are attribute keys masked in addition to
 	// redact.DefaultBlockedKeys (unless DisableDefaultKeys is true),
@@ -280,17 +282,16 @@ func (c *Config) normalize() error {
 	return nil
 }
 
-func (c *Config) redactionEnabled() bool {
-	return c.Redact ||
-		len(c.BlockedKeys) > 0 ||
-		c.DisableDefaultKeys ||
-		len(c.BlockedValuePatterns) > 0 ||
-		c.MaskReplacement != "" ||
-		c.RedactLogBody
-}
-
 func (c *Config) redactor() (*redact.Redactor, error) {
-	if !c.redactionEnabled() {
+	if _, err := redact.CompilePatterns(c.BlockedValuePatterns); err != nil {
+		return nil, err
+	}
+	for i, k := range c.BlockedKeys {
+		if strings.TrimSpace(k) == "" {
+			return nil, fmt.Errorf("blocked_keys[%d] is empty", i)
+		}
+	}
+	if !c.Redact {
 		return nil, nil
 	}
 	var keys []string
@@ -298,16 +299,31 @@ func (c *Config) redactor() (*redact.Redactor, error) {
 		keys = append(keys, redact.DefaultBlockedKeys()...)
 	}
 	keys = append(keys, c.BlockedKeys...)
+	if len(keys) == 0 && len(c.BlockedValuePatterns) == 0 {
+		return nil, errors.New("redact is enabled but disable_default_keys leaves no blocked_keys and no blocked_value_patterns")
+	}
 	mask := c.MaskReplacement
 	if mask == "" {
 		mask = redact.DefaultMaskReplacement
 	}
-	return redact.New(redact.Config{
+	rd, err := redact.New(redact.Config{
 		BlockedKeys:          keys,
 		BlockedValuePatterns: c.BlockedValuePatterns,
 		MaskReplacement:      mask,
 		RedactLogBody:        c.RedactLogBody,
 	})
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range []struct{ field, key string }{
+		{"insert_id_attribute", c.InsertIDAttribute},
+		{"log_name_attribute", c.LogNameAttribute},
+	} {
+		if item.key != "" && rd.KeyBlocked(item.key) {
+			return nil, fmt.Errorf("%s %q matches a blocked redaction key (built-in or blocked_keys) and would be masked on every record", item.field, item.key)
+		}
+	}
+	return rd, nil
 }
 
 func (c *Config) signals() []string {

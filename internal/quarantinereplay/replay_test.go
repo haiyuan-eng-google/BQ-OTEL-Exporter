@@ -1332,6 +1332,68 @@ func TestOTLPHTTPSink(t *testing.T) {
 			wantPermanent: false,
 			wantCalls:     1,
 		},
+		{
+			name:          "200 JSON with trailing HTML after object is rejected",
+			signal:        "traces",
+			script:        []scriptedResponse{{status: 200, header: map[string]string{"Content-Type": "application/json"}, body: []byte(`{}<html>Sign in</html>`)}},
+			wantErr:       []string{"decoding 200 OK response"},
+			wantPermanent: false,
+			wantCalls:     1,
+		},
+		{
+			name:          "200 JSON with trailing truncated JSON is rejected",
+			signal:        "traces",
+			script:        []scriptedResponse{{status: 200, header: map[string]string{"Content-Type": "application/json"}, body: []byte(`{} {"partialSuccess":`)}},
+			wantErr:       []string{"decoding 200 OK response"},
+			wantPermanent: false,
+			wantCalls:     1,
+		},
+		{
+			name:          "200 JSON null is rejected",
+			signal:        "traces",
+			script:        []scriptedResponse{{status: 200, header: map[string]string{"Content-Type": "application/json"}, body: []byte(`null`)}},
+			wantErr:       []string{"decoding 200 OK response"},
+			wantPermanent: false,
+			wantCalls:     1,
+		},
+		{
+			name:          "200 empty body with malformed Content-Type is rejected",
+			signal:        "traces",
+			script:        []scriptedResponse{{status: 200, header: map[string]string{"Content-Type": ";"}}},
+			wantErr:       []string{`unexpected Content-Type ";"`},
+			wantPermanent: false,
+			wantCalls:     1,
+		},
+		{
+			name:      "200 empty body with absent Content-Type succeeds",
+			signal:    "traces",
+			script:    []scriptedResponse{{status: 200}},
+			wantCalls: 1,
+		},
+		{
+			name:      "200 empty body with JSON Content-Type succeeds",
+			signal:    "traces",
+			script:    []scriptedResponse{{status: 200, header: map[string]string{"Content-Type": "application/json"}}},
+			wantCalls: 1,
+		},
+		{
+			name:      "200 empty body with protobuf Content-Type succeeds",
+			signal:    "traces",
+			script:    []scriptedResponse{{status: 200, header: protoHeader}},
+			wantCalls: 1,
+		},
+		{
+			name:      "200 empty JSON object succeeds",
+			signal:    "traces",
+			script:    []scriptedResponse{{status: 200, header: map[string]string{"Content-Type": "application/json"}, body: []byte(`{}`)}},
+			wantCalls: 1,
+		},
+		{
+			name:      "204 No Content with empty body succeeds",
+			signal:    "traces",
+			script:    []scriptedResponse{{status: 204}},
+			wantCalls: 1,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1444,6 +1506,91 @@ func TestReplayIntoOTLPHTTPSink(t *testing.T) {
 			t.Errorf("NewOTLPHTTPSink with %+v succeeded", opts)
 		}
 	}
+
+	// Ambiguous 2xx responses (trailing HTML/JSON after {}, JSON null, or a
+	// malformed Content-Type on an empty 200) must never advance a checkpoint,
+	// while valid empty/JSON/protobuf/204 responses must advance it.
+	input1 := spanRecordsJSONL(t, "OVERSIZE_ROW")
+	for _, tc := range []struct {
+		name string
+		resp scriptedResponse
+	}{
+		{
+			name: "trailing HTML after JSON object",
+			resp: scriptedResponse{status: 200, header: map[string]string{"Content-Type": "application/json"}, body: []byte(`{}<html>Sign in</html>`)},
+		},
+		{
+			name: "trailing truncated JSON after JSON object",
+			resp: scriptedResponse{status: 200, header: map[string]string{"Content-Type": "application/json"}, body: []byte(`{} {"partialSuccess":`)},
+		},
+		{
+			name: "JSON null body",
+			resp: scriptedResponse{status: 200, header: map[string]string{"Content-Type": "application/json"}, body: []byte(`null`)},
+		},
+		{
+			name: "malformed Content-Type on empty 200",
+			resp: scriptedResponse{status: 200, header: map[string]string{"Content-Type": ";"}},
+		},
+	} {
+		t.Run("checkpoint rejected on "+tc.name, func(t *testing.T) {
+			badRC := newOTLPReceiver(map[string][]scriptedResponse{"/otlp/v1/traces": {tc.resp}})
+			badSrv := httptest.NewServer(badRC)
+			defer badSrv.Close()
+			badSink, err := NewOTLPHTTPSink(badSrv.URL+"/otlp", OTLPHTTPSinkOptions{MaxAttempts: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer badSink.Close()
+			ckptPath := filepath.Join(t.TempDir(), "ambiguous.ckpt")
+			sum, err := Replay(context.Background(), strings.NewReader(input1), badSink, Options{
+				Checkpoint: &CheckpointConfig{Path: ckptPath, Source: "file:q.jsonl"},
+			})
+			if err == nil {
+				t.Fatalf("Replay(%s) succeeded unexpectedly", tc.name)
+			}
+			if sum.ReplayedSpans != 0 || sum.FailedExport != 1 {
+				t.Errorf("Replay(%s) summary = %+v, want ReplayedSpans=0 FailedExport=1", tc.name, sum)
+			}
+			if _, statErr := os.Stat(ckptPath); !errors.Is(statErr, os.ErrNotExist) {
+				t.Errorf("Replay(%s) wrote checkpoint %s (statErr=%v), want no checkpoint created", tc.name, ckptPath, statErr)
+			}
+		})
+	}
+
+	okProto := ptraceotlp.NewExportResponse()
+	okProtoBytes := mustMarshal(t, okProto.MarshalProto)
+	for _, tc := range []struct {
+		name string
+		resp scriptedResponse
+	}{
+		{name: "empty 200 without Content-Type", resp: scriptedResponse{status: 200}},
+		{name: "empty 200 with application/json", resp: scriptedResponse{status: 200, header: map[string]string{"Content-Type": "application/json"}}},
+		{name: "empty 200 with application/x-protobuf", resp: scriptedResponse{status: 200, header: map[string]string{"Content-Type": "application/x-protobuf"}}},
+		{name: "200 with {}", resp: scriptedResponse{status: 200, header: map[string]string{"Content-Type": "application/json"}, body: []byte(`{}`)}},
+		{name: "200 with nonempty protobuf response", resp: scriptedResponse{status: 200, header: map[string]string{"Content-Type": "application/x-protobuf"}, body: okProtoBytes}},
+		{name: "empty 204 No Content", resp: scriptedResponse{status: 204}},
+	} {
+		t.Run("checkpoint advances on "+tc.name, func(t *testing.T) {
+			okRC := newOTLPReceiver(map[string][]scriptedResponse{"/otlp/v1/traces": {tc.resp}})
+			okSrv := httptest.NewServer(okRC)
+			defer okSrv.Close()
+			okSink, err := NewOTLPHTTPSink(okSrv.URL+"/otlp", OTLPHTTPSinkOptions{MaxAttempts: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer okSink.Close()
+			ckptPath := filepath.Join(t.TempDir(), "valid.ckpt")
+			sum, err := Replay(context.Background(), strings.NewReader(input1), okSink, Options{
+				Checkpoint: &CheckpointConfig{Path: ckptPath, Source: "file:q.jsonl"},
+			})
+			if err != nil || sum.ReplayedSpans != 1 {
+				t.Fatalf("Replay(%s) = (%+v, %v), want ReplayedSpans=1 and nil error", tc.name, sum, err)
+			}
+			if st := readCheckpointFile(t, ckptPath); st.Next != 1 || st.Handled != 1 {
+				t.Errorf("Replay(%s) checkpoint = %+v, want Next=1 Handled=1", tc.name, st)
+			}
+		})
+	}
 }
 
 func TestOTLPRetryDelays(t *testing.T) {
@@ -1502,6 +1649,19 @@ func (r fakeQuarantineRow) after(c bigQueryCursor) bool {
 	return r.ord > c.DuplicateOrdinal
 }
 
+func (r fakeQuarantineRow) canonicalKey() string {
+	b, _ := json.Marshal(struct {
+		Signal  string `json:"signal"`
+		Code    string `json:"error_code"`
+		Payload string `json:"raw_payload"`
+	}{
+		Signal:  r.signal,
+		Code:    r.code,
+		Payload: r.payload,
+	})
+	return string(b)
+}
+
 func (r fakeQuarantineRow) json() map[string]any {
 	cell := func(v string) map[string]any {
 		if v == "" {
@@ -1556,12 +1716,31 @@ func (f *fakeQuarantineBigQuery) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		}
 		cursor, resume := cursorParams(req)
 		f.selected = nil
+		ordered := slices.Clone(f.rows)
+		if strings.Contains(req.Query, "ROW_NUMBER() OVER (PARTITION BY ingest_time, row_fp ORDER BY row_key)") &&
+			strings.Contains(req.Query, "ORDER BY ingest_time, row_fp, row_ord, row_key") {
+			slices.SortStableFunc(ordered, func(a, b fakeQuarantineRow) int {
+				if a.ingest.UnixMicro() != b.ingest.UnixMicro() {
+					return strings.Compare(
+						fmt.Sprintf("%020d", a.ingest.UnixMicro()),
+						fmt.Sprintf("%020d", b.ingest.UnixMicro()),
+					)
+				}
+				if a.fp != b.fp {
+					if a.fp < b.fp {
+						return -1
+					}
+					return 1
+				}
+				return strings.Compare(a.canonicalKey(), b.canonicalKey())
+			})
+		}
 		type rowKey struct {
 			us int64
 			fp int64
 		}
 		ords := map[rowKey]int64{}
-		for _, row := range f.rows {
+		for _, row := range ordered {
 			k := rowKey{us: row.ingest.UnixMicro(), fp: row.fp}
 			row.ord = ords[k]
 			ords[k]++
@@ -1872,6 +2051,51 @@ func TestReplayBigQueryDuplicateRowsWithCheckpoint(t *testing.T) {
 	st2 = readCheckpointFile(t, opts2.Checkpoint.Path)
 	if want := (bigQueryCursor{IngestTimeMicros: base.UnixMicro(), RowFingerprint: 77, DuplicateOrdinal: 2}); st2.Cursor == nil || *st2.Cursor != want || st2.Handled != 3 {
 		t.Errorf("final duplicate checkpoint = %+v (cursor %+v), want %+v", st2, st2.Cursor, want)
+	}
+
+	// 3. Two distinct rows sharing (ingest_time, row_fp) must receive a
+	// deterministic row_ord across restarts even when the underlying table scan
+	// order reverses between the initial query and the resumed query.
+	spanA := sampleSpanJSON(t, "collision-span-A")
+	spanB := sampleSpanJSON(t, "collision-span-B")
+	fakeCollision := &fakeQuarantineBigQuery{rows: []fakeQuarantineRow{
+		{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: spanA},
+		{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: spanB},
+	}}
+	srvCollision := httptest.NewServer(fakeCollision)
+	defer srvCollision.Close()
+
+	dir3 := t.TempDir()
+	opts3 := Options{Checkpoint: &CheckpointConfig{Path: filepath.Join(dir3, "collision.ckpt")}}
+	flakyCollision := &recordingSink{fail: func(call int) error {
+		if call == 2 {
+			return errors.New("transient collision timeout")
+		}
+		return nil
+	}}
+	_, err = ReplayBigQuery(context.Background(), src, flakyCollision, opts3, bigQueryTestOptions(srvCollision)...)
+	if err == nil || !strings.Contains(err.Error(), "transient collision timeout") {
+		t.Fatalf("first collision run = %v, want transient collision timeout", err)
+	}
+	if !slices.Equal(flakyCollision.names, []string{"collision-span-A"}) {
+		t.Fatalf("first collision run exported %v, want [collision-span-A]", flakyCollision.names)
+	}
+
+	// Reverse the physical table scan order before resuming.
+	fakeCollision.mu.Lock()
+	fakeCollision.rows[0], fakeCollision.rows[1] = fakeCollision.rows[1], fakeCollision.rows[0]
+	fakeCollision.mu.Unlock()
+
+	resumedCollision := &recordingSink{}
+	sum3, err := ReplayBigQuery(context.Background(), src, resumedCollision, opts3, bigQueryTestOptions(srvCollision)...)
+	if err != nil {
+		t.Fatalf("resumed collision run: %v", err)
+	}
+	if want := (Summary{TotalRead: 1, Matched: 1, ReplayedSpans: 1}); sum3 != want {
+		t.Errorf("resumed collision summary = %+v, want %+v", sum3, want)
+	}
+	if !slices.Equal(resumedCollision.names, []string{"collision-span-B"}) {
+		t.Errorf("resumed collision run exported %v, want [collision-span-B] (must not re-export collision-span-A or drop collision-span-B)", resumedCollision.names)
 	}
 }
 

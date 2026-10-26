@@ -142,7 +142,7 @@ this section in the same change to record it.
    codeowners:
 -    active: [haiyuan-eng-google]
 +    active: [haiyuan-eng-google, <sponsor>, <codeowner-3>]
- 
+
  tests:
    config:
 ```

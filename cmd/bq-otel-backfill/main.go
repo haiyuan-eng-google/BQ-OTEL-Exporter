@@ -85,7 +85,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		tracesTable              = fs.String("traces-table", backfill.DefaultTracesTable, "Span table (the exporter's traces.table)")
 		logsTable                = fs.String("logs-table", backfill.DefaultLogsTable, "Log table (the exporter's logs.table)")
 		metricsTable             = fs.String("metrics-table", backfill.DefaultMetricsTable, "Metric table (the exporter's metrics.table)")
-		redactEnabled            = fs.Bool("redact", false, "Enable client-side redaction (the exporter's redaction.enabled); also enabled when any other -redact-* flag is set")
+		redactEnabled            = fs.Bool("redact", false, "Enable client-side redaction (the exporter's redaction.enabled); when omitted, enabled implicitly if any other -redact-* flag is set")
 		redactKeys               = fs.String("redact-keys", "", "Comma-separated attribute keys masked in addition to the defaults (the exporter's redaction.blocked_keys)")
 		redactDisableDefaultKeys = fs.Bool("redact-disable-default-keys", false, "Disable the built-in blocked key list so only -redact-keys apply (the exporter's redaction.disable_default_keys)")
 		redactMaskReplacement    = fs.String("redact-mask-replacement", "", "Replacement text for redacted values (the exporter's redaction.mask_replacement; defaults to [REDACTED])")
@@ -132,6 +132,18 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			keys = append(keys, k)
 		}
 	}
+	visited := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) {
+		visited[f.Name] = true
+	})
+	redactOn := *redactEnabled
+	if !visited["redact"] {
+		redactOn = len(keys) > 0 ||
+			*redactDisableDefaultKeys ||
+			len(valuePatterns) > 0 ||
+			*redactMaskReplacement != "" ||
+			*redactLogBody
+	}
 	cfg := backfill.Config{
 		Source:               *source,
 		Project:              *project,
@@ -142,7 +154,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		MetricsTable:         *metricsTable,
 		BatchSize:            *batchSize,
 		MaxWorkers:           *maxWorkers,
-		Redact:               *redactEnabled,
+		Redact:               redactOn,
 		BlockedKeys:          keys,
 		DisableDefaultKeys:   *redactDisableDefaultKeys,
 		BlockedValuePatterns: valuePatterns,

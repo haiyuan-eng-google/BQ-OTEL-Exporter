@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -24,12 +25,15 @@ import (
 
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
+	"go.opentelemetry.io/collector/component/componenttest"
+	"go.opentelemetry.io/collector/exporter/exportertest"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"google.golang.org/api/option"
 
+	bigqueryexporter "github.com/haiyuan-eng-google/BQ-OTEL-Exporter"
 	bqi "github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/bigquery"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/protoenc"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/redact"
@@ -590,6 +594,7 @@ func TestRunRedactsBeforeAppending(t *testing.T) {
 	e.gcs.put("exports/secrets.jsonl.gz", gzipped(t, jsonl(tracesJSON(t, td), logsJSON(t, ld), metricsJSON(t, md))))
 
 	cfg := e.config()
+	cfg.Redact = true
 	cfg.BlockedKeys = []string{"x-session"}
 	cfg.BlockedValuePatterns = []string{`\d{4}-\d{4}-\d{4}-\d{4}`, `hunter2-[a-z]+`}
 	cfg.RedactLogBody = true
@@ -625,69 +630,310 @@ func TestRunRedactsBeforeAppending(t *testing.T) {
 }
 
 func TestRunRedactionParityWithLiveExporter(t *testing.T) {
-	makeArchive := func(t *testing.T) []byte {
-		t.Helper()
+	makeInputs := func() (ptrace.Traces, plog.Logs) {
 		td, spans := newSpans(1, "parity", spanStart)
-		attrs := spans.At(0).Attributes()
-		attrs.PutStr("authorization", "Bearer live-default-must-survive")
-		attrs.PutStr("x-custom-header", "custom-header-cleartext")
-		return jsonl(tracesJSON(t, td))
+		sAttrs := spans.At(0).Attributes()
+		sAttrs.PutStr("authorization", "Bearer secret")
+		sAttrs.PutStr("x-custom", "custom value")
+		sAttrs.PutStr("note", "card 4111-1111-1111-1111 on file")
+
+		ld, records := newLogs(1, "login token hunter2-body accepted", logTime)
+		lAttrs := records.At(0).Attributes()
+		lAttrs.PutStr("authorization", "Bearer secret")
+		lAttrs.PutStr("x-custom", "custom value")
+		lAttrs.PutStr("note", "card 4111-1111-1111-1111 on file")
+		return td, ld
 	}
 
-	t.Run("default config keeps built-in keys like live exporter", func(t *testing.T) {
-		e := newTestEnv(t)
-		e.gcs.put("exports/default.jsonl", makeArchive(t))
-		rep := mustRun(t, e.config())
-		if !rep.Complete() {
-			t.Fatalf("Complete() = false: %+v", rep.Failures)
-		}
-		dump := fmt.Sprint(e.bq.Rows(DefaultTracesTable))
-		if !strings.Contains(dump, "Bearer live-default-must-survive") {
-			t.Errorf("default backfill redacted authorization when Redact=false: %s", dump)
-		}
-		if !strings.Contains(dump, "custom-header-cleartext") {
-			t.Errorf("default backfill redacted x-custom-header: %s", dump)
-		}
-	})
+	cases := []struct {
+		name         string
+		configure    func(*bigqueryexporter.RedactionConfig)
+		wantAuthKept bool
+		wantCustKept bool
+	}{
+		{
+			name: "materialized factory defaults with Enabled=false and MaskReplacement=[REDACTED]",
+			configure: func(_ *bigqueryexporter.RedactionConfig) {
+				// Leave factory defaults untouched: Enabled=false, MaskReplacement="[REDACTED]".
+			},
+			wantAuthKept: true,
+			wantCustKept: true,
+		},
+		{
+			name: "disabled custom rules with Enabled=false",
+			configure: func(rc *bigqueryexporter.RedactionConfig) {
+				rc.Enabled = false
+				rc.DisableDefaultKeys = true
+				rc.BlockedKeys = []string{"x-custom"}
+				rc.BlockedValuePatterns = []string{`\d{4}-\d{4}-\d{4}-\d{4}`, `hunter2-[a-z]+`}
+				rc.MaskReplacement = "<CUSTOM_MASK>"
+				rc.RedactLogBody = true
+			},
+			wantAuthKept: true,
+			wantCustKept: true,
+		},
+		{
+			name: "enabled defaults",
+			configure: func(rc *bigqueryexporter.RedactionConfig) {
+				rc.Enabled = true
+			},
+			wantAuthKept: false,
+			wantCustKept: true,
+		},
+		{
+			name: "enabled with disabled built-ins",
+			configure: func(rc *bigqueryexporter.RedactionConfig) {
+				rc.Enabled = true
+				rc.DisableDefaultKeys = true
+				rc.BlockedKeys = []string{"x-custom"}
+			},
+			wantAuthKept: true,
+			wantCustKept: false,
+		},
+		{
+			name: "enabled custom masks and patterns",
+			configure: func(rc *bigqueryexporter.RedactionConfig) {
+				rc.Enabled = true
+				rc.BlockedKeys = []string{"x-custom"}
+				rc.BlockedValuePatterns = []string{`\d{4}-\d{4}-\d{4}-\d{4}`, `hunter2-[a-z]+`}
+				rc.MaskReplacement = "<CUSTOM_MASK>"
+				rc.RedactLogBody = true
+			},
+			wantAuthKept: false,
+			wantCustKept: false,
+		},
+	}
 
-	t.Run("Redact=true enables default blocked keys", func(t *testing.T) {
-		e := newTestEnv(t)
-		e.gcs.put("exports/enabled.jsonl", makeArchive(t))
-		cfg := e.config()
-		cfg.Redact = true
-		rep := mustRun(t, cfg)
-		if !rep.Complete() {
-			t.Fatalf("Complete() = false: %+v", rep.Failures)
-		}
-		dump := fmt.Sprint(e.bq.Rows(DefaultTracesTable))
-		if strings.Contains(dump, "Bearer live-default-must-survive") {
-			t.Errorf("Redact=true left authorization in the clear: %s", dump)
-		}
-		if !strings.Contains(dump, "custom-header-cleartext") {
-			t.Errorf("Redact=true without BlockedKeys masked x-custom-header: %s", dump)
-		}
-	})
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			liveSrv := bqfake.NewServer(t)
+			factory := bigqueryexporter.NewFactory()
+			expCfg := factory.CreateDefaultConfig().(*bigqueryexporter.Config)
+			expCfg.Project = testProject
+			expCfg.Dataset = testDataset
+			expCfg.Endpoint.URL = liveSrv.Addr()
+			expCfg.Endpoint.Insecure = true
+			expCfg.Endpoint.WithoutAuthentication = true
+			expCfg.BackOffConfig.Enabled = false
+			tc.configure(&expCfg.Redaction)
+			if err := expCfg.Validate(); err != nil {
+				t.Fatalf("expCfg.Validate() = %v", err)
+			}
 
-	t.Run("DisableDefaultKeys and custom MaskReplacement", func(t *testing.T) {
-		e := newTestEnv(t)
-		e.gcs.put("exports/custom.jsonl", makeArchive(t))
-		cfg := e.config()
-		cfg.Redact = true
-		cfg.DisableDefaultKeys = true
-		cfg.BlockedKeys = []string{"x-custom-header"}
-		cfg.MaskReplacement = "<CUSTOM_MASK>"
-		rep := mustRun(t, cfg)
-		if !rep.Complete() {
-			t.Fatalf("Complete() = false: %+v", rep.Failures)
-		}
-		dump := fmt.Sprint(e.bq.Rows(DefaultTracesTable))
-		if !strings.Contains(dump, "Bearer live-default-must-survive") {
-			t.Errorf("DisableDefaultKeys=true still redacted authorization: %s", dump)
-		}
-		if strings.Contains(dump, "custom-header-cleartext") || !strings.Contains(dump, "<CUSTOM_MASK>") {
-			t.Errorf("custom BlockedKeys + MaskReplacement not applied: %s", dump)
-		}
-	})
+			set := exportertest.NewNopSettings(factory.Type())
+			tracesExp, err := factory.CreateTraces(ctx, set, expCfg)
+			if err != nil {
+				t.Fatalf("CreateTraces: %v", err)
+			}
+			logsExp, err := factory.CreateLogs(ctx, set, expCfg)
+			if err != nil {
+				t.Fatalf("CreateLogs: %v", err)
+			}
+			if err := tracesExp.Start(ctx, componenttest.NewNopHost()); err != nil {
+				t.Fatalf("tracesExp.Start: %v", err)
+			}
+			if err := logsExp.Start(ctx, componenttest.NewNopHost()); err != nil {
+				_ = tracesExp.Shutdown(ctx)
+				t.Fatalf("logsExp.Start: %v", err)
+			}
+
+			tdLive, ldLive := makeInputs()
+			if err := tracesExp.ConsumeTraces(ctx, tdLive); err != nil {
+				_ = tracesExp.Shutdown(ctx)
+				_ = logsExp.Shutdown(ctx)
+				t.Fatalf("ConsumeTraces: %v", err)
+			}
+			if err := logsExp.ConsumeLogs(ctx, ldLive); err != nil {
+				_ = tracesExp.Shutdown(ctx)
+				_ = logsExp.Shutdown(ctx)
+				t.Fatalf("ConsumeLogs: %v", err)
+			}
+			if err := tracesExp.Shutdown(ctx); err != nil {
+				_ = logsExp.Shutdown(ctx)
+				t.Fatalf("tracesExp.Shutdown: %v", err)
+			}
+			if err := logsExp.Shutdown(ctx); err != nil {
+				t.Fatalf("logsExp.Shutdown: %v", err)
+			}
+
+			// Copy all redaction fields from expCfg.Redaction into backfill.Config.
+			e := newTestEnv(t)
+			tdArchive, ldArchive := makeInputs()
+			e.gcs.put("exports/parity.jsonl", jsonl(tracesJSON(t, tdArchive), logsJSON(t, ldArchive)))
+			bfCfg := e.config()
+			bfCfg.Redact = expCfg.Redaction.Enabled
+			bfCfg.BlockedKeys = slices.Clone(expCfg.Redaction.BlockedKeys)
+			bfCfg.DisableDefaultKeys = expCfg.Redaction.DisableDefaultKeys
+			bfCfg.BlockedValuePatterns = slices.Clone(expCfg.Redaction.BlockedValuePatterns)
+			bfCfg.MaskReplacement = expCfg.Redaction.MaskReplacement
+			bfCfg.RedactLogBody = expCfg.Redaction.RedactLogBody
+			bfCfg.LogNameAttribute = expCfg.Logs.LogNameAttribute
+			bfCfg.InsertIDAttribute = expCfg.Logs.InsertIDAttribute
+
+			rep := mustRun(t, bfCfg)
+			if !rep.Complete() {
+				t.Fatalf("backfill Complete() = false: %+v", rep.Failures)
+			}
+
+			liveSpans := liveSrv.Rows(DefaultTracesTable)
+			bfSpans := e.bq.Rows(DefaultTracesTable)
+			if len(liveSpans) != 1 || len(bfSpans) != 1 {
+				t.Fatalf("spans rows: live=%d backfill=%d, want 1 each", len(liveSpans), len(bfSpans))
+			}
+			delete(liveSpans[0], "receive_time")
+			delete(bfSpans[0], "receive_time")
+			delete(liveSpans[0], "receive_time_unix_nano")
+			delete(bfSpans[0], "receive_time_unix_nano")
+			if !reflect.DeepEqual(liveSpans[0], bfSpans[0]) {
+				t.Errorf("span row mismatch:\nlive:     %+v\nbackfill: %+v", liveSpans[0], bfSpans[0])
+			}
+
+			liveLogs := liveSrv.Rows(DefaultLogsTable)
+			bfLogs := e.bq.Rows(DefaultLogsTable)
+			if len(liveLogs) != 1 || len(bfLogs) != 1 {
+				t.Fatalf("logs rows: live=%d backfill=%d, want 1 each", len(liveLogs), len(bfLogs))
+			}
+			liveFP := fmt.Sprint(liveLogs[0]["insert_id"])
+			bfFP := fmt.Sprint(bfLogs[0]["insert_id"])
+			if !strings.HasPrefix(liveFP, "fp1:") || liveFP != bfFP {
+				t.Errorf("log insert_id fingerprint mismatch: live=%q backfill=%q", liveFP, bfFP)
+			}
+			delete(liveLogs[0], "receive_time")
+			delete(bfLogs[0], "receive_time")
+			delete(liveLogs[0], "receive_time_unix_nano")
+			delete(bfLogs[0], "receive_time_unix_nano")
+			if !reflect.DeepEqual(liveLogs[0], bfLogs[0]) {
+				t.Errorf("log row mismatch:\nlive:     %+v\nbackfill: %+v", liveLogs[0], bfLogs[0])
+			}
+
+			dump := fmt.Sprint(bfLogs[0])
+			if got := strings.Contains(dump, "Bearer secret"); got != tc.wantAuthKept {
+				t.Errorf("authorization cleartext present = %v, want %v (row=%s)", got, tc.wantAuthKept, dump)
+			}
+			if got := strings.Contains(dump, "custom value"); got != tc.wantCustKept {
+				t.Errorf("x-custom cleartext present = %v, want %v (row=%s)", got, tc.wantCustKept, dump)
+			}
+		})
+	}
+}
+
+func TestRedactionRejectsBlockedLogIdentityAttributes(t *testing.T) {
+	base := Config{Source: testSource, Project: testProject, Dataset: testDataset, Redact: true}
+	for _, tc := range []struct {
+		name string
+		edit func(*Config)
+		want string
+	}{
+		{
+			name: "insert_id_attribute matches built-in exact blocked key",
+			edit: func(c *Config) { c.InsertIDAttribute = "authorization" },
+			want: `redaction: insert_id_attribute "authorization" matches a blocked redaction key`,
+		},
+		{
+			name: "insert_id_attribute matches built-in glob blocked key",
+			edit: func(c *Config) { c.InsertIDAttribute = "user_secret_id" },
+			want: `redaction: insert_id_attribute "user_secret_id" matches a blocked redaction key`,
+		},
+		{
+			name: "insert_id_attribute matches custom exact key with DisableDefaultKeys",
+			edit: func(c *Config) {
+				c.DisableDefaultKeys = true
+				c.BlockedKeys = []string{"session_token"}
+				c.InsertIDAttribute = "session_token"
+			},
+			want: `redaction: insert_id_attribute "session_token" matches a blocked redaction key`,
+		},
+		{
+			name: "insert_id_attribute matches custom glob key with DisableDefaultKeys",
+			edit: func(c *Config) {
+				c.DisableDefaultKeys = true
+				c.BlockedKeys = []string{"session_*"}
+				c.InsertIDAttribute = "session_token"
+			},
+			want: `redaction: insert_id_attribute "session_token" matches a blocked redaction key`,
+		},
+		{
+			name: "log_name_attribute matches built-in exact blocked key",
+			edit: func(c *Config) { c.LogNameAttribute = "api_key" },
+			want: `redaction: log_name_attribute "api_key" matches a blocked redaction key`,
+		},
+		{
+			name: "log_name_attribute matches built-in glob blocked key",
+			edit: func(c *Config) { c.LogNameAttribute = "oauth_token" },
+			want: `redaction: log_name_attribute "oauth_token" matches a blocked redaction key`,
+		},
+		{
+			name: "log_name_attribute matches custom glob key with DisableDefaultKeys",
+			edit: func(c *Config) {
+				c.DisableDefaultKeys = true
+				c.BlockedKeys = []string{"tenant.*.secret"}
+				c.LogNameAttribute = "tenant.prod.secret"
+			},
+			want: `redaction: log_name_attribute "tenant.prod.secret" matches a blocked redaction key`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := base
+			tc.edit(&c)
+			if err := c.Validate(); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("Validate() = %v, want %q", err, tc.want)
+			}
+			e := newTestEnv(t)
+			ld, records := newLogs(2, "event", logTime)
+			records.At(0).Attributes().PutStr(c.InsertIDAttribute, "id-1")
+			records.At(1).Attributes().PutStr(c.InsertIDAttribute, "id-2")
+			e.gcs.put("exports/logs.jsonl", jsonl(logsJSON(t, ld)))
+			runCfg := e.config()
+			runCfg.Redact = c.Redact
+			runCfg.DisableDefaultKeys = c.DisableDefaultKeys
+			runCfg.BlockedKeys = c.BlockedKeys
+			runCfg.InsertIDAttribute = c.InsertIDAttribute
+			runCfg.LogNameAttribute = c.LogNameAttribute
+			if _, err := Run(context.Background(), runCfg); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("Run() error = %v, want %q", err, tc.want)
+			}
+			if got := e.bq.RowCount(DefaultLogsTable); got != 0 {
+				t.Errorf("otel_logs holds %d rows after rejected identity config, want 0", got)
+			}
+		})
+	}
+
+	// Row-level check: when InsertIDAttribute and LogNameAttribute do NOT match
+	// built-in or custom globs, distinct records keep distinct insert_id and
+	// log_name values while sibling blocked attributes are masked.
+	e := newTestEnv(t)
+	ld, records := newLogs(2, "audit event", logTime)
+	records.At(0).Attributes().PutStr("app.record_id", "rec-1")
+	records.At(0).Attributes().PutStr("app.log", "audit-a")
+	records.At(0).Attributes().PutStr("session_token", "tok-1")
+	records.At(1).Attributes().PutStr("app.record_id", "rec-2")
+	records.At(1).Attributes().PutStr("app.log", "audit-b")
+	records.At(1).Attributes().PutStr("session_token", "tok-2")
+	e.gcs.put("exports/logs.jsonl", jsonl(logsJSON(t, ld)))
+
+	cfg := e.config()
+	cfg.Redact = true
+	cfg.BlockedKeys = []string{"session_*"}
+	cfg.InsertIDAttribute = "app.record_id"
+	cfg.LogNameAttribute = "app.log"
+	rep := mustRun(t, cfg)
+	if !rep.Complete() {
+		t.Fatalf("Complete() = false: %+v", rep.Failures)
+	}
+	rows := e.bq.Rows(DefaultLogsTable)
+	if len(rows) != 2 {
+		t.Fatalf("otel_logs holds %d rows, want 2", len(rows))
+	}
+	if got := []string{fmt.Sprint(rows[0]["insert_id"]), fmt.Sprint(rows[1]["insert_id"])}; !slices.Equal(got, []string{"rec-1", "rec-2"}) {
+		t.Errorf("insert_id values = %v, want [rec-1 rec-2]", got)
+	}
+	if got := []string{fmt.Sprint(rows[0]["log_name"]), fmt.Sprint(rows[1]["log_name"])}; !slices.Equal(got, []string{"audit-a", "audit-b"}) {
+		t.Errorf("log_name values = %v, want [audit-a audit-b]", got)
+	}
+	if dump := fmt.Sprint(rows); strings.Contains(dump, "tok-1") || strings.Contains(dump, "tok-2") {
+		t.Errorf("session_token leaked in rows: %s", dump)
+	}
 }
 
 func TestRunSignalSkipsOtherSignals(t *testing.T) {
@@ -992,6 +1238,83 @@ func TestRunStopsOnPermanentAppendFailure(t *testing.T) {
 		}
 		if acked != 0 || refused != 1 {
 			t.Errorf("acked=%d refused=%d, want acked=0 refused=1", acked, refused)
+		}
+		if got := e.requests(); got != 2 {
+			t.Errorf("%d append requests, want 2 (no retry after permanent failure)", got)
+		}
+	})
+
+	t.Run("final batch via batcher.flushAll with row errors and permanent failure aborts", func(t *testing.T) {
+		e := newTestEnv(t)
+		cfg := e.config()
+		if err := cfg.normalize(); err != nil {
+			t.Fatal(err)
+		}
+		lifetimeCtx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		client, err := managedwriter.NewClient(lifetimeCtx, cfg.Project, cfg.WriteClientOptions...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = client.Close() }()
+		ts, label := tableSchema(SignalTraces)
+		enc, err := protoenc.New(ts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sk := &sink{
+			table: DefaultTracesTable,
+			enc:   enc,
+			writer: bqi.NewWriter(lifetimeCtx, client, bqi.WriterOptions{
+				Project:             cfg.Project,
+				Dataset:             cfg.Dataset,
+				Table:               DefaultTracesTable,
+				Signal:              label,
+				Descriptor:          enc.Descriptor(),
+				MaxRequestBytes:     64,
+				MaxInflightRequests: maxInflightRequests,
+				MaxInflightBytes:    maxInflightBytes,
+				StreamPoolSize:      1,
+				TraceID:             writeTraceID,
+			}),
+		}
+		defer func() { _ = sk.writer.Close() }()
+
+		row := bytes.Repeat([]byte{0x08, 0x01}, 64)
+		e.bq.EnqueueFault(
+			bqfake.Fault{
+				Mode:      bqfake.FaultRowErrors,
+				Table:     DefaultTracesTable,
+				RowErrors: []*storagepb.RowError{{Index: 0, Code: storagepb.RowError_FIELDS_ERROR, Message: "bad row"}},
+			},
+			bqfake.Fault{
+				Mode:  bqfake.FaultPermissionDenied,
+				Table: DefaultTracesTable,
+			},
+		)
+		r := &run{
+			cfg:    cfg,
+			sinks:  map[string]*sink{SignalTraces: sk},
+			totals: map[string]*signalStats{},
+		}
+		st := &objectStats{
+			url:     "gs://" + testBucket + "/exports/final.jsonl",
+			signals: map[string]*signalStats{SignalTraces: {records: 2, encoded: 2}},
+		}
+		b := &batcher{
+			run:  r,
+			st:   st,
+			rows: map[string][][]byte{SignalTraces: {row, row}},
+		}
+		err = b.flushAll(context.Background(), 1)
+
+		var permanent *PermanentError
+		if !errors.As(err, &permanent) || permanent.Label != bqi.LabelPermission || permanent.Table != DefaultTracesTable {
+			t.Fatalf("flushAll error = %v, want *PermanentError labeled %s", err, bqi.LabelPermission)
+		}
+		s := st.signal(SignalTraces)
+		if s.appended != 0 || s.rejected["row_error"] != 1 || s.encoded-s.appended-s.rejected["row_error"] != 1 {
+			t.Errorf("signal stats = %+v, want appended=0 rejected[row_error]=1 unwritten=1", s)
 		}
 		if got := e.requests(); got != 2 {
 			t.Errorf("%d append requests, want 2 (no retry after permanent failure)", got)

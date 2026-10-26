@@ -7,6 +7,8 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -179,10 +181,29 @@ type otlpResponse interface {
 }
 
 func unmarshalOTLPResponse(r otlpResponse, body []byte, isJSON bool) error {
-	if isJSON {
-		return r.UnmarshalJSON(body)
+	if !isJSON {
+		return r.UnmarshalProto(body)
 	}
-	return r.UnmarshalProto(body)
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) < 2 || trimmed[0] != '{' || trimmed[len(trimmed)-1] != '}' {
+		return errors.New("JSON response must be a single JSON object")
+	}
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	var obj map[string]json.RawMessage
+	if err := dec.Decode(&obj); err != nil {
+		return err
+	}
+	if obj == nil {
+		return errors.New("JSON response must be a non-null JSON object")
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("JSON response contains trailing data after object")
+		}
+		return err
+	}
+	return r.UnmarshalJSON(trimmed)
 }
 
 // send posts body to path, retrying as the type comment describes. unit
@@ -229,8 +250,15 @@ func (s *OTLPHTTPSink) post(ctx context.Context, path string, body []byte, unit 
 		_ = resp.Body.Close()
 	}()
 	respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, otlpMaxResponseBytes+1))
-	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
-	isJSON := mediaType == "application/json"
+	rawContentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
+	var (
+		mediaType string
+		ctErr     error
+	)
+	if rawContentType != "" {
+		mediaType, _, ctErr = mime.ParseMediaType(rawContentType)
+	}
+	isJSON := ctErr == nil && mediaType == "application/json"
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		if resp.StatusCode != http.StatusOK && (resp.StatusCode != http.StatusNoContent || len(respBody) > 0) {
@@ -241,6 +269,9 @@ func (s *OTLPHTTPSink) post(ctx context.Context, path string, body []byte, unit 
 		}
 		if len(respBody) > otlpMaxResponseBytes {
 			return false, 0, fmt.Errorf("POST %s%s: %s response body exceeds %d bytes", s.display, path, resp.Status, otlpMaxResponseBytes)
+		}
+		if ctErr != nil {
+			return false, 0, fmt.Errorf("POST %s%s: %s: unexpected Content-Type %q: %w", s.display, path, resp.Status, resp.Header.Get("Content-Type"), ctErr)
 		}
 		if len(respBody) == 0 {
 			if mediaType != "" && mediaType != otlpProtobufContentType && !isJSON {

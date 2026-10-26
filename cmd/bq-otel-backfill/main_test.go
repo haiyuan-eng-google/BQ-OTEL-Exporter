@@ -296,6 +296,23 @@ func TestRedactionAndLogIdentityFlags(t *testing.T) {
 	if strings.Contains(spans2, "session-cleartext") || !strings.Contains(spans2, "<MASKED>") {
 		t.Errorf("custom mask replacement not applied to x-session: %s", spans2)
 	}
+
+	// Explicit -redact=false is authoritative even when other -redact-* flags
+	// (such as -redact-mask-replacement=[REDACTED] or -redact-keys) are passed.
+	e3 := startEnv(t)
+	e3.gcs.put("exports/2025-03-14.jsonl", jsonl(spansLine))
+	code, stdout, stderr = runCommand(t, withRequired(
+		"-redact=false",
+		"-redact-mask-replacement=[REDACTED]",
+		"-redact-keys=x-session",
+	)...)
+	if code != 0 {
+		t.Fatalf("exit %d, stderr %q, stdout:\n%s", code, stderr, stdout)
+	}
+	spans3 := fmt.Sprint(e3.bq.Rows("otel_spans"))
+	if !strings.Contains(spans3, "session-cleartext") || strings.Contains(spans3, "[REDACTED]") {
+		t.Errorf("explicit -redact=false still redacted spans: %s", spans3)
+	}
 }
 
 func TestSignalTableAndBatchFlags(t *testing.T) {
@@ -422,6 +439,8 @@ func TestUsageErrors(t *testing.T) {
 		{"source scheme", []string{"-source-gcs-prefix=s3://bucket/x", "-project=p", "-dataset=d"}, `source "s3://bucket/x": want gs://bucket/prefix`},
 		{"source bucket", []string{"-source-gcs-prefix=gs:///x", "-project=p", "-dataset=d"}, `source "gs:///x" names no bucket`},
 		{"value pattern", withRequired("-redact-value-pattern=("), "redaction: "},
+		{"blocked insert_id_attribute", withRequired("-redact", "-insert-id-attribute=authorization"), `insert_id_attribute "authorization" matches a blocked redaction key`},
+		{"blocked log_name_attribute", withRequired("-redact", "-redact-disable-default-keys", "-redact-keys=session_*", "-log-name-attribute=session_stream"), `log_name_attribute "session_stream" matches a blocked redaction key`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			code, stdout, stderr := runCommand(t, tc.args...)
