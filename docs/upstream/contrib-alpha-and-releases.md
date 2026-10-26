@@ -303,13 +303,20 @@ pull request to opentelemetry.io and a human step; see
 
 ## How this staging was verified
 
-In scratch, on 2026-10-25, the pull request 3 tree (the pull request 1 and 2
-files, then the two files above) went through the same run as the other
-trees, described in
-[contrib-pr-staging.md](contrib-pr-staging.md#how-this-staging-was-verified).
+In a standalone checkout of this repository, `go test ./internal/contribcheck/...`
+checks the fenced-file layout and `metadata.yaml` stability transitions in this
+document (`TestMdatagen` skips unless `CONTRIBCHECK_MDATAGEN` is set, and the
+fenced wrapper templates are not compiled by the root module).
+
+As **author-reported** observations from an external scratch directory on
+2026-10-25 (not reproduced by a standalone `go test ./...` run in this
+repository), the pull request 3 tree (the pull request 1 and 2 files, then the
+two files above) went through the same manual scratch run as the other trees,
+described in
+[contrib-pr-staging.md](contrib-pr-staging.md#how-this-staging-was-verified):
 mdatagen v0.163.0 wrote `component.StabilityLevelAlpha` for traces, logs, and
-metrics into `internal/metadata/generated_status.go` and left the staged
-README unchanged. `go vet` passed, and `go test -race` passed with 100%
-statement coverage of the component package, including
-`TestComponentLifecycle`. The negative probes listed there ran on this tree.
-No contrib or releases gate was run in a checkout.
+metrics into `internal/metadata/generated_status.go` and left the staged README
+unchanged; `go vet` and `go test -race` passed in that scratch module (reporting
+100% statement coverage of the staged component package, including
+`TestComponentLifecycle`); and the negative probes listed there ran on that
+scratch tree. No contrib or releases gate was run in an upstream checkout.

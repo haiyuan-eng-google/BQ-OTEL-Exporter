@@ -276,8 +276,17 @@ func (rc *traceReceiver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func TestCLIBigQueryToOTLP(t *testing.T) {
 	micros := strconv.FormatInt(time.Date(2026, 10, 11, 10, 0, 0, 0, time.UTC).UnixMicro(), 10)
-	spanKey := `{"signal":"spans","error_code":"OVERSIZE_ROW","raw_payload":"` + spanPayload(t, "from-bigquery") + `"}`
-	logKey := `{"signal":"logs","error_code":"ROW_ERROR","raw_payload":""}`
+	spanKeyBytes, err := json.Marshal(map[string]string{
+		"signal":        "spans",
+		"error_code":    "OVERSIZE_ROW",
+		"error_message": "rejected",
+		"raw_payload":   spanPayload(t, "from-bigquery"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spanKey := string(spanKeyBytes)
+	logKey := `{"signal":"logs","error_code":"ROW_ERROR","error_message":"rejected","raw_payload":""}`
 	bq := &fakeBigQuery{rows: [][]any{
 		{micros, "spans", "OVERSIZE_ROW", spanPayload(t, "from-bigquery"), "42", "0", spanKey},
 		{micros, "logs", "ROW_ERROR", "", "43", "0", logKey},

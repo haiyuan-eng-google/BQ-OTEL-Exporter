@@ -926,8 +926,16 @@ request 2 changes `go.mod` and the generated tests.
 
 ## How this staging was verified
 
-All of this ran in a scratch directory outside the repository, on 2026-10-25.
-These are observations of those runs, not results of the contrib gates.
+In a standalone checkout of this repository, `go test ./internal/contribcheck/...`
+verifies the markdown structure, fenced-file layout, `metadata.yaml` schema, and
+upstream checklist invariants; `TestMdatagen` skips unless `CONTRIBCHECK_MDATAGEN`
+points to an `mdatagen` binary, and the fenced wrapper files in this document are
+staged templates rather than Go packages compiled by the root module.
+
+The additional checks below are **author-reported** observations from a one-off
+scratch directory outside the repository on 2026-10-25 (not reproduced by a
+standalone `go test ./...` run in this repository and not results of the
+upstream contrib CI gates):
 
 - **Trees.** For each pull request, the staged files were overlaid in order,
   then `mdatagen metadata.yaml` (v0.163.0) ran, a `replace` pointed the

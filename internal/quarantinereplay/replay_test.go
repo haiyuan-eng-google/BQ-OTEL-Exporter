@@ -558,6 +558,14 @@ func assertCursor(t *testing.T, st checkpointState, wantIngestMicros, wantFP, wa
 	if st.Cursor.CanonicalRowKey != wantKey {
 		t.Errorf("cursor canonical_row_key = %q, want %q", st.Cursor.CanonicalRowKey, wantKey)
 	}
+	if wantKey != "" {
+		if int64(st.Cursor.GroupCount) <= wantOrd {
+			t.Errorf("cursor group_count = %d, want > %d", st.Cursor.GroupCount, wantOrd)
+		}
+		if err := validateHexSHA256(st.Cursor.PrefixSHA256); err != nil {
+			t.Errorf("cursor prefix_sha256 = %q: %v", st.Cursor.PrefixSHA256, err)
+		}
+	}
 	if st.Handled != wantHandled {
 		t.Errorf("handled = %d, want %d", st.Handled, wantHandled)
 	}
@@ -1649,17 +1657,20 @@ func TestOTLPRetryDelays(t *testing.T) {
 // quarantineResultColumns are the columns the replay query selects.
 var quarantineResultColumns = []string{
 	"ingest_time_us", "signal", "error_code", "error_message", "service_name",
-	"trace_id", "span_id", "raw_payload", "payload_ref_uri", "payload_ref_version", "row_fp", "row_ord", "row_key",
+	"trace_id", "span_id", "raw_payload", "payload_ref_uri", "payload_ref_version",
+	"row_fp", "row_ord", "row_key", "group_size", "prefix_sha256",
 }
 
 // fakeQuarantineRow is one row the fake BigQuery returns.
 type fakeQuarantineRow struct {
-	ingest  time.Time
-	fp      int64
-	ord     int64
-	signal  string
-	code    string
-	payload string
+	ingest       time.Time
+	fp           int64
+	ord          int64
+	groupSize    int
+	prefixSHA256 string
+	signal       string
+	code         string
+	payload      string
 }
 
 func (r fakeQuarantineRow) after(c bigQueryCursor) bool {
@@ -1677,10 +1688,12 @@ func (r fakeQuarantineRow) canonicalKey() string {
 	b, _ := json.Marshal(struct {
 		Signal  string `json:"signal"`
 		Code    string `json:"error_code"`
+		Message string `json:"error_message"`
 		Payload string `json:"raw_payload"`
 	}{
 		Signal:  r.signal,
 		Code:    r.code,
+		Message: "rejected",
 		Payload: r.payload,
 	})
 	return string(b)
@@ -1707,6 +1720,8 @@ func (r fakeQuarantineRow) jsonForCols(cols []string) map[string]any {
 		"row_fp":              cell(strconv.FormatInt(r.fp, 10)),
 		"row_ord":             cell(strconv.FormatInt(r.ord, 10)),
 		"row_key":             cell(r.canonicalKey()),
+		"group_size":          cell(strconv.Itoa(r.groupSize)),
+		"prefix_sha256":       cell(r.prefixSHA256),
 	}
 	f := make([]any, len(cols))
 	for i, c := range cols {
@@ -1809,19 +1824,32 @@ func (f *fakeQuarantineBigQuery) ServeHTTP(w http.ResponseWriter, r *http.Reques
 			us int64
 			fp int64
 		}
+		groupCounts := map[rowKey]int{}
+		for i := range ordered {
+			k := rowKey{us: ordered[i].ingest.UnixMicro(), fp: ordered[i].fp}
+			groupCounts[k]++
+		}
 		ords := map[rowKey]int64{}
+		groupKeys := map[rowKey][]string{}
 		for i := range ordered {
 			k := rowKey{us: ordered[i].ingest.UnixMicro(), fp: ordered[i].fp}
 			ordered[i].ord = ords[k]
 			ords[k]++
+			ordered[i].groupSize = groupCounts[k]
+			groupKeys[k] = append(groupKeys[k], ordered[i].canonicalKey())
+			ordered[i].prefixSHA256 = prefixDigest(groupKeys[k])
 		}
-		if resume && strings.Contains(req.Query, "@cursor_key") {
+		if resume && strings.Contains(req.Query, "@cursor_key") &&
+			strings.Contains(req.Query, "@cursor_group_count") &&
+			strings.Contains(req.Query, "@cursor_prefix_sha256") {
 			matched := false
 			for _, row := range ordered {
 				if row.ingest.UnixMicro() == cursor.IngestTimeMicros &&
 					row.fp == cursor.RowFingerprint &&
 					row.ord == cursor.DuplicateOrdinal &&
-					row.canonicalKey() == cursor.CanonicalRowKey {
+					row.canonicalKey() == cursor.CanonicalRowKey &&
+					row.groupSize == cursor.GroupCount &&
+					row.prefixSHA256 == cursor.PrefixSHA256 {
 					matched = true
 					break
 				}
@@ -1829,6 +1857,8 @@ func (f *fakeQuarantineBigQuery) ServeHTTP(w http.ResponseWriter, r *http.Reques
 			if !matched {
 				cursor.DuplicateOrdinal = -1
 				cursor.CanonicalRowKey = ""
+				cursor.GroupCount = 0
+				cursor.PrefixSHA256 = ""
 			}
 		}
 		for _, row := range ordered {
@@ -1863,7 +1893,7 @@ func (f *fakeQuarantineBigQuery) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		fields := make([]any, len(cols))
 		for i, name := range cols {
 			typ := "STRING"
-			if name == "ingest_time_us" || name == "row_fp" || name == "row_ord" {
+			if name == "ingest_time_us" || name == "row_fp" || name == "row_ord" || name == "group_size" {
 				typ = "INTEGER"
 			}
 			fields[i] = map[string]any{"name": name, "type": typ}
@@ -1909,6 +1939,12 @@ func cursorParams(req *bigqueryapi.QueryRequest) (bigQueryCursor, bool) {
 			}
 		case "cursor_key":
 			c.CanonicalRowKey = p.ParameterValue.Value
+		case "cursor_group_count":
+			if cnt, err := strconv.Atoi(p.ParameterValue.Value); err == nil {
+				c.GroupCount = cnt
+			}
+		case "cursor_prefix_sha256":
+			c.PrefixSHA256 = p.ParameterValue.Value
 		}
 	}
 	return c, haveTime && haveFP
@@ -2064,19 +2100,22 @@ func TestReplayBigQueryCheckpointResume(t *testing.T) {
 	req := fake.requests[len(fake.requests)-1]
 	for _, want := range []string{
 		"FROM `proj.ds.dead_letters`",
-		"WHERE ingest_time > @cursor_time OR (ingest_time = @cursor_time AND (row_fp > @cursor_fp OR (row_fp = @cursor_fp AND (row_ord > @cursor_ord OR NOT EXISTS (SELECT 1 FROM quarantined WHERE ingest_time = @cursor_time AND row_fp = @cursor_fp AND row_ord = @cursor_ord AND row_key = @cursor_key)))))\nORDER BY ingest_time, row_fp, row_ord",
+		"WHERE ingest_time > @cursor_time OR (ingest_time = @cursor_time AND (row_fp > @cursor_fp OR (row_fp = @cursor_fp AND (row_ord > @cursor_ord OR NOT EXISTS (SELECT 1 FROM quarantined WHERE ingest_time = @cursor_time AND row_fp = @cursor_fp AND row_ord = @cursor_ord AND row_key = @cursor_key AND group_size = @cursor_group_count AND prefix_sha256 = @cursor_prefix_sha256)))))\nORDER BY ingest_time, row_fp, row_ord",
 	} {
 		if !strings.Contains(req.Query, want) {
 			t.Errorf("resume query lacks %q:\n%s", want, req.Query)
 		}
 	}
 	params := queryParamValues(req)
+	wantFirstPfx := prefixDigest([]string{fake.rows[0].canonicalKey()})
 	if params["since"] != "TIMESTAMP 2026-10-11 10:00:00+00:00" ||
 		params["cursor_time"] != "TIMESTAMP 2026-10-11 10:00:00+00:00" ||
 		params["cursor_fp"] != "INT64 -9" ||
 		params["cursor_ord"] != "INT64 0" ||
-		params["cursor_key"] != "STRING "+fake.rows[0].canonicalKey() {
-		t.Errorf("resume parameters = %v, want the partition bound raised to the cursor with cursor_key", params)
+		params["cursor_key"] != "STRING "+fake.rows[0].canonicalKey() ||
+		params["cursor_group_count"] != "INT64 1" ||
+		params["cursor_prefix_sha256"] != "STRING "+wantFirstPfx {
+		t.Errorf("resume parameters = %v, want the partition bound raised to the cursor with cursor_key, cursor_group_count, and cursor_prefix_sha256", params)
 	}
 	st = readCheckpointFile(t, opts.Checkpoint.Path)
 	assertCursor(t, st, base.Add(time.Second).UnixMicro(), -1, 0, fake.rows[2].canonicalKey(), 3)
@@ -2417,6 +2456,235 @@ func TestReplayBigQueryV2ChangedCollisionGroup(t *testing.T) {
 		}
 	})
 
+	t.Run("deleted copy in 3-way duplicate group rewinds and delivers remaining duplicate", func(t *testing.T) {
+		dupPayload := sampleSpanJSON(t, "dup-span-X")
+		rowX := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: dupPayload}
+		fake := &fakeQuarantineBigQuery{rows: []fakeQuarantineRow{rowX, rowX, rowX}}
+		srv := httptest.NewServer(fake)
+		defer srv.Close()
+
+		ckptPath := filepath.Join(t.TempDir(), "dup_deleted.ckpt")
+		opts := Options{Checkpoint: &CheckpointConfig{Path: ckptPath}}
+		flaky := &recordingSink{fail: func(call int) error {
+			if call == 2 {
+				return errors.New("transient failure on 2nd duplicate")
+			}
+			return nil
+		}}
+		if _, err := ReplayBigQuery(context.Background(), src, flaky, opts, bigQueryTestOptions(srv)...); err == nil {
+			t.Fatal("first run succeeded, want transient failure on 2nd duplicate")
+		}
+		st1 := readCheckpointFile(t, ckptPath)
+		assertCursor(t, st1, base.UnixMicro(), 77, 0, rowX.canonicalKey(), 1)
+		if st1.Cursor.GroupCount != 3 {
+			t.Fatalf("first run cursor group_count = %d, want 3", st1.Cursor.GroupCount)
+		}
+
+		// Delete one of the 3 identical copies so 2 copies remain ([X, X]).
+		// Even though ord=0 still has key(X) and prefix_sha256 H(X), group_size
+		// dropped from 3 to 2, so the boundary group must rewind and replay [X, X].
+		fake.mu.Lock()
+		fake.rows = []fakeQuarantineRow{rowX, rowX}
+		fake.mu.Unlock()
+
+		resumed := &recordingSink{}
+		sum, err := ReplayBigQuery(context.Background(), src, resumed, opts, bigQueryTestOptions(srv)...)
+		if err != nil {
+			t.Fatalf("resumed run after deleting one duplicate copy: %v", err)
+		}
+		if want := (Summary{TotalRead: 2, Matched: 2, ReplayedSpans: 2}); sum != want {
+			t.Errorf("resumed summary = %+v, want %+v", sum, want)
+		}
+		if !slices.Equal(resumed.names, []string{"dup-span-X", "dup-span-X"}) {
+			t.Errorf("resumed run exported %v, want [dup-span-X dup-span-X]", resumed.names)
+		}
+		st2 := readCheckpointFile(t, ckptPath)
+		assertCursor(t, st2, base.UnixMicro(), 77, 1, rowX.canonicalKey(), 3)
+		if st2.Cursor.GroupCount != 2 {
+			t.Errorf("resumed cursor group_count = %d, want 2", st2.Cursor.GroupCount)
+		}
+
+		// A second resume against the unchanged [X, X] group must be quiet.
+		quiet := &recordingSink{}
+		sumQuiet, err := ReplayBigQuery(context.Background(), src, quiet, opts, bigQueryTestOptions(srv)...)
+		if err != nil || sumQuiet != (Summary{}) || len(quiet.names) != 0 {
+			t.Errorf("quiet second resume = (%+v, %v, %v), want TotalRead=0 and 0 exports", sumQuiet, err, quiet.names)
+		}
+	})
+
+	t.Run("deleted A and inserted D between A and B in 3-way collision group rewinds and delivers D B C", func(t *testing.T) {
+		rowA := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-A")}
+		rowD := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-B")}
+		rowB := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-C")}
+		rowC := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-D")}
+		if !(rowA.canonicalKey() < rowD.canonicalKey() && rowD.canonicalKey() < rowB.canonicalKey() && rowB.canonicalKey() < rowC.canonicalKey()) {
+			t.Fatalf("canonical keys not ordered A < D < B < C")
+		}
+		fake := &fakeQuarantineBigQuery{rows: []fakeQuarantineRow{rowA, rowB, rowC}}
+		srv := httptest.NewServer(fake)
+		defer srv.Close()
+
+		ckptPath := filepath.Join(t.TempDir(), "replaced_ad.ckpt")
+		opts := Options{Checkpoint: &CheckpointConfig{Path: ckptPath}}
+		flaky := &recordingSink{fail: func(call int) error {
+			if call == 3 {
+				return errors.New("transient failure on C")
+			}
+			return nil
+		}}
+		if _, err := ReplayBigQuery(context.Background(), src, flaky, opts, bigQueryTestOptions(srv)...); err == nil {
+			t.Fatal("first run succeeded, want transient failure on C")
+		}
+		assertCursor(t, readCheckpointFile(t, ckptPath), base.UnixMicro(), 77, 1, rowB.canonicalKey(), 2)
+
+		// Delete A and insert D (A < D < B) so the group is [D, B, C].
+		// Even though B still sits at ord=1 and group_size is still 3, the
+		// prefix_sha256 for 0..1 changed from H(A, B) to H(D, B), so the group
+		// must rewind and deliver [D, B, C] without losing D.
+		fake.mu.Lock()
+		fake.rows = []fakeQuarantineRow{rowD, rowB, rowC}
+		fake.mu.Unlock()
+
+		resumed := &recordingSink{}
+		sum, err := ReplayBigQuery(context.Background(), src, resumed, opts, bigQueryTestOptions(srv)...)
+		if err != nil {
+			t.Fatalf("resumed run after replacing A with D: %v", err)
+		}
+		if want := (Summary{TotalRead: 3, Matched: 3, ReplayedSpans: 3}); sum != want {
+			t.Errorf("resumed summary = %+v, want %+v", sum, want)
+		}
+		if !slices.Equal(resumed.names, []string{"collision-span-B", "collision-span-C", "collision-span-D"}) {
+			t.Errorf("resumed run exported %v, want [collision-span-B collision-span-C collision-span-D]", resumed.names)
+		}
+
+		quiet := &recordingSink{}
+		sumQuiet, err := ReplayBigQuery(context.Background(), src, quiet, opts, bigQueryTestOptions(srv)...)
+		if err != nil || sumQuiet != (Summary{}) || len(quiet.names) != 0 {
+			t.Errorf("quiet second resume = (%+v, %v, %v), want TotalRead=0 and 0 exports", sumQuiet, err, quiet.names)
+		}
+	})
+
+	t.Run("deleted A and inserted X before A in 3-way collision group rewinds and delivers X B C", func(t *testing.T) {
+		rowX := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-0")}
+		rowA := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-A")}
+		rowB := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-B")}
+		rowC := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-C")}
+		if !(rowX.canonicalKey() < rowA.canonicalKey() && rowA.canonicalKey() < rowB.canonicalKey() && rowB.canonicalKey() < rowC.canonicalKey()) {
+			t.Fatalf("canonical keys not ordered X < A < B < C")
+		}
+		fake := &fakeQuarantineBigQuery{rows: []fakeQuarantineRow{rowA, rowB, rowC}}
+		srv := httptest.NewServer(fake)
+		defer srv.Close()
+
+		ckptPath := filepath.Join(t.TempDir(), "replaced_ax.ckpt")
+		opts := Options{Checkpoint: &CheckpointConfig{Path: ckptPath}}
+		flaky := &recordingSink{fail: func(call int) error {
+			if call == 3 {
+				return errors.New("transient failure on C")
+			}
+			return nil
+		}}
+		if _, err := ReplayBigQuery(context.Background(), src, flaky, opts, bigQueryTestOptions(srv)...); err == nil {
+			t.Fatal("first run succeeded, want transient failure on C")
+		}
+		assertCursor(t, readCheckpointFile(t, ckptPath), base.UnixMicro(), 77, 1, rowB.canonicalKey(), 2)
+
+		// Delete A and insert X (X < A < B) so the group is [X, B, C].
+		fake.mu.Lock()
+		fake.rows = []fakeQuarantineRow{rowX, rowB, rowC}
+		fake.mu.Unlock()
+
+		resumed := &recordingSink{}
+		sum, err := ReplayBigQuery(context.Background(), src, resumed, opts, bigQueryTestOptions(srv)...)
+		if err != nil {
+			t.Fatalf("resumed run after replacing A with X: %v", err)
+		}
+		if want := (Summary{TotalRead: 3, Matched: 3, ReplayedSpans: 3}); sum != want {
+			t.Errorf("resumed summary = %+v, want %+v", sum, want)
+		}
+		if !slices.Equal(resumed.names, []string{"collision-span-0", "collision-span-B", "collision-span-C"}) {
+			t.Errorf("resumed run exported %v, want [collision-span-0 collision-span-B collision-span-C]", resumed.names)
+		}
+
+		quiet := &recordingSink{}
+		sumQuiet, err := ReplayBigQuery(context.Background(), src, quiet, opts, bigQueryTestOptions(srv)...)
+		if err != nil || sumQuiet != (Summary{}) || len(quiet.names) != 0 {
+			t.Errorf("quiet second resume = (%+v, %v, %v), want TotalRead=0 and 0 exports", sumQuiet, err, quiet.names)
+		}
+	})
+
+	t.Run("paginated insertion before A after checkpointing B rewinds group across pages", func(t *testing.T) {
+		rowX := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-0")}
+		rowA := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-A")}
+		rowB := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-B")}
+		rowC := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-C")}
+		rowLater := fakeQuarantineRow{ingest: base.Add(time.Second), fp: 88, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "later-span")}
+		fake := &fakeQuarantineBigQuery{rows: []fakeQuarantineRow{rowA, rowB, rowC, rowLater}}
+		srv := httptest.NewServer(fake)
+		defer srv.Close()
+
+		pagedSrc := BigQuerySource{Project: "proj", Dataset: "ds", Table: "dead_letters", PageSize: 1}
+		ckptPath := filepath.Join(t.TempDir(), "paged_insert.ckpt")
+		opts := Options{Checkpoint: &CheckpointConfig{Path: ckptPath}}
+		flaky := &recordingSink{fail: func(call int) error {
+			if call == 3 {
+				return errors.New("transient failure on C")
+			}
+			return nil
+		}}
+		if _, err := ReplayBigQuery(context.Background(), pagedSrc, flaky, opts, bigQueryTestOptions(srv)...); err == nil {
+			t.Fatal("first run succeeded, want transient failure on C")
+		}
+		assertCursor(t, readCheckpointFile(t, ckptPath), base.UnixMicro(), 77, 1, rowB.canonicalKey(), 2)
+
+		// Insert X < A so the boundary group becomes [X, A, B, C] (4 rows).
+		// Without rp.cp.rewindCursorGroup(), X (at ord=0 < 1 with key(X) < key(B))
+		// would be treated as handled by pos.after(cursorAtB) and silently dropped!
+		fake.mu.Lock()
+		fake.rows = []fakeQuarantineRow{rowX, rowA, rowB, rowC, rowLater}
+		fake.mu.Unlock()
+
+		// Mid-rewind failure after delivering X (call 1) and failing on A (call 2)
+		// must save the new 4-row group's cursor at X (ord=0, GroupCount=4).
+		midFlaky := &recordingSink{fail: func(call int) error {
+			if call == 2 {
+				return errors.New("transient failure during rewind on A")
+			}
+			return nil
+		}}
+		if _, err := ReplayBigQuery(context.Background(), pagedSrc, midFlaky, opts, bigQueryTestOptions(srv)...); err == nil {
+			t.Fatal("mid-rewind run succeeded, want transient failure on A")
+		}
+		if !slices.Equal(midFlaky.names, []string{"collision-span-0"}) {
+			t.Fatalf("mid-rewind run exported %v, want [collision-span-0] (X must not be skipped)", midFlaky.names)
+		}
+		stMid := readCheckpointFile(t, ckptPath)
+		assertCursor(t, stMid, base.UnixMicro(), 77, 0, rowX.canonicalKey(), 3)
+		if stMid.Cursor.GroupCount != 4 {
+			t.Fatalf("mid-rewind cursor group_count = %d, want 4", stMid.Cursor.GroupCount)
+		}
+
+		// Resuming after the mid-rewind failure must skip X (already delivered in
+		// the 4-row group) and deliver [A, B, C, later-span].
+		resumed := &recordingSink{}
+		sum, err := ReplayBigQuery(context.Background(), pagedSrc, resumed, opts, bigQueryTestOptions(srv)...)
+		if err != nil {
+			t.Fatalf("resumed run after mid-rewind failure: %v", err)
+		}
+		if want := (Summary{TotalRead: 4, Matched: 4, ReplayedSpans: 4}); sum != want {
+			t.Errorf("resumed summary = %+v, want %+v", sum, want)
+		}
+		if !slices.Equal(resumed.names, []string{"collision-span-A", "collision-span-B", "collision-span-C", "later-span"}) {
+			t.Errorf("resumed run exported %v, want [collision-span-A collision-span-B collision-span-C later-span]", resumed.names)
+		}
+
+		quiet := &recordingSink{}
+		sumQuiet, err := ReplayBigQuery(context.Background(), pagedSrc, quiet, opts, bigQueryTestOptions(srv)...)
+		if err != nil || sumQuiet != (Summary{}) || len(quiet.names) != 0 {
+			t.Errorf("quiet final resume = (%+v, %v, %v), want TotalRead=0 and 0 exports", sumQuiet, err, quiet.names)
+		}
+	})
+
 	t.Run("stamped legacy cursor with v2 and B key at ord 0 rewinds group and delivers A and B", func(t *testing.T) {
 		rowA := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-A")}
 		rowB := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-B")}
@@ -2473,6 +2741,8 @@ func TestReplayBigQueryV2ChangedCollisionGroup(t *testing.T) {
 			DuplicateOrdinal:   0,
 			CursorOrderVersion: cursorOrderVersionCanonical,
 			CanonicalRowKey:    rowA.canonicalKey(),
+			GroupCount:         2,
+			PrefixSHA256:       prefixDigest([]string{rowA.canonicalKey()}),
 		}
 		// If A is deleted and B shifts to ordinal 0, B's position at ordinal 0
 		// must still sort after cursorAtA on the client side.
@@ -2494,6 +2764,41 @@ func TestReplayBigQueryV2ChangedCollisionGroup(t *testing.T) {
 		}
 		if posAAtZero.after(cursorAtA) {
 			t.Errorf("posAAtZero.after(cursorAtA) = true, want false for already-handled row A")
+		}
+
+		// Directly exercise queryRows.reconcileBoundaryGroup on both a matching
+		// 2-row group [A, B] and a mutated 1-row group [B] or 1-row group [A].
+		qRowA := quarantineRow{pos: posAAtZero}
+		fields := []*bigqueryapi.TableFieldSchema{
+			{Name: "ingest_time_us", Type: "INTEGER"},
+			{Name: "row_fp", Type: "INTEGER"},
+			{Name: "row_ord", Type: "INTEGER"},
+			{Name: "row_key", Type: "STRING"},
+		}
+		pageRowBAtOne := &bigqueryapi.TableRow{
+			F: []*bigqueryapi.TableCell{
+				{V: strconv.FormatInt(base.UnixMicro(), 10)},
+				{V: "77"},
+				{V: "1"},
+				{V: rowB.canonicalKey()},
+			},
+		}
+		qrMatch := &queryRows{started: true, fields: fields, page: []*bigqueryapi.TableRow{pageRowBAtOne}}
+		matched, err := qrMatch.reconcileBoundaryGroup(context.Background(), qRowA, cursorAtA)
+		if err != nil || !matched {
+			t.Errorf("reconcileBoundaryGroup([A, B], cursorAtA) = (%v, %v), want (true, nil)", matched, err)
+		}
+
+		qrKeyMismatch := &queryRows{started: true}
+		matched, err = qrKeyMismatch.reconcileBoundaryGroup(context.Background(), quarantineRow{pos: posBAtZero}, cursorAtA)
+		if err != nil || matched {
+			t.Errorf("reconcileBoundaryGroup([B], cursorAtA) = (%v, %v), want (false, nil)", matched, err)
+		}
+
+		qrCountMismatch := &queryRows{started: true}
+		matched, err = qrCountMismatch.reconcileBoundaryGroup(context.Background(), qRowA, cursorAtA)
+		if err != nil || matched {
+			t.Errorf("reconcileBoundaryGroup([A] with len=1 != GroupCount=2, cursorAtA) = (%v, %v), want (false, nil)", matched, err)
 		}
 	})
 }
@@ -2562,8 +2867,43 @@ func TestReplayBigQueryCursorVersionAndKeyValidation(t *testing.T) {
 		},
 		{
 			name: "v2 cursor with unexpected field in canonical_row_key",
-			cur:  bigQueryCursor{IngestTimeMicros: base.UnixMicro(), RowFingerprint: 77, DuplicateOrdinal: 0, CursorOrderVersion: 2, CanonicalRowKey: `{"signal":"spans","error_code":"OVERSIZE_ROW","raw_payload":"{}","extra":"x"}`},
+			cur:  bigQueryCursor{IngestTimeMicros: base.UnixMicro(), RowFingerprint: 77, DuplicateOrdinal: 0, CursorOrderVersion: 2, CanonicalRowKey: `{"signal":"spans","error_code":"OVERSIZE_ROW","error_message":"rejected","raw_payload":"{}","extra":"x"}`},
 			want: "invalid canonical_row_key",
+		},
+		{
+			name: "v2 cursor with null signal in canonical_row_key",
+			cur:  bigQueryCursor{IngestTimeMicros: base.UnixMicro(), RowFingerprint: 77, DuplicateOrdinal: 0, CursorOrderVersion: 2, CanonicalRowKey: `{"signal":null,"error_code":"OVERSIZE_ROW","error_message":"rejected","raw_payload":"{}"}`},
+			want: `non-nullable field "signal" must not be null`,
+		},
+		{
+			name: "v2 cursor with null error_code in canonical_row_key",
+			cur:  bigQueryCursor{IngestTimeMicros: base.UnixMicro(), RowFingerprint: 77, DuplicateOrdinal: 0, CursorOrderVersion: 2, CanonicalRowKey: `{"signal":"spans","error_code":null,"error_message":"rejected","raw_payload":"{}"}`},
+			want: `non-nullable field "error_code" must not be null`,
+		},
+		{
+			name: "v2 cursor with null error_message in canonical_row_key",
+			cur:  bigQueryCursor{IngestTimeMicros: base.UnixMicro(), RowFingerprint: 77, DuplicateOrdinal: 0, CursorOrderVersion: 2, CanonicalRowKey: `{"signal":"spans","error_code":"OVERSIZE_ROW","error_message":null,"raw_payload":"{}"}`},
+			want: `non-nullable field "error_message" must not be null`,
+		},
+		{
+			name: "v2 cursor with missing error_message in canonical_row_key",
+			cur:  bigQueryCursor{IngestTimeMicros: base.UnixMicro(), RowFingerprint: 77, DuplicateOrdinal: 0, CursorOrderVersion: 2, CanonicalRowKey: `{"signal":"spans","error_code":"OVERSIZE_ROW","raw_payload":"{}"}`},
+			want: `missing required field "error_message"`,
+		},
+		{
+			name: "v2 cursor with mismatched group_count and prefix_sha256",
+			cur:  bigQueryCursor{IngestTimeMicros: base.UnixMicro(), RowFingerprint: 77, DuplicateOrdinal: 0, CursorOrderVersion: 2, CanonicalRowKey: rowA.canonicalKey(), GroupCount: 2},
+			want: "mismatched group_count",
+		},
+		{
+			name: "v2 cursor with group_count <= duplicate_ordinal",
+			cur:  bigQueryCursor{IngestTimeMicros: base.UnixMicro(), RowFingerprint: 77, DuplicateOrdinal: 2, CursorOrderVersion: 2, CanonicalRowKey: rowA.canonicalKey(), GroupCount: 2, PrefixSHA256: prefixDigest([]string{rowA.canonicalKey()})},
+			want: "group_count 2 <= duplicate_ordinal 2",
+		},
+		{
+			name: "v2 cursor with invalid prefix_sha256",
+			cur:  bigQueryCursor{IngestTimeMicros: base.UnixMicro(), RowFingerprint: 77, DuplicateOrdinal: 0, CursorOrderVersion: 2, CanonicalRowKey: rowA.canonicalKey(), GroupCount: 2, PrefixSHA256: "not-a-sha256"},
+			want: "invalid prefix_sha256",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2625,23 +2965,78 @@ func TestReplayBigQueryCursorVersionAndKeyValidation(t *testing.T) {
 }
 
 // TestFakeQuarantineBigQueryHonorsSelectedProjection verifies that
-// fakeQuarantineBigQuery only returns columns present in the outer
-// `SELECT ... FROM quarantined` projection, so omitting `row_key` from the
-// outer SELECT leaves CanonicalRowKey empty.
+// fakeQuarantineBigQuery's HTTP POST/GET handlers only serve columns present in
+// the outer `SELECT ... FROM quarantined` projection, so omitting `row_key`,
+// `group_size`, and `prefix_sha256` from the outer SELECT omits them from the
+// returned TableSchema/TableRow and leaves CanonicalRowKey empty.
 func TestFakeQuarantineBigQueryHonorsSelectedProjection(t *testing.T) {
-	withRowKey := selectedQuarantineColumns(quarantineQueryTemplate)
-	if !slices.Contains(withRowKey, "row_key") {
-		t.Fatalf("selectedQuarantineColumns(quarantineQueryTemplate) = %v, want row_key included", withRowKey)
+	base := time.Date(2026, 10, 11, 10, 0, 0, 0, time.UTC)
+	fake := &fakeQuarantineBigQuery{rows: []fakeQuarantineRow{
+		{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "proj-span")},
+	}}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	defer srv.Client().CloseIdleConnections()
+
+	opts := append(slices.Clone(bigQueryTestOptions(srv)), option.WithHTTPClient(srv.Client()))
+	svc, err := bigqueryapi.NewService(context.Background(), opts...)
+	if err != nil {
+		t.Fatal(err)
 	}
+	runProjectionQuery := func(t *testing.T, sqlText string) (*bigqueryapi.GetQueryResultsResponse, quarantineRow) {
+		t.Helper()
+		useLegacy := false
+		qResp, err := svc.Jobs.Query("proj", &bigqueryapi.QueryRequest{
+			Query:         sqlText,
+			UseLegacySql:  &useLegacy,
+			ParameterMode: "NAMED",
+		}).Do()
+		if err != nil {
+			t.Fatalf("Jobs.Query: %v", err)
+		}
+		res, err := svc.Jobs.GetQueryResults("proj", qResp.JobReference.JobId).Location(qResp.JobReference.Location).Do()
+		if err != nil {
+			t.Fatalf("Jobs.GetQueryResults: %v", err)
+		}
+		if res.Schema == nil || len(res.Rows) != 1 {
+			t.Fatalf("GetQueryResults rows=%d schema=%v, want 1 row", len(res.Rows), res.Schema)
+		}
+		decoded, haveOrd, err := decodeQuarantineRow(res.Schema.Fields, res.Rows[0])
+		if err != nil || !haveOrd {
+			t.Fatalf("decodeQuarantineRow = (%+v, %v, %v), want haveOrd=true and nil error", decoded, haveOrd, err)
+		}
+		return res, decoded
+	}
+
+	fullQuery := fmt.Sprintf(quarantineQueryTemplate, "proj.ds.dead_letters", "TRUE", "")
+	fullRes, fullRow := runProjectionQuery(t, fullQuery)
+	var fullFieldNames []string
+	for _, f := range fullRes.Schema.Fields {
+		fullFieldNames = append(fullFieldNames, f.Name)
+	}
+	if !slices.Contains(fullFieldNames, "row_key") || fullRow.pos.canonicalKey == "" || fullRow.pos.groupSize != 1 || fullRow.pos.prefixSHA256 == "" {
+		t.Fatalf("full projection fields=%v row.pos=%+v, want row_key, group_size=1, and prefix_sha256 populated", fullFieldNames, fullRow.pos)
+	}
+
 	withoutRowKeyQuery := strings.Replace(
-		quarantineQueryTemplate,
-		"payload_ref_uri, payload_ref_version, row_fp, row_ord, row_key\nFROM quarantined",
+		fullQuery,
+		"payload_ref_uri, payload_ref_version, row_fp, row_ord, row_key, group_size, prefix_sha256\nFROM quarantined",
 		"payload_ref_uri, payload_ref_version, row_fp, row_ord\nFROM quarantined",
 		1,
 	)
-	withoutRowKey := selectedQuarantineColumns(withoutRowKeyQuery)
-	if slices.Contains(withoutRowKey, "row_key") {
-		t.Fatalf("selectedQuarantineColumns(withoutRowKeyQuery) = %v, want row_key omitted when dropped from outer SELECT", withoutRowKey)
+	if withoutRowKeyQuery == fullQuery {
+		t.Fatal("strings.Replace did not modify outer SELECT list in quarantineQueryTemplate")
+	}
+	reducedRes, reducedRow := runProjectionQuery(t, withoutRowKeyQuery)
+	var reducedFieldNames []string
+	for _, f := range reducedRes.Schema.Fields {
+		reducedFieldNames = append(reducedFieldNames, f.Name)
+	}
+	if slices.Contains(reducedFieldNames, "row_key") || slices.Contains(reducedFieldNames, "group_size") || slices.Contains(reducedFieldNames, "prefix_sha256") {
+		t.Fatalf("reduced projection HTTP response schema = %v, want row_key/group_size/prefix_sha256 omitted", reducedFieldNames)
+	}
+	if reducedRow.pos.canonicalKey != "" || reducedRow.pos.groupSize != 0 || reducedRow.pos.prefixSHA256 != "" {
+		t.Fatalf("reduced projection decoded row.pos = %+v, want empty canonicalKey, groupSize=0, and empty prefixSHA256", reducedRow.pos)
 	}
 }
 

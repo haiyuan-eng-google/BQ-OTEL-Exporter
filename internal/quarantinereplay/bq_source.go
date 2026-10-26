@@ -48,10 +48,14 @@ var (
 // quarantineQueryTemplate selects the quarantine rows a replay reads,
 // ordered by (ingest_time, row_fp, row_ord, row_key). row_key is the
 // canonical JSON representation of the row's content columns, row_fp
-// fingerprints row_key, and row_ord is the 0-based ordinal within rows that
-// share (ingest_time, row_fp) ordered by row_key, so both identical duplicate
-// rows and distinct rows sharing (ingest_time, row_fp) have deterministic sort
-// keys across queries and a checkpoint can resume after a specific row.
+// fingerprints row_key, row_ord is the 0-based ordinal within rows that
+// share (ingest_time, row_fp) ordered by row_key, group_size is the total
+// cardinality of the (ingest_time, row_fp) group, and prefix_sha256 is the
+// lowercase hex SHA-256 digest of the length-delimited row_key prefix
+// 0..row_ord, so both identical duplicate rows and distinct rows sharing
+// (ingest_time, row_fp) have deterministic sort keys across queries and a
+// checkpoint can verify that neither the boundary group's cardinality nor its
+// handled prefix changed before skipping 0..row_ord.
 // The verbs are the backquoted table, the partition-pruning WHERE conditions,
 // and the optional resume condition.
 const quarantineQueryTemplate = "WITH canonical AS (\n" +
@@ -81,13 +85,15 @@ const quarantineQueryTemplate = "WITH canonical AS (\n" +
 	"quarantined AS (\n" +
 	"  SELECT\n" +
 	"    *,\n" +
-	"    ROW_NUMBER() OVER (PARTITION BY ingest_time, row_fp ORDER BY row_key) - 1 AS row_ord\n" +
+	"    ROW_NUMBER() OVER (PARTITION BY ingest_time, row_fp ORDER BY row_key) - 1 AS row_ord,\n" +
+	"    COUNT(*) OVER (PARTITION BY ingest_time, row_fp) AS group_size,\n" +
+	"    TO_HEX(SHA256(STRING_AGG(CONCAT(CAST(BYTE_LENGTH(row_key) AS STRING), ':', row_key), '') OVER (PARTITION BY ingest_time, row_fp ORDER BY row_key ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW))) AS prefix_sha256\n" +
 	"  FROM fingerprinted\n" +
 	")\n" +
 	"SELECT\n" +
 	"  UNIX_MICROS(ingest_time) AS ingest_time_us,\n" +
 	"  signal, error_code, error_message, service_name, trace_id, span_id, raw_payload,\n" +
-	"  payload_ref_uri, payload_ref_version, row_fp, row_ord, row_key\n" +
+	"  payload_ref_uri, payload_ref_version, row_fp, row_ord, row_key, group_size, prefix_sha256\n" +
 	"FROM quarantined%s\n" +
 	"ORDER BY ingest_time, row_fp, row_ord, row_key"
 
@@ -284,12 +290,14 @@ func quarantineQuery(table string, f Filter, cursor *bigQueryCursor) (string, []
 	}
 	resume := ""
 	if cursor != nil {
-		resume = "\nWHERE ingest_time > @cursor_time OR (ingest_time = @cursor_time AND (row_fp > @cursor_fp OR (row_fp = @cursor_fp AND (row_ord > @cursor_ord OR NOT EXISTS (SELECT 1 FROM quarantined WHERE ingest_time = @cursor_time AND row_fp = @cursor_fp AND row_ord = @cursor_ord AND row_key = @cursor_key)))))"
+		resume = "\nWHERE ingest_time > @cursor_time OR (ingest_time = @cursor_time AND (row_fp > @cursor_fp OR (row_fp = @cursor_fp AND (row_ord > @cursor_ord OR NOT EXISTS (SELECT 1 FROM quarantined WHERE ingest_time = @cursor_time AND row_fp = @cursor_fp AND row_ord = @cursor_ord AND row_key = @cursor_key AND group_size = @cursor_group_count AND prefix_sha256 = @cursor_prefix_sha256)))))"
 		params = append(params,
 			timestampParam("cursor_time", time.UnixMicro(cursor.IngestTimeMicros)),
 			int64Param("cursor_fp", cursor.RowFingerprint),
 			int64Param("cursor_ord", cursor.DuplicateOrdinal),
-			stringParam("cursor_key", cursor.CanonicalRowKey))
+			stringParam("cursor_key", cursor.CanonicalRowKey),
+			int64Param("cursor_group_count", int64(cursor.GroupCount)),
+			stringParam("cursor_prefix_sha256", cursor.PrefixSHA256))
 	}
 	return fmt.Sprintf(quarantineQueryTemplate, table, strings.Join(where, "\n    AND "), resume), params
 }
@@ -449,16 +457,17 @@ func (q *queryRows) readNext(ctx context.Context) (quarantineRow, error) {
 	return out, nil
 }
 
-// reconcileBoundaryGroup buffers the cursor's (ingest_time, row_fp) boundary
-// group up through cursor.DuplicateOrdinal (beginning with first) and reports
-// whether the row at cursor.DuplicateOrdinal still has canonicalKey ==
-// cursor.CanonicalRowKey. All inspected rows are pushed back onto q.buffered
-// in order so the caller can process them next.
+// reconcileBoundaryGroup buffers the cursor's entire (ingest_time, row_fp)
+// boundary group (beginning with first) across result pages and reports whether
+// the group's total cardinality matches cursor.GroupCount, the row at
+// cursor.DuplicateOrdinal still has canonicalKey == cursor.CanonicalRowKey, and
+// the SHA-256 digest of the handled prefix 0..cursor.DuplicateOrdinal matches
+// cursor.PrefixSHA256. All inspected rows are pushed back onto q.buffered in
+// order so the caller can process them next.
 func (q *queryRows) reconcileBoundaryGroup(ctx context.Context, first quarantineRow, cursor bigQueryCursor) (bool, error) {
 	seen := []quarantineRow{first}
-	for seen[len(seen)-1].pos.ingestMicros == cursor.IngestTimeMicros &&
-		seen[len(seen)-1].pos.fingerprint == cursor.RowFingerprint &&
-		seen[len(seen)-1].pos.ordinal < cursor.DuplicateOrdinal {
+	var tail []quarantineRow
+	for {
 		r, err := q.readNext(ctx)
 		if errors.Is(err, io.EOF) {
 			break
@@ -466,19 +475,39 @@ func (q *queryRows) reconcileBoundaryGroup(ctx context.Context, first quarantine
 		if err != nil {
 			return false, err
 		}
-		seen = append(seen, r)
+		if r.pos.ingestMicros == cursor.IngestTimeMicros && r.pos.fingerprint == cursor.RowFingerprint {
+			seen = append(seen, r)
+			continue
+		}
+		tail = append(tail, r)
+		break
 	}
-	matched := false
-	for _, r := range seen {
-		if r.pos.ingestMicros == cursor.IngestTimeMicros &&
-			r.pos.fingerprint == cursor.RowFingerprint &&
-			r.pos.ordinal == cursor.DuplicateOrdinal &&
-			r.pos.canonicalKey == cursor.CanonicalRowKey {
-			matched = true
-			break
+	keys := make([]string, len(seen))
+	contiguous := true
+	for i := range seen {
+		if seen[i].pos.ordinal != int64(i) {
+			contiguous = false
+		}
+		keys[i] = seen[i].pos.canonicalKey
+	}
+	for i := range seen {
+		if seen[i].pos.groupSize <= 0 || seen[i].pos.groupSize != len(seen) {
+			seen[i].pos.groupSize = len(seen)
+		}
+		if contiguous {
+			seen[i].pos.prefixSHA256 = prefixDigest(keys[:i+1])
 		}
 	}
-	q.buffered = append(seen, q.buffered...)
+	matched := contiguous &&
+		cursor.DuplicateOrdinal >= 0 &&
+		cursor.CanonicalRowKey != "" &&
+		cursor.GroupCount > 0 &&
+		cursor.PrefixSHA256 != "" &&
+		len(seen) == cursor.GroupCount &&
+		int(cursor.DuplicateOrdinal) < len(seen) &&
+		seen[cursor.DuplicateOrdinal].pos.canonicalKey == cursor.CanonicalRowKey &&
+		seen[cursor.DuplicateOrdinal].pos.prefixSHA256 == cursor.PrefixSHA256
+	q.buffered = append(append(seen, tail...), q.buffered...)
 	return matched, nil
 }
 
@@ -624,6 +653,16 @@ func decodeQuarantineRow(fields []*bigqueryapi.TableFieldSchema, row *bigqueryap
 			version = value
 		case "row_key":
 			out.pos.canonicalKey = value
+		case "group_size":
+			if value != "" {
+				n, err := strconv.ParseInt(value, 10, 64)
+				if err != nil {
+					return quarantineRow{}, false, fmt.Errorf("column group_size: %w", err)
+				}
+				out.pos.groupSize = int(n)
+			}
+		case "prefix_sha256":
+			out.pos.prefixSHA256 = value
 		}
 	}
 	if !haveTime || !haveKey {

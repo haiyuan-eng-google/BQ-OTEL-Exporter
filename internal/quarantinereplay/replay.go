@@ -15,6 +15,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -390,6 +392,13 @@ type recordPosition struct {
 	// mismatched key), both the query and the client rewind that
 	// (ingest_time, row_fp) group to replay it at-least-once.
 	canonicalKey string
+	// groupSize is the total number of rows in the row's (ingest_time, row_fp)
+	// group as reported by the query or boundary-group reconciliation.
+	groupSize int
+	// prefixSHA256 is the lowercase hex SHA-256 digest of the length-delimited
+	// canonical row_key values for ordinals 0..ordinal in the row's
+	// (ingest_time, row_fp) group.
+	prefixSHA256 string
 }
 
 // after reports whether p sorts after the BigQuery cursor c. Within the
@@ -723,14 +732,16 @@ type checkpointState struct {
 // bigQueryCursor is the (ingest_time, row_fp, row_ord) sort key of a
 // quarantine row read by ReplayBigQuery. CursorOrderVersion records the
 // row-ordering version the cursor was written under: version 2 cursors carry a
-// validated CanonicalRowKey and use the canonical row_key ordering, skipping
-// handled rows when CanonicalRowKey still sits at DuplicateOrdinal in the
-// current (ingest_time, row_fp) group and rewinding that group at-least-once
-// if the group's membership changed; legacy version 0 or 1 cursors (or a
-// version 2 cursor with an empty CanonicalRowKey) are rewound to replay their
-// whole (ingest_time, row_fp) group at-least-once before any delivery.
-// Negative or unknown CursorOrderVersion values and malformed CanonicalRowKey
-// values are rejected before querying.
+// validated CanonicalRowKey, GroupCount, and PrefixSHA256 and use the canonical
+// row_key ordering, skipping handled rows when CanonicalRowKey still sits at
+// DuplicateOrdinal and the current (ingest_time, row_fp) group's total
+// cardinality and 0..DuplicateOrdinal prefix digest still match GroupCount and
+// PrefixSHA256, and rewinding that group at-least-once if the group's
+// membership changed; legacy version 0 or 1 cursors (or a version 2 cursor with
+// an empty CanonicalRowKey) are rewound to replay their whole (ingest_time,
+// row_fp) group at-least-once before any delivery. Negative or unknown
+// CursorOrderVersion values and malformed CanonicalRowKey, GroupCount, or
+// PrefixSHA256 values are rejected before querying.
 type bigQueryCursor struct {
 	IngestTimeMicros int64 `json:"ingest_time_micros"`
 	RowFingerprint   int64 `json:"row_fingerprint"`
@@ -740,6 +751,13 @@ type bigQueryCursor struct {
 	// cursorOrderVersionCanonical = 2).
 	CursorOrderVersion int    `json:"cursor_order_version,omitempty"`
 	CanonicalRowKey    string `json:"canonical_row_key,omitempty"`
+	// GroupCount is the total number of rows in the cursor's
+	// (ingest_time, row_fp) group when the checkpoint was written.
+	GroupCount int `json:"group_count,omitempty"`
+	// PrefixSHA256 is the lowercase hex SHA-256 digest of the length-delimited
+	// canonical row_key values for ordinals 0..DuplicateOrdinal in the
+	// cursor's (ingest_time, row_fp) group.
+	PrefixSHA256 string `json:"prefix_sha256,omitempty"`
 }
 
 // checkpointTempFile is the temporary file seam checkpointer.save uses.
@@ -772,10 +790,14 @@ var checkpointHooks = defaultCheckpointFS
 
 // checkpointer loads, advances, and saves a checkpoint.
 type checkpointer struct {
-	path  string
-	sink  Sink
-	state checkpointState
-	fs    checkpointFS
+	path        string
+	sink        Sink
+	state       checkpointState
+	fs          checkpointFS
+	hasGroup    bool
+	groupIngest int64
+	groupFP     int64
+	groupKeys   []string
 }
 
 func openCheckpoint(cfg CheckpointConfig, kind string, f Filter, sink Sink) (*checkpointer, error) {
@@ -810,7 +832,7 @@ func openCheckpoint(cfg CheckpointConfig, kind string, f Filter, sink Sink) (*ch
 			"checkpoint %q was written for %s source %q with filter %s, but this run reads %s source %q with filter %s; remove it or choose another checkpoint file",
 			cfg.Path, got.Kind, got.Source, got.Filter, want.Kind, want.Source, want.Filter)
 	}
-	if got.Next < 0 || got.Handled < 0 || (got.Cursor != nil && got.Cursor.DuplicateOrdinal < 0) {
+	if got.Next < 0 || got.Handled < 0 || (got.Cursor != nil && (got.Cursor.DuplicateOrdinal < 0 || got.Cursor.GroupCount < 0)) {
 		return nil, fmt.Errorf("checkpoint %q holds a negative position", cfg.Path)
 	}
 	if got.Kind == checkpointKindBigQuery && got.Cursor != nil {
@@ -826,14 +848,30 @@ func openCheckpoint(cfg CheckpointConfig, kind string, f Filter, sink Sink) (*ch
 			got.Cursor.DuplicateOrdinal = -1
 			got.Cursor.CursorOrderVersion = cursorOrderVersionCanonical
 			got.Cursor.CanonicalRowKey = ""
+			got.Cursor.GroupCount = 0
+			got.Cursor.PrefixSHA256 = ""
 		case cursorOrderVersionCanonical:
 			if got.Cursor.CanonicalRowKey == "" {
 				// An explicit v2 cursor with an empty CanonicalRowKey cannot
 				// be reconciled with a specific row in its group; rewind the
 				// group to replay it at-least-once.
 				got.Cursor.DuplicateOrdinal = -1
+				got.Cursor.GroupCount = 0
+				got.Cursor.PrefixSHA256 = ""
 			} else if err := validateCanonicalRowKey(got.Cursor.CanonicalRowKey); err != nil {
 				return nil, fmt.Errorf("checkpoint %q has invalid canonical_row_key: %w", cfg.Path, err)
+			} else {
+				if (got.Cursor.GroupCount > 0) != (got.Cursor.PrefixSHA256 != "") {
+					return nil, fmt.Errorf("checkpoint %q has mismatched group_count (%d) and prefix_sha256 (%q)", cfg.Path, got.Cursor.GroupCount, got.Cursor.PrefixSHA256)
+				}
+				if got.Cursor.GroupCount > 0 && int64(got.Cursor.GroupCount) <= got.Cursor.DuplicateOrdinal {
+					return nil, fmt.Errorf("checkpoint %q has group_count %d <= duplicate_ordinal %d", cfg.Path, got.Cursor.GroupCount, got.Cursor.DuplicateOrdinal)
+				}
+				if got.Cursor.PrefixSHA256 != "" {
+					if err := validateHexSHA256(got.Cursor.PrefixSHA256); err != nil {
+						return nil, fmt.Errorf("checkpoint %q has invalid prefix_sha256: %w", cfg.Path, err)
+					}
+				}
 			}
 		default:
 			return nil, fmt.Errorf(
@@ -857,6 +895,12 @@ var allowedCanonicalRowKeyFields = map[string]bool{
 	"payload_ref_version": true,
 }
 
+var nonNullableCanonicalRowKeyFields = []string{
+	"signal",
+	"error_code",
+	"error_message",
+}
+
 func validateCanonicalRowKey(raw string) error {
 	dec := json.NewDecoder(strings.NewReader(raw))
 	var fields map[string]json.RawMessage
@@ -877,6 +921,9 @@ func validateCanonicalRowKey(raw string) error {
 			return fmt.Errorf("unexpected field %q", k)
 		}
 		if string(v) == "null" {
+			if slices.Contains(nonNullableCanonicalRowKeyFields, k) {
+				return fmt.Errorf("non-nullable field %q must not be null", k)
+			}
 			continue
 		}
 		var s string
@@ -884,7 +931,7 @@ func validateCanonicalRowKey(raw string) error {
 			return fmt.Errorf("field %q is not a string: %w", k, err)
 		}
 	}
-	for _, req := range []string{"signal", "error_code", "raw_payload"} {
+	for _, req := range []string{"signal", "error_code", "error_message", "raw_payload"} {
 		if _, ok := fields[req]; !ok {
 			return fmt.Errorf("missing required field %q", req)
 		}
@@ -892,13 +939,38 @@ func validateCanonicalRowKey(raw string) error {
 	return nil
 }
 
+func validateHexSHA256(raw string) error {
+	if len(raw) != sha256.Size*2 {
+		return fmt.Errorf("want %d hex chars, got %d", sha256.Size*2, len(raw))
+	}
+	if _, err := hex.DecodeString(raw); err != nil {
+		return err
+	}
+	return nil
+}
+
+// prefixDigest returns the lowercase 64-character hex SHA-256 digest over the
+// length-delimited canonical row_key values in keys (`<byte_len>:<row_key>`).
+func prefixDigest(keys []string) string {
+	h := sha256.New()
+	for _, k := range keys {
+		_, _ = fmt.Fprintf(h, "%d:%s", len(k), k)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 // rewindCursorGroup rewinds the BigQuery cursor's current (ingest_time, row_fp)
-// group when its saved (CanonicalRowKey, DuplicateOrdinal) no longer matches
-// the group's rows, so every row in that group is replayed at-least-once.
+// group when its saved (CanonicalRowKey, DuplicateOrdinal, GroupCount,
+// PrefixSHA256) no longer matches the group's rows, so every row in that group
+// is replayed at-least-once.
 func (c *checkpointer) rewindCursorGroup() {
 	if c != nil && c.state.Kind == checkpointKindBigQuery && c.state.Cursor != nil {
 		c.state.Cursor.DuplicateOrdinal = -1
 		c.state.Cursor.CanonicalRowKey = ""
+		c.state.Cursor.GroupCount = 0
+		c.state.Cursor.PrefixSHA256 = ""
+		c.hasGroup = false
+		c.groupKeys = nil
 	}
 }
 
@@ -913,13 +985,34 @@ func (c *checkpointer) handled(pos recordPosition) bool {
 // advance records the record at pos as handled and saves the checkpoint.
 func (c *checkpointer) advance(pos recordPosition) error {
 	if c.state.Kind == checkpointKindBigQuery {
+		if !c.hasGroup || c.groupIngest != pos.ingestMicros || c.groupFP != pos.fingerprint || pos.ordinal == 0 {
+			c.hasGroup = true
+			c.groupIngest = pos.ingestMicros
+			c.groupFP = pos.fingerprint
+			c.groupKeys = nil
+		}
+		c.groupKeys = append(c.groupKeys, pos.canonicalKey)
 		if c.state.Cursor == nil || pos.after(*c.state.Cursor) {
+			var grpCnt int
+			var pfx string
+			if pos.canonicalKey != "" {
+				grpCnt = pos.groupSize
+				if grpCnt <= int(pos.ordinal) {
+					grpCnt = int(pos.ordinal) + 1
+				}
+				pfx = pos.prefixSHA256
+				if pfx == "" {
+					pfx = prefixDigest(c.groupKeys)
+				}
+			}
 			c.state.Cursor = &bigQueryCursor{
 				IngestTimeMicros:   pos.ingestMicros,
 				RowFingerprint:     pos.fingerprint,
 				DuplicateOrdinal:   pos.ordinal,
 				CursorOrderVersion: cursorOrderVersionCanonical,
 				CanonicalRowKey:    pos.canonicalKey,
+				GroupCount:         grpCnt,
+				PrefixSHA256:       pfx,
 			}
 		}
 	} else if pos.index >= c.state.Next {
