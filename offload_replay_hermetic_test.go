@@ -34,6 +34,7 @@ import (
 	"google.golang.org/api/option"
 
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/quarantinereplay"
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/testfakes/bqfake"
 )
 
@@ -554,23 +555,20 @@ func isExpectedContinuousQueryDryRunError(err error) bool {
 	if code != http.StatusBadRequest && code != http.StatusForbidden {
 		return false
 	}
-	// Collect every non-nil error message from the googleapi.Error.
+	// Collect the primary message and every structured ErrorItem message (even
+	// when empty or whitespace-only) so an empty/unclassified message fails the
+	// allow check rather than being silently ignored.
 	var messages []string
 	var apiErr *googleapi.Error
 	if errors.As(err, &apiErr) {
-		if apiErr.Message != "" {
-			messages = append(messages, apiErr.Message)
-		}
+		messages = append(messages, apiErr.Message)
 		for _, item := range apiErr.Errors {
 			if !isAllowedContinuousQueryDryRunReason(item.Reason) {
 				return false
 			}
-			if item.Message != "" {
-				messages = append(messages, item.Message)
-			}
+			messages = append(messages, item.Message)
 		}
-	}
-	if len(messages) == 0 {
+	} else {
 		messages = append(messages, primaryErrorMessage(err))
 	}
 	// Check the trailing reason on the primary message.
@@ -582,8 +580,12 @@ func isExpectedContinuousQueryDryRunError(err error) bool {
 			}
 		}
 	}
-	// Every collected message must pass the reject and allow checks independently.
+	// Every collected message must be non-empty and pass the reject and allow
+	// checks independently.
 	for _, msg := range messages {
+		if strings.TrimSpace(msg) == "" {
+			return false
+		}
 		if rejectContinuousQueryMessage(msg) {
 			return false
 		}
@@ -654,14 +656,15 @@ func validateContinuousExportDryRunJob(job *bigqueryapi.Job, err error) (skipRea
 		if job.Status.ErrorResult.Reason == "accessDenied" {
 			code = http.StatusForbidden
 		}
-		// Build a composite message containing every error message so that
-		// isExpectedContinuousQueryDryRunError classifies each independently.
-		// Only the primary ErrorResult.Message was passed before, which let a
-		// secondary SQL syntax error hide behind a valid reservation rejection.
-		compositeMsg := job.Status.ErrorResult.Message
+		// Keep the original ErrorResult.Message separate from the composite
+		// diagnostic so an empty ErrorResult.Message is classified as-is by
+		// isExpectedContinuousQueryDryRunError rather than being masked by a
+		// non-empty secondary message.
+		primaryMsg := job.Status.ErrorResult.Message
+		compositeDiag := primaryMsg
 		errItems := []googleapi.ErrorItem{{
 			Reason:  job.Status.ErrorResult.Reason,
-			Message: job.Status.ErrorResult.Message,
+			Message: primaryMsg,
 		}}
 		for _, item := range job.Status.Errors {
 			if item != nil {
@@ -669,20 +672,24 @@ func validateContinuousExportDryRunJob(job *bigqueryapi.Job, err error) (skipRea
 					Reason:  item.Reason,
 					Message: item.Message,
 				})
-				if item.Message != "" && !strings.Contains(compositeMsg, item.Message) {
-					compositeMsg += " | " + item.Message
+				if item.Message != "" && !strings.Contains(compositeDiag, item.Message) {
+					if compositeDiag == "" {
+						compositeDiag = item.Message
+					} else {
+						compositeDiag += " | " + item.Message
+					}
 				}
 			}
 		}
 		statusErr := &googleapi.Error{
 			Code:    code,
-			Message: compositeMsg,
+			Message: primaryMsg,
 			Errors:  errItems,
 		}
 		if isExpectedContinuousQueryDryRunError(statusErr) {
-			return statusErr.Error(), nil
+			return fmt.Sprintf("googleapi: Error %d: %s", code, compositeDiag), nil
 		}
-		return "", fmt.Errorf("job.Status.ErrorResult = %s: %s", job.Status.ErrorResult.Reason, job.Status.ErrorResult.Message)
+		return "", fmt.Errorf("job.Status.ErrorResult = %s: %s", job.Status.ErrorResult.Reason, compositeDiag)
 	}
 	if len(job.Status.Errors) > 0 {
 		for i, item := range job.Status.Errors {
@@ -858,6 +865,81 @@ func TestIsExpectedContinuousQueryDryRunError(t *testing.T) {
 	}
 	if isExpectedContinuousQueryDryRunError(directMixedErr) {
 		t.Fatalf("isExpectedContinuousQueryDryRunError(primary reservation + secondary SQL syntax) = true, want false")
+	}
+	// Round-8 P1-1 regression: empty or whitespace-only primary/secondary
+	// structured messages must fail closed across both returned-job and
+	// direct-RPC googleapi.Error adapters (all 4 empty-primary / empty-secondary
+	// combinations plus whitespace variants).
+	for _, emptyText := range []string{"", "   \t\n  "} {
+		// (1) Returned-job adapter: reservation primary + empty secondary item.
+		jobEmptySecondary := &bigqueryapi.Job{
+			Status: &bigqueryapi.JobStatus{
+				ErrorResult: &bigqueryapi.ErrorProto{
+					Reason:  "invalidQuery",
+					Message: "Continuous queries require the project to have a CONTINUOUS assignment to a reservation.",
+				},
+				Errors: []*bigqueryapi.ErrorProto{
+					{
+						Reason:  "invalidQuery",
+						Message: emptyText,
+					},
+				},
+			},
+			Statistics: &bigqueryapi.JobStatistics{},
+		}
+		if skipReason, fatalErr := validateContinuousExportDryRunJob(jobEmptySecondary, nil); fatalErr == nil || skipReason != "" {
+			t.Fatalf("validateContinuousExportDryRunJob(reservation primary + empty secondary %q) = (skip=%q, err=%v), want (\"\", non-nil fatalErr)", emptyText, skipReason, fatalErr)
+		}
+
+		// (2) Returned-job adapter: empty primary + reservation secondary item.
+		jobEmptyPrimary := &bigqueryapi.Job{
+			Status: &bigqueryapi.JobStatus{
+				ErrorResult: &bigqueryapi.ErrorProto{
+					Reason:  "invalidQuery",
+					Message: emptyText,
+				},
+				Errors: []*bigqueryapi.ErrorProto{
+					{
+						Reason:  "invalidQuery",
+						Message: "Continuous queries require the project to have a CONTINUOUS assignment to a reservation.",
+					},
+				},
+			},
+			Statistics: &bigqueryapi.JobStatistics{},
+		}
+		if skipReason, fatalErr := validateContinuousExportDryRunJob(jobEmptyPrimary, nil); fatalErr == nil || skipReason != "" {
+			t.Fatalf("validateContinuousExportDryRunJob(empty primary %q + reservation secondary) = (skip=%q, err=%v), want (\"\", non-nil fatalErr)", emptyText, skipReason, fatalErr)
+		}
+
+		// (3) Direct-RPC googleapi.Error adapter: reservation primary + empty secondary item.
+		directEmptySecondary := &googleapi.Error{
+			Code:    http.StatusBadRequest,
+			Message: "Continuous queries require the project to have a CONTINUOUS assignment to a reservation.",
+			Errors: []googleapi.ErrorItem{
+				{Reason: "invalidQuery", Message: emptyText},
+			},
+		}
+		if isExpectedContinuousQueryDryRunError(directEmptySecondary) {
+			t.Fatalf("isExpectedContinuousQueryDryRunError(reservation primary + empty secondary %q) = true, want false", emptyText)
+		}
+		if skipReason, fatalErr := validateContinuousExportDryRunJob(nil, directEmptySecondary); fatalErr == nil || skipReason != "" {
+			t.Fatalf("validateContinuousExportDryRunJob(direct reservation primary + empty secondary %q) = (skip=%q, err=%v), want (\"\", non-nil fatalErr)", emptyText, skipReason, fatalErr)
+		}
+
+		// (4) Direct-RPC googleapi.Error adapter: empty primary + reservation secondary item.
+		directEmptyPrimary := &googleapi.Error{
+			Code:    http.StatusBadRequest,
+			Message: emptyText,
+			Errors: []googleapi.ErrorItem{
+				{Reason: "invalidQuery", Message: "Continuous queries require the project to have a CONTINUOUS assignment to a reservation."},
+			},
+		}
+		if isExpectedContinuousQueryDryRunError(directEmptyPrimary) {
+			t.Fatalf("isExpectedContinuousQueryDryRunError(empty primary %q + reservation secondary) = true, want false", emptyText)
+		}
+		if skipReason, fatalErr := validateContinuousExportDryRunJob(nil, directEmptyPrimary); fatalErr == nil || skipReason != "" {
+			t.Fatalf("validateContinuousExportDryRunJob(direct empty primary %q + reservation secondary) = (skip=%q, err=%v), want (\"\", non-nil fatalErr)", emptyText, skipReason, fatalErr)
+		}
 	}
 	jobNilStats := &bigqueryapi.Job{
 		Status: &bigqueryapi.JobStatus{},
@@ -1166,6 +1248,174 @@ func TestColdStartCleanupRegistration(t *testing.T) {
 	}
 	if !strings.Contains(errsTrue[0], "delete ephemeral dataset") {
 		t.Fatalf("owned=true: error = %q, want 'delete ephemeral dataset'", errsTrue[0])
+	}
+
+	// Round-8 P2-1 regression: verify the cold-start sequence when dataset
+	// creation succeeds (setting createdDataset=true) and a later step in
+	// prepareSignalDestination (creating the destination table) fails.
+	// Cleanup must still be registered before failing on startErr so
+	// creates=1 deletes=1, whereas pre-existing datasets (200 OK metadata or
+	// 409 Conflict create) that fail later during table creation get deletes=0.
+	var coldMode atomic.Int32 // 1 = 404 ds + 200 create + 500 table, 2 = 200 ds + 500 table, 3 = 404 ds + 409 create + 500 table
+	var coldCreates atomic.Int32
+	var coldDeletes atomic.Int32
+	var coldDeleteStatus atomic.Int32
+	coldDeleteStatus.Store(http.StatusNoContent)
+
+	coldSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/datasets/cold_ds"):
+			if coldMode.Load() == 2 {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"datasetReference":{"projectId":"test-proj","datasetId":"cold_ds"},"location":"US"}`))
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"code":404,"message":"Not found: Dataset test-proj:cold_ds","errors":[{"reason":"notFound"}]}}`))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/datasets"):
+			coldCreates.Add(1)
+			if coldMode.Load() == 3 {
+				w.WriteHeader(http.StatusConflict)
+				_, _ = w.Write([]byte(`{"error":{"code":409,"message":"Already Exists: Dataset test-proj:cold_ds","errors":[{"reason":"duplicate"}]}}`))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"datasetReference":{"projectId":"test-proj","datasetId":"cold_ds"},"location":"US"}`))
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/tables/"):
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"code":404,"message":"Not found: Table","errors":[{"reason":"notFound"}]}}`))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/tables"):
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"code":400,"message":"Simulated table creation failure after dataset create","errors":[{"reason":"invalid"}]}}`))
+		case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/datasets/cold_ds"):
+			coldDeletes.Add(1)
+			st := int(coldDeleteStatus.Load())
+			w.WriteHeader(st)
+			if st >= 400 {
+				_, _ = w.Write([]byte(`{"error":{"code":403,"message":"Delete forbidden on cold_ds"}}`))
+			}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer coldSrv.Close()
+
+	coldClient, err := bq.NewClient(ctx, "test-proj",
+		option.WithEndpoint(coldSrv.URL),
+		option.WithoutAuthentication(),
+	)
+	if err != nil {
+		t.Fatalf("bq.NewClient(coldSrv): %v", err)
+	}
+	defer func() { _ = coldClient.Close() }()
+
+	coldAdmin := &bigQueryDestinationAdmin{
+		client:   coldClient,
+		httpBase: &http.Transport{},
+		dataset:  coldClient.Dataset("cold_ds"),
+	}
+	coldCfg := createDefaultConfig().(*Config)
+	coldCfg.Project = "test-proj"
+	coldCfg.Dataset = "cold_ds"
+	coldCfg.Location = "US"
+	coldCfg.AutoCreate.Dataset = true
+	coldCfg.AutoCreate.Tables = true
+
+	// Subcase A: Dataset created (200 OK), then table creation fails (400), and
+	// cleanup delete fails (403) -> creates=1, deletes=1, delete error reported.
+	coldMode.Store(1)
+	coldCreates.Store(0)
+	coldDeletes.Store(0)
+	coldDeleteStatus.Store(http.StatusForbidden)
+	seFailAfterCreate := &signalExporter{
+		cfg:    coldCfg,
+		logger: zap.NewNop(),
+		table:  "otel_spans",
+		schema: schema.SpansTableSchema(),
+	}
+	var coldCleanups []func()
+	var coldCleanupErrs []string
+	startErr := seFailAfterCreate.prepareSignalDestination(ctx, coldAdmin)
+	registerColdStartCleanup(
+		func(fn func()) { coldCleanups = append(coldCleanups, fn) },
+		func(err error) { coldCleanupErrs = append(coldCleanupErrs, err.Error()) },
+		coldClient,
+		coldCfg.Dataset,
+		seFailAfterCreate.createdDataset.Load(),
+	)
+	if startErr == nil {
+		t.Fatal("prepareSignalDestination succeeded when table creation returned 400, want error")
+	}
+	if !seFailAfterCreate.createdDataset.Load() {
+		t.Fatal("createdDataset = false after 200 OK CreateDataset and 400 CreateTable, want true")
+	}
+	for _, fn := range coldCleanups {
+		fn()
+	}
+	if coldCreates.Load() != 1 || coldDeletes.Load() != 1 {
+		t.Fatalf("after-create/before-start-complete failure: creates=%d deletes=%d, want creates=1 deletes=1", coldCreates.Load(), coldDeletes.Load())
+	}
+	if len(coldCleanupErrs) != 1 || !strings.Contains(coldCleanupErrs[0], "delete ephemeral dataset cold_ds") {
+		t.Fatalf("after-create cleanup errors = %v, want 1 error containing 'delete ephemeral dataset cold_ds'", coldCleanupErrs)
+	}
+
+	// Subcase B: Pre-existing dataset (200 OK on metadata) fails during table creation -> deletes=0.
+	coldMode.Store(2)
+	coldCreates.Store(0)
+	coldDeletes.Store(0)
+	sePreExisting := &signalExporter{
+		cfg:    coldCfg,
+		logger: zap.NewNop(),
+		table:  "otel_spans",
+		schema: schema.SpansTableSchema(),
+	}
+	coldCleanups = nil
+	startErr = sePreExisting.prepareSignalDestination(ctx, coldAdmin)
+	registerColdStartCleanup(
+		func(fn func()) { coldCleanups = append(coldCleanups, fn) },
+		func(err error) { t.Errorf("unexpected cleanup error: %v", err) },
+		coldClient,
+		coldCfg.Dataset,
+		sePreExisting.createdDataset.Load(),
+	)
+	if startErr == nil {
+		t.Fatal("prepareSignalDestination(pre-existing 200) succeeded when table creation returned 400, want error")
+	}
+	for _, fn := range coldCleanups {
+		fn()
+	}
+	if coldCreates.Load() != 0 || coldDeletes.Load() != 0 {
+		t.Fatalf("pre-existing 200 dataset failure: creates=%d deletes=%d, want creates=0 deletes=0", coldCreates.Load(), coldDeletes.Load())
+	}
+
+	// Subcase C: Concurrent 409 Conflict on dataset create + table creation failure -> creates=1, deletes=0.
+	coldMode.Store(3)
+	coldCreates.Store(0)
+	coldDeletes.Store(0)
+	seConflict := &signalExporter{
+		cfg:    coldCfg,
+		logger: zap.NewNop(),
+		table:  "otel_spans",
+		schema: schema.SpansTableSchema(),
+	}
+	coldCleanups = nil
+	startErr = seConflict.prepareSignalDestination(ctx, coldAdmin)
+	registerColdStartCleanup(
+		func(fn func()) { coldCleanups = append(coldCleanups, fn) },
+		func(err error) { t.Errorf("unexpected cleanup error: %v", err) },
+		coldClient,
+		coldCfg.Dataset,
+		seConflict.createdDataset.Load(),
+	)
+	if startErr == nil {
+		t.Fatal("prepareSignalDestination(409 conflict) succeeded when table creation returned 400, want error")
+	}
+	for _, fn := range coldCleanups {
+		fn()
+	}
+	if coldCreates.Load() != 1 || coldDeletes.Load() != 0 {
+		t.Fatalf("409 conflict dataset failure: creates=%d deletes=%d, want creates=1 deletes=0", coldCreates.Load(), coldDeletes.Load())
 	}
 }
 

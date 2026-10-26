@@ -89,10 +89,11 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := traces.start(ctx, nil); err != nil {
-		t.Fatalf("first trace startup: %v", err)
-	}
+	startErr := traces.start(ctx, nil)
 	registerColdStartCleanup(t.Cleanup, func(err error) { t.Errorf("%v", err) }, admin, dataset, traces.createdDataset.Load())
+	if startErr != nil {
+		t.Fatalf("first trace startup: %v", startErr)
+	}
 	if !traces.createdDataset.Load() {
 		t.Fatalf("first trace startup did not cold-create dataset %s.%s (createdDataset=false)", project, dataset)
 	}
