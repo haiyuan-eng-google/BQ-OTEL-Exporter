@@ -615,10 +615,6 @@ func dfxExpandWithVars(text string, incremental bool, vars map[string]string) (s
 }
 
 // dfxEval evaluates one ${...} expression.
-func dfxEval(expr string, incremental bool) (string, error) {
-	return dfxEvalWithVars(expr, incremental, nil)
-}
-
 func dfxEvalWithVars(expr string, incremental bool, vars map[string]string) (string, error) {
 	if m := dfxRefCall.FindStringSubmatch(expr); m != nil {
 		return "`ref." + m[1] + "`", nil
@@ -636,12 +632,8 @@ func dfxEvalWithVars(expr string, incremental bool, vars map[string]string) (str
 	return "", fmt.Errorf("the expression ${%s} is not one the package uses (self(), ref(\"name\"), JSON.stringify(%srun_timestamp) and when(incremental(), ...))", dfxSnippet(expr), dfxVarExpr)
 }
 
-// dfxWhen evaluates the arguments of when(incremental(), `a`[, `b`]): a for an
+// dfxWhenWithVars evaluates the arguments of when(incremental(), `a`[, `b`]): a for an
 // incremental run, b, or nothing, for a full refresh.
-func dfxWhen(args string, incremental bool) (string, error) {
-	return dfxWhenWithVars(args, incremental, nil)
-}
-
 func dfxWhenWithVars(args string, incremental bool, vars map[string]string) (string, error) {
 	rest, ok := strings.CutPrefix(strings.TrimSpace(args), "incremental()")
 	if !ok {
