@@ -120,18 +120,21 @@ window_start = TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 HOU
 
 so `T - 4h < window_start <= T - 3h`: the lookback `L` is 3 to 4 hours.
 `stg_run_window` captures `T` and `window_start` once at the start of the
-invocation (or from `vars.run_timestamp` when set) with `is_committed = FALSE`,
+invocation (or from `vars.run_timestamp` when set; on a full refresh, it seeds
+`window_start = 1970-01-01 00:00:00+00`) with `is_committed = FALSE`,
 and every incremental action and assertion reads `stg_run_window.window_start`
 so the whole DAG shares a single cutoff even if execution crosses an hour
 boundary. `m_gen_ai_agent_trajectory` depends on `stg_spans_dedup` and the three
-aggregate marts, and its `post_operations` set `stg_run_window.is_committed = TRUE`
-only after all staging and mart refreshes have succeeded. If any action fails
-mid-DAG, its own transaction (`BEGIN TRANSACTION` ... `DELETE` ... `INSERT` ...
-`COMMIT TRANSACTION`) rolls back and `stg_run_window.is_committed` remains
+aggregate marts, and its `post_operations` commit the trajectory table, run
+`ASSERT NOT EXISTS` checks equivalent to `assert_no_unhandled_cycles` and
+`assert_no_orphan_tokens` over `start_time >= context_start`, and only then set
+`stg_run_window.is_committed = TRUE`. If any staging action, mart, or assertion
+check fails (including on a full refresh), `stg_run_window.is_committed` remains
 `FALSE`; on the next incremental run, `stg_run_window` retains the uncommitted
-`prev_window_start` via `LEAST(candidate_window_start, prev_window_start)` so
-every staging table and mart automatically re-covers the failed run's window. In
-addition, `m_gen_ai_agent_trajectory` includes any trace in the 24-hour
+`prev_window_start` (including the `1970-01-01 00:00:00+00` epoch cutoff after a
+failed full refresh) via `LEAST(candidate_window_start, prev_window_start)` so
+every staging table, mart, and assertion automatically re-covers the failed
+window across retries. In addition, `m_gen_ai_agent_trajectory` includes any trace in the 24-hour
 `context_start` window that has a staged span in `stg_spans_dedup` not yet
 present in the trajectory mart, and both assertions validate staged and emitted
 spans across the full 24-hour `context_start` window. A first run or a full

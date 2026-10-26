@@ -2,7 +2,8 @@
  * Copyright 2026 Google LLC
  * SPDX-License-Identifier: Apache-2.0
  *
- * Assertion: every span staged in the last 3 hours is in the trajectory mart as
+ * Assertion: every span staged in the 24-hour context window anchored at
+ * stg_run_window.window_start (window_start - 24h) is in the trajectory mart as
  * one row. The assertion fails when this query returns a row.
  *
  * The trajectory query only starts from true roots and from orphan roots, so a
@@ -12,16 +13,15 @@
  * It also catches a span emitted more than once, which would double count it.
  *
  * Spans are compared by (trace_id, service_name, span_id), the identity the
- * trajectory canonicalizes on. The window is read from stg_run_window so every
- * action in one Dataform invocation shares the same 3-hour cutoff. The mart is
- * read from 24 hours earlier, because a span can be emitted with an earlier
- * start_time than a redelivered copy of it.
+ * trajectory canonicalizes on. Both staged and emitted spans are read across
+ * the 24-hour context window anchored at stg_run_window.window_start
+ * (window_start - 24h), matching the trajectory mart's recursion reach.
  */
 config {
   type: "assertion",
   tags: ["otel_marts"],
   dependencies: ["stg_run_window"],
-  description: "Fails when a span staged in the last 3 hours is missing from, or repeated in, the trajectory mart."
+  description: "Fails when a span staged in the 24-hour context window anchored at stg_run_window.window_start is missing from, or repeated in, the trajectory mart."
 }
 
 WITH staged AS (

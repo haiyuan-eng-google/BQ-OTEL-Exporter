@@ -345,9 +345,65 @@ func dashParseSQL(src string) (*dashQuery, error) {
 	return dashParseQuery(toks, nil)
 }
 
+func dashValidateTypedArrays(toks []dashTok) error {
+	for i := 0; i < len(toks); i++ {
+		if toks[i].up == "ARRAY" && i+1 < len(toks) && toks[i+1].text == "<>" {
+			return fmt.Errorf("malformed ARRAY<...> type specification at byte %d", toks[i].pos)
+		}
+		if toks[i].up != "ARRAY" || i+1 >= len(toks) || !toks[i+1].is("<") {
+			continue
+		}
+		isTypeCast := i > 0 && toks[i-1].up == "AS"
+		angleDepth := 0
+		closeAngle := -1
+		for j := i + 1; j < len(toks); j++ {
+			switch {
+			case toks[j].is("<"):
+				angleDepth++
+			case toks[j].is(">"):
+				angleDepth--
+				if angleDepth == 0 {
+					closeAngle = j
+				}
+			case toks[j].text == ">>":
+				angleDepth -= 2
+				if angleDepth <= 0 {
+					closeAngle = j
+				}
+			}
+			if closeAngle >= 0 {
+				break
+			}
+		}
+		if closeAngle < 0 || closeAngle == i+2 {
+			return fmt.Errorf("malformed ARRAY<...> type specification at byte %d", toks[i].pos)
+		}
+		if isTypeCast {
+			i = closeAngle
+			continue
+		}
+		if closeAngle+1 >= len(toks) || !toks[closeAngle+1].is("[") {
+			got := "end of input"
+			if closeAngle+1 < len(toks) {
+				got = fmt.Sprintf("%q", toks[closeAngle+1].text)
+			}
+			return fmt.Errorf("typed array literal ARRAY<...> must be followed by '[...]', got %s at byte %d", got, toks[closeAngle].pos)
+		}
+		closeBracket := dashClosing(toks, closeAngle+1)
+		if closeBracket < 0 {
+			return fmt.Errorf("unclosed '[' after ARRAY<...> at byte %d", toks[closeAngle+1].pos)
+		}
+		i = closeBracket
+	}
+	return nil
+}
+
 func dashParseQuery(toks []dashTok, parent *dashQuery) (*dashQuery, error) {
 	if len(toks) == 0 {
 		return nil, errors.New("empty query")
+	}
+	if err := dashValidateTypedArrays(toks); err != nil {
+		return nil, err
 	}
 	q := &dashQuery{parent: parent}
 	base := toks[0].depth
@@ -1220,22 +1276,33 @@ func dashInferExprType(toks []dashTok, colTypes map[string]string) string {
 			return dashInferExprType(toks[commas[1]+1:len(toks)-1], colTypes)
 		}
 	}
-	// Top-level binary arithmetic (+, -, *, /).
+	// Top-level binary arithmetic (+, -, *, /). Both operands must be numeric
+	// (INT64 or FLOAT64); otherwise inference fails ("") so invalid arithmetic
+	// such as CAST(col AS STRING) + 0 is rejected.
 	baseDepth := toks[0].depth
+	isNumeric := func(typ string) bool {
+		return typ == "INT64" || typ == "FLOAT64"
+	}
 	for i := len(toks) - 1; i > 0; i-- {
 		if toks[i].depth == baseDepth && toks[i].kind == dashPunct {
 			switch toks[i].text {
 			case "/":
-				return "FLOAT64"
+				lt := dashInferExprType(toks[:i], colTypes)
+				rt := dashInferExprType(toks[i+1:], colTypes)
+				if isNumeric(lt) && isNumeric(rt) {
+					return "FLOAT64"
+				}
+				return ""
 			case "+", "-", "*":
 				lt := dashInferExprType(toks[:i], colTypes)
 				rt := dashInferExprType(toks[i+1:], colTypes)
+				if !isNumeric(lt) || !isNumeric(rt) {
+					return ""
+				}
 				if lt == "FLOAT64" || rt == "FLOAT64" {
 					return "FLOAT64"
 				}
-				if lt == "INT64" || rt == "INT64" {
-					return "INT64"
-				}
+				return "INT64"
 			}
 		}
 	}
@@ -1969,6 +2036,12 @@ func (l *dashLooker) checkComponent(page, prefix, dateField string, c dashSpecCo
 		if roles["x"] == "" || roles["y"] == "" {
 			l.probs.addf("%s: a scatter chart needs metrics with the roles x and y", where)
 		}
+	}
+	if slices.Contains(c.Dimensions, "span_id") &&
+		!slices.Contains(c.Dimensions, "trace_id") &&
+		!slices.Contains(c.Dimensions, "trace_link") &&
+		!slices.Contains(c.Dimensions, "exemplar_span_key") {
+		l.probs.addf("%s: dimension span_id cannot be used without trace_id, trace_link, or exemplar_span_key; span_id is only unique within a trace", where)
 	}
 	for role := range roles {
 		switch {
@@ -3516,6 +3589,17 @@ var dashMutations = []dashMutation{
 		dashReplaceFirst("  total_input_tokens,\n", "  CAST(total_input_tokens AS STRING) AS total_input_tokens,\n"), "select item total_input_tokens has type STRING, want INT64"},
 	{"looker_studio", "a query wraps a string cast of a numeric column in parentheses", dashLookerDir + "queries/executive_summary.sql",
 		dashReplaceFirst("  total_input_tokens,\n", "  (CAST(total_input_tokens AS STRING)) AS total_input_tokens,\n"), "select item total_input_tokens has type STRING, want INT64"},
+	{"looker_studio", "a query adds zero to a string cast of a numeric column", dashLookerDir + "queries/executive_summary.sql",
+		dashReplaceFirst("  total_input_tokens,\n", "  CAST(total_input_tokens AS STRING) + 0 AS total_input_tokens,\n"), "cannot infer type of select item total_input_tokens"},
+	{"looker_studio", "a query adds a string cast of a numeric column on the right", dashLookerDir + "queries/executive_summary.sql",
+		dashReplaceFirst("  total_reasoning_tokens,\n", "  0 + CAST(total_reasoning_tokens AS STRING) AS total_reasoning_tokens,\n"), "cannot infer type of select item total_reasoning_tokens"},
+	{"looker_studio", "a query multiplies a parenthesized string cast of a numeric column", dashLookerDir + "queries/executive_summary.sql",
+		dashReplaceFirst("  total_reasoning_tokens,\n", "  (CAST(total_reasoning_tokens AS STRING)) * 1 AS total_reasoning_tokens,\n"), "cannot infer type of select item total_reasoning_tokens"},
+	{"looker_studio", "a query divides a string cast of a numeric column", dashLookerDir + "queries/executive_summary.sql",
+		dashReplaceFirst("  total_reasoning_tokens,\n", "  CAST(total_reasoning_tokens AS STRING) / 1 AS total_reasoning_tokens,\n"), "cannot infer type of select item total_reasoning_tokens"},
+	{"looker_studio", "a scatter chart groups by bare span_id without exemplar_span_key", dashSpecFile,
+		dashReplaceAfter("id: p6_value_vs_duration", "dimensions: [exemplar_span_key]", "dimensions: [span_id]"),
+		"dimension span_id cannot be used without trace_id, trace_link, or exemplar_span_key"},
 	{"looker_studio", "the trajectory query outputs bare agent_path without ARRAY_TO_STRING", dashLookerDir + "queries/agent_trajectory.sql",
 		dashReplaceFirst("  ARRAY_TO_STRING(agent_path, ' > ') AS agent_path,\n", "  agent_path,\n"), "select item agent_path has type ARRAY<STRING>, want STRING"},
 	{"looker_studio", "a component sums a string column", dashSpecFile,
@@ -4141,6 +4225,57 @@ func TestDashSQLParser(t *testing.T) {
 			t.Errorf("qualified columns: problems %v, want only t.nope", problems)
 		}
 	})
+
+	t.Run("typed arrays and expression type inference", func(t *testing.T) {
+		for _, badSQL := range []string{
+			"SELECT 1 FROM t WHERE ('__all' IN UNNEST(ARRAY<STRING>__all))",
+			"SELECT 1 FROM t WHERE x IN UNNEST(ARRAY<INT64>)",
+			"SELECT ARRAY<>[] FROM t",
+		} {
+			if _, err := dashParseSQL(badSQL); err == nil {
+				t.Errorf("dashParseSQL(%q) succeeded, want typed-array syntax error", badSQL)
+			}
+		}
+		for _, goodSQL := range []string{
+			`SELECT 1 FROM t WHERE ('__all' IN UNNEST(ARRAY<STRING>["__all"]))`,
+			`SELECT CAST(x AS ARRAY<STRING>) AS a FROM t`,
+		} {
+			if _, err := dashParseSQL(goodSQL); err != nil {
+				t.Errorf("dashParseSQL(%q) failed: %v", goodSQL, err)
+			}
+		}
+		colTypes := map[string]string{
+			"total_input_tokens":     "INT64",
+			"total_output_tokens":    "INT64",
+			"total_reasoning_tokens": "INT64",
+			"avg_duration_ms":        "FLOAT64",
+			"model":                  "STRING",
+		}
+		for _, tc := range []struct {
+			expr string
+			want string
+		}{
+			{"total_input_tokens + total_output_tokens", "INT64"},
+			{"total_input_tokens + 0.5", "FLOAT64"},
+			{"avg_duration_ms * total_input_tokens", "FLOAT64"},
+			{"total_input_tokens / 2", "FLOAT64"},
+			{"CAST(total_input_tokens AS STRING) + 0", ""},
+			{"CAST(total_reasoning_tokens AS STRING) + 0", ""},
+			{"(CAST(total_reasoning_tokens AS STRING)) * 1", ""},
+			{"0 + CAST(total_reasoning_tokens AS STRING)", ""},
+			{"CAST(total_reasoning_tokens AS STRING) / 1", ""},
+			{"1 / CAST(total_reasoning_tokens AS STRING)", ""},
+			{"model + 1", ""},
+		} {
+			toks, err := dashTokenize(tc.expr)
+			if err != nil {
+				t.Fatalf("dashTokenize(%q): %v", tc.expr, err)
+			}
+			if got := dashInferExprType(toks, colTypes); got != tc.want {
+				t.Errorf("dashInferExprType(%q) = %q, want %q", tc.expr, got, tc.want)
+			}
+		}
+	})
 }
 
 func mustParse(t *testing.T, sql string) *dashQuery {
@@ -4263,6 +4398,32 @@ func TestGrafanaBQVariableExpansionAndAlertOnlyServices(t *testing.T) {
 			if panelCount != 24 {
 				t.Fatalf("case %s: checked %d panels, want 24", tc.name, panelCount)
 			}
+		}
+
+		// Verify that if allValue were the bare unquoted string "__all" (expanding
+		// ARRAY<STRING>${service:json} to ARRAY<STRING>__all), dashParseSQL rejects
+		// every single one of the 24 expanded panel queries.
+		badAllRepl := strings.NewReplacer(
+			"${VAR_PROJECT}", "my-proj",
+			"${VAR_DATASET}", "my_ds",
+			"${service:json}", "__all",
+			"${__from}", dashGrafanaFrom,
+			"${__to}", dashGrafanaTo,
+		)
+		badAllPanels := 0
+		for _, pn := range g.Panels {
+			if pn.Type == "row" || len(pn.Targets) == 0 {
+				continue
+			}
+			badAllPanels++
+			badAll := badAllRepl.Replace(pn.Targets[0].RawSQL)
+			badAll = dashTimeFilter.ReplaceAllString(badAll, "$1 BETWEEN TIMESTAMP_MILLIS("+dashGrafanaFrom+") AND TIMESTAMP_MILLIS("+dashGrafanaTo+")")
+			if _, err := dashParseSQL(badAll); err == nil {
+				t.Fatalf("panel %q: dashParseSQL(badAll) succeeded on UNNEST(ARRAY<STRING>__all), want syntax error", pn.Title)
+			}
+		}
+		if badAllPanels != 24 {
+			t.Fatalf("checked %d badAll panels, want 24", badAllPanels)
 		}
 
 		// 1b. Parse the 5-branch service variable query and verify that services
@@ -4446,5 +4607,23 @@ func TestLookerStudioWeightedDurationAndCompositeSpanKey(t *testing.T) {
 	}
 	if len(compositeKeys) != 2 || len(bareSpanIDs) != 1 {
 		t.Fatalf("composite count = %d (want 2), bare span_id count = %d (want 1)", len(compositeKeys), len(bareSpanIDs))
+	}
+
+	// Verify p6_value_vs_duration scatter_chart groups by exemplar_span_key so
+	// two exemplars from different traces sharing the same span_id plot as 2
+	// points rather than collapsing into 1.
+	var scatterDims []string
+	for _, p := range spec.Pages {
+		if p.ID != "metric_exemplars" {
+			continue
+		}
+		for _, comp := range p.Components {
+			if comp.ID == "p6_value_vs_duration" {
+				scatterDims = comp.Dimensions
+			}
+		}
+	}
+	if !slices.Equal(scatterDims, []string{"exemplar_span_key"}) {
+		t.Fatalf("p6_value_vs_duration dimensions = %v, want [exemplar_span_key]", scatterDims)
 	}
 }

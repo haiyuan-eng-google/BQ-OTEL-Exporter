@@ -3,7 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Assertion: the token columns of the trajectory mart keep the is_token_leaf
- * invariants for the spans staged in the last 3 hours. The assertion fails when
+ * invariants for the spans staged in the 24-hour context window anchored at
+ * stg_run_window.window_start (window_start - 24h). The assertion fails when
  * this query returns a row; violation names the broken rule.
  *
  * is_token_leaf marks the spans whose token usage is not already reported by an
@@ -28,14 +29,14 @@
  *   partial leaf keeps a family that an emitted descendant already covers.
  *
  * Spans are paired with their staged row by (trace_id, service_name, span_id).
- * The window is read from stg_run_window so every action in one Dataform
- * invocation shares the same 3-hour cutoff.
+ * The 24-hour context window is anchored at stg_run_window.window_start so
+ * every action in one Dataform invocation shares the same cutoff.
  */
 config {
   type: "assertion",
   tags: ["otel_marts"],
   dependencies: ["stg_run_window"],
-  description: "Fails when the token columns of the trajectory mart break the is_token_leaf sum invariants."
+  description: "Fails when the token columns of the trajectory mart break the is_token_leaf sum invariants in the 24-hour context window anchored at stg_run_window.window_start."
 }
 
 WITH RECURSIVE

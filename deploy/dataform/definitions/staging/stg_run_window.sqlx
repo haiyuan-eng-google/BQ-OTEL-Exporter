@@ -18,7 +18,7 @@ config {
 -- next run re-covers the uncommitted window without a lookback gap.
 
 pre_operations {
-  DECLARE prev_window_start TIMESTAMP DEFAULT ${when(incremental(), `(SELECT MIN(IF(is_committed, TIMESTAMP('9999-12-31 23:59:59+00'), window_start)) FROM ${self()})`, `TIMESTAMP('9999-12-31 23:59:59+00')`)}
+  DECLARE prev_window_start TIMESTAMP DEFAULT ${when(incremental(), `(SELECT MIN(IF(is_committed, TIMESTAMP('9999-12-31 23:59:59+00'), window_start)) FROM ${self()})`, `TIMESTAMP('1970-01-01 00:00:00+00')`)}
   ---
   ${when(incremental(), `BEGIN TRANSACTION`)}
   ---
@@ -49,7 +49,7 @@ SELECT
       TIMESTAMP_SUB(run_ts, INTERVAL 3 HOUR),
       HOUR
     ),
-    COALESCE(prev_window_start, TIMESTAMP('9999-12-31 23:59:59+00'))
+    ${when(incremental(), `COALESCE(prev_window_start, TIMESTAMP('9999-12-31 23:59:59+00'))`, `TIMESTAMP('1970-01-01 00:00:00+00')`)}
   ) AS window_start,
   FALSE AS is_committed
 FROM clock

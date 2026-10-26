@@ -647,7 +647,7 @@ pages:
       - id: p6_value_vs_duration
         type: scatter_chart
         title: Exemplar value vs span duration
-        dimensions: [span_id]
+        dimensions: [exemplar_span_key]
         metrics:
           - {field: exemplar_value, aggregation: MAX, role: x}
           - {field: span_duration_ms, aggregation: MAX, role: y}
