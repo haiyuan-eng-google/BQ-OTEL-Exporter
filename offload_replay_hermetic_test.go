@@ -1184,6 +1184,34 @@ func TestCreateOwnedEphemeralDatasetDeleteFailureReportsError(t *testing.T) {
 	}
 }
 
+// startAndRegisterColdStartCleanup runs the cold-start sequence that both
+// TestAutoCreateLiveBigQuery (integration_auto_create_test.go) and
+// TestColdStartCleanupRegistration (this file) must share: call startFn,
+// register cleanup reading se.createdDataset.Load() inside the helper (so the
+// caller cannot pass a stale or forced value), then fail when startErr is
+// non-nil. Moving the registerColdStartCleanup call below the startErr check,
+// replacing se.createdDataset.Load() with true, or dropping the startErr != nil
+// fatalf check breaks the hermetic test.
+//
+// This helper has no //go:build integration tag, so it is compiled in both
+// `go test ./...` and `go test -tags=integration ./...`.
+func startAndRegisterColdStartCleanup(
+	ctx context.Context,
+	startFn func(context.Context) error,
+	se *signalExporter,
+	registerCleanup func(func()),
+	reportCleanupError func(error),
+	admin *bq.Client,
+	dataset string,
+	fatalf func(string, ...any),
+) {
+	startErr := startFn(ctx)
+	registerColdStartCleanup(registerCleanup, reportCleanupError, admin, dataset, se.createdDataset.Load())
+	if startErr != nil {
+		fatalf("cold start failed: %v", startErr)
+	}
+}
+
 // registerColdStartCleanup registers a DeleteWithContents cleanup for a
 // pre-created dataset only when owned is true. When owned is false (dataset
 // was pre-created and is not owned by this test), no DELETE is registered.
@@ -1324,6 +1352,9 @@ func TestColdStartCleanupRegistration(t *testing.T) {
 
 	// Subcase A: Dataset created (200 OK), then table creation fails (400), and
 	// cleanup delete fails (403) -> creates=1, deletes=1, delete error reported.
+	// The shared helper must register cleanup BEFORE failing on startErr;
+	// moving the register below the fatalf check means cleanup is never
+	// registered when start fails, and the fatalf closure catches that.
 	coldMode.Store(1)
 	coldCreates.Store(0)
 	coldDeletes.Store(0)
@@ -1336,16 +1367,28 @@ func TestColdStartCleanupRegistration(t *testing.T) {
 	}
 	var coldCleanups []func()
 	var coldCleanupErrs []string
-	startErr := seFailAfterCreate.prepareSignalDestination(ctx, coldAdmin)
-	registerColdStartCleanup(
+	fatalfCalled := false
+	startAndRegisterColdStartCleanup(
+		ctx,
+		func(ctx context.Context) error { return seFailAfterCreate.prepareSignalDestination(ctx, coldAdmin) },
+		seFailAfterCreate,
 		func(fn func()) { coldCleanups = append(coldCleanups, fn) },
 		func(err error) { coldCleanupErrs = append(coldCleanupErrs, err.Error()) },
 		coldClient,
 		coldCfg.Dataset,
-		seFailAfterCreate.createdDataset.Load(),
+		func(format string, args ...any) {
+			// fatalf for subcase A: start is expected to fail, so this is
+			// reached only after cleanup was registered. Verify that
+			// cleanup was indeed registered before this point; if not,
+			// the helper has the wrong ordering (mutation).
+			if len(coldCleanups) == 0 {
+				t.Fatalf("subcase A: startAndRegisterColdStartCleanup called fatalf before registering cleanup: "+format, args...)
+			}
+			fatalfCalled = true
+		},
 	)
-	if startErr == nil {
-		t.Fatal("prepareSignalDestination succeeded when table creation returned 400, want error")
+	if !fatalfCalled {
+		t.Fatal("expected fatalf to be called on startErr != nil")
 	}
 	if !seFailAfterCreate.createdDataset.Load() {
 		t.Fatal("createdDataset = false after 200 OK CreateDataset and 400 CreateTable, want true")
@@ -1360,7 +1403,9 @@ func TestColdStartCleanupRegistration(t *testing.T) {
 		t.Fatalf("after-create cleanup errors = %v, want 1 error containing 'delete ephemeral dataset cold_ds'", coldCleanupErrs)
 	}
 
-	// Subcase B: Pre-existing dataset (200 OK on metadata) fails during table creation -> deletes=0.
+	// Subcase B: Pre-existing dataset (200 OK on metadata) fails during table
+	// creation -> deletes=0. The shared helper reads createdDataset (false)
+	// inside, so forcing true would register an unwanted DELETE.
 	coldMode.Store(2)
 	coldCreates.Store(0)
 	coldDeletes.Store(0)
@@ -1371,16 +1416,24 @@ func TestColdStartCleanupRegistration(t *testing.T) {
 		schema: schema.SpansTableSchema(),
 	}
 	coldCleanups = nil
-	startErr = sePreExisting.prepareSignalDestination(ctx, coldAdmin)
-	registerColdStartCleanup(
+	fatalfCalled = false
+	startAndRegisterColdStartCleanup(
+		ctx,
+		func(ctx context.Context) error { return sePreExisting.prepareSignalDestination(ctx, coldAdmin) },
+		sePreExisting,
 		func(fn func()) { coldCleanups = append(coldCleanups, fn) },
 		func(err error) { t.Errorf("unexpected cleanup error: %v", err) },
 		coldClient,
 		coldCfg.Dataset,
-		sePreExisting.createdDataset.Load(),
+		func(format string, args ...any) {
+			if len(coldCleanups) != 0 {
+				t.Fatalf("subcase B: cleanup registered for pre-existing dataset (createdDataset should be false): "+format, args...)
+			}
+			fatalfCalled = true
+		},
 	)
-	if startErr == nil {
-		t.Fatal("prepareSignalDestination(pre-existing 200) succeeded when table creation returned 400, want error")
+	if !fatalfCalled {
+		t.Fatal("expected fatalf to be called on startErr != nil")
 	}
 	for _, fn := range coldCleanups {
 		fn()
@@ -1389,7 +1442,9 @@ func TestColdStartCleanupRegistration(t *testing.T) {
 		t.Fatalf("pre-existing 200 dataset failure: creates=%d deletes=%d, want creates=0 deletes=0", coldCreates.Load(), coldDeletes.Load())
 	}
 
-	// Subcase C: Concurrent 409 Conflict on dataset create + table creation failure -> creates=1, deletes=0.
+	// Subcase C: Concurrent 409 Conflict on dataset create + table creation
+	// failure -> creates=1, deletes=0. createdDataset is false (409 is not a
+	// successful create), so no DELETE is registered.
 	coldMode.Store(3)
 	coldCreates.Store(0)
 	coldDeletes.Store(0)
@@ -1400,22 +1455,63 @@ func TestColdStartCleanupRegistration(t *testing.T) {
 		schema: schema.SpansTableSchema(),
 	}
 	coldCleanups = nil
-	startErr = seConflict.prepareSignalDestination(ctx, coldAdmin)
-	registerColdStartCleanup(
+	fatalfCalled = false
+	startAndRegisterColdStartCleanup(
+		ctx,
+		func(ctx context.Context) error { return seConflict.prepareSignalDestination(ctx, coldAdmin) },
+		seConflict,
 		func(fn func()) { coldCleanups = append(coldCleanups, fn) },
 		func(err error) { t.Errorf("unexpected cleanup error: %v", err) },
 		coldClient,
 		coldCfg.Dataset,
-		seConflict.createdDataset.Load(),
+		func(format string, args ...any) {
+			if len(coldCleanups) != 0 {
+				t.Fatalf("subcase C: cleanup registered for 409-conflict dataset (createdDataset should be false): "+format, args...)
+			}
+			fatalfCalled = true
+		},
 	)
-	if startErr == nil {
-		t.Fatal("prepareSignalDestination(409 conflict) succeeded when table creation returned 400, want error")
+	if !fatalfCalled {
+		t.Fatal("expected fatalf to be called on startErr != nil")
 	}
 	for _, fn := range coldCleanups {
 		fn()
 	}
 	if coldCreates.Load() != 1 || coldDeletes.Load() != 0 {
 		t.Fatalf("409 conflict dataset failure: creates=%d deletes=%d, want creates=1 deletes=0", coldCreates.Load(), coldDeletes.Load())
+	}
+
+	// Subcase D: Successful startup (startErr == nil) after dataset creation
+	// (createdDataset == true) registers cleanup without invoking fatalf.
+	seSuccess := &signalExporter{
+		cfg:    coldCfg,
+		logger: zap.NewNop(),
+		table:  "otel_spans",
+		schema: schema.SpansTableSchema(),
+	}
+	coldCleanups = nil
+	fatalfCalled = false
+	startAndRegisterColdStartCleanup(
+		ctx,
+		func(context.Context) error {
+			seSuccess.createdDataset.Store(true)
+			return nil
+		},
+		seSuccess,
+		func(fn func()) { coldCleanups = append(coldCleanups, fn) },
+		func(err error) { t.Errorf("unexpected cleanup error: %v", err) },
+		coldClient,
+		coldCfg.Dataset,
+		func(format string, args ...any) {
+			fatalfCalled = true
+			t.Fatalf("subcase D: unexpected fatalf when startErr == nil: "+format, args...)
+		},
+	)
+	if fatalfCalled {
+		t.Fatal("subcase D: expected fatalf not to be called when startErr == nil")
+	}
+	if len(coldCleanups) != 1 {
+		t.Fatalf("subcase D: len(coldCleanups) = %d, want 1 when startErr == nil and createdDataset == true", len(coldCleanups))
 	}
 }
 
