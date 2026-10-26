@@ -1748,7 +1748,7 @@
         "sort": 1,
         "multi": true,
         "includeAll": true,
-        "allValue": "__all",
+        "allValue": "[\"__all\"]",
         "allowCustomValue": false,
         "hide": 0,
         "skipUrlSync": false,
@@ -1762,7 +1762,7 @@
           ]
         },
         "options": [],
-        "description": "Services with GenAI or MCP activity in the time range. All sets the __all sentinel so every panel (including otel_alerts for alert-only services) remains unfiltered by the option list."
+        "description": "Services with GenAI or MCP activity in the time range. All sets the [\"__all\"] sentinel so every panel (including otel_alerts for alert-only services) remains unfiltered by the option list."
       }
     ]
   },

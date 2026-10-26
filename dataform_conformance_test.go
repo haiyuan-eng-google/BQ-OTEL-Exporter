@@ -80,11 +80,14 @@ var (
 	dfxCoreVersion = regexp.MustCompile(`^3\.\d+\.\d+$`)
 	dfxDatasetName = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
 
+	// dfxClockRE matches the run_ts item of the clock WITH table in stg_run_window, as dashJoin writes it.
+	dfxClockRE = regexp.MustCompile(`^COALESCE \( CAST \( NULLIF \( "[^"]*" , '' \) AS TIMESTAMP \) , CURRENT_TIMESTAMP \( \) \) AS RUN_TS$`)
+
 	// dfxWindowRE matches the incremental window_start item of stg_run_window, as dashJoin writes it.
-	dfxWindowRE = regexp.MustCompile(`^TIMESTAMP_TRUNC \( TIMESTAMP_SUB \( COALESCE \( SAFE_CAST \( NULLIF \( '' , '' \) AS TIMESTAMP \) , CURRENT_TIMESTAMP \( \) \) , INTERVAL (\d+) HOUR \) , HOUR \) AS WINDOW_START$`)
+	dfxWindowRE = regexp.MustCompile(`^TIMESTAMP_TRUNC \( TIMESTAMP_SUB \( RUN_TS , INTERVAL (\d+) HOUR \) , HOUR \) AS WINDOW_START$`)
 
 	// dfxIntervalRE finds the window that an action takes from the clock.
-	dfxIntervalRE = regexp.MustCompile(`CURRENT_TIMESTAMP \( \)(?: \))? , INTERVAL (\d+) (\w+) \)`)
+	dfxIntervalRE = regexp.MustCompile(`(?:CURRENT_TIMESTAMP \( \)|RUN_TS) , INTERVAL (\d+) (\w+) \)`)
 
 	// dfxHoursRE finds the hours of an interval of the trajectory view.
 	dfxHoursRE = regexp.MustCompile(`INTERVAL (\d+) HOUR`)
@@ -586,6 +589,10 @@ var dfxRefCall = regexp.MustCompile(`^ref\(\s*"([A-Za-z0-9_]+)"\s*\)$`)
 // the quoted name `ref.x`, so that the SQL reader can tell the references apart
 // from the tables of the exporter dataset.
 func dfxExpand(text string, incremental bool) (string, error) {
+	return dfxExpandWithVars(text, incremental, nil)
+}
+
+func dfxExpandWithVars(text string, incremental bool, vars map[string]string) (string, error) {
 	var out strings.Builder
 	for {
 		i := strings.Index(text, "${")
@@ -597,7 +604,7 @@ func dfxExpand(text string, incremental bool) (string, error) {
 		if end < 0 {
 			return "", fmt.Errorf("unterminated ${ near %q", dfxSnippet(text[i:]))
 		}
-		rep, err := dfxEval(strings.TrimSpace(text[i+2:end]), incremental)
+		rep, err := dfxEvalWithVars(strings.TrimSpace(text[i+2:end]), incremental, vars)
 		if err != nil {
 			return "", err
 		}
@@ -609,23 +616,33 @@ func dfxExpand(text string, incremental bool) (string, error) {
 
 // dfxEval evaluates one ${...} expression.
 func dfxEval(expr string, incremental bool) (string, error) {
+	return dfxEvalWithVars(expr, incremental, nil)
+}
+
+func dfxEvalWithVars(expr string, incremental bool, vars map[string]string) (string, error) {
 	if m := dfxRefCall.FindStringSubmatch(expr); m != nil {
 		return "`ref." + m[1] + "`", nil
 	}
 	switch {
 	case expr == "self()":
 		return "SELF", nil
+	case expr == "JSON.stringify("+dfxVarExpr+"run_timestamp)":
+		return strconv.Quote(vars["run_timestamp"]), nil
 	case expr == dfxVarExpr+"run_timestamp":
-		return "", nil
+		return "", fmt.Errorf("run_timestamp must be escaped with JSON.stringify(%srun_timestamp)", dfxVarExpr)
 	case strings.HasPrefix(expr, "when(") && strings.HasSuffix(expr, ")"):
-		return dfxWhen(expr[len("when("):len(expr)-1], incremental)
+		return dfxWhenWithVars(expr[len("when("):len(expr)-1], incremental, vars)
 	}
-	return "", fmt.Errorf("the expression ${%s} is not one the package uses (self(), ref(\"name\"), %srun_timestamp and when(incremental(), ...))", dfxSnippet(expr), dfxVarExpr)
+	return "", fmt.Errorf("the expression ${%s} is not one the package uses (self(), ref(\"name\"), JSON.stringify(%srun_timestamp) and when(incremental(), ...))", dfxSnippet(expr), dfxVarExpr)
 }
 
 // dfxWhen evaluates the arguments of when(incremental(), `a`[, `b`]): a for an
 // incremental run, b, or nothing, for a full refresh.
 func dfxWhen(args string, incremental bool) (string, error) {
+	return dfxWhenWithVars(args, incremental, nil)
+}
+
+func dfxWhenWithVars(args string, incremental bool, vars map[string]string) (string, error) {
 	rest, ok := strings.CutPrefix(strings.TrimSpace(args), "incremental()")
 	if !ok {
 		return "", errors.New("when() must test incremental()")
@@ -654,9 +671,9 @@ func dfxWhen(args string, incremental bool) (string, error) {
 	case len(branches) < 1 || len(branches) > 2:
 		return "", fmt.Errorf("when() takes one or two template literals, got %d", len(branches))
 	case incremental:
-		return dfxExpand(branches[0], incremental)
+		return dfxExpandWithVars(branches[0], incremental, vars)
 	case len(branches) == 2:
-		return dfxExpand(branches[1], incremental)
+		return dfxExpandWithVars(branches[1], incremental, vars)
 	}
 	return "", nil
 }
@@ -952,6 +969,10 @@ func dfxKinds(stmts []dfxStmt) []string {
 
 // dfxRender resolves an action for an incremental run or for a full refresh.
 func dfxRender(a *dfxAction, incremental bool) (*dfxRun, error) {
+	return dfxRenderWithVars(a, incremental, nil)
+}
+
+func dfxRenderWithVars(a *dfxAction, incremental bool, vars map[string]string) (*dfxRun, error) {
 	var (
 		run dfxRun
 		err error
@@ -962,7 +983,7 @@ func dfxRender(a *dfxAction, incremental bool) (*dfxRun, error) {
 	if run.post, err = dfxBlock(a.post, incremental); err != nil {
 		return nil, fmt.Errorf("post_operations: %w", err)
 	}
-	if run.body, err = dfxExpand(a.body, incremental); err != nil {
+	if run.body, err = dfxExpandWithVars(a.body, incremental, vars); err != nil {
 		return nil, fmt.Errorf("query: %w", err)
 	}
 	run.body = strings.TrimSpace(run.body)
@@ -1188,13 +1209,24 @@ func dfxLookback(pkg *dfxPackage) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("%s: %w", dfxRunWindow, err)
 	}
-	if len(q.branches) != 1 || len(q.branches[0].items) != 2 {
-		return 0, fmt.Errorf("%s: expected 1 SELECT with 2 items (run_ts, window_start)", dfxRunWindow)
+	clock := dfxCTE(q, "clock")
+	if len(q.ctes) != 1 || clock == nil || len(clock.branches) != 1 || len(clock.branches[0].items) != 1 {
+		return 0, fmt.Errorf("%s: expected 1 WITH table clock with 1 item (run_ts)", dfxRunWindow)
+	}
+	clockExpr := dashJoin(clock.branches[0].items[0].toks)
+	if !dfxClockRE.MatchString(clockExpr) {
+		return 0, fmt.Errorf("%s: clock run_ts item is %q, want COALESCE ( CAST ( NULLIF ( \"\" , '' ) AS TIMESTAMP ) , CURRENT_TIMESTAMP ( ) ) AS RUN_TS (must use CAST, not SAFE_CAST, so an invalid vars.run_timestamp fails fast)", dfxRunWindow, clockExpr)
+	}
+	if len(q.branches) != 1 || len(q.branches[0].items) != 2 || dashJoin(q.branches[0].clauses["FROM"]) != "CLOCK" {
+		return 0, fmt.Errorf("%s: expected 1 SELECT with 2 items (run_ts, window_start) FROM clock", dfxRunWindow)
+	}
+	if got := dashJoin(q.branches[0].items[0].toks); got != "RUN_TS" {
+		return 0, fmt.Errorf("%s: run_ts item is %q, want RUN_TS", dfxRunWindow, got)
 	}
 	expr := dashJoin(q.branches[0].items[1].toks)
 	m := dfxWindowRE.FindStringSubmatch(expr)
 	if m == nil {
-		return 0, fmt.Errorf("%s: window_start item is %q, want TIMESTAMP_TRUNC ( TIMESTAMP_SUB ( COALESCE ( SAFE_CAST ( NULLIF ( '' , '' ) AS TIMESTAMP ) , CURRENT_TIMESTAMP ( ) ) , INTERVAL n HOUR ) , HOUR ) AS WINDOW_START", dfxRunWindow, expr)
+		return 0, fmt.Errorf("%s: window_start item is %q, want TIMESTAMP_TRUNC ( TIMESTAMP_SUB ( RUN_TS , INTERVAL n HOUR ) , HOUR ) AS WINDOW_START", dfxRunWindow, expr)
 	}
 	return strconv.Atoi(m[1])
 }
@@ -2753,6 +2785,10 @@ var dfxMutations = []dfxMutation{
 		edit: dashReplaceFirst("DELETE FROM ${self()} AS mart", "DELETE FROM ${self()}"), want: `the DELETE names the mart "", want "mart"`},
 	{area: "refresh", name: "unsupported_expression", file: dfxFCosts,
 		edit: dashReplaceFirst("DELETE FROM ${self()} WHERE", "DELETE FROM ${self() + \"x\"} WHERE"), want: `m_gen_ai_model_costs_hourly: an incremental run: pre_operations: the expression ${self() + "x"} is not one the package uses`},
+	{area: "refresh", name: "run_window_uses_safe_cast", file: dfxFRunWindow,
+		edit: dashReplaceFirst("CAST(NULLIF(", "SAFE_CAST(NULLIF("), want: "must use CAST, not SAFE_CAST"},
+	{area: "refresh", name: "run_window_unquoted_var", file: dfxFRunWindow,
+		edit: dashReplaceFirst("${JSON.stringify(dataform.projectConfig.vars.run_timestamp)}", "'${dataform.projectConfig.vars.run_timestamp}'"), want: "run_timestamp must be escaped with JSON.stringify(dataform.projectConfig.vars.run_timestamp)"},
 
 	// The columns and the queries of the tables.
 	{area: "marts", name: "staging_holds_status_message", file: dfxFStaging,
@@ -3280,6 +3316,63 @@ func TestDataformSharedRunWindowAcrossHourBoundary(t *testing.T) {
 		}
 		if strings.Contains(strings.ToUpper(inc.body), "CURRENT_TIMESTAMP") {
 			t.Errorf("%s: body calls CURRENT_TIMESTAMP() directly", e.name)
+		}
+	}
+
+	// Verify stg_run_window evaluation under empty default, valid RFC3339 override,
+	// invalid non-empty override (which must fail CAST instead of silently falling
+	// back to CURRENT_TIMESTAMP()), and quote-bearing input (escaped by JSON.stringify).
+	rwAction := pkg.byName[dfxRunWindow]
+	if rwAction == nil {
+		t.Fatalf("missing action %s", dfxRunWindow)
+	}
+	evalRunWindow := func(rawTS string, now time.Time) (time.Time, time.Time, error) {
+		run, err := dfxRenderWithVars(rwAction, true, map[string]string{"run_timestamp": rawTS})
+		if err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+		q, err := dashParseSQL(run.body)
+		if err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+		clock := dfxCTE(q, "clock")
+		if clock == nil || len(clock.branches) != 1 || len(clock.branches[0].items) != 1 {
+			return time.Time{}, time.Time{}, errors.New("missing clock CTE")
+		}
+		// Extract the single quoted string literal inside NULLIF(<lit>, '').
+		var lit string
+		for _, tok := range clock.branches[0].items[0].toks {
+			if tok.kind == dashString && strings.HasPrefix(tok.text, "\"") {
+				unq, err := strconv.Unquote(tok.text)
+				if err != nil {
+					return time.Time{}, time.Time{}, err
+				}
+				lit = unq
+				break
+			}
+		}
+		runTS := now
+		if lit != "" {
+			parsed, err := time.Parse(time.RFC3339, lit)
+			if err != nil {
+				return time.Time{}, time.Time{}, fmt.Errorf("CAST(%q AS TIMESTAMP): %w", lit, err)
+			}
+			runTS = parsed.UTC()
+		}
+		return runTS, runTS.Add(-time.Duration(lookback) * time.Hour).Truncate(time.Hour), nil
+	}
+
+	if gotTS, gotWin, err := evalRunWindow("", dagStart); err != nil || !gotTS.Equal(dagStart) || !gotWin.Equal(sharedWindowStart) {
+		t.Errorf("empty run_timestamp = (%v, %v, %v), want (%v, %v, nil)", gotTS, gotWin, err, dagStart, sharedWindowStart)
+	}
+	pinned := time.Date(2026, 4, 20, 12, 34, 56, 0, time.UTC)
+	wantPinnedWin := time.Date(2026, 4, 20, 9, 0, 0, 0, time.UTC)
+	if gotTS, gotWin, err := evalRunWindow("2026-04-20T12:34:56Z", dagStart); err != nil || !gotTS.Equal(pinned) || !gotWin.Equal(wantPinnedWin) {
+		t.Errorf("pinned run_timestamp = (%v, %v, %v), want (%v, %v, nil)", gotTS, gotWin, err, pinned, wantPinnedWin)
+	}
+	for _, bad := range []string{"2026-13-45", "not-a-timestamp", "2026-04-20' OR '1'='1"} {
+		if _, _, err := evalRunWindow(bad, dagStart); err == nil {
+			t.Errorf("evalRunWindow(%q) succeeded, want CAST failure", bad)
 		}
 	}
 }

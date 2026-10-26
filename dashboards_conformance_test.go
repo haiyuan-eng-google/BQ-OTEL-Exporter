@@ -983,75 +983,99 @@ func dashSourceColumnTypes(files dashFileSet, view string) map[string]string {
 	types := map[string]string{
 		// Timestamps and dates
 		"usage_hour":         "TIMESTAMP",
+		"usage_date":         "DATE",
 		"session_start_date": "DATE",
+		"session_start_time": "TIMESTAMP",
+		"session_end_time":   "TIMESTAMP",
 		"first_turn_time":    "TIMESTAMP",
 		"last_turn_time":     "TIMESTAMP",
 		"start_time":         "TIMESTAMP",
+		"start_date":         "DATE",
 		"end_time":           "TIMESTAMP",
 		"root_start_time":    "TIMESTAMP",
 		"metric_time":        "TIMESTAMP",
+		"metric_timestamp":   "TIMESTAMP",
+		"metric_date":        "DATE",
+		"exemplar_timestamp": "TIMESTAMP",
 		"span_start_time":    "TIMESTAMP",
 		"span_end_time":      "TIMESTAMP",
 		"event_time":         "TIMESTAMP",
+		"event_date":         "DATE",
 		"publish_time":       "TIMESTAMP",
 		// Strings
-		"service_name":           "STRING",
-		"service_version":        "STRING",
-		"deployment_environment": "STRING",
-		"provider":               "STRING",
-		"operation_name":         "STRING",
-		"request_model":          "STRING",
-		"response_model":         "STRING",
-		"model":                  "STRING",
-		"agent_name":             "STRING",
-		"agent_id":               "STRING",
-		"session_id":             "STRING",
-		"user_id":                "STRING",
-		"first_trace_id":         "STRING",
-		"last_trace_id":          "STRING",
-		"mcp_method_name":        "STRING",
-		"tool_name":              "STRING",
-		"tool_type":              "STRING",
-		"server_address":         "STRING",
-		"network_transport":      "STRING",
-		"mcp_protocol_version":   "STRING",
-		"trace_id":               "STRING",
-		"span_id":                "STRING",
-		"parent_span_id":         "STRING",
-		"root_span_id":           "STRING",
-		"span_name":              "STRING",
-		"step_kind":              "STRING",
-		"status_message":         "STRING",
-		"error_type":             "STRING",
-		"gen_ai_system":          "STRING",
-		"gen_ai_operation_name":  "STRING",
-		"gen_ai_request_model":   "STRING",
-		"gen_ai_response_model":  "STRING",
-		"gen_ai_agent_id":        "STRING",
-		"gen_ai_agent_name":      "STRING",
-		"gen_ai_conversation_id": "STRING",
-		"gen_ai_tool_name":       "STRING",
-		"gen_ai_tool_type":       "STRING",
-		"gen_ai_tool_call_id":    "STRING",
-		"gen_ai_user_id":         "STRING",
-		"gen_ai_Workflow_name":   "STRING",
-		"gen_ai_output_type":     "STRING",
-		"gen_ai_data_source_id":  "STRING",
-		"agent_path":             "STRING",
-		"span_path":              "STRING",
-		"metric_name":            "STRING",
-		"metric_unit":            "STRING",
-		"metric_type":            "STRING",
-		"span_status_message":    "STRING",
-		"span_error_type":        "STRING",
-		"alert_id":               "STRING",
-		"subscription_name":      "STRING",
-		"source":                 "STRING",
-		"trace_url":              "STRING",
-		"alert_kind":             "STRING",
-		"window_start":           "STRING",
-		"window_end":             "STRING",
-		"last_error_type":        "STRING",
+		"service_name":                 "STRING",
+		"service_version":              "STRING",
+		"deployment_environment":       "STRING",
+		"provider":                     "STRING",
+		"operation_name":               "STRING",
+		"request_model":                "STRING",
+		"response_model":               "STRING",
+		"model":                        "STRING",
+		"agent_name":                   "STRING",
+		"agent_id":                     "STRING",
+		"session_id":                   "STRING",
+		"user_id":                      "STRING",
+		"first_trace_id":               "STRING",
+		"last_trace_id":                "STRING",
+		"mcp_method_name":              "STRING",
+		"mcp_target_name":              "STRING",
+		"mcp_session_id":               "STRING",
+		"tool_name":                    "STRING",
+		"tool_type":                    "STRING",
+		"server_address":               "STRING",
+		"network_transport":            "STRING",
+		"mcp_protocol_version":         "STRING",
+		"trace_id":                     "STRING",
+		"span_id":                      "STRING",
+		"parent_span_id":               "STRING",
+		"root_span_id":                 "STRING",
+		"span_name":                    "STRING",
+		"step_kind":                    "STRING",
+		"status_message":               "STRING",
+		"error_type":                   "STRING",
+		"top_error_types":              "STRING",
+		"gen_ai_system":                "STRING",
+		"gen_ai_provider_name":         "STRING",
+		"gen_ai_operation_name":        "STRING",
+		"gen_ai_request_model":         "STRING",
+		"gen_ai_response_model":        "STRING",
+		"gen_ai_agent_id":              "STRING",
+		"gen_ai_agent_name":            "STRING",
+		"gen_ai_main_agent_name":       "STRING",
+		"gen_ai_conversation_id":       "STRING",
+		"adk_session_id":               "STRING",
+		"adk_invocation_id":            "STRING",
+		"adk_user_id":                  "STRING",
+		"gen_ai_tool_name":             "STRING",
+		"gen_ai_tool_type":             "STRING",
+		"gen_ai_tool_call_id":          "STRING",
+		"gen_ai_user_id":               "STRING",
+		"gen_ai_workflow_name":         "STRING",
+		"gen_ai_output_type":           "STRING",
+		"gen_ai_data_source_id":        "STRING",
+		"gen_ai_token_type":            "STRING",
+		"gen_ai_token_modality":        "STRING",
+		"nearest_agent_name":           "STRING",
+		"agent_path":                   "STRING",
+		"span_path":                    "STRING",
+		"metric_name":                  "STRING",
+		"metric_unit":                  "STRING",
+		"metric_type":                  "STRING",
+		"metric_error_type":            "STRING",
+		"exemplar_filtered_attributes": "STRING",
+		"span_status_message":          "STRING",
+		"span_error_type":              "STRING",
+		"span_gen_ai_agent_name":       "STRING",
+		"span_gen_ai_tool_name":        "STRING",
+		"alert_id":                     "STRING",
+		"subscription_name":            "STRING",
+		"source":                       "STRING",
+		"trace_url":                    "STRING",
+		"alert_kind":                   "STRING",
+		"window_start":                 "STRING",
+		"window_end":                   "STRING",
+		"last_error_type":              "STRING",
+		"payload_json":                 "STRING",
 		// Booleans
 		"is_orphan":     "BOOL",
 		"is_leaf":       "BOOL",
@@ -1062,6 +1086,7 @@ func dashSourceColumnTypes(files dashFileSet, view string) map[string]string {
 		"span_status_code":                  "INT64",
 		"call_count":                        "INT64",
 		"error_count":                       "INT64",
+		"typed_error_count":                 "INT64",
 		"total_input_tokens":                "INT64",
 		"total_output_tokens":               "INT64",
 		"total_reasoning_tokens":            "INT64",
@@ -1069,15 +1094,19 @@ func dashSourceColumnTypes(files dashFileSet, view string) map[string]string {
 		"total_cache_creation_input_tokens": "INT64",
 		"total_tokens":                      "INT64",
 		"turn_count":                        "INT64",
+		"invocation_count":                  "INT64",
+		"agent_invocation_count":            "INT64",
 		"llm_call_count":                    "INT64",
 		"tool_call_count":                   "INT64",
-		"agent_Error_count":                 "INT64",
+		"agent_error_count":                 "INT64",
 		"distinct_models_used":              "INT64",
 		"distinct_tools_used":               "INT64",
 		"gen_ai_tagged_call_count":          "INT64",
 		"mcp_only_call_count":               "INT64",
 		"server_port":                       "INT64",
 		"depth":                             "INT64",
+		"agent_path_length":                 "INT64",
+		"step_index":                        "INT64",
 		"gen_ai_usage_input_tokens":         "INT64",
 		"gen_ai_usage_output_tokens":        "INT64",
 		"gen_ai_usage_reasoning_tokens":     "INT64",
@@ -1086,6 +1115,10 @@ func dashSourceColumnTypes(files dashFileSet, view string) map[string]string {
 		"leaf_input_tokens":                 "INT64",
 		"leaf_output_tokens":                "INT64",
 		"leaf_reasoning_tokens":             "INT64",
+		"input_tokens":                      "INT64",
+		"output_tokens":                     "INT64",
+		"reasoning_tokens":                  "INT64",
+		"error_spans":                       "INT64",
 		// Floats
 		"avg_duration_ms":       "FLOAT64",
 		"p50_duration_ms":       "FLOAT64",
@@ -1171,15 +1204,41 @@ func dashInferExprType(toks []dashTok, colTypes map[string]string) string {
 			return dashInferExprType(toks[commas[1]+1:len(toks)-1], colTypes)
 		}
 	}
+	// Top-level binary arithmetic (+, -, *, /).
+	baseDepth := toks[0].depth
+	for i := len(toks) - 1; i > 0; i-- {
+		if toks[i].depth == baseDepth && toks[i].kind == dashPunct {
+			switch toks[i].text {
+			case "/":
+				return "FLOAT64"
+			case "+", "-", "*":
+				lt := dashInferExprType(toks[:i], colTypes)
+				rt := dashInferExprType(toks[i+1:], colTypes)
+				if lt == "FLOAT64" || rt == "FLOAT64" {
+					return "FLOAT64"
+				}
+				if lt == "INT64" || rt == "INT64" {
+					return "INT64"
+				}
+			}
+		}
+	}
+	if (toks[0].up == "SUM" || toks[0].up == "MIN" || toks[0].up == "MAX" || toks[0].up == "ANY_VALUE") && len(toks) >= 4 && toks[1].is("(") && toks[len(toks)-1].is(")") {
+		return dashInferExprType(toks[2:len(toks)-1], colTypes)
+	}
 	switch toks[0].up {
 	case "CONCAT", "JSON_VALUE", "JSON_EXTRACT_SCALAR", "TO_JSON_STRING", "LOWER", "UPPER", "TRIM", "ARRAY_TO_STRING":
 		return "STRING"
-	case "COUNT", "ARRAY_LENGTH":
+	case "COUNT", "COUNTIF", "ARRAY_LENGTH":
 		return "INT64"
 	case "AVG", "SAFE_DIVIDE", "ROUND":
 		return "FLOAT64"
 	case "LOGICAL_OR", "REGEXP_CONTAINS":
 		return "BOOL"
+	case "DATE", "PARSE_DATE", "DATE_ADD", "DATE_SUB", "DATE_TRUNC":
+		return "DATE"
+	case "TIMESTAMP", "TIMESTAMP_SUB", "TIMESTAMP_ADD", "TIMESTAMP_TRUNC", "TIMESTAMP_MILLIS", "CURRENT_TIMESTAMP":
+		return "TIMESTAMP"
 	}
 	return ""
 }
@@ -1477,7 +1536,12 @@ func (l *dashLooker) checkQueries() {
 				}
 				gotType := dashInferExprType(it.body, colTypes)
 				wantType := colTypes[it.name]
-				if gotType != "" && wantType != "" && gotType != wantType {
+				switch {
+				case wantType == "":
+					l.probs.addf("%s: select item %s has no declared type in dashSourceColumnTypes", label, it.name)
+				case gotType == "":
+					l.probs.addf("%s: cannot infer type of select item %s", label, it.name)
+				case gotType != wantType:
 					l.probs.addf("%s: select item %s has type %s, want %s", label, it.name, gotType, wantType)
 				}
 			}
@@ -2478,8 +2542,8 @@ func dashCheckTraceLink(label string, pn dashGrafanaPanel) []string {
 func dashCheckServiceVar(files dashFileSet, v dashGrafanaVar) []string {
 	const label = dashGrafanaBQ + ": variable service"
 	var p dashProblems
-	if v.Type != "query" || !v.Multi || !v.IncludeAll || v.AllValue != "__all" || v.AllowCustomValue == nil || *v.AllowCustomValue {
-		p.addf("%s has to be a multi-value query variable with All (allValue __all) and without custom values", label)
+	if v.Type != "query" || !v.Multi || !v.IncludeAll || v.AllValue != "[\"__all\"]" || v.AllowCustomValue == nil || *v.AllowCustomValue {
+		p.addf("%s has to be a multi-value query variable with All (allValue [\"__all\"]) and without custom values", label)
 	}
 	if v.Datasource == nil || *v.Datasource != (dashGrafanaDS{Type: "grafana-bigquery-datasource", UID: "${DS_BIGQUERY}"}) {
 		p.addf("%s has the data source %+v", label, v.Datasource)
@@ -2749,8 +2813,8 @@ func dashCheckPromVar(md *dashMetadata, g *dashGrafana) []string {
 		return []string{label + " is missing"}
 	}
 	var p dashProblems
-	if v.Type != "query" || !v.Multi || !v.IncludeAll || v.AllValue != ".*" {
-		p.addf(`%s has to be a multi-value query variable whose All value is .*, so that instance=~"$instance" matches every instance`, label)
+	if v.Type != "query" || !v.Multi || !v.IncludeAll || v.AllValue != ".*" || v.AllowCustomValue == nil || *v.AllowCustomValue {
+		p.addf(`%s has to be a multi-value query variable without custom values whose All value is .*, so that instance=~"$instance" matches every instance`, label)
 	}
 	if v.Datasource == nil || *v.Datasource != (dashGrafanaDS{Type: "prometheus", UID: "${DS_PROMETHEUS}"}) {
 		p.addf("%s has the data source %+v", label, v.Datasource)
@@ -3662,6 +3726,9 @@ var dashMutations = []dashMutation{
 			templating["list"] = append(list, map[string]any{"name": "project", "type": "constant", "hide": 2, "query": "${VAR_PROJECT}"})
 			return nil
 		}), "want only service"},
+	{"looker_studio", "the sessions query casts agent_invocation_count to STRING", dashLookerDir + "queries/agent_sessions.sql",
+		dashReplaceFirst("  agent_invocation_count,\n", "  CAST(agent_invocation_count AS STRING) AS agent_invocation_count,\n"),
+		"select item agent_invocation_count has type STRING, want INT64"},
 	{"grafana_bigquery", "the service variable loses its __all sentinel", dashGrafanaBQ,
 		dashEditJSON(func(doc map[string]any) error {
 			templating, _ := doc["templating"].(map[string]any)
@@ -3673,7 +3740,19 @@ var dashMutations = []dashMutation{
 				}
 			}
 			return errors.New("no service variable")
-		}), "allValue __all"},
+		}), "allValue [\"__all\"]"},
+	{"grafana_bigquery", "the service variable uses bare __all instead of a JSON array literal", dashGrafanaBQ,
+		dashEditJSON(func(doc map[string]any) error {
+			templating, _ := doc["templating"].(map[string]any)
+			list, _ := templating["list"].([]any)
+			for _, item := range list {
+				if v, _ := item.(map[string]any); v != nil && v["name"] == "service" {
+					v["allValue"] = "__all"
+					return nil
+				}
+			}
+			return errors.New("no service variable")
+		}), "allValue [\"__all\"]"},
 	{"grafana_bigquery", "a panel holds a character that is not ASCII", dashGrafanaBQ,
 		dashEditTarget("LLM calls", "rawSql", "SELECT ", "SELECT /* \u00e9 */ "), "is not ASCII"},
 	{"grafana_bigquery", "a time series names its first column something else", dashGrafanaBQ,
@@ -4034,8 +4113,38 @@ func TestGrafanaBQVariableExpansionAndAlertOnlyServices(t *testing.T) {
 		if v.Name != "service" {
 			t.Fatalf("unexpected template variable %q in %s", v.Name, dashGrafanaBQ)
 		}
-		if v.AllValue != "__all" {
-			t.Fatalf("service.allValue = %q, want \"__all\"", v.AllValue)
+		if v.AllValue != "[\"__all\"]" {
+			t.Fatalf("service.allValue = %q, want \"[\\\"__all\\\"]\"", v.AllValue)
+		}
+		// Expand every panel's rawSql with ${service:json} replaced verbatim by
+		// v.AllValue (no json.Marshal wrapper, matching Grafana 10.4 when "All" is
+		// selected on a variable with custom allValue) and verify that every panel
+		// parses as valid GoogleSQL with ARRAY<STRING>["__all"].
+		allRepl := strings.NewReplacer(
+			"${VAR_PROJECT}", "my-proj",
+			"${VAR_DATASET}", "my_ds",
+			"${service:json}", v.AllValue,
+			"${__from}", dashGrafanaFrom,
+			"${__to}", dashGrafanaTo,
+		)
+		for _, pn := range g.Panels {
+			if pn.Type == "row" || len(pn.Targets) == 0 {
+				continue
+			}
+			expanded := allRepl.Replace(pn.Targets[0].RawSQL)
+			expanded = dashTimeFilter.ReplaceAllString(expanded, "$1 BETWEEN TIMESTAMP_MILLIS("+dashGrafanaFrom+") AND TIMESTAMP_MILLIS("+dashGrafanaTo+")")
+			q, err := dashParseSQL(expanded)
+			if err != nil {
+				t.Fatalf("panel %q failed to parse when All (allValue=%q) is selected: %v", pn.Title, v.AllValue, err)
+			}
+			if len(q.branches) == 0 {
+				t.Fatalf("panel %q has 0 branches", pn.Title)
+			}
+			whereJoined := dashJoin(q.branches[0].clauses["WHERE"])
+			wantAllPred := `'__all' IN UNNEST ( ARRAY < STRING > [ "__all" ] )`
+			if !strings.Contains(whereJoined, wantAllPred) {
+				t.Fatalf("panel %q WHERE under All expansion = %q, want substring %q", pn.Title, whereJoined, wantAllPred)
+			}
 		}
 	}
 

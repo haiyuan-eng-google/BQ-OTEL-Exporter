@@ -14,18 +14,18 @@ config {
 -- downstream staging table, mart and assertion evaluates the exact same
 -- window_start even if execution crosses an hour boundary.
 
-SELECT
-  COALESCE(
-    SAFE_CAST(NULLIF('${dataform.projectConfig.vars.run_timestamp}', '') AS TIMESTAMP),
-    CURRENT_TIMESTAMP()
-  ) AS run_ts,
-  TIMESTAMP_TRUNC(
-    TIMESTAMP_SUB(
+WITH
+  clock AS (
+    SELECT
       COALESCE(
-        SAFE_CAST(NULLIF('${dataform.projectConfig.vars.run_timestamp}', '') AS TIMESTAMP),
+        CAST(NULLIF(${JSON.stringify(dataform.projectConfig.vars.run_timestamp)}, '') AS TIMESTAMP),
         CURRENT_TIMESTAMP()
-      ),
-      INTERVAL 3 HOUR
-    ),
+      ) AS run_ts
+  )
+SELECT
+  run_ts,
+  TIMESTAMP_TRUNC(
+    TIMESTAMP_SUB(run_ts, INTERVAL 3 HOUR),
     HOUR
   ) AS window_start
+FROM clock

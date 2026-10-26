@@ -54,7 +54,7 @@ instead of re-reading the raw spans through the view chain on every run.
    | `defaultLocation` | Location of the marts datasets. It must equal the location of the exporter dataset: a query cannot read across locations |
    | `defaultDataset`, `defaultAssertionDataset` | Datasets for the marts and the assertion views. Dataform creates them when they do not exist |
    | `vars.source_project`, `vars.source_dataset` | `project_id` and `dataset_id` of the exporter. Only read |
-   | `vars.run_timestamp` | Optional ISO-8601 UTC timestamp override for `stg_run_window` (empty uses the run-start `CURRENT_TIMESTAMP()`) |
+   | `vars.run_timestamp` | Optional ISO-8601 UTC timestamp override for `stg_run_window` (empty uses the run-start `CURRENT_TIMESTAMP()`; an invalid non-empty value fails the `CAST`) |
 
    Always set `defaultProject` and `defaultLocation` in
    [`workflow_settings.yaml`](workflow_settings.yaml) before running (`--vars`

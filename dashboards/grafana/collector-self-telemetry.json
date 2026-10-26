@@ -1351,6 +1351,7 @@
         "multi": true,
         "includeAll": true,
         "allValue": ".*",
+        "allowCustomValue": false,
         "hide": 0,
         "skipUrlSync": false,
         "current": {

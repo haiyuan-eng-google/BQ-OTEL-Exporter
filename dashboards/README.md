@@ -73,7 +73,7 @@ The dashboard has one template variable (`service`) and two import-time
   values are JSON-encoded as string literals and cannot break out of the array
   literal. It lists the services that have GenAI or MCP activity in the time
   range (`v_gen_ai_model_costs`, `v_mcp_tool_usage`, `v_gen_ai_sessions`), and
-  **All** sets the variable to the `__all` sentinel (`allValue: "__all"`),
+  **All** sets the variable to the `["__all"]` sentinel (`allValue: "[\"__all\"]"`),
   which satisfies `'__all' IN UNNEST(ARRAY<STRING>${service:json})` and leaves
   every panel (including `otel_alerts` for alert-only services) unfiltered by
   the option list.
