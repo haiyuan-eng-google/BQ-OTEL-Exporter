@@ -2517,7 +2517,7 @@ func TestReplayBigQueryV2ChangedCollisionGroup(t *testing.T) {
 		rowD := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-B")}
 		rowB := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-C")}
 		rowC := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-D")}
-		if !(rowA.canonicalKey() < rowD.canonicalKey() && rowD.canonicalKey() < rowB.canonicalKey() && rowB.canonicalKey() < rowC.canonicalKey()) {
+		if rowA.canonicalKey() >= rowD.canonicalKey() || rowD.canonicalKey() >= rowB.canonicalKey() || rowB.canonicalKey() >= rowC.canonicalKey() {
 			t.Fatalf("canonical keys not ordered A < D < B < C")
 		}
 		fake := &fakeQuarantineBigQuery{rows: []fakeQuarantineRow{rowA, rowB, rowC}}
@@ -2569,7 +2569,7 @@ func TestReplayBigQueryV2ChangedCollisionGroup(t *testing.T) {
 		rowA := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-A")}
 		rowB := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-B")}
 		rowC := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-C")}
-		if !(rowX.canonicalKey() < rowA.canonicalKey() && rowA.canonicalKey() < rowB.canonicalKey() && rowB.canonicalKey() < rowC.canonicalKey()) {
+		if rowX.canonicalKey() >= rowA.canonicalKey() || rowA.canonicalKey() >= rowB.canonicalKey() || rowB.canonicalKey() >= rowC.canonicalKey() {
 			t.Fatalf("canonical keys not ordered X < A < B < C")
 		}
 		fake := &fakeQuarantineBigQuery{rows: []fakeQuarantineRow{rowA, rowB, rowC}}
