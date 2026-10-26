@@ -1355,10 +1355,11 @@ func TestRunPartialFailureEmptyWindowInvalidOffloadAndPanicRecovery(t *testing.T
 		OffloadThresholdBytes: 512,
 		AllowPartialFailures:  true,
 		workerHook: func(_, seq int) {
-			if seq == 1 {
+			switch seq {
+			case 1:
 				_ = os.RemoveAll(flakyBucketPath)
 				_ = os.WriteFile(flakyBucketPath, []byte("blocker"), 0o600)
-			} else if seq == 2 {
+			case 2:
 				_ = os.Remove(flakyBucketPath)
 			}
 		},
