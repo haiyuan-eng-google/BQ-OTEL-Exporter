@@ -624,12 +624,11 @@ func (g *Generator) MetricsBatch(pointCount int) pmetric.Metrics {
 			dp = tokenDPByFramework[fwIdx].AppendEmpty()
 			dp.SetStartTimestamp(pcommon.NewTimestampFromTime(pointTs.Add(-10 * time.Second)))
 			dp.SetTimestamp(pcommon.NewTimestampFromTime(pointTs))
-			dp.SetCount(12)
-			dp.SetSum(float64(1420 + (seq % 500)))
-			dp.SetMin(64)
-			dp.SetMax(2048)
-			dp.ExplicitBounds().FromRaw([]float64{64, 256, 512, 1024, 2048, 4096})
-			dp.BucketCounts().FromRaw([]uint64{1, 2, 4, 3, 2, 0, 0})
+			populateHistogramFromSamples(
+				dp,
+				[]float64{64, 256, 512, 1024, 2048, 4096},
+				[]float64{64, 128, 192, 300, 360, 420, 480, 600, 768, 900, float64(1280 + (seq % 500)), 2048},
+			)
 		} else {
 			if !hasDurMetric[fwIdx] {
 				durMetric := smByFramework[fwIdx].Metrics().AppendEmpty()
@@ -644,12 +643,11 @@ func (g *Generator) MetricsBatch(pointCount int) pmetric.Metrics {
 			dp = durDPByFramework[fwIdx].AppendEmpty()
 			dp.SetStartTimestamp(pcommon.NewTimestampFromTime(pointTs.Add(-10 * time.Second)))
 			dp.SetTimestamp(pcommon.NewTimestampFromTime(pointTs))
-			dp.SetCount(1)
-			dp.SetSum(0.042)
-			dp.SetMin(0.042)
-			dp.SetMax(0.042)
-			dp.ExplicitBounds().FromRaw([]float64{0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96, 81.92})
-			dp.BucketCounts().FromRaw([]uint64{0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0})
+			populateHistogramFromSamples(
+				dp,
+				[]float64{0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96, 81.92},
+				[]float64{0.042},
+			)
 		}
 
 		attrs := dp.Attributes()
@@ -695,6 +693,42 @@ func (g *Generator) MetricsBatch(pointCount int) pmetric.Metrics {
 		ex.FilteredAttributes().PutStr("gen_ai.agent.name", fw.AgentName)
 	}
 	return md
+}
+
+func populateHistogramFromSamples(dp pmetric.HistogramDataPoint, bounds []float64, samples []float64) {
+	dp.ExplicitBounds().FromRaw(bounds)
+	buckets := make([]uint64, len(bounds)+1)
+	if len(samples) == 0 {
+		dp.SetCount(0)
+		dp.SetSum(0)
+		dp.BucketCounts().FromRaw(buckets)
+		return
+	}
+	var sum float64
+	minVal := samples[0]
+	maxVal := samples[0]
+	for _, v := range samples {
+		sum += v
+		if v < minVal {
+			minVal = v
+		}
+		if v > maxVal {
+			maxVal = v
+		}
+		bucketIdx := len(bounds)
+		for i, b := range bounds {
+			if v <= b {
+				bucketIdx = i
+				break
+			}
+		}
+		buckets[bucketIdx]++
+	}
+	dp.SetCount(uint64(len(samples)))
+	dp.SetSum(sum)
+	dp.SetMin(minVal)
+	dp.SetMax(maxVal)
+	dp.BucketCounts().FromRaw(buckets)
 }
 
 func populateMCPSpan(sp ptrace.Span, attrs pcommon.Map, treeID, seq uint64, payload string) {

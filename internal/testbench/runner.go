@@ -26,7 +26,9 @@ import (
 	bigqueryexporter "github.com/haiyuan-eng-google/BQ-OTEL-Exporter"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/googlehttp"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/offload"
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/protoenc"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/redact"
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/testfakes/bqfake"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
 	"go.opentelemetry.io/collector/component"
@@ -58,9 +60,15 @@ const (
 	MaxBenchmarkBatchSize = 100_000
 	// MaxBenchmarkWorkers bounds concurrent benchmark workers (256 goroutines).
 	MaxBenchmarkWorkers = 256
+	// MaxBenchmarkInflightRequests bounds write.max_inflight_requests (65,536) so
+	// extreme flag values fail closed during validation rather than allocating a
+	// multi-gigabyte flow-control semaphore slice in managedwriter.
+	MaxBenchmarkInflightRequests = 65536
 	// MaxBatchPayloadBudgetBytes bounds int64(batch_size)*int64(payload_bytes)
 	// (256 MiB per batch) to prevent pre-allocation OOM panics.
 	MaxBatchPayloadBudgetBytes = 256 * 1024 * 1024
+
+	ephemeralOwnerLabelKey = "bq_otel_testbench_owner"
 )
 
 var blockedSecretPatterns = []string{
@@ -212,6 +220,9 @@ func (c *RunnerConfig) Normalize() error {
 	}
 	if c.MaxInflightRequests == 0 {
 		c.MaxInflightRequests = 32
+	}
+	if c.MaxInflightRequests > MaxBenchmarkInflightRequests {
+		return fmt.Errorf("max_inflight_requests %d exceeds maximum %d", c.MaxInflightRequests, MaxBenchmarkInflightRequests)
 	}
 	if c.MaxRequestBytes < 0 {
 		return fmt.Errorf("max_request_bytes %d must be > 0", c.MaxRequestBytes)
@@ -643,6 +654,14 @@ func datasetExists(ctx context.Context, projectID, datasetID string, opts ...opt
 	return false, fmt.Errorf("checking whether dataset %s.%s exists: %w", projectID, datasetID, err)
 }
 
+func generateEphemeralOwnerToken() (string, error) {
+	var randBytes [16]byte
+	if _, err := rand.Read(randBytes[:]); err != nil {
+		return "", fmt.Errorf("generating cryptographic ownership token for ephemeral dataset: %w", err)
+	}
+	return hex.EncodeToString(randBytes[:]), nil
+}
+
 func createEphemeralDataset(ctx context.Context, projectID, datasetID, location string, opts ...option.ClientOption) error {
 	exists, err := datasetExists(ctx, projectID, datasetID, opts...)
 	if err != nil {
@@ -651,15 +670,67 @@ func createEphemeralDataset(ctx context.Context, projectID, datasetID, location 
 	if exists {
 		return fmt.Errorf("refusing to use existing dataset %s.%s with ephemeral_dataset=true", projectID, datasetID)
 	}
+	ownerToken, err := generateEphemeralOwnerToken()
+	if err != nil {
+		return err
+	}
 	client, closeAll, err := newBigQueryClient(ctx, projectID, opts...)
 	if err != nil {
 		return fmt.Errorf("creating bigquery client for ephemeral dataset provisioning: %w", err)
 	}
 	defer closeAll()
-	if err := client.Dataset(datasetID).Create(ctx, &bigquery.DatasetMetadata{Location: location}); err != nil {
-		return fmt.Errorf("creating ephemeral dataset %s.%s: %w", projectID, datasetID, err)
+
+	createErr := client.Dataset(datasetID).Create(ctx, &bigquery.DatasetMetadata{
+		Location:    location,
+		Description: "bq-otel-testbench ephemeral dataset owner=" + ownerToken,
+		Labels: map[string]string{
+			ephemeralOwnerLabelKey: ownerToken,
+		},
+	})
+	if createErr == nil {
+		return nil
 	}
-	return nil
+
+	var apiErr *googleapi.Error
+	if errors.As(createErr, &apiErr) && apiErr.Code == http.StatusConflict {
+		return fmt.Errorf("creating ephemeral dataset %s.%s: %w", projectID, datasetID, createErr)
+	}
+
+	// A non-409 failure (e.g. HTTP 500, client timeout, or context cancellation)
+	// may occur after the server already committed the dataset. Inspect the
+	// dataset metadata on a bounded background context and delete it only if
+	// the ownership label matches our unique per-call token.
+	verifyCtx, cancelVerify := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelVerify()
+	verifyClient, closeVerify, verifyClientErr := newBigQueryClient(verifyCtx, projectID, opts...)
+	if verifyClientErr != nil {
+		return fmt.Errorf("creating ephemeral dataset %s.%s (ambiguous create outcome; verify whether dataset %s.%s was left behind: %v): %w",
+			projectID, datasetID, projectID, datasetID, verifyClientErr, createErr)
+	}
+	defer closeVerify()
+
+	md, metaErr := verifyClient.Dataset(datasetID).Metadata(verifyCtx)
+	if metaErr != nil {
+		var metaAPIErr *googleapi.Error
+		if errors.As(metaErr, &metaAPIErr) && metaAPIErr.Code == http.StatusNotFound {
+			return fmt.Errorf("creating ephemeral dataset %s.%s: %w", projectID, datasetID, createErr)
+		}
+		return fmt.Errorf("creating ephemeral dataset %s.%s (ambiguous create outcome; verify whether dataset %s.%s was left behind: %v): %w",
+			projectID, datasetID, projectID, datasetID, metaErr, createErr)
+	}
+	if md != nil && md.Labels[ephemeralOwnerLabelKey] == ownerToken {
+		if delErr := verifyClient.Dataset(datasetID).DeleteWithContents(verifyCtx); delErr != nil {
+			return errors.Join(
+				fmt.Errorf("creating ephemeral dataset %s.%s (committed before error; cleanup failed for dataset %s.%s): %w",
+					projectID, datasetID, projectID, datasetID, createErr),
+				fmt.Errorf("deleting dataset %s.%s: %w", projectID, datasetID, delErr),
+			)
+		}
+		return fmt.Errorf("creating ephemeral dataset %s.%s (committed dataset %s.%s was cleaned up after create error): %w",
+			projectID, datasetID, projectID, datasetID, createErr)
+	}
+	return fmt.Errorf("creating ephemeral dataset %s.%s (dataset %s.%s exists without matching ownership token; refusing to delete): %w",
+		projectID, datasetID, projectID, datasetID, createErr)
 }
 
 // DeleteDatasetWithContents removes a BigQuery dataset and all tables inside it.
@@ -1084,10 +1155,15 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 	if ackedRows > 0 {
 		attemptedBytesPerAckedRow = float64(telem.AppendBytesTotal) / float64(ackedRows)
 		bytesPerRow = attemptedBytesPerAckedRow
-		succeededBatches := batchesSucceeded.Load()
-		totalAppendAttempts := succeededBatches + telem.Retries + consumeBatchesFailed.Load()
-		if succeededBatches > 0 && totalAppendAttempts > succeededBatches {
-			bytesPerRow = (float64(telem.AppendBytesTotal) * float64(succeededBatches) / float64(totalAppendAttempts)) / float64(ackedRows)
+		if fakeSrv != nil && fakeSrv.AckedBytes() > 0 {
+			// In bqfake mode, fakeSrv.AckedBytes() sums the exact serialized
+			// ProtoRows byte length of every acknowledged AppendRows chunk,
+			// remaining invariant under whole-batch or uneven split-chunk retries.
+			bytesPerRow = float64(fakeSrv.AckedBytes()) / float64(ackedRows)
+		} else if telem.Retries > 0 || consumeBatchesFailed.Load() > 0 {
+			if singleBPR, err := measureSingleAttemptBytesPerRow(cfg, signal); err == nil && singleBPR > 0 {
+				bytesPerRow = singleBPR
+			}
 		}
 	}
 
@@ -1151,6 +1227,124 @@ func runSingleSignal(ctx context.Context, cfg RunnerConfig, signal string) (Sign
 		},
 		Telemetry: telem,
 	}, firstConsumeErr, nil
+}
+
+func measureSingleAttemptBytesPerRow(cfg RunnerConfig, signal string) (float64, error) {
+	const refRecords = 28
+	refGen := NewGenerator(GeneratorConfig{
+		PayloadBytes:   cfg.PayloadBytes,
+		PlantSecrets:   cfg.Redaction || cfg.PlantSecrets,
+		UniquePayloads: cfg.UniquePayloads,
+	})
+	tOpts := transform.Options{Limits: transform.DefaultLimits()}
+	if cfg.Redaction {
+		rd, err := redact.New(redact.Config{
+			BlockedKeys:          redact.DefaultBlockedKeys(),
+			BlockedValuePatterns: blockedSecretPatterns,
+			MaskReplacement:      redact.DefaultMaskReplacement,
+			RedactLogBody:        true,
+		})
+		if err != nil {
+			return 0, err
+		}
+		tOpts.Redactor = rd
+	}
+	var (
+		rows    []transform.Row
+		enc     *protoenc.Encoder
+		encErr  error
+		offload *offload.Offloader
+	)
+	if cfg.OffloadDir != "" && (signal == "traces" || signal == "logs") {
+		offload, encErr = newMemReferenceOffloader(cfg.OffloadThresholdBytes, false)
+		if encErr != nil {
+			return 0, encErr
+		}
+	} else if cfg.OffloadGCSBucket != "" && (signal == "traces" || signal == "logs") {
+		offload, encErr = newMemReferenceOffloader(cfg.OffloadThresholdBytes, true)
+		if encErr != nil {
+			return 0, encErr
+		}
+		tOpts.PayloadOffloader = offload
+	}
+
+	switch signal {
+	case "traces":
+		td := refGen.TracesBatch(refRecords)
+		if tOpts.Redactor != nil {
+			tOpts.Redactor.RedactTraces(td)
+			tOpts.Redactor = nil
+		}
+		if offload != nil && tOpts.PayloadOffloader == nil {
+			if err := offloadTraceBatch(context.Background(), offload, td); err != nil {
+				return 0, err
+			}
+		}
+		rows, _ = transform.SpanRows(td, tOpts)
+		enc, encErr = protoenc.New(schema.SpansTableSchema())
+	case "logs":
+		ld := refGen.LogsBatch(refRecords)
+		if tOpts.Redactor != nil {
+			tOpts.Redactor.RedactLogs(ld)
+			tOpts.Redactor = nil
+		}
+		if offload != nil && tOpts.PayloadOffloader == nil {
+			if err := offloadLogBatch(context.Background(), offload, ld); err != nil {
+				return 0, err
+			}
+		}
+		rows, _ = transform.LogRows(ld, tOpts)
+		enc, encErr = protoenc.New(schema.LogsTableSchema())
+	case "metrics":
+		md := refGen.MetricsBatch(refRecords)
+		rows, _ = transform.MetricRows(md, tOpts)
+		enc, encErr = protoenc.New(schema.MetricsTableSchema())
+	default:
+		return 0, fmt.Errorf("unsupported signal %q", signal)
+	}
+	if encErr != nil || len(rows) == 0 {
+		return 0, encErr
+	}
+	var totalBytes int64
+	var encodedCount int64
+	for _, r := range rows {
+		b, err := enc.Encode(r)
+		if err != nil {
+			continue
+		}
+		totalBytes += int64(len(b))
+		encodedCount++
+	}
+	if encodedCount == 0 {
+		return 0, nil
+	}
+	return float64(totalBytes) / float64(encodedCount), nil
+}
+
+type noopBlobStore struct {
+	seq atomic.Int64
+}
+
+func (s *noopBlobStore) WriteObject(ctx context.Context, _, _, _ string, _ []byte) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%d", s.seq.Add(1)), nil
+}
+
+func newMemReferenceOffloader(thresholdBytes int, _ bool) (*offload.Offloader, error) {
+	if thresholdBytes <= 0 {
+		thresholdBytes = 4096
+	}
+	return offload.New(&noopBlobStore{}, offload.Options{
+		Bucket:         "local-offload-bench",
+		Prefix:         "otel-offload",
+		MinBytes:       thresholdBytes,
+		MaxObjectBytes: 64 * 1024 * 1024,
+		MaxConcurrency: 8,
+		CacheSize:      10000,
+		Timeout:        5 * time.Second,
+	})
 }
 
 type localDirBlobStore struct {
@@ -1401,7 +1595,7 @@ func FormatMarkdown(report *BenchmarkReport) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "### Benchmark Summary (`mode=%s`, Go `%s`, `%s/%s`, `%d` vCPU)\n\n",
 		report.Config.Mode, report.GoVersion, report.GOOS, report.GOARCH, report.NumCPU)
-	sb.WriteString("| Signal | Stream Pool | Redaction | Backpressure | Samples | Achieved Rows/s | Wire MiB/s | Bytes/Row | p50 (ms) | p95 (ms) | p99 (ms) | CPU Cores / 10k rows/s | Heap Alloc Snapshot (MiB) | Process Peak RSS (MiB) | Acked Rows | Rejected Rows | Batches Failed | Redacted Values |\n")
+	sb.WriteString("| Signal | Stream Pool | Redaction | Backpressure | Samples | Achieved Rows/s | Encoded-Row MiB/s | Bytes/Row | p50 (ms) | p95 (ms) | p99 (ms) | CPU Cores / 10k rows/s | Heap Alloc Snapshot (MiB) | Process Peak RSS (MiB) | Acked Rows | Rejected Rows | Batches Failed | Redacted Values |\n")
 	sb.WriteString("|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, r := range report.Results {
 		fmt.Fprintf(&sb, "| `%s` | %d | `%t` | `%t` | %d | %.1f | %.2f | %.0f | %.2f | %.2f | %.2f | %.2f | %.2f | %.1f | %d | %d | %d | %d |\n",

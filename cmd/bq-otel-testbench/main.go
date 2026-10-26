@@ -58,7 +58,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs.IntVar(&cfg.StreamPoolSize, "stream-pool-size", 4, "BigQuery Write API stream_pool_size (1..16)")
 	fs.StringVar(&sweepCSV, "stream-pool-sweep", "", "Optional comma-separated stream_pool_size sweep (e.g. 1,2,4,8,16)")
 	fs.IntVar(&cfg.ConnectionPoolSize, "connection-pool-size", 4, "BigQuery Write API gRPC connection_pool_size (1..16)")
-	fs.IntVar(&cfg.MaxInflightRequests, "max-inflight-requests", 32, "Maximum in-flight AppendRows requests per stream")
+	fs.IntVar(&cfg.MaxInflightRequests, "max-inflight-requests", 32, "Maximum in-flight AppendRows requests per stream (1..65536)")
 	fs.IntVar(&cfg.MaxRequestBytes, "max-request-bytes", 8*1024*1024, "Maximum serialized ProtoRows payload bytes per request")
 	fs.StringVar(&cfg.Compression, "compression", "", "Optional gRPC compressor (empty or gzip)")
 	fs.BoolVar(&cfg.Redaction, "redaction", false, "Enable Step-0 sensitive-data redaction and plant synthetic secrets")
@@ -85,6 +85,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 	if fs.NArg() > 0 {
 		return fmt.Errorf("unexpected positional arguments: %v", fs.Args())
+	}
+	if cfg.MaxInflightRequests <= 0 || cfg.MaxInflightRequests > testbench.MaxBenchmarkInflightRequests {
+		return fmt.Errorf("--max-inflight-requests must be in 1..%d, got %d", testbench.MaxBenchmarkInflightRequests, cfg.MaxInflightRequests)
 	}
 
 	cfg.Signals = splitNonEmptyCSV(signalsCSV)

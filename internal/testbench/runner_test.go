@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"math"
 	"net/http"
@@ -16,10 +17,14 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/offload"
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/protoenc"
+	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/schema"
 	"github.com/haiyuan-eng-google/BQ-OTEL-Exporter/internal/transform"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -368,7 +373,88 @@ func TestGeneratorAllSevenFrameworksAndMCP(t *testing.T) {
 				seenMetricNames[m.Name()] += m.Histogram().DataPoints().Len()
 				dps := m.Histogram().DataPoints()
 				for d := 0; d < dps.Len(); d++ {
-					ex := dps.At(d).Exemplars().At(0)
+					dp := dps.At(d)
+					bounds := dp.ExplicitBounds().AsRaw()
+					buckets := dp.BucketCounts().AsRaw()
+					if len(buckets) != len(bounds)+1 {
+						t.Fatalf("metric %s dp[%d] len(buckets)=%d, want len(bounds)+1=%d", m.Name(), d, len(buckets), len(bounds)+1)
+					}
+					var bucketSum uint64
+					firstNonEmpty, lastNonEmpty := -1, -1
+					for bIdx, c := range buckets {
+						bucketSum += c
+						if c > 0 {
+							if firstNonEmpty == -1 {
+								firstNonEmpty = bIdx
+							}
+							lastNonEmpty = bIdx
+						}
+					}
+					if bucketSum != dp.Count() {
+						t.Fatalf("metric %s dp[%d] sum(buckets)=%d, want Count=%d", m.Name(), d, bucketSum, dp.Count())
+					}
+					if !dp.HasMin() || !dp.HasMax() || dp.Min() > dp.Max() {
+						t.Fatalf("metric %s dp[%d] invalid min/max: hasMin=%t hasMax=%t min=%v max=%v",
+							m.Name(), d, dp.HasMin(), dp.HasMax(), dp.Min(), dp.Max())
+					}
+					if firstNonEmpty < 0 || lastNonEmpty < 0 {
+						t.Fatalf("metric %s dp[%d] has 0 non-empty buckets", m.Name(), d)
+					}
+					if firstNonEmpty > 0 && dp.Min() <= bounds[firstNonEmpty-1] {
+						t.Fatalf("metric %s dp[%d] Min=%v <= lower bound %v of first non-empty bucket %d",
+							m.Name(), d, dp.Min(), bounds[firstNonEmpty-1], firstNonEmpty)
+					}
+					if firstNonEmpty < len(bounds) && dp.Min() > bounds[firstNonEmpty] {
+						t.Fatalf("metric %s dp[%d] Min=%v > upper bound %v of first non-empty bucket %d",
+							m.Name(), d, dp.Min(), bounds[firstNonEmpty], firstNonEmpty)
+					}
+					if lastNonEmpty > 0 && dp.Max() <= bounds[lastNonEmpty-1] {
+						t.Fatalf("metric %s dp[%d] Max=%v <= lower bound %v of last non-empty bucket %d",
+							m.Name(), d, dp.Max(), bounds[lastNonEmpty-1], lastNonEmpty)
+					}
+					if lastNonEmpty < len(bounds) && dp.Max() > bounds[lastNonEmpty] {
+						t.Fatalf("metric %s dp[%d] Max=%v > upper bound %v of last non-empty bucket %d",
+							m.Name(), d, dp.Max(), bounds[lastNonEmpty], lastNonEmpty)
+					}
+					var impliedMinSum, impliedMaxSum float64
+					for bIdx, c := range buckets {
+						if c == 0 {
+							continue
+						}
+						lo := dp.Min()
+						if bIdx > 0 && bounds[bIdx-1] > lo {
+							lo = bounds[bIdx-1]
+						}
+						hi := dp.Max()
+						if bIdx < len(bounds) && bounds[bIdx] < hi {
+							hi = bounds[bIdx]
+						}
+						switch {
+						case bIdx == firstNonEmpty && bIdx == lastNonEmpty:
+							if c == 1 {
+								impliedMinSum += dp.Min()
+								impliedMaxSum += dp.Max()
+							} else {
+								impliedMinSum += dp.Min() + dp.Max() + float64(c-2)*lo
+								impliedMaxSum += dp.Min() + dp.Max() + float64(c-2)*hi
+							}
+						case bIdx == firstNonEmpty:
+							impliedMinSum += dp.Min() + float64(c-1)*lo
+							impliedMaxSum += dp.Min() + float64(c-1)*hi
+						case bIdx == lastNonEmpty:
+							impliedMinSum += dp.Max() + float64(c-1)*lo
+							impliedMaxSum += dp.Max() + float64(c-1)*hi
+						default:
+							impliedMinSum += float64(c) * lo
+							impliedMaxSum += float64(c) * hi
+						}
+					}
+					if dp.Sum() < impliedMinSum-1e-9 || dp.Sum() > impliedMaxSum+1e-9 {
+						t.Fatalf("metric %s dp[%d] Sum=%v outside bucket/min/max implied range [%v, %v]",
+							m.Name(), d, dp.Sum(), impliedMinSum, impliedMaxSum)
+					}
+
+					ex := dp.Exemplars().At(0)
 					key := ex.TraceID().String() + "/" + ex.SpanID().String()
 					wantSvc, ok := spanServiceByPair[key]
 					if !ok {
@@ -960,6 +1046,14 @@ func TestRunStreamPoolSweepAndValidation(t *testing.T) {
 		}
 	}
 
+	validMaxInflightCfg := RunnerConfig{
+		Mode:                ModeBQFake,
+		MaxInflightRequests: MaxBenchmarkInflightRequests,
+	}
+	if err := validMaxInflightCfg.Normalize(); err != nil {
+		t.Fatalf("Normalize(MaxInflightRequests=%d) unexpected error: %v", MaxBenchmarkInflightRequests, err)
+	}
+
 	invalidCases := []RunnerConfig{
 		{Mode: "invalid"},
 		{Mode: ModeBQFake, Signals: []string{"profiles"}},
@@ -978,6 +1072,9 @@ func TestRunStreamPoolSweepAndValidation(t *testing.T) {
 		{Mode: ModeBQFake, Workers: MaxBenchmarkWorkers + 1},
 		{Mode: ModeBQFake, StreamPoolSize: -1},
 		{Mode: ModeBQFake, ConnectionPoolSize: -1},
+		{Mode: ModeBQFake, MaxInflightRequests: -1},
+		{Mode: ModeBQFake, MaxInflightRequests: MaxBenchmarkInflightRequests + 1},
+		{Mode: ModeBQFake, MaxInflightRequests: math.MaxInt},
 		{Mode: ModeBQFake, PayloadBytes: -1},
 		{Mode: ModeBQFake, PayloadBytes: math.MaxInt},
 		{Mode: ModeBQFake, BatchSize: 1000, PayloadBytes: 512 * 1024},
@@ -998,14 +1095,22 @@ func TestDeleteDatasetWithContentsAndDatasetExistsHTTP(t *testing.T) {
 	defer cancel()
 
 	var (
-		getCalls    atomic.Int32
-		postCalls   atomic.Int32
-		deleteCalls atomic.Int32
-		postStatus  atomic.Int32
-		delStatus   atomic.Int32
+		getCalls           atomic.Int32
+		postCalls          atomic.Int32
+		deleteCalls        atomic.Int32
+		postStatus         atomic.Int32
+		delStatus          atomic.Int32
+		commitOnPostError  atomic.Bool
+		postWaitCancel     atomic.Bool
+		postCancelRelease  = make(chan struct{})
+		getCommittedStatus atomic.Int32
+		committedMu        sync.Mutex
+		committedLabels    = make(map[string]map[string]string)
 	)
+	defer close(postCancelRelease)
 	postStatus.Store(http.StatusOK)
 	delStatus.Store(http.StatusNoContent)
+	getCommittedStatus.Store(http.StatusOK)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -1027,19 +1132,81 @@ func TestDeleteDatasetWithContentsAndDatasetExistsHTTP(t *testing.T) {
 				_, _ = w.Write([]byte(`{"error":{"code":500,"message":"Internal Server Error"}}`))
 				return
 			}
+			parts := strings.Split(r.URL.Path, "/datasets/")
+			if len(parts) == 2 && parts[1] != "" {
+				dsID := parts[1]
+				committedMu.Lock()
+				labels, ok := committedLabels[dsID]
+				committedMu.Unlock()
+				if ok {
+					status := int(getCommittedStatus.Load())
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(status)
+					if status >= 400 {
+						_, _ = fmt.Fprintf(w, `{"error":{"code":%d,"message":"Metadata Check Error"}}`, status)
+						return
+					}
+					resp := map[string]any{
+						"datasetReference": map[string]string{
+							"projectId": "test-proj",
+							"datasetId": dsID,
+						},
+						"labels": labels,
+					}
+					_ = json.NewEncoder(w).Encode(resp)
+					return
+				}
+			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = w.Write([]byte(`{"error":{"code":404,"message":"Not found"}}`))
 		case http.MethodPost:
 			postCalls.Add(1)
+			var body struct {
+				DatasetReference struct {
+					DatasetID string `json:"datasetId"`
+				} `json:"datasetReference"`
+				Labels map[string]string `json:"labels"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			dsID := body.DatasetReference.DatasetID
+			if dsID == "" {
+				dsID = "created_ds"
+			}
 			code := int(postStatus.Load())
+			if code == http.StatusOK || commitOnPostError.Load() || postWaitCancel.Load() {
+				committedMu.Lock()
+				if _, exists := committedLabels[dsID]; !exists {
+					copied := make(map[string]string, len(body.Labels))
+					for k, v := range body.Labels {
+						copied[k] = v
+					}
+					if dsID == "post_500_other_owner_ds" {
+						copied[ephemeralOwnerLabelKey] = "foreign-owner-token"
+					}
+					committedLabels[dsID] = copied
+				}
+				committedMu.Unlock()
+			}
+			if postWaitCancel.Load() {
+				select {
+				case <-r.Context().Done():
+				case <-postCancelRelease:
+				case <-time.After(80 * time.Millisecond):
+				}
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(code)
 			if code == http.StatusConflict {
 				_, _ = w.Write([]byte(`{"error":{"code":409,"message":"Already Exists"}}`))
 				return
 			}
-			_, _ = w.Write([]byte(`{"datasetReference":{"projectId":"test-proj","datasetId":"created_ds"}}`))
+			if code >= 400 {
+				_, _ = fmt.Fprintf(w, `{"error":{"code":%d,"message":"Post-Commit Server Error"}}`, code)
+				return
+			}
+			_, _ = fmt.Fprintf(w, `{"datasetReference":{"projectId":"test-proj","datasetId":%q}}`, dsID)
 		case http.MethodDelete:
 			deleteCalls.Add(1)
 			if r.URL.Query().Get("deleteContents") != "true" {
@@ -1047,6 +1214,14 @@ func TestDeleteDatasetWithContentsAndDatasetExistsHTTP(t *testing.T) {
 				return
 			}
 			code := int(delStatus.Load())
+			if code < 400 {
+				parts := strings.Split(r.URL.Path, "/datasets/")
+				if len(parts) == 2 {
+					committedMu.Lock()
+					delete(committedLabels, parts[1])
+					committedMu.Unlock()
+				}
+			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(code)
 			if code >= 400 {
@@ -1193,6 +1368,88 @@ func TestDeleteDatasetWithContentsAndDatasetExistsHTTP(t *testing.T) {
 	if delFailRep != nil && delFailRep.EphemeralDatasetDeleted {
 		t.Fatal("EphemeralDatasetDeleted = true when DELETE returned 403, want false")
 	}
+
+	// 5. Ambiguous dataset Create failure cleanup via ownership label verification:
+	// 5a. Post-commit 500 where dataset was created with our bq_otel_testbench_owner label:
+	// createEphemeralDataset must verify the label via GET and delete the leaked dataset immediately.
+	// Use a short caller deadline because the BigQuery client retries 500 responses until context expiry,
+	// while createEphemeralDataset runs its metadata verification + DELETE on an independent background context.
+	commitOnPostError.Store(true)
+	postStatus.Store(http.StatusInternalServerError)
+	delStatus.Store(http.StatusNoContent)
+	getCommittedStatus.Store(http.StatusOK)
+	getCalls.Store(0)
+	postCalls.Store(0)
+	deleteCalls.Store(0)
+	ctxPost500, cancelPost500 := context.WithTimeout(ctx, 60*time.Millisecond)
+	defer cancelPost500()
+	post500Err := createEphemeralDataset(ctxPost500, "test-proj", "post_500_owned_ds", "US", opts...)
+	if post500Err == nil || !strings.Contains(post500Err.Error(), "creating ephemeral dataset test-proj.post_500_owned_ds") {
+		t.Fatalf("createEphemeralDataset(post_500_owned_ds) error = %v, want creating ephemeral dataset error", post500Err)
+	}
+	if postCalls.Load() < 1 || deleteCalls.Load() != 1 {
+		t.Fatalf("post-commit 500 with matching owner label: post=%d, delete=%d, want >=1, 1",
+			postCalls.Load(), deleteCalls.Load())
+	}
+
+	// 5b. Post-commit client timeout / context cancellation during POST:
+	// createEphemeralDataset must use its bounded background cleanup context to verify the
+	// bq_otel_testbench_owner label and delete the dataset even though the caller ctx expired.
+	commitOnPostError.Store(false)
+	postWaitCancel.Store(true)
+	postStatus.Store(http.StatusOK)
+	delStatus.Store(http.StatusNoContent)
+	getCalls.Store(0)
+	postCalls.Store(0)
+	deleteCalls.Store(0)
+	postTimeoutCtx, cancelPostTimeout := context.WithTimeout(ctx, 40*time.Millisecond)
+	defer cancelPostTimeout()
+	timeoutCreateErr := createEphemeralDataset(postTimeoutCtx, "test-proj", "post_timeout_owned_ds", "US", opts...)
+	if timeoutCreateErr == nil {
+		t.Fatal("createEphemeralDataset(post_timeout_owned_ds) succeeded on timed-out ctx, want error")
+	}
+	if postCalls.Load() != 1 || deleteCalls.Load() != 1 {
+		t.Fatalf("post-commit timeout with matching owner label: post=%d, delete=%d, want 1, 1",
+			postCalls.Load(), deleteCalls.Load())
+	}
+	postWaitCancel.Store(false)
+
+	// 5c. Ambiguous POST failure where follow-up GET fails (403) or owner label belongs to another creator:
+	// createEphemeralDataset must NOT delete the dataset and must report the dataset ID when unverified.
+	commitOnPostError.Store(true)
+	postStatus.Store(http.StatusInternalServerError)
+	getCommittedStatus.Store(http.StatusForbidden)
+	getCalls.Store(0)
+	postCalls.Store(0)
+	deleteCalls.Store(0)
+	ctxUnverified, cancelUnverified := context.WithTimeout(ctx, 60*time.Millisecond)
+	defer cancelUnverified()
+	unverifiedErr := createEphemeralDataset(ctxUnverified, "test-proj", "post_500_unverified_ds", "US", opts...)
+	if unverifiedErr == nil || !strings.Contains(unverifiedErr.Error(), "was left behind") {
+		t.Fatalf("createEphemeralDataset(post_500_unverified_ds) error = %v, want 'was left behind' notice", unverifiedErr)
+	}
+	if deleteCalls.Load() != 0 {
+		t.Fatalf("unverified metadata DELETE calls = %d, want 0", deleteCalls.Load())
+	}
+
+	getCommittedStatus.Store(http.StatusOK)
+	commitOnPostError.Store(true)
+	postStatus.Store(http.StatusInternalServerError)
+	getCalls.Store(0)
+	postCalls.Store(0)
+	deleteCalls.Store(0)
+	ctxOtherOwner, cancelOtherOwner := context.WithTimeout(ctx, 60*time.Millisecond)
+	defer cancelOtherOwner()
+	otherOwnerErr := createEphemeralDataset(ctxOtherOwner, "test-proj", "post_500_other_owner_ds", "US", opts...)
+	if otherOwnerErr == nil || !strings.Contains(otherOwnerErr.Error(), "refusing to delete") {
+		t.Fatalf("createEphemeralDataset(post_500_other_owner_ds) error = %v, want 'refusing to delete'", otherOwnerErr)
+	}
+	if deleteCalls.Load() != 0 {
+		t.Fatalf("foreign owner label DELETE calls = %d, want 0", deleteCalls.Load())
+	}
+	commitOnPostError.Store(false)
+	postStatus.Store(http.StatusOK)
+	delStatus.Store(http.StatusNoContent)
 }
 
 func TestRunPartialFailureEmptyWindowInvalidOffloadAndPanicRecovery(t *testing.T) {
@@ -1324,6 +1581,55 @@ func TestRunPartialFailureEmptyWindowInvalidOffloadAndPanicRecovery(t *testing.T
 			throttleRep.Results[0].AttemptedBytesPerAckedRow, throttleRep.Results[0].BytesPerRow)
 	}
 
+	// 6b. Uneven split-batch retry (500 spans x 16 KiB = ~9.13 MiB -> split into 9 uneven
+	// AppendRows chunks: eight 57-row chunks and one 44-row tail chunk under 1 MiB max_request_bytes)
+	// with SimulateThrottleEvery=1 must preserve exact uninflated BytesPerRow.
+	splitThrottleRep, err := Run(ctx, RunnerConfig{
+		Mode:                  ModeBQFake,
+		Signals:               []string{"traces"},
+		Duration:              250 * time.Millisecond,
+		BatchSize:             500,
+		Workers:               1,
+		StreamPoolSize:        1,
+		ConnectionPoolSize:    1,
+		PayloadBytes:          16384,
+		SimulateThrottleEvery: 1,
+	})
+	if err != nil {
+		t.Fatalf("Run(split 500 x 16 KiB throttled) error: %v", err)
+	}
+	if splitThrottleRep.Results[0].Telemetry.Retries <= 0 {
+		t.Fatalf("split throttled Retries = %d, want > 0", splitThrottleRep.Results[0].Telemetry.Retries)
+	}
+	if math.Abs(splitThrottleRep.Results[0].BytesPerRow-largeRep.Results[0].BytesPerRow) > 1.0 {
+		t.Fatalf("split throttled BytesPerRow = %.2f vs unthrottled %.2f, want exact match within 1 B",
+			splitThrottleRep.Results[0].BytesPerRow, largeRep.Results[0].BytesPerRow)
+	}
+	if splitThrottleRep.Results[0].AttemptedBytesPerAckedRow <= splitThrottleRep.Results[0].BytesPerRow {
+		t.Fatalf("split throttled AttemptedBytesPerAckedRow (%.2f) must exceed BytesPerRow (%.2f)",
+			splitThrottleRep.Results[0].AttemptedBytesPerAckedRow, splitThrottleRep.Results[0].BytesPerRow)
+	}
+	// Also verify measureSingleAttemptBytesPerRow (used in live mode when Retries > 0) matches
+	// bqfake AckedBytes()/AcknowledgedRows across all three signals.
+	for _, sig := range []string{"traces", "logs", "metrics"} {
+		sampleCfg := RunnerConfig{
+			Mode:         ModeBQFake,
+			Signals:      []string{sig},
+			Duration:     100 * time.Millisecond,
+			BatchSize:    28,
+			Workers:      1,
+			PayloadBytes: 16384,
+			Redaction:    true,
+		}
+		if err := sampleCfg.Normalize(); err != nil {
+			t.Fatalf("Normalize(%s): %v", sig, err)
+		}
+		singleBPR, err := measureSingleAttemptBytesPerRow(sampleCfg, sig)
+		if err != nil || singleBPR <= 0 {
+			t.Fatalf("measureSingleAttemptBytesPerRow(%s) = %f, err = %v, want > 0, nil", sig, singleBPR, err)
+		}
+	}
+
 	// 7. Pre-append offload failures under AllowPartialFailures=true must not
 	// dilute BytesPerRow (since ConsumeTraces was not dispatched for those batches).
 	cleanOffloadDir := t.TempDir()
@@ -1374,5 +1680,250 @@ func TestRunPartialFailureEmptyWindowInvalidOffloadAndPanicRecovery(t *testing.T
 	if math.Abs(partialOffloadRep.Results[0].BytesPerRow-cleanOffloadRep.Results[0].BytesPerRow) > 5.0 {
 		t.Fatalf("partialOffload BytesPerRow = %.2f vs cleanOffload %.2f, want pre-append offload failures excluded from BytesPerRow denominator",
 			partialOffloadRep.Results[0].BytesPerRow, cleanOffloadRep.Results[0].BytesPerRow)
+	}
+}
+
+func TestDocsCostModelOffloadSizesAndBenchmarkReportJSON(t *testing.T) {
+	// 1. Verify exact single-row ProtoRows serialized sizes (inline vs ObjectRef offload)
+	// and content-addressed GCS object key format (no .json extension) documented in docs/cost-estimation.md.
+	gen := NewGenerator(GeneratorConfig{
+		PayloadBytes: 16384,
+	})
+	tdInline := gen.TracesBatch(28)
+	ldInline := gen.LogsBatch(28)
+	mdInline := gen.MetricsBatch(28)
+
+	tOpts := transform.Options{
+		Limits: transform.DefaultLimits(),
+	}
+	spanEnc, err := protoenc.New(schema.SpansTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(SpansTableSchema): %v", err)
+	}
+	logEnc, err := protoenc.New(schema.LogsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(LogsTableSchema): %v", err)
+	}
+	metricEnc, err := protoenc.New(schema.MetricsTableSchema())
+	if err != nil {
+		t.Fatalf("protoenc.New(MetricsTableSchema): %v", err)
+	}
+	encodeSumBytes := func(enc *protoenc.Encoder, rows []transform.Row) int {
+		var sum int
+		for _, r := range rows {
+			b, encErr := enc.Encode(r)
+			if encErr != nil {
+				t.Fatalf("enc.Encode: %v", encErr)
+			}
+			sum += len(b)
+		}
+		return sum
+	}
+
+	inlineSpanRows, _ := transform.SpanRows(tdInline, tOpts)
+	inlineSpanBytes := encodeSumBytes(spanEnc, inlineSpanRows)
+	if math.Abs(float64(inlineSpanBytes)/28.0-18256.0) > 10.0 {
+		t.Fatalf("inlineSpanBytes/28 = %.2f (%d B), want ~18256 B/span", float64(inlineSpanBytes)/28.0, inlineSpanBytes)
+	}
+
+	inlineLogRows, _ := transform.LogRows(ldInline, tOpts)
+	inlineLogBytes := encodeSumBytes(logEnc, inlineLogRows)
+	if inlineLogBytes <= 400000 {
+		t.Fatalf("inlineLogBytes = %d, want > 400000", inlineLogBytes)
+	}
+
+	inlineMetricRows, _ := transform.MetricRows(mdInline, tOpts)
+	inlineMetricBytes := encodeSumBytes(metricEnc, inlineMetricRows)
+	if int(math.Round(float64(inlineMetricBytes)/28.0)) != 1252 {
+		t.Fatalf("inlineMetricBytes = %d (%.2f B/point), want 1252 B/point", inlineMetricBytes, float64(inlineMetricBytes)/28.0)
+	}
+
+	// Offload via internal/offload with MinBytes=4096 and verify exact offloaded row sizes and object keys.
+	offloadRoot := t.TempDir()
+	store := &localDirBlobStore{rootDir: offloadRoot}
+	offloader, err := offload.New(store, offload.Options{
+		Bucket:         "local-offload-bench",
+		Prefix:         "otel-offload",
+		MinBytes:       4096,
+		MaxObjectBytes: 64 * 1024 * 1024,
+		MaxConcurrency: 8,
+		CacheSize:      10000,
+		Timeout:        5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("offload.New: %v", err)
+	}
+
+	genOff := NewGenerator(GeneratorConfig{
+		PayloadBytes: 16384,
+	})
+	tdOff := genOff.TracesBatch(28)
+	ldOff := genOff.LogsBatch(28)
+
+	offOpts := transform.Options{
+		Limits:           transform.DefaultLimits(),
+		PayloadOffloader: offloader,
+	}
+	offSpanRows, spanOffErrs := transform.SpanRows(tdOff, offOpts)
+	if len(spanOffErrs) != 0 {
+		t.Fatalf("transform.SpanRows(offOpts) errs: %v", spanOffErrs)
+	}
+	offSpanBytes := encodeSumBytes(spanEnc, offSpanRows)
+	if math.Abs(float64(offSpanBytes)/28.0-2402.0) > 1.0 {
+		t.Fatalf("offSpanBytes = %d (%.2f B/span), want ~2402 B/span", offSpanBytes, float64(offSpanBytes)/28.0)
+	}
+
+	offLogRows, logOffErrs := transform.LogRows(ldOff, offOpts)
+	if len(logOffErrs) != 0 {
+		t.Fatalf("transform.LogRows(offOpts) errs: %v", logOffErrs)
+	}
+	offLogBytes := encodeSumBytes(logEnc, offLogRows)
+	if math.Abs(float64(offLogBytes)/28.0-1872.0) > 1.0 {
+		t.Fatalf("offLogBytes = %d (%.2f B/log), want ~1872 B/log", offLogBytes, float64(offLogBytes)/28.0)
+	}
+
+	turnBytesOffload := int(math.Round((float64(offSpanBytes)*4 + float64(offLogBytes)*2 + float64(inlineMetricBytes)*2) / 28.0))
+	if math.Abs(float64(turnBytesOffload)-15855.0) > 5.0 {
+		t.Fatalf("turnBytesOffload = %d, want ~15855", turnBytesOffload)
+	}
+
+	keyPattern := regexp.MustCompile(`^otel-offload/(spans|logs)/\d{4}-\d{2}-\d{2}/[0-9a-f]{64}$`)
+	bucketDir := filepath.Join(offloadRoot, "local-offload-bench")
+	var objectCount int
+	err = filepath.WalkDir(bucketDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() {
+			return walkErr
+		}
+		rel, relErr := filepath.Rel(bucketDir, path)
+		if relErr != nil {
+			return relErr
+		}
+		rel = filepath.ToSlash(rel)
+		if !keyPattern.MatchString(rel) {
+			t.Fatalf("offloaded object key %q does not match %s (must not have .json suffix)", rel, keyPattern)
+		}
+		objectCount++
+		return nil
+	})
+	if err != nil || objectCount == 0 {
+		t.Fatalf("walking offloaded objects: count=%d err=%v", objectCount, err)
+	}
+
+	// 2. Verify docs/cost-estimation.md contains the exact verified figures and no stale pricing/sizes.
+	costDocRaw, err := os.ReadFile(filepath.Join("..", "..", "docs", "cost-estimation.md"))
+	if err != nil {
+		t.Fatalf("ReadFile(docs/cost-estimation.md): %v", err)
+	}
+	costDoc := string(costDocRaw)
+	for _, wantSubstr := range []string{
+		"2,402 B",
+		"1,872 B",
+		"15,855 B / turn",
+		"`gs://<bucket>/<prefix>/<signal>/YYYY-MM-DD/<sha256>`",
+		"`$0.010` / 1,000 ops",
+		"$36.00",
+		"$360.00",
+		"$3,600.00",
+		"$187.14",
+		"$1,871.41",
+		"$18,714.11",
+		"$19.56",
+		"$78.26",
+		"$313.02",
+		"$19.68 / mo",
+		"$83.01 / mo",
+		"$141.29 / mo",
+		"$456.47 / mo",
+		"$455.92 / mo",
+		"$1,456.22 / mo",
+		"$4,163.40 / mo",
+		"~98.6%",
+		"~97.2%",
+		"~94.6%",
+		"~95.1%",
+		"~90.5%",
+		"26.7%",
+		"51.1%",
+		"63.3%",
+		"46.9%",
+		"64.6%",
+		"73.5%",
+		"`10 MiB` per-query minimum",
+		"0.137 TiB/mo",
+	} {
+		if !strings.Contains(costDoc, wantSubstr) {
+			t.Errorf("docs/cost-estimation.md missing expected substring %q", wantSubstr)
+		}
+	}
+	for _, forbiddenSubstr := range []string{
+		"<sha256>.json",
+		"| **GCS Standard Class A Ops (`PUT`)** | `$0.005` / 1,000 ops |",
+		"$24 / vCPU-mo",
+		"$58.60",
+		"$234.40",
+		"2,228 B",
+		"1,717 B",
+		"14,850 B",
+	} {
+		if strings.Contains(costDoc, forbiddenSubstr) {
+			t.Errorf("docs/cost-estimation.md contains stale substring %q", forbiddenSubstr)
+		}
+	}
+
+	// 3. Verify docs/benchmarks/v0.1.0-performance-envelope.md Section 5 JSON snippet
+	// unmarshals cleanly into BenchmarkReport with DisallowUnknownFields() and matches Table 5.1.
+	benchDocRaw, err := os.ReadFile(filepath.Join("..", "..", "docs", "benchmarks", "v0.1.0-performance-envelope.md"))
+	if err != nil {
+		t.Fatalf("ReadFile(docs/benchmarks/v0.1.0-performance-envelope.md): %v", err)
+	}
+	benchDoc := string(benchDocRaw)
+	for _, wantBenchSubstr := range []string{
+		"Encoded-Row MiB/s",
+		"**`14 of 18` Go packages with tests**",
+		"+48.5%` to `+56.1%",
+		"+47.0%` to `+48.3%",
+		"+19.8%` to `+28.0%",
+	} {
+		if !strings.Contains(benchDoc, wantBenchSubstr) {
+			t.Errorf("docs/benchmarks/v0.1.0-performance-envelope.md missing %q", wantBenchSubstr)
+		}
+	}
+
+	jsonStart := strings.Index(benchDoc, "```json\n")
+	if jsonStart < 0 {
+		t.Fatal("missing ```json block in docs/benchmarks/v0.1.0-performance-envelope.md")
+	}
+	jsonBody := benchDoc[jsonStart+len("```json\n"):]
+	jsonEnd := strings.Index(jsonBody, "\n```")
+	if jsonEnd < 0 {
+		t.Fatal("unterminated ```json block in docs/benchmarks/v0.1.0-performance-envelope.md")
+	}
+	jsonSnippet := jsonBody[:jsonEnd]
+
+	dec := json.NewDecoder(strings.NewReader(jsonSnippet))
+	dec.DisallowUnknownFields()
+	var docReport BenchmarkReport
+	if err := dec.Decode(&docReport); err != nil {
+		t.Fatalf("BenchmarkReport JSON snippet in docs/benchmarks/v0.1.0-performance-envelope.md failed strict schema decode: %v", err)
+	}
+	if docReport.Timestamp != "2026-10-25T23:14:06Z" || !docReport.EphemeralDatasetDeleted || docReport.Config.Mode != ModeLive {
+		t.Fatalf("unexpected docReport header fields: timestamp=%q deleted=%t mode=%q",
+			docReport.Timestamp, docReport.EphemeralDatasetDeleted, docReport.Config.Mode)
+	}
+	if len(docReport.Results) != 3 {
+		t.Fatalf("len(docReport.Results) = %d, want 3", len(docReport.Results))
+	}
+	wantRates := map[string]float64{
+		"traces":  10404.2,
+		"logs":    9593.6,
+		"metrics": 9185.0,
+	}
+	for _, r := range docReport.Results {
+		if r.AchievedRowsPerSec != wantRates[r.Signal] {
+			t.Errorf("docReport signal %s AchievedRowsPerSec = %v, want %v", r.Signal, r.AchievedRowsPerSec, wantRates[r.Signal])
+		}
+		if r.Telemetry.AcknowledgedRows <= 0 || r.Latency.Samples <= 0 {
+			t.Errorf("docReport signal %s has empty telemetry/latency: %+v", r.Signal, r)
+		}
 	}
 }

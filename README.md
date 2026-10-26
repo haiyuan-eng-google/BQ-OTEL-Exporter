@@ -23,18 +23,21 @@ This component has exactly one job: **reliable transport with a stable,
 documented schema.** It is not an analytics product. It does not aggregate,
 sample, downsample, or interpret telemetry.
 
-> **Status: pre-`v0.1.0` (development stability).** The write path, schema provisioning,
-> and Step-0 redaction have been benchmarked against both the in-process `bqfake`
-> Storage Write API server (`18,791`–`29,459` spans/s, `22,650`–`28,983` logs/s, and
-> `15,876`–`23,544` metric points/s across `stream_pool_size=1..16`; `27,896` spans/s,
-> `28,983` logs/s, and `23,544` metric points/s at `stream_pool_size=4`) and live BigQuery
-> (`10,404` spans/s, `9,594` logs/s, and `9,185` metric points/s at `stream_pool_size=4`,
-> `1.24`–`1.66` vCPU cores per `10,000` rows/s, `86.8 MiB` process peak RSS); AIMD
-> backpressure and content-addressed payload offload (`--offload-dir`, `99.92%` SHA-256
-> deduplication hit rate) have been benchmarked under fault injection in `bqfake` (with
-> offload unit-tested in `internal/offload`); and live `auto_create` provisioning, timeout
-> recovery, and the deduplication views are exercised by the live integration test suite
-> (`-tags=integration`).
+> **Status: pre-`v0.1.0` (development stability).** The write path, base table
+> provisioning (`auto_create.tables`), and Step-0 redaction have been benchmarked
+> against both the in-process `bqfake` Storage Write API server (`18,791`–`29,459`
+> spans/s, `22,650`–`28,983` logs/s, and `15,876`–`23,544` metric points/s across
+> `stream_pool_size=1..16`; `27,896` spans/s, `28,983` logs/s, and `23,544` metric
+> points/s at `stream_pool_size=4`) and live BigQuery (`10,404` spans/s, `9,594`
+> logs/s, and `9,185` metric points/s at `stream_pool_size=4`, `1.24`–`1.66` vCPU
+> cores per `10,000` rows/s, `86.8 MiB` process peak RSS, with `companion_views`
+> disabled during throughput runs); AIMD backpressure and content-addressed payload
+> offload (`--offload-dir`, `99.92%` SHA-256 deduplication hit rate) have been
+> benchmarked under fault injection in `bqfake` (with offload unit-tested in
+> `internal/offload` and semantic view filter predicates checked offline on
+> transformed row shapes in `internal/testbench`); and live `auto_create` view
+> DDL provisioning, timeout recovery, and the deduplication views are exercised by
+> the live integration test suite (`-tags=integration`).
 > See [`docs/benchmarks/v0.1.0-performance-envelope.md`](docs/benchmarks/v0.1.0-performance-envelope.md)
 > for reproducible benchmark measurements and [`docs/cost-estimation.md`](docs/cost-estimation.md)
 > for BigQuery + GCS FinOps cost modeling.
@@ -954,8 +957,9 @@ in-process `bqfake` pipeline scaling (`write.stream_pool_size` `1..16`, reaching
 `27,896` spans/s, `28,983` logs/s, and `23,544` metric points/s at
 `stream_pool_size: 4`, and peaking at `29,459` spans/s and `28,983` logs/s) and
 live BigQuery Storage Write API throughput (`10,404` spans/s / `28.72 MiB/s`
-wire, `9,594` logs/s / `21.81 MiB/s` wire, and `9,185` metric points/s /
-`10.97 MiB/s` wire at `stream_pool_size: 4`, `p50 = 114.9–129.9 ms`,
+encoded-row payload, `9,594` logs/s / `21.81 MiB/s` encoded-row payload, and
+`9,185` metric points/s / `10.97 MiB/s` encoded-row payload at
+`stream_pool_size: 4`, `p50 = 114.9–129.9 ms`,
 `1.24–1.66` vCPU cores per `10,000` rows/s, `86.8 MiB` process peak RSS). Full
 tables and reproduction commands are recorded in
 [`docs/benchmarks/v0.1.0-performance-envelope.md`](docs/benchmarks/v0.1.0-performance-envelope.md),

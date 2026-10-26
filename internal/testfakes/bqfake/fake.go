@@ -93,6 +93,7 @@ type Server struct {
 	connections int
 	requests    int
 	ackedRows   int
+	ackedBytes  int64
 	etagSeq     int
 
 	datasets map[string]*bigqueryapi.Dataset
@@ -258,6 +259,14 @@ func (s *Server) Counts() (connections, requests, ackedRows int) {
 	return s.connections, s.requests, s.ackedRows
 }
 
+// AckedBytes returns the total serialized ProtoRows byte length across all
+// acknowledged AppendRows requests.
+func (s *Server) AckedBytes() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ackedBytes
+}
+
 // Rows returns a deep copy of all decoded rows appended to table.
 func (s *Server) Rows(table string) []map[string]any {
 	s.mu.Lock()
@@ -284,6 +293,7 @@ func (s *Server) ResetRows() {
 	s.rows = make(map[string][]map[string]any)
 	s.requests = 0
 	s.ackedRows = 0
+	s.ackedBytes = 0
 }
 
 // Dataset returns a snapshot of the REST v2 Dataset metadata if created.
@@ -545,8 +555,13 @@ func (s *Server) AppendRows(srv storagepb.BigQueryWrite_AppendRowsServer) error 
 			continue
 		}
 
+		var chunkBytes int64
+		for _, raw := range serialized {
+			chunkBytes += int64(len(raw))
+		}
 		s.mu.Lock()
 		s.ackedRows += len(serialized)
+		s.ackedBytes += chunkBytes
 		if streamTable != "" && len(decodedBatch) > 0 {
 			s.rows[streamTable] = append(s.rows[streamTable], decodedBatch...)
 		}

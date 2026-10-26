@@ -39,8 +39,8 @@ func TestCLIRunBQFakeAndJSONOut(t *testing.T) {
 	}
 
 	outStr := stdout.String()
-	if !strings.Contains(outStr, "| `traces` |") || !strings.Contains(outStr, "| `logs` |") {
-		t.Fatalf("stdout missing expected markdown table rows:\n%s", outStr)
+	if !strings.Contains(outStr, "| `traces` |") || !strings.Contains(outStr, "| `logs` |") || !strings.Contains(outStr, "Encoded-Row MiB/s") {
+		t.Fatalf("stdout missing expected markdown table headers/rows:\n%s", outStr)
 	}
 
 	raw, err := os.ReadFile(jsonPath)
@@ -104,6 +104,10 @@ func TestCLISweepAndFlagValidation(t *testing.T) {
 	badFlagCases := [][]string{
 		{"-format=xml"},
 		{"-stream-pool-sweep=0,abc"},
+		{"-max-inflight-requests=0"},
+		{"-max-inflight-requests=-1"},
+		{"-max-inflight-requests=65537"},
+		{"-max-inflight-requests=9223372036854775807"},
 		{"unexpected-positional-arg"},
 	}
 	for _, args := range badFlagCases {
