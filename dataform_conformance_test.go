@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"path"
 	"reflect"
 	"regexp"
@@ -718,10 +719,37 @@ var dfxStmtKinds = []struct{ prefix, kind string }{
 	{"DECLARE CONTEXT_START TIMESTAMP DEFAULT", "declare context_start"},
 	{"CREATE TEMP TABLE TOUCHED_TRACES AS", "temp table touched_traces"},
 	{"CREATE TEMP TABLE TRAJECTORY_ROWS AS", "temp table trajectory_rows"},
+	{"CREATE OR REPLACE TEMP TABLE _BQ_OTEL_ORPHAN_TOKEN_VIOLATIONS AS", "temp table orphan_token_violations"},
 	{"BEGIN TRANSACTION", "begin transaction"},
 	{"COMMIT TRANSACTION", "commit transaction"},
 	{"DELETE FROM SELF", "delete"},
 	{"UPDATE ref." + dfxRunWindow + " SET IS_COMMITTED = TRUE WHERE TRUE", "commit run_window"},
+}
+
+var dfxTopTempTablePrefixRE = regexp.MustCompile(`^CREATE (OR REPLACE )?(TEMP|TEMPORARY) TABLE [A-Z0-9_]+ AS$`)
+
+// dfxCheckRecursivePlacement verifies that WITH RECURSIVE only appears at the
+// top level of a query (depth == 0, index 0) or immediately after a top-level
+// CREATE [OR REPLACE] TEMP TABLE <name> AS statement, never inside
+// ASSERT NOT EXISTS (...) or any parenthesized subquery expression.
+func dfxCheckRecursivePlacement(label string, toks []dashTok) []string {
+	var p dashProblems
+	for i := 0; i+1 < len(toks); i++ {
+		if toks[i].up != "WITH" || toks[i+1].up != "RECURSIVE" {
+			continue
+		}
+		if toks[i].depth > 0 {
+			p.addf("%s: WITH RECURSIVE is not allowed inside a parenthesized subquery or ASSERT NOT EXISTS (...) expression (depth %d); materialize a top-level TEMP TABLE first", label, toks[i].depth)
+			continue
+		}
+		if i > 0 {
+			prefix := dashJoin(toks[:i])
+			if !dfxTopTempTablePrefixRE.MatchString(prefix) {
+				p.addf("%s: WITH RECURSIVE must be at the start of a query or immediately follow CREATE [OR REPLACE] TEMP TABLE <name> AS, got prefix %q", label, prefix)
+			}
+		}
+	}
+	return p
 }
 
 func dfxClassify(toks []dashTok) string {
@@ -735,7 +763,7 @@ func dfxClassify(toks []dashTok) string {
 		switch {
 		case strings.Contains(joined, "'span_in_trajectory_more_than_once'"):
 			return "assert no_unhandled_cycles"
-		case strings.Contains(joined, "TOKEN_PARENT_COVERAGE"):
+		case strings.Contains(joined, "_BQ_OTEL_ORPHAN_TOKEN_VIOLATIONS"), strings.Contains(joined, "TOKEN_PARENT_COVERAGE"):
 			return "assert no_orphan_tokens"
 		}
 	}
@@ -1642,7 +1670,10 @@ func dfxCheckRun(a *dfxAction, e dfxActionPlan, run *dfxRun, incremental bool, r
 		wantPost = []string{"commit transaction"}
 	}
 	if e.name == dfxTraj {
-		wantPost = append(wantPost, "assert no_unhandled_cycles", "assert no_orphan_tokens", "commit run_window")
+		wantPost = append(wantPost, "assert no_unhandled_cycles", "temp table orphan_token_violations", "assert no_orphan_tokens", "commit run_window")
+	}
+	for _, st := range slices.Concat(run.pre, run.post) {
+		p = append(p, dfxCheckRecursivePlacement(fmt.Sprintf("%s: in %s, %s", a.name, mode, st.kind), st.toks)...)
 	}
 	if got := dfxKinds(run.pre); !slices.Equal(got, wantPre) {
 		p.addf("%s: in %s, pre_operations run %v, want %v", a.name, mode, got, wantPre)
@@ -2028,8 +2059,14 @@ var (
 // dfxAssertNotExistsSQL extracts and normalizes the inner query of an
 // ASSERT NOT EXISTS ( <query> ) statement from m_gen_ai_agent_trajectory's
 // post_operations so it can be compared or evaluated against the standalone
-// assertion queries.
+// assertion queries. It rejects WITH RECURSIVE inside ASSERT NOT EXISTS (...).
 func dfxAssertNotExistsSQL(st *dfxStmt) (string, error) {
+	if st == nil {
+		return "", errors.New("missing ASSERT NOT EXISTS statement")
+	}
+	if probs := dfxCheckRecursivePlacement("ASSERT NOT EXISTS", st.toks); len(probs) > 0 {
+		return "", errors.New(probs[0])
+	}
 	if len(st.toks) < 5 || st.toks[0].up != "ASSERT" || st.toks[1].up != "NOT" || st.toks[2].up != "EXISTS" ||
 		!st.toks[3].is("(") || !st.toks[len(st.toks)-1].is(")") {
 		return "", errors.New("expected ASSERT NOT EXISTS ( <query> )")
@@ -2041,11 +2078,65 @@ func dfxAssertNotExistsSQL(st *dfxStmt) (string, error) {
 	return normalized, nil
 }
 
+// dfxOrphanTokenTempTableSQL validates the outer wrapper of the
+// CREATE OR REPLACE TEMP TABLE _bq_otel_orphan_token_violations AS WITH RECURSIVE ...
+// statement in m_gen_ai_agent_trajectory's post_operations and returns its
+// normalized query text for parity and semantic evaluation.
+func dfxOrphanTokenTempTableSQL(st *dfxStmt) (string, error) {
+	if st == nil {
+		return "", errors.New("missing temp table orphan_token_violations statement")
+	}
+	if probs := dfxCheckRecursivePlacement("temp table orphan_token_violations", st.toks); len(probs) > 0 {
+		return "", errors.New(probs[0])
+	}
+	const wantPrefix = "CREATE OR REPLACE TEMP TABLE _BQ_OTEL_ORPHAN_TOKEN_VIOLATIONS AS"
+	if len(st.toks) <= 8 || dashJoin(st.toks[:7]) != wantPrefix || st.toks[7].up != "WITH" || st.toks[8].up != "RECURSIVE" {
+		return "", fmt.Errorf("expected %s WITH RECURSIVE ..., got %q", wantPrefix, dashJoin(st.toks))
+	}
+	inner := st.text[st.toks[7].pos:]
+	normalized := dfxSelfWordRE.ReplaceAllString(inner, "`ref."+dfxTraj+"`")
+	normalized = dfxContextStartWordRE.ReplaceAllString(normalized,
+		"TIMESTAMP_SUB((SELECT rw.window_start FROM `ref."+dfxRunWindow+"` AS rw), INTERVAL 24 HOUR)")
+	return normalized, nil
+}
+
+// dfxCheckOrphanTokenAssertStmt validates the complete ASSERT NOT EXISTS
+// wrapper that checks _bq_otel_orphan_token_violations in post_operations.
+func dfxCheckOrphanTokenAssertStmt(st *dfxStmt) error {
+	if st == nil {
+		return errors.New("missing assert no_orphan_tokens statement")
+	}
+	if probs := dfxCheckRecursivePlacement("assert no_orphan_tokens", st.toks); len(probs) > 0 {
+		return errors.New(probs[0])
+	}
+	const wantStmt = "ASSERT NOT EXISTS ( SELECT 1 FROM _BQ_OTEL_ORPHAN_TOKEN_VIOLATIONS )"
+	if got := dashJoin(st.toks); got != wantStmt {
+		return fmt.Errorf("got %q, want %q", got, wantStmt)
+	}
+	innerSQL, err := dfxAssertNotExistsSQL(st)
+	if err != nil {
+		return err
+	}
+	q, err := dashParseSQL(innerSQL)
+	if err != nil {
+		return err
+	}
+	if len(q.ctes) != 0 || len(q.branches) != 1 || dashJoin(q.branches[0].clauses["FROM"]) != "_BQ_OTEL_ORPHAN_TOKEN_VIOLATIONS" || len(q.branches[0].clauses["WHERE"]) != 0 {
+		return fmt.Errorf("inner query must be unconditional SELECT 1 FROM _bq_otel_orphan_token_violations")
+	}
+	return nil
+}
+
 // dfxCheckTrajectory checks the trajectory mart: the statements that run the
 // recursive query, the query that inserts its rows, and the post_operations
-// ASSERT NOT EXISTS gates that guard updating stg_run_window.is_committed.
+// temp-table + ASSERT NOT EXISTS gates that guard updating stg_run_window.is_committed.
 func dfxCheckTrajectory(pkg *dfxPackage, a *dfxAction, run *dfxRun, body, view *dashQuery, stagingCols []string) []string {
 	var p dashProblems
+	for _, st := range slices.Concat(run.pre, run.post) {
+		for _, msg := range dfxCheckRecursivePlacement(fmt.Sprintf("%s: %s", a.name, st.kind), st.toks) {
+			p.addf("%s", msg)
+		}
+	}
 	if st := run.find("temp table touched_traces"); st != nil {
 		q, err := dfxStmtQuery(st, 5)
 		if err != nil {
@@ -2070,25 +2161,32 @@ func dfxCheckTrajectory(pkg *dfxPackage, a *dfxAction, run *dfxRun, body, view *
 			}
 		}
 	}
+	if st := run.find("assert no_orphan_tokens"); st != nil {
+		if err := dfxCheckOrphanTokenAssertStmt(st); err != nil {
+			p.addf("%s: assert no_orphan_tokens: %v", a.name, err)
+		}
+	}
 	for _, spec := range []struct {
-		kind       string
+		stmtKind   string
+		reportKind string
 		assertName string
+		extract    func(*dfxStmt) (string, error)
 	}{
-		{"assert no_unhandled_cycles", "assert_no_unhandled_cycles"},
-		{"assert no_orphan_tokens", "assert_no_orphan_tokens"},
+		{"assert no_unhandled_cycles", "assert no_unhandled_cycles", "assert_no_unhandled_cycles", dfxAssertNotExistsSQL},
+		{"temp table orphan_token_violations", "assert no_orphan_tokens", "assert_no_orphan_tokens", dfxOrphanTokenTempTableSQL},
 	} {
-		st := run.find(spec.kind)
+		st := run.find(spec.stmtKind)
 		if st == nil {
 			continue // dfxCheckRun reports missing post_operations statement
 		}
-		normSQL, err := dfxAssertNotExistsSQL(st)
+		normSQL, err := spec.extract(st)
 		if err != nil {
-			p.addf("%s: %s: %v", a.name, spec.kind, err)
+			p.addf("%s: %s: %v", a.name, spec.reportKind, err)
 			continue
 		}
 		gotQ, err := dashParseSQL(normSQL)
 		if err != nil {
-			p.addf("%s: %s: %v", a.name, spec.kind, err)
+			p.addf("%s: %s: %v", a.name, spec.reportKind, err)
 			continue
 		}
 		assertAction := pkg.byName[spec.assertName]
@@ -2104,16 +2202,16 @@ func dfxCheckTrajectory(pkg *dfxPackage, a *dfxAction, run *dfxRun, body, view *
 			continue
 		}
 		if !slices.Equal(dfxCTENames(gotQ), dfxCTENames(wantQ)) {
-			p.addf("%s: %s WITH tables are %v, want %s's %v", a.name, spec.kind, dfxCTENames(gotQ), spec.assertName, dfxCTENames(wantQ))
+			p.addf("%s: %s WITH tables are %v, want %s's %v", a.name, spec.reportKind, dfxCTENames(gotQ), spec.assertName, dfxCTENames(wantQ))
 			continue
 		}
 		for _, cteName := range dfxCTENames(wantQ) {
 			if d := dfxDiffSeq(dfxQuerySig(dfxCTE(gotQ, cteName)), dfxQuerySig(dfxCTE(wantQ, cteName))); d != "" {
-				p.addf("%s: %s WITH table %s differs from %s: %s", a.name, spec.kind, cteName, spec.assertName, d)
+				p.addf("%s: %s WITH table %s differs from %s: %s", a.name, spec.reportKind, cteName, spec.assertName, d)
 			}
 		}
 		if d := dfxDiffSeq(dfxQuerySig(gotQ), dfxQuerySig(wantQ)); d != "" {
-			p.addf("%s: %s final SELECT differs from %s: %s", a.name, spec.kind, spec.assertName, d)
+			p.addf("%s: %s final SELECT differs from %s: %s", a.name, spec.reportKind, spec.assertName, d)
 		}
 	}
 	return append(p, dfxCheckTrajectoryBody(a, body, rowCols)...)
@@ -2240,6 +2338,9 @@ func dfxCheckAssertion(a *dfxAction, rule dfxAssertionRule, run *dfxRun, tables 
 		return []string{fmt.Sprintf("%s: the query: %v", a.name, err)}
 	}
 	var p dashProblems
+	for _, msg := range dfxCheckRecursivePlacement(a.name, toks) {
+		p.addf("%s", msg)
+	}
 	if got := dfxCTENames(q); !slices.Equal(got, rule.ctes) {
 		p.addf("%s: the WITH tables are %v, want %v", a.name, got, rule.ctes)
 	}
@@ -2274,6 +2375,12 @@ func dfxCheckAssertion(a *dfxAction, rule dfxAssertionRule, run *dfxRun, tables 
 		p.addf("%s: reads the staging table and the trajectory mart %d times, want %d, each read with its own window predicate", a.name, n, rule.wantRefs)
 	}
 	if a.name == "assert_no_orphan_tokens" {
+		if tc := dfxCTE(q, "trajectory_context"); tc != nil && len(tc.branches) == 1 {
+			wantTCFrom := "ref.m_gen_ai_agent_trajectory AS M JOIN ref.stg_spans_dedup AS S ON M . TRACE_ID = S . TRACE_ID AND M . SERVICE_NAME IS NOT DISTINCT FROM S . SERVICE_NAME AND M . SPAN_ID = S . SPAN_ID"
+			if gotTCFrom := dashJoin(tc.branches[0].clauses["FROM"]); gotTCFrom != wantTCFrom {
+				p.addf("%s: trajectory_context FROM is %q, want %q", a.name, gotTCFrom, wantTCFrom)
+			}
+		}
 		if ea := dfxCTE(q, "emitted_ancestors"); ea != nil && len(ea.branches) == 2 {
 			wantSeed := []string{
 				"C . TRACE_ID",
@@ -2292,6 +2399,14 @@ func dfxCheckAssertion(a *dfxAction, rule dfxAssertionRule, run *dfxRun, tables 
 			if d := dfxDiffSeq(dfxItemSigs(ea.branches[0]), wantSeed); d != "" {
 				p.addf("%s: emitted_ancestors seed select items: %s", a.name, d)
 			}
+			wantSeedFrom := "TRAJECTORY_CONTEXT AS C JOIN TRAJECTORY_CONTEXT AS P ON P . TRACE_ID = C . TRACE_ID AND P . SPAN_ID = C . PARENT_SPAN_ID AND P . SERVICE_NAME IS NOT DISTINCT FROM C . SERVICE_NAME"
+			if gotSeedFrom := dashJoin(ea.branches[0].clauses["FROM"]); gotSeedFrom != wantSeedFrom {
+				p.addf("%s: emitted_ancestors seed FROM is %q, want %q", a.name, gotSeedFrom, wantSeedFrom)
+			}
+			wantSeedWhere := "P . SPAN_ID != C . SPAN_ID"
+			if gotSeedWhere := dashJoin(ea.branches[0].clauses["WHERE"]); gotSeedWhere != wantSeedWhere {
+				p.addf("%s: emitted_ancestors seed WHERE is %q, want %q", a.name, gotSeedWhere, wantSeedWhere)
+			}
 			wantRec := []string{
 				"EA . TRACE_ID",
 				"EA . SERVICE_NAME",
@@ -2308,6 +2423,14 @@ func dfxCheckAssertion(a *dfxAction, rule dfxAssertionRule, run *dfxRun, tables 
 			}
 			if d := dfxDiffSeq(dfxItemSigs(ea.branches[1]), wantRec); d != "" {
 				p.addf("%s: emitted_ancestors recursive select items: %s", a.name, d)
+			}
+			wantRecFrom := "EMITTED_ANCESTORS AS EA JOIN TRAJECTORY_CONTEXT AS P ON P . TRACE_ID = EA . TRACE_ID AND P . SPAN_ID = EA . ANCESTOR_PARENT_SPAN_ID AND P . SERVICE_NAME IS NOT DISTINCT FROM EA . SERVICE_NAME"
+			if gotRecFrom := dashJoin(ea.branches[1].clauses["FROM"]); gotRecFrom != wantRecFrom {
+				p.addf("%s: emitted_ancestors recursive FROM is %q, want %q", a.name, gotRecFrom, wantRecFrom)
+			}
+			wantRecWhere := "EA . HOP < 32 AND P . SPAN_ID NOT IN UNNEST ( EA . PATH_SPAN_IDS )"
+			if gotRecWhere := dashJoin(ea.branches[1].clauses["WHERE"]); gotRecWhere != wantRecWhere {
+				p.addf("%s: emitted_ancestors recursive WHERE is %q, want %q", a.name, gotRecWhere, wantRecWhere)
 			}
 		}
 		if cov := dfxCTE(q, "token_parent_coverage"); cov != nil && len(cov.branches) == 1 {
@@ -2333,6 +2456,12 @@ func dfxCheckAssertion(a *dfxAction, rule dfxAssertionRule, run *dfxRun, tables 
 			joined := dashJoin(dc.branches[0].clauses["WHERE"])
 			if !strings.Contains(joined, "( E . IS_TOKEN_LEAF AND NOT E . EXPECTED_IS_TOKEN_LEAF )") {
 				p.addf("%s: double_counted WHERE must check ( E . IS_TOKEN_LEAF AND NOT E . EXPECTED_IS_TOKEN_LEAF )", a.name)
+			}
+		}
+		if missing := dfxCTE(q, "missing"); missing != nil && len(missing.branches) == 1 {
+			wantMissingWhere := repl.Replace("( S . RAW_INPUT_TOKENS IS NOT NULL OR S . RAW_OUTPUT_TOKENS IS NOT NULL OR S . RAW_REASONING_TOKENS IS NOT NULL ) AND NOT EXISTS ( SELECT 1 FROM ref.m_gen_ai_agent_trajectory AS M WHERE M . START_TIME >= %R AND M . TRACE_ID = S . TRACE_ID AND M . SERVICE_NAME IS NOT DISTINCT FROM S . SERVICE_NAME AND M . SPAN_ID = S . SPAN_ID )")
+			if gotMissingWhere := dashJoin(missing.branches[0].clauses["WHERE"]); gotMissingWhere != wantMissingWhere {
+				p.addf("%s: the WHERE of the WITH table missing is %q, want %q", a.name, gotMissingWhere, wantMissingWhere)
 			}
 		}
 		wantFinalSig := []string{
@@ -2974,7 +3103,7 @@ var dfxMutations = []dfxMutation{
 	{area: "refresh", name: "commit_missing", file: dfxFTools,
 		edit: dashReplaceFirst("${when(incremental(), `COMMIT TRANSACTION`)}", ""), want: "m_mcp_tool_usage_hourly: in an incremental run, post_operations run [], want [commit transaction]"},
 	{area: "refresh", name: "trajectory_commit_run_window_missing", file: dfxFTraj,
-		edit: dashReplaceFirst("  ---\n  UPDATE ${ref(\"stg_run_window\")} SET is_committed = TRUE WHERE TRUE\n", ""), want: "m_gen_ai_agent_trajectory: in an incremental run, post_operations run [commit transaction assert no_unhandled_cycles assert no_orphan_tokens], want [commit transaction assert no_unhandled_cycles assert no_orphan_tokens commit run_window]"},
+		edit: dashReplaceFirst("  ---\n  UPDATE ${ref(\"stg_run_window\")} SET is_committed = TRUE WHERE TRUE\n", ""), want: "m_gen_ai_agent_trajectory: in an incremental run, post_operations run [commit transaction assert no_unhandled_cycles temp table orphan_token_violations assert no_orphan_tokens], want [commit transaction assert no_unhandled_cycles temp table orphan_token_violations assert no_orphan_tokens commit run_window]"},
 	{area: "refresh", name: "run_window_full_refresh_prev_not_epoch", file: dfxFRunWindow,
 		edit: dashReplaceFirst("`TIMESTAMP('1970-01-01 00:00:00+00')`", "`TIMESTAMP('9999-12-31 23:59:59+00')`"), want: "stg_run_window: in a full refresh, prev_window_start is TIMESTAMP ( '9999-12-31 23:59:59+00' ), want TIMESTAMP ( '1970-01-01 00:00:00+00' )"},
 	{area: "refresh", name: "run_window_prev_cutoff_missing", file: dfxFRunWindow,
@@ -3060,13 +3189,31 @@ var dfxMutations = []dfxMutation{
 	{area: "marts", name: "trajectory_post_assert_cycles_drifted", file: dfxFTraj,
 		edit: dashReplaceFirst("WHERE emitted.emitted_rows IS NULL\n      OR emitted.emitted_rows != 1", "WHERE emitted.emitted_rows IS NULL"), want: "m_gen_ai_agent_trajectory: assert no_unhandled_cycles final SELECT differs from assert_no_unhandled_cycles"},
 	{area: "marts", name: "trajectory_post_assert_orphans_drifted", file: dfxFTraj,
-		edit: dashReplaceFirst("SELECT trace_id, service_name, span_id, violation\n    FROM missing", "SELECT trace_id, service_name, span_id, violation\n    FROM missing\n    WHERE FALSE"), want: "m_gen_ai_agent_trajectory: assert no_orphan_tokens final SELECT differs from assert_no_orphan_tokens"},
+		edit: dashReplaceFirst("  SELECT trace_id, service_name, span_id, violation\n  FROM missing", "  SELECT trace_id, service_name, span_id, violation\n  FROM missing\n  WHERE FALSE"), want: "m_gen_ai_agent_trajectory: assert no_orphan_tokens final SELECT differs from assert_no_orphan_tokens"},
+	{area: "marts", name: "trajectory_post_assert_recursive_in_subquery", file: dfxFTraj,
+		edit: dashReplaceFirst("    SELECT 1 FROM _bq_otel_orphan_token_violations", "    WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 2) SELECT 1 FROM r"), want: "WITH RECURSIVE is not allowed inside a parenthesized subquery or ASSERT NOT EXISTS"},
 
 	// The assertions.
 	{area: "assertions", name: "orphans_emitted_ancestors_has_input_false", file: dfxFOrphans,
 		edit: dashReplaceFirst("c.raw_input_tokens IS NOT NULL AS has_input", "FALSE AS has_input"), want: "assert_no_orphan_tokens: emitted_ancestors seed select items"},
 	{area: "assertions", name: "orphans_emitted_ancestors_has_input_swapped", file: dfxFOrphans,
 		edit: dashReplaceFirst("c.raw_input_tokens IS NOT NULL AS has_input", "c.raw_output_tokens IS NOT NULL AS has_input"), want: "assert_no_orphan_tokens: emitted_ancestors seed select items"},
+	{area: "assertions", name: "orphans_trajectory_context_join_broken", file: dfxFOrphans,
+		edit: dashReplaceFirst("ON m.trace_id = s.trace_id\n      AND m.service_name IS NOT DISTINCT FROM s.service_name\n      AND m.span_id = s.span_id", "ON m.trace_id = s.trace_id\n      AND m.service_name IS NOT DISTINCT FROM s.service_name\n      AND m.span_id = m.parent_span_id"), want: "assert_no_orphan_tokens: trajectory_context FROM is"},
+	{area: "assertions", name: "orphans_seed_join_self_span", file: dfxFOrphans,
+		edit: dashReplaceFirst("AND p.span_id = c.parent_span_id", "AND p.span_id = c.span_id"), want: "assert_no_orphan_tokens: emitted_ancestors seed FROM is"},
+	{area: "assertions", name: "orphans_seed_path_array_broken", file: dfxFOrphans,
+		edit: dashReplaceFirst("[c.span_id, p.span_id] AS path_span_ids", "[c.span_id, c.span_id] AS path_span_ids"), want: "assert_no_orphan_tokens: emitted_ancestors seed select items"},
+	{area: "assertions", name: "orphans_recursive_join_broken", file: dfxFOrphans,
+		edit: dashReplaceFirst("AND p.span_id = ea.ancestor_parent_span_id", "AND p.span_id = ea.ancestor_span_id"), want: "assert_no_orphan_tokens: emitted_ancestors recursive FROM is"},
+	{area: "assertions", name: "orphans_recursive_path_array_broken", file: dfxFOrphans,
+		edit: dashReplaceFirst("ARRAY_CONCAT(ea.path_span_ids, [p.span_id]) AS path_span_ids", "[p.span_id] AS path_span_ids"), want: "assert_no_orphan_tokens: emitted_ancestors recursive select items"},
+	{area: "assertions", name: "orphans_recursive_where_and_false", file: dfxFOrphans,
+		edit: dashReplaceFirst("WHERE ea.hop < 32", "WHERE ea.hop < 32 AND FALSE"), want: "assert_no_orphan_tokens: emitted_ancestors recursive WHERE is"},
+	{area: "assertions", name: "orphans_recursive_cycle_guard_removed", file: dfxFOrphans,
+		edit: dashReplaceFirst("    WHERE ea.hop < 32\n      AND p.span_id NOT IN UNNEST(ea.path_span_ids)", "    WHERE ea.hop < 32"), want: "assert_no_orphan_tokens: emitted_ancestors recursive WHERE is"},
+	{area: "assertions", name: "orphans_missing_not_exists_and_false", file: dfxFOrphans,
+		edit: dashReplaceFirst("          AND m.span_id = s.span_id\n      )", "          AND m.span_id = s.span_id\n          AND FALSE\n      )"), want: "assert_no_orphan_tokens: the WHERE of the WITH table missing is"},
 	{area: "assertions", name: "orphans_missing_branch_where_false", file: dfxFOrphans,
 		edit: dashReplaceFirst("SELECT trace_id, service_name, span_id, violation\nFROM missing", "SELECT trace_id, service_name, span_id, violation\nFROM missing\nWHERE FALSE"), want: "assert_no_orphan_tokens: final UNION ALL branches"},
 	{area: "assertions", name: "orphans_description_claims_3h_window", file: dfxFOrphans,
@@ -3683,9 +3830,77 @@ func TestDataformSharedRunWindowAcrossHourBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("extract post_operations assert no_unhandled_cycles: %v", err)
 	}
-	postOrphansSQL, err := dfxAssertNotExistsSQL(trajRun.find("assert no_orphan_tokens"))
+	postOrphansSQL, err := dfxOrphanTokenTempTableSQL(trajRun.find("temp table orphan_token_violations"))
 	if err != nil {
-		t.Fatalf("extract post_operations assert no_orphan_tokens: %v", err)
+		t.Fatalf("extract post_operations temp table orphan_token_violations: %v", err)
+	}
+	if err := dfxCheckOrphanTokenAssertStmt(trajRun.find("assert no_orphan_tokens")); err != nil {
+		t.Fatalf("post_operations assert no_orphan_tokens: %v", err)
+	}
+
+	// evalTrajectoryPostOps executes a slice of m_gen_ai_agent_trajectory
+	// post_operations statements in order, validating top-level statement
+	// wrappers and GoogleSQL WITH RECURSIVE placement rules and aborting before
+	// UPDATE stg_run_window SET is_committed = TRUE whenever any ASSERT fails.
+	evalTrajectoryPostOps := func(stmts []dfxStmt, next []dfxSpanRow, win time.Time) (committed bool, cycViol, orphViol map[string][]string, err error) {
+		var tempTableViolations map[string][]string
+		hasTempTable := false
+		assertCyclesRan := false
+		assertOrphansRan := false
+		for i, st := range stmts {
+			for _, msg := range dfxCheckRecursivePlacement(st.kind, st.toks) {
+				return false, nil, nil, fmt.Errorf("post_operations statement %d (%s): %s", i+1, st.kind, msg)
+			}
+			switch st.kind {
+			case "commit transaction":
+				if dashJoin(st.toks) != "COMMIT TRANSACTION" {
+					return false, nil, nil, fmt.Errorf("unexpected commit transaction statement %q", dashJoin(st.toks))
+				}
+			case "assert no_unhandled_cycles":
+				sqlText, err := dfxAssertNotExistsSQL(&st)
+				if err != nil {
+					return false, nil, nil, fmt.Errorf("assert no_unhandled_cycles wrapper: %w", err)
+				}
+				cycViol, err = dfxEvalUnhandledCyclesAssertion(sqlText, next, win)
+				if err != nil {
+					return false, nil, nil, fmt.Errorf("evaluating assert no_unhandled_cycles: %w", err)
+				}
+				assertCyclesRan = true
+				if len(cycViol) > 0 {
+					return false, cycViol, orphViol, nil
+				}
+			case "temp table orphan_token_violations":
+				sqlText, err := dfxOrphanTokenTempTableSQL(&st)
+				if err != nil {
+					return false, nil, nil, fmt.Errorf("temp table orphan_token_violations wrapper: %w", err)
+				}
+				tempTableViolations, err = dfxEvalOrphanTokensAssertion(sqlText, next, win)
+				if err != nil {
+					return false, nil, nil, fmt.Errorf("evaluating temp table orphan_token_violations: %w", err)
+				}
+				hasTempTable = true
+			case "assert no_orphan_tokens":
+				if !hasTempTable {
+					return false, nil, nil, errors.New("assert no_orphan_tokens executed before temp table orphan_token_violations")
+				}
+				if err := dfxCheckOrphanTokenAssertStmt(&st); err != nil {
+					return false, nil, nil, err
+				}
+				orphViol = tempTableViolations
+				assertOrphansRan = true
+				if len(orphViol) > 0 {
+					return false, cycViol, orphViol, nil
+				}
+			case "commit run_window":
+				if !assertCyclesRan || !assertOrphansRan {
+					return false, nil, nil, errors.New("commit run_window executed before both post_operations ASSERT gates succeeded")
+				}
+				committed = true
+			default:
+				return false, nil, nil, fmt.Errorf("unexpected post_operations statement kind %q", st.kind)
+			}
+		}
+		return committed, cycViol, orphViol, nil
 	}
 
 	// runDAGStep executes one Dataform invocation in true DAG order:
@@ -3694,9 +3909,11 @@ func TestDataformSharedRunWindowAcrossHourBoundary(t *testing.T) {
 	//   3. m_gen_ai_agent_trajectory body + COMMIT TRANSACTION (materializes
 	//      reachable non-cycle spans in touched_traces; if failMartBeforePost is
 	//      true, aborts before post_operations)
-	//   4. m_gen_ai_agent_trajectory post_operations: runs both ASSERT NOT EXISTS
-	//      gates over start_time >= context_start; only if both return 0 rows
-	//      does UPDATE stg_run_window SET is_committed = TRUE execute.
+	//   4. m_gen_ai_agent_trajectory post_operations: runs COMMIT TRANSACTION,
+	//      ASSERT NOT EXISTS (cycles), CREATE OR REPLACE TEMP TABLE
+	//      _bq_otel_orphan_token_violations AS WITH RECURSIVE ..., ASSERT NOT
+	//      EXISTS (SELECT 1 FROM _bq_otel_orphan_token_violations), and finally
+	//      UPDATE stg_run_window SET is_committed = TRUE WHERE TRUE.
 	//   5. downstream assertions (assert_no_unhandled_cycles, assert_no_orphan_tokens)
 	type dagStepResult struct {
 		windowStart      time.Time
@@ -3729,7 +3946,7 @@ func TestDataformSharedRunWindowAcrossHourBoundary(t *testing.T) {
 				windowStart:     win,
 				stagedCount:     stagedCnt,
 				materializedCnt: matCnt,
-				committed:       false,
+				committed:       committed,
 			}
 		}
 
@@ -3788,6 +4005,11 @@ func TestDataformSharedRunWindowAcrossHourBoundary(t *testing.T) {
 			}
 		}
 
+		postCommitted, _, _, err := evalTrajectoryPostOps(trajRun.post, next, win)
+		if err != nil {
+			t.Fatalf("evalTrajectoryPostOps: %v", err)
+		}
+
 		cycViol, err := dfxEvalUnhandledCyclesAssertion(postCyclesSQL, next, win)
 		if err != nil {
 			t.Fatalf("dfxEvalUnhandledCyclesAssertion (post_operations): %v", err)
@@ -3819,9 +4041,11 @@ func TestDataformSharedRunWindowAcrossHourBoundary(t *testing.T) {
 		for spanID := range orphViol {
 			violatingSpans[spanID] = true
 		}
-		if len(violatingSpans) == 0 {
-			committed = true // UPDATE stg_run_window SET is_committed = TRUE executes
+		wantCommitted := len(violatingSpans) == 0
+		if postCommitted != wantCommitted {
+			t.Fatalf("evalTrajectoryPostOps committed = %v, want %v (violations=%v)", postCommitted, wantCommitted, violatingSpans)
 		}
+		committed = postCommitted
 
 		stagedCnt, matCnt := 0, 0
 		for _, r := range next {
@@ -3989,6 +4213,53 @@ func TestDataformSharedRunWindowAcrossHourBoundary(t *testing.T) {
 			t.Fatalf("next incremental run at 14:00Z = (%v, %v), want (%v, true)", nextInc.windowStart, nextInc.committed, want1100)
 		}
 	})
+
+	// Timeline 5: post_operations statement-level validation for GoogleSQL
+	// WITH RECURSIVE placement and orphan-token gate ordering before UPDATE.
+	t.Run("post_operations temp table + ASSERT NOT EXISTS ordering and WITH RECURSIVE placement", func(t *testing.T) {
+		cleanRow := []dfxSpanRow{
+			{
+				traceID: "t_clean", serviceName: "svc", spanID: "s_clean", parentSpanID: "",
+				startTime: time.Date(2026, 10, 25, 10, 15, 0, 0, time.UTC),
+				inMart:    true, isTokenLeaf: true, inputTokens: dfxInt64(10), rawInput: dfxInt64(10),
+			},
+		}
+		committed, cycViol, orphViol, err := evalTrajectoryPostOps(trajRun.post, cleanRow, want0900)
+		if err != nil || !committed || len(cycViol) != 0 || len(orphViol) != 0 {
+			t.Fatalf("clean post_operations = (committed=%v, cyc=%v, orph=%v, err=%v), want (true, empty, empty, nil)", committed, cycViol, orphViol, err)
+		}
+
+		// Emitted span whose rollup token was silently dropped passes cycle gate
+		// but fails the orphan-token temp table + ASSERT gate before UPDATE.
+		orphanDroppedRow := []dfxSpanRow{
+			{
+				traceID: "t_drop", serviceName: "svc", spanID: "s_drop", parentSpanID: "",
+				startTime: time.Date(2026, 10, 25, 10, 15, 0, 0, time.UTC),
+				inMart:    true, isTokenLeaf: false, inputTokens: dfxInt64(10), rawInput: dfxInt64(10),
+			},
+		}
+		committed, cycViol, orphViol, err = evalTrajectoryPostOps(trajRun.post, orphanDroppedRow, want0900)
+		if err != nil || committed || len(cycViol) != 0 || !slices.Equal(orphViol["s_drop"], []string{"rollup_token_changed"}) {
+			t.Fatalf("orphan-token violation post_operations = (committed=%v, cyc=%v, orph=%v, err=%v), want committed=false orph[s_drop]=[rollup_token_changed]", committed, cycViol, orphViol, err)
+		}
+
+		// Putting WITH RECURSIVE inside ASSERT NOT EXISTS (...) is rejected by the statement validator.
+		badToks, err := dashTokenize("ASSERT NOT EXISTS ( WITH RECURSIVE r AS ( SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 2 ) SELECT 1 FROM r )")
+		if err != nil {
+			t.Fatalf("dashTokenize: %v", err)
+		}
+		badStmts := slices.Clone(trajRun.post)
+		badStmts[3] = dfxStmt{kind: "assert no_orphan_tokens", toks: badToks}
+		if _, _, _, err := evalTrajectoryPostOps(badStmts, cleanRow, want0900); err == nil || !strings.Contains(err.Error(), "WITH RECURSIVE is not allowed inside a parenthesized subquery or ASSERT NOT EXISTS") {
+			t.Fatalf("expected WITH RECURSIVE inside ASSERT NOT EXISTS to fail statement validator, got %v", err)
+		}
+
+		// Reordering UPDATE before ASSERT NOT EXISTS is rejected.
+		reordered := []dfxStmt{trajRun.post[0], trajRun.post[1], trajRun.post[4], trajRun.post[2], trajRun.post[3]}
+		if _, _, _, err := evalTrajectoryPostOps(reordered, cleanRow, want0900); err == nil {
+			t.Fatal("expected UPDATE before assert no_orphan_tokens to fail")
+		}
+	})
 }
 
 // dfxSpanRow models a staged/emitted trajectory span row for testing the
@@ -4011,15 +4282,9 @@ type dfxSpanRow struct {
 
 func dfxInt64(v int64) *int64 { return &v }
 
-func dfxSameIntPtr(a, b *int64) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
-	}
-	return *a == *b
-}
-
 // dfxEvalBoolToks evaluates a boolean SQL expression from assert_no_orphan_tokens.sqlx
-// (emitted, row_violations, double_counted) directly from its parsed dashTok slice
+// (staged, trajectory_context, emitted_ancestors, token_parent_coverage, emitted,
+// row_violations, double_counted, missing) directly from its parsed dashTok slice
 // against the given identifier environment.
 func dfxEvalBoolToks(toks []dashTok, env map[string]any) (bool, error) {
 	pos := 0
@@ -4046,13 +4311,32 @@ func dfxEvalBoolToks(toks []dashTok, env map[string]any) (bool, error) {
 		return false
 	}
 
+	asInt64 := func(v any) (int64, bool) {
+		switch x := v.(type) {
+		case int:
+			return int64(x), true
+		case int64:
+			return x, true
+		case *int64:
+			if x != nil {
+				return *x, true
+			}
+		}
+		return 0, false
+	}
+
 	equalVal := func(a, b any) bool {
 		if isNilVal(a) || isNilVal(b) {
 			return isNilVal(a) && isNilVal(b)
 		}
-		if pa, ok := a.(*int64); ok {
-			if pb, ok := b.(*int64); ok {
-				return dfxSameIntPtr(pa, pb)
+		if ia, ok := asInt64(a); ok {
+			if ib, ok := asInt64(b); ok {
+				return ia == ib
+			}
+		}
+		if ta, ok := a.(time.Time); ok {
+			if tb, ok := b.(time.Time); ok {
+				return ta.Equal(tb)
 			}
 		}
 		if ba, ok := a.(bool); ok {
@@ -4061,6 +4345,61 @@ func dfxEvalBoolToks(toks []dashTok, env map[string]any) (bool, error) {
 			}
 		}
 		return reflect.DeepEqual(a, b)
+	}
+
+	compareVal := func(a, b any, op string) (bool, error) {
+		if isNilVal(a) || isNilVal(b) {
+			return false, nil
+		}
+		if op == "=" {
+			return equalVal(a, b), nil
+		}
+		if op == "!=" || op == "<>" {
+			return !equalVal(a, b), nil
+		}
+		if ia, ok := asInt64(a); ok {
+			if ib, ok := asInt64(b); ok {
+				switch op {
+				case "<":
+					return ia < ib, nil
+				case "<=":
+					return ia <= ib, nil
+				case ">":
+					return ia > ib, nil
+				case ">=":
+					return ia >= ib, nil
+				}
+			}
+		}
+		if ta, ok := a.(time.Time); ok {
+			if tb, ok := b.(time.Time); ok {
+				switch op {
+				case "<":
+					return ta.Before(tb), nil
+				case "<=":
+					return !ta.After(tb), nil
+				case ">":
+					return ta.After(tb), nil
+				case ">=":
+					return !ta.Before(tb), nil
+				}
+			}
+		}
+		if sa, ok := a.(string); ok {
+			if sb, ok := b.(string); ok {
+				switch op {
+				case "<":
+					return sa < sb, nil
+				case "<=":
+					return sa <= sb, nil
+				case ">":
+					return sa > sb, nil
+				case ">=":
+					return sa >= sb, nil
+				}
+			}
+		}
+		return false, fmt.Errorf("unsupported comparison %T %s %T", a, op, b)
 	}
 
 	parseVal = func() (any, error) {
@@ -4074,6 +4413,12 @@ func dfxEvalBoolToks(toks []dashTok, env map[string]any) (bool, error) {
 				return nil, err
 			}
 			inner := toks[pos+1 : closeIdx]
+			if len(inner) > 0 && inner[0].up == "SELECT" {
+				if v, ok := env[dashJoin(toks[pos:closeIdx+1])]; ok {
+					pos = closeIdx + 1
+					return v, nil
+				}
+			}
 			pos = closeIdx + 1
 			return dfxEvalBoolToks(inner, env)
 		}
@@ -4088,6 +4433,113 @@ func dfxEvalBoolToks(toks []dashTok, env map[string]any) (bool, error) {
 		if t.up == "NULL" {
 			pos++
 			return (*int64)(nil), nil
+		}
+		if t.kind == dashNumber {
+			n, err := strconv.ParseInt(t.text, 10, 64)
+			if err != nil {
+				return nil, err
+			}
+			pos++
+			return n, nil
+		}
+		if t.kind == dashString {
+			pos++
+			if len(t.text) >= 2 && (t.text[0] == '\'' || t.text[0] == '"') {
+				return t.text[1 : len(t.text)-1], nil
+			}
+			return t.text, nil
+		}
+		if t.up == "EXISTS" && pos+1 < len(toks) && toks[pos+1].is("(") {
+			closeIdx, err := findMatchingClose(pos + 1)
+			if err != nil {
+				return nil, err
+			}
+			subToks := toks[pos+2 : closeIdx]
+			pos = closeIdx + 1
+			subQ, err := dashParseSQL(dashJoin(subToks))
+			if err != nil {
+				return nil, fmt.Errorf("invalid EXISTS subquery: %w", err)
+			}
+			if len(subQ.branches) != 1 {
+				return nil, errors.New("invalid EXISTS subquery: want 1 branch")
+			}
+			sb := subQ.branches[0]
+			fromToks := sb.clauses["FROM"]
+			if len(fromToks) < 3 || fromToks[len(fromToks)-2].up != "AS" {
+				return nil, fmt.Errorf("EXISTS subquery FROM %q must end with AS <alias>", dashJoin(fromToks))
+			}
+			alias := strings.ToLower(fromToks[len(fromToks)-1].text)
+			subWhere := sb.clauses["WHERE"]
+			rowsVal, ok := env["__mart_rows__"]
+			if !ok {
+				return nil, errors.New("missing __mart_rows__ in environment for EXISTS subquery")
+			}
+			martRows, ok := rowsVal.([]dfxSpanRow)
+			if !ok {
+				return nil, errors.New("__mart_rows__ has unexpected type")
+			}
+			for _, mr := range martRows {
+				subEnv := maps.Clone(env)
+				subEnv[alias+".trace_id"] = mr.traceID
+				subEnv[alias+".service_name"] = mr.serviceName
+				subEnv[alias+".span_id"] = mr.spanID
+				subEnv[alias+".parent_span_id"] = mr.parentSpanID
+				subEnv[alias+".start_time"] = mr.startTime
+				subEnv[alias+".is_token_leaf"] = mr.isTokenLeaf
+				subEnv[alias+".input_tokens"] = mr.inputTokens
+				subEnv[alias+".output_tokens"] = mr.outputTokens
+				subEnv[alias+".reasoning_tokens"] = mr.reasoningTokens
+				subEnv[alias+".raw_input_tokens"] = mr.rawInput
+				subEnv[alias+".raw_output_tokens"] = mr.rawOutput
+				subEnv[alias+".raw_reasoning_tokens"] = mr.rawReasoning
+				matched, err := dfxEvalBoolToks(subWhere, subEnv)
+				if err != nil {
+					return nil, err
+				}
+				if matched {
+					return true, nil
+				}
+			}
+			return false, nil
+		}
+		if t.up == "TIMESTAMP_SUB" && pos+1 < len(toks) && toks[pos+1].is("(") {
+			closeIdx, err := findMatchingClose(pos + 1)
+			if err != nil {
+				return nil, err
+			}
+			argDepth := toks[pos+1].depth + 1
+			commaIdx := -1
+			for i := pos + 2; i < closeIdx; i++ {
+				if toks[i].depth == argDepth && toks[i].is(",") {
+					commaIdx = i
+					break
+				}
+			}
+			if commaIdx < 0 || commaIdx+4 != closeIdx || toks[commaIdx+1].up != "INTERVAL" || toks[commaIdx+3].up != "HOUR" {
+				return nil, fmt.Errorf("unsupported TIMESTAMP_SUB call %q", dashJoin(toks[pos:closeIdx+1]))
+			}
+			hrs, err := strconv.Atoi(toks[commaIdx+2].text)
+			if err != nil {
+				return nil, err
+			}
+			baseToks := toks[pos+2 : commaIdx]
+			var baseTime time.Time
+			if v, ok := env[dashJoin(baseToks)]; ok {
+				if bt, ok := v.(time.Time); ok {
+					baseTime = bt
+				}
+			} else if len(baseToks) == 1 {
+				if v, ok := env[strings.ToLower(baseToks[0].text)]; ok {
+					if bt, ok := v.(time.Time); ok {
+						baseTime = bt
+					}
+				}
+			}
+			if baseTime.IsZero() {
+				return nil, fmt.Errorf("unknown base timestamp %q in TIMESTAMP_SUB", dashJoin(baseToks))
+			}
+			pos = closeIdx + 1
+			return baseTime.Add(-time.Duration(hrs) * time.Hour), nil
 		}
 		if t.up == "COALESCE" && pos+1 < len(toks) && toks[pos+1].is("(") {
 			closeIdx, err := findMatchingClose(pos + 1)
@@ -4146,6 +4598,40 @@ func dfxEvalBoolToks(toks []dashTok, env map[string]any) (bool, error) {
 		if err != nil {
 			return false, err
 		}
+		if pos < len(toks) && (toks[pos].up == "NOT" || toks[pos].up == "IN") {
+			notIn := false
+			savePos := pos
+			if toks[pos].up == "NOT" {
+				notIn = true
+				pos++
+			}
+			if pos+2 < len(toks) && toks[pos].up == "IN" && toks[pos+1].up == "UNNEST" && toks[pos+2].is("(") {
+				closeIdx, err := findMatchingClose(pos + 2)
+				if err != nil {
+					return false, err
+				}
+				arrKey := strings.ToLower(strings.ReplaceAll(dashJoin(toks[pos+3:closeIdx]), " ", ""))
+				pos = closeIdx + 1
+				arrVal, ok := env[arrKey]
+				if !ok {
+					return false, fmt.Errorf("unknown array identifier %q in UNNEST", arrKey)
+				}
+				strSlice, ok := arrVal.([]string)
+				if !ok {
+					return false, fmt.Errorf("UNNEST(%s) is %T, want []string", arrKey, arrVal)
+				}
+				needle, ok := val.(string)
+				if !ok {
+					return false, fmt.Errorf("LHS of IN UNNEST is %T, want string", val)
+				}
+				found := slices.Contains(strSlice, needle)
+				if notIn {
+					return !found, nil
+				}
+				return found, nil
+			}
+			pos = savePos
+		}
 		if pos < len(toks) && toks[pos].up == "IS" {
 			pos++
 			notFlag := false
@@ -4173,6 +4659,17 @@ func dfxEvalBoolToks(toks []dashTok, env map[string]any) (bool, error) {
 				return !eq, nil
 			}
 			return false, fmt.Errorf("unsupported IS predicate at token %d", pos)
+		}
+		if pos < len(toks) {
+			op := toks[pos].text
+			if op == "=" || op == "!=" || op == "<>" || op == "<" || op == "<=" || op == ">" || op == ">=" {
+				pos++
+				rhs, err := parseVal()
+				if err != nil {
+					return false, err
+				}
+				return compareVal(val, rhs, op)
+			}
 		}
 		b, ok := val.(bool)
 		if !ok {
@@ -4338,19 +4835,223 @@ func dfxEvalUnhandledCyclesAssertion(sqlText string, rows []dfxSpanRow, windowSt
 	return violations, nil
 }
 
+// dfxExtractJoinOn extracts the ON <expr> tokens of a JOIN or LEFT JOIN from a
+// FROM clause token slice.
+func dfxExtractJoinOn(fromToks []dashTok) ([]dashTok, error) {
+	if len(fromToks) == 0 {
+		return nil, errors.New("empty FROM clause")
+	}
+	base := fromToks[0].depth
+	for i, t := range fromToks {
+		if t.depth == base && t.up == "ON" && i+1 < len(fromToks) {
+			return fromToks[i+1:], nil
+		}
+	}
+	return nil, fmt.Errorf("FROM clause %q has no top-level ON predicate", dashJoin(fromToks))
+}
+
+// dfxEvalStringArrayToks evaluates a targeted GoogleSQL string-array expression
+// subset: array literals ([a, b, ...]), ARRAY_CONCAT(arr1, arr2), and
+// environment array identifiers (such as ea.path_span_ids).
+func dfxEvalStringArrayToks(toks []dashTok, env map[string]any) ([]string, error) {
+	if len(toks) == 0 {
+		return nil, errors.New("empty string-array expression")
+	}
+	// Array literal: [ expr, expr, ... ]
+	if toks[0].is("[") && toks[len(toks)-1].is("]") {
+		inner := toks[1 : len(toks)-1]
+		if len(inner) == 0 {
+			return nil, nil
+		}
+		var out []string
+		start := 0
+		bracketDepth := 0
+		for i, t := range inner {
+			switch t.text {
+			case "[", "(":
+				bracketDepth++
+			case "]", ")":
+				bracketDepth--
+			case ",":
+				if bracketDepth == 0 {
+					elem := strings.ToLower(strings.ReplaceAll(dashJoin(inner[start:i]), " ", ""))
+					v, ok := env[elem]
+					if !ok {
+						return nil, fmt.Errorf("unknown array element identifier %q", elem)
+					}
+					s, ok := v.(string)
+					if !ok {
+						return nil, fmt.Errorf("array element %q is %T, want string", elem, v)
+					}
+					out = append(out, s)
+					start = i + 1
+				}
+			}
+		}
+		elem := strings.ToLower(strings.ReplaceAll(dashJoin(inner[start:]), " ", ""))
+		v, ok := env[elem]
+		if !ok {
+			return nil, fmt.Errorf("unknown array element identifier %q", elem)
+		}
+		s, ok := v.(string)
+		if !ok {
+			return nil, fmt.Errorf("array element %q is %T, want string", elem, v)
+		}
+		out = append(out, s)
+		return out, nil
+	}
+	// ARRAY_CONCAT(arg1, arg2, ...)
+	if len(toks) >= 4 && toks[0].up == "ARRAY_CONCAT" && toks[1].is("(") && toks[len(toks)-1].is(")") {
+		inner := toks[2 : len(toks)-1]
+		var out []string
+		start := 0
+		bracketDepth := 0
+		for i, t := range inner {
+			switch t.text {
+			case "[", "(":
+				bracketDepth++
+			case "]", ")":
+				bracketDepth--
+			case ",":
+				if bracketDepth == 0 {
+					part, err := dfxEvalStringArrayToks(inner[start:i], env)
+					if err != nil {
+						return nil, err
+					}
+					out = append(out, part...)
+					start = i + 1
+				}
+			}
+		}
+		part, err := dfxEvalStringArrayToks(inner[start:], env)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, part...)
+		return out, nil
+	}
+	// Qualified identifier: e.g. ea.path_span_ids
+	key := strings.ToLower(strings.ReplaceAll(dashJoin(toks), " ", ""))
+	v, ok := env[key]
+	if !ok {
+		return nil, fmt.Errorf("unsupported string-array expression %q", dashJoin(toks))
+	}
+	arr, ok := v.([]string)
+	if !ok {
+		return nil, fmt.Errorf("identifier %q is %T, want []string", key, v)
+	}
+	return slices.Clone(arr), nil
+}
+
 // dfxEvalOrphanTokensAssertion parses sqlText (the rendered SQL of
-// assert_no_orphan_tokens.sqlx or the second ASSERT NOT EXISTS query in
+// assert_no_orphan_tokens.sqlx or the temp table query in
 // m_gen_ai_agent_trajectory's post_operations) and evaluates its 32-hop
 // recursive emitted_ancestors -> token_parent_coverage -> emitted ->
 // (row_violations UNION ALL double_counted UNION ALL missing) AST on a set of
-// spans. Because the evaluator executes the parsed SQL AST of
-// emitted_ancestors, token_parent_coverage, emitted, row_violations,
-// double_counted, missing, and the final UNION ALL branches, mutating any of
-// those SQL expressions changes the evaluated result.
+// spans. Because the evaluator executes the parsed SQL AST of staged,
+// trajectory_context, emitted_ancestors (including JOIN ON, WHERE, and
+// path_span_ids cycle guard), token_parent_coverage, emitted, row_violations,
+// double_counted, missing (including the NOT EXISTS subquery), and the final
+// UNION ALL branches, mutating any of those SQL expressions changes the
+// evaluated result.
 func dfxEvalOrphanTokensAssertion(sqlText string, rows []dfxSpanRow, windowStart time.Time) (map[string][]string, error) {
 	q, err := dashParseSQL(sqlText)
 	if err != nil {
 		return nil, fmt.Errorf("parsing assertion SQL: %w", err)
+	}
+
+	contextStart := windowStart.Add(-24 * time.Hour)
+	baseEnv := map[string]any{
+		"window_start":                       windowStart,
+		"context_start":                      contextStart,
+		dfxSharedWindowExpr:                  windowStart,
+		strings.ToUpper(dfxSharedWindowExpr): windowStart,
+		"( SELECT RW . WINDOW_START FROM REF . STG_RUN_WINDOW AS RW )": windowStart,
+	}
+	bindRow := func(env map[string]any, prefix string, r dfxSpanRow) {
+		env[prefix+"trace_id"] = r.traceID
+		env[prefix+"service_name"] = r.serviceName
+		env[prefix+"span_id"] = r.spanID
+		env[prefix+"parent_span_id"] = r.parentSpanID
+		env[prefix+"start_time"] = r.startTime
+		env[prefix+"is_token_leaf"] = r.isTokenLeaf
+		env[prefix+"input_tokens"] = r.inputTokens
+		env[prefix+"output_tokens"] = r.outputTokens
+		env[prefix+"reasoning_tokens"] = r.reasoningTokens
+		env[prefix+"raw_input_tokens"] = r.rawInput
+		env[prefix+"raw_output_tokens"] = r.rawOutput
+		env[prefix+"raw_reasoning_tokens"] = r.rawReasoning
+	}
+
+	// Parse staged CTE and evaluate its WHERE predicate on rows.
+	stagedCTE := dfxCTE(q, "staged")
+	if stagedCTE == nil || len(stagedCTE.branches) != 1 {
+		return nil, errors.New("missing staged CTE")
+	}
+	stagedWhere := stagedCTE.branches[0].clauses["WHERE"]
+	if len(stagedWhere) == 0 {
+		return nil, errors.New("staged CTE missing WHERE clause")
+	}
+	var staged []dfxSpanRow
+	for _, r := range rows {
+		env := maps.Clone(baseEnv)
+		bindRow(env, "", r)
+		bindRow(env, "s.", r)
+		keep, err := dfxEvalBoolToks(stagedWhere, env)
+		if err != nil {
+			return nil, fmt.Errorf("evaluating staged WHERE: %w", err)
+		}
+		if keep {
+			staged = append(staged, r)
+		}
+	}
+
+	// Parse trajectory_context CTE and evaluate its JOIN ON and WHERE predicates.
+	tcCTE := dfxCTE(q, "trajectory_context")
+	if tcCTE == nil || len(tcCTE.branches) != 1 {
+		return nil, errors.New("missing trajectory_context CTE")
+	}
+	tcJoinOn, err := dfxExtractJoinOn(tcCTE.branches[0].clauses["FROM"])
+	if err != nil {
+		return nil, fmt.Errorf("trajectory_context FROM: %w", err)
+	}
+	tcWhere := tcCTE.branches[0].clauses["WHERE"]
+	if len(tcWhere) == 0 {
+		return nil, errors.New("trajectory_context missing WHERE clause")
+	}
+
+	var martRows []dfxSpanRow
+	for _, r := range rows {
+		if r.inMart {
+			martRows = append(martRows, r)
+		}
+	}
+
+	var context []dfxSpanRow
+	for _, m := range martRows {
+		for _, s := range staged {
+			jEnv := maps.Clone(baseEnv)
+			bindRow(jEnv, "m.", m)
+			bindRow(jEnv, "s.", s)
+			jKeep, err := dfxEvalBoolToks(tcJoinOn, jEnv)
+			if err != nil {
+				return nil, fmt.Errorf("evaluating trajectory_context JOIN ON: %w", err)
+			}
+			if !jKeep {
+				continue
+			}
+			wKeep, err := dfxEvalBoolToks(tcWhere, jEnv)
+			if err != nil {
+				return nil, fmt.Errorf("evaluating trajectory_context WHERE: %w", err)
+			}
+			if wKeep {
+				merged := m
+				merged.rawInput = s.rawInput
+				merged.rawOutput = s.rawOutput
+				merged.rawReasoning = s.rawReasoning
+				context = append(context, merged)
+			}
+		}
 	}
 
 	// Parse emitted_ancestors seed and recursive branches from the SQL AST.
@@ -4358,8 +5059,21 @@ func dfxEvalOrphanTokensAssertion(sqlText string, rows []dfxSpanRow, windowStart
 	if eaCTE == nil || len(eaCTE.branches) != 2 {
 		return nil, errors.New("missing emitted_ancestors recursive CTE with 2 branches")
 	}
-	if gotSeedWhere := dashJoin(eaCTE.branches[0].clauses["WHERE"]); gotSeedWhere != "P . SPAN_ID != C . SPAN_ID" {
-		return nil, fmt.Errorf("emitted_ancestors seed WHERE = %q, want P . SPAN_ID != C . SPAN_ID", gotSeedWhere)
+	eaSeedJoinOn, err := dfxExtractJoinOn(eaCTE.branches[0].clauses["FROM"])
+	if err != nil {
+		return nil, fmt.Errorf("emitted_ancestors seed FROM: %w", err)
+	}
+	eaSeedWhere := eaCTE.branches[0].clauses["WHERE"]
+	if len(eaSeedWhere) == 0 {
+		return nil, errors.New("emitted_ancestors seed missing WHERE clause")
+	}
+	eaRecJoinOn, err := dfxExtractJoinOn(eaCTE.branches[1].clauses["FROM"])
+	if err != nil {
+		return nil, fmt.Errorf("emitted_ancestors recursive FROM: %w", err)
+	}
+	eaRecWhere := eaCTE.branches[1].clauses["WHERE"]
+	if len(eaRecWhere) == 0 {
+		return nil, errors.New("emitted_ancestors recursive missing WHERE clause")
 	}
 	eaSeedExprs := map[string][]dashTok{}
 	for _, it := range eaCTE.branches[0].items {
@@ -4369,7 +5083,7 @@ func dfxEvalOrphanTokensAssertion(sqlText string, rows []dfxSpanRow, windowStart
 	for _, it := range eaCTE.branches[1].items {
 		eaRecExprs[strings.ToLower(it.name)] = it.body
 	}
-	for _, need := range []string{"has_input", "has_output", "has_reasoning"} {
+	for _, need := range []string{"has_input", "has_output", "has_reasoning", "path_span_ids"} {
 		if len(eaSeedExprs[need]) == 0 {
 			return nil, fmt.Errorf("emitted_ancestors seed branch missing item %s", need)
 		}
@@ -4377,13 +5091,48 @@ func dfxEvalOrphanTokensAssertion(sqlText string, rows []dfxSpanRow, windowStart
 			return nil, fmt.Errorf("emitted_ancestors recursive branch missing item %s", need)
 		}
 	}
-	hopMatch := dfxHopLimitRE.FindStringSubmatch(dashJoin(eaCTE.branches[1].clauses["WHERE"]))
+	hopMatch := dfxHopLimitRE.FindStringSubmatch(dashJoin(eaRecWhere))
 	if hopMatch == nil {
-		return nil, fmt.Errorf("emitted_ancestors recursive WHERE %q missing EA . HOP < N", dashJoin(eaCTE.branches[1].clauses["WHERE"]))
+		return nil, fmt.Errorf("emitted_ancestors recursive WHERE %q missing EA . HOP < N", dashJoin(eaRecWhere))
 	}
 	maxHops, err := strconv.Atoi(hopMatch[1])
 	if err != nil {
 		return nil, err
+	}
+	// Verify that seed/recursive path_span_ids expressions and the recursive WHERE
+	// predicate evaluate to [c.span_id, p.span_id] and ARRAY_CONCAT(ea.path_span_ids, [p.span_id])
+	// and reject extending a path onto any span_id already present in ea.path_span_ids.
+	seedProbePath, err := dfxEvalStringArrayToks(eaSeedExprs["path_span_ids"], map[string]any{
+		"c.span_id": "probe_desc",
+		"p.span_id": "probe_anc",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("evaluating emitted_ancestors seed path_span_ids: %w", err)
+	}
+	if !slices.Equal(seedProbePath, []string{"probe_desc", "probe_anc"}) {
+		return nil, fmt.Errorf("emitted_ancestors seed path_span_ids evaluated to %v, want [probe_desc probe_anc]", seedProbePath)
+	}
+	recProbePath, err := dfxEvalStringArrayToks(eaRecExprs["path_span_ids"], map[string]any{
+		"ea.path_span_ids": seedProbePath,
+		"p.span_id":        "probe_gp",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("evaluating emitted_ancestors recursive path_span_ids: %w", err)
+	}
+	if !slices.Equal(recProbePath, []string{"probe_desc", "probe_anc", "probe_gp"}) {
+		return nil, fmt.Errorf("emitted_ancestors recursive path_span_ids evaluated to %v, want [probe_desc probe_anc probe_gp]", recProbePath)
+	}
+	for _, cycleSpan := range []string{"probe_desc", "probe_anc", "probe_gp"} {
+		cycleProbeEnv := map[string]any{
+			"ea.hop":           int64(2),
+			"ea.path_span_ids": recProbePath,
+			"p.span_id":        cycleSpan,
+		}
+		if cycleProbeAllowed, err := dfxEvalBoolToks(eaRecWhere, cycleProbeEnv); err != nil {
+			return nil, fmt.Errorf("evaluating emitted_ancestors recursive WHERE on cycle probe: %w", err)
+		} else if cycleProbeAllowed {
+			return nil, fmt.Errorf("emitted_ancestors recursive WHERE %q does not reject p.span_id %q already in ea.path_span_ids %v", dashJoin(eaRecWhere), cycleSpan, recProbePath)
+		}
 	}
 
 	// Parse token_parent_coverage LOGICAL_OR(ea.<col>) mappings from the SQL AST.
@@ -4476,50 +5225,12 @@ func dfxEvalOrphanTokensAssertion(sqlText string, rows []dfxSpanRow, windowStart
 		return nil, errors.New("missing CTE has no violation string literal")
 	}
 	missingWhere := missingCTE.branches[0].clauses["WHERE"]
-	andNotExistsIdx := -1
-	if len(missingWhere) > 0 {
-		base := missingWhere[0].depth
-		for i := 0; i+3 < len(missingWhere); i++ {
-			if missingWhere[i].depth == base &&
-				missingWhere[i].up == "AND" &&
-				missingWhere[i+1].up == "NOT" &&
-				missingWhere[i+2].up == "EXISTS" &&
-				missingWhere[i+3].is("(") {
-				andNotExistsIdx = i
-				break
-			}
-		}
-	}
-	if andNotExistsIdx <= 0 {
-		return nil, errors.New("missing CTE WHERE lacks top-level AND NOT EXISTS (...)")
-	}
-	missingTokenPred := missingWhere[:andNotExistsIdx]
-	notExistsJoin := dashJoin(missingWhere[andNotExistsIdx:])
-	if !strings.Contains(notExistsJoin, "M . TRACE_ID = S . TRACE_ID AND M . SERVICE_NAME IS NOT DISTINCT FROM S . SERVICE_NAME AND M . SPAN_ID = S . SPAN_ID") {
-		return nil, fmt.Errorf("missing CTE NOT EXISTS subquery %q missing span identity join", notExistsJoin)
+	if len(missingWhere) == 0 {
+		return nil, errors.New("missing CTE has no WHERE clause")
 	}
 
-	contextStart := windowStart.Add(-24 * time.Hour)
-
-	// 1. staged: spans in stg_spans_dedup with start_time >= contextStart (24h window).
-	var staged []dfxSpanRow
-	for _, r := range rows {
-		if !r.startTime.Before(contextStart) {
-			staged = append(staged, r)
-		}
-	}
-
-	// 2. trajectory_context: emitted rows joined with staged rows in the 24h context window.
-	var context []dfxSpanRow
-	byKey := map[string]dfxSpanRow{}
-	for _, r := range rows {
-		if r.inMart && !r.startTime.Before(contextStart) {
-			context = append(context, r)
-			byKey[r.traceID+"|"+r.serviceName+"|"+r.spanID] = r
-		}
-	}
-
-	// 3. emitted_ancestors: evaluated from the parsed seed and recursive SELECT ASTs.
+	// 3. emitted_ancestors: evaluated from the parsed seed and recursive
+	// JOIN ON, WHERE, and SELECT ASTs.
 	type ancEdge struct {
 		traceID             string
 		serviceName         string
@@ -4529,68 +5240,49 @@ func dfxEvalOrphanTokensAssertion(sqlText string, rows []dfxSpanRow, windowStart
 		hasOutput           bool
 		hasReasoning        bool
 		ancestorSpanID      string
+		ancestorParentID    string
 		ancestorStartTime   time.Time
+		hop                 int64
+		pathSpanIDs         []string
 	}
 	var edges []ancEdge
+	var frontier []ancEdge
 	for _, c := range context {
-		curParent := c.parentSpanID
-		visited := map[string]bool{c.spanID: true}
-		var curIn, curOut, curReas bool
-		for hop := 1; hop <= maxHops && curParent != ""; hop++ {
-			if visited[curParent] {
-				break
+		for _, p := range context {
+			seedEnv := maps.Clone(baseEnv)
+			bindRow(seedEnv, "c.", c)
+			bindRow(seedEnv, "p.", p)
+			joined, err := dfxEvalBoolToks(eaSeedJoinOn, seedEnv)
+			if err != nil {
+				return nil, fmt.Errorf("evaluating emitted_ancestors seed JOIN ON: %w", err)
 			}
-			p, ok := byKey[c.traceID+"|"+c.serviceName+"|"+curParent]
-			if !ok {
-				break
+			if !joined {
+				continue
 			}
-			visited[p.spanID] = true
-			if hop == 1 {
-				seedEnv := map[string]any{
-					"c.raw_input_tokens":     c.rawInput,
-					"c.raw_output_tokens":    c.rawOutput,
-					"c.raw_reasoning_tokens": c.rawReasoning,
-					"c.input_tokens":         c.inputTokens,
-					"c.output_tokens":        c.outputTokens,
-					"c.reasoning_tokens":     c.reasoningTokens,
-					"c.is_token_leaf":        c.isTokenLeaf,
-					"p.raw_input_tokens":     p.rawInput,
-					"p.raw_output_tokens":    p.rawOutput,
-					"p.raw_reasoning_tokens": p.rawReasoning,
-					"p.is_token_leaf":        p.isTokenLeaf,
-				}
-				var err error
-				if curIn, err = dfxEvalBoolToks(eaSeedExprs["has_input"], seedEnv); err != nil {
-					return nil, fmt.Errorf("evaluating emitted_ancestors seed has_input: %w", err)
-				}
-				if curOut, err = dfxEvalBoolToks(eaSeedExprs["has_output"], seedEnv); err != nil {
-					return nil, fmt.Errorf("evaluating emitted_ancestors seed has_output: %w", err)
-				}
-				if curReas, err = dfxEvalBoolToks(eaSeedExprs["has_reasoning"], seedEnv); err != nil {
-					return nil, fmt.Errorf("evaluating emitted_ancestors seed has_reasoning: %w", err)
-				}
-			} else {
-				recEnv := map[string]any{
-					"ea.has_input":           curIn,
-					"ea.has_output":          curOut,
-					"ea.has_reasoning":       curReas,
-					"p.raw_input_tokens":     p.rawInput,
-					"p.raw_output_tokens":    p.rawOutput,
-					"p.raw_reasoning_tokens": p.rawReasoning,
-					"p.is_token_leaf":        p.isTokenLeaf,
-				}
-				var err error
-				if curIn, err = dfxEvalBoolToks(eaRecExprs["has_input"], recEnv); err != nil {
-					return nil, fmt.Errorf("evaluating emitted_ancestors recursive has_input: %w", err)
-				}
-				if curOut, err = dfxEvalBoolToks(eaRecExprs["has_output"], recEnv); err != nil {
-					return nil, fmt.Errorf("evaluating emitted_ancestors recursive has_output: %w", err)
-				}
-				if curReas, err = dfxEvalBoolToks(eaRecExprs["has_reasoning"], recEnv); err != nil {
-					return nil, fmt.Errorf("evaluating emitted_ancestors recursive has_reasoning: %w", err)
-				}
+			keep, err := dfxEvalBoolToks(eaSeedWhere, seedEnv)
+			if err != nil {
+				return nil, fmt.Errorf("evaluating emitted_ancestors seed WHERE: %w", err)
 			}
-			edges = append(edges, ancEdge{
+			if !keep {
+				continue
+			}
+			curIn, err := dfxEvalBoolToks(eaSeedExprs["has_input"], seedEnv)
+			if err != nil {
+				return nil, fmt.Errorf("evaluating emitted_ancestors seed has_input: %w", err)
+			}
+			curOut, err := dfxEvalBoolToks(eaSeedExprs["has_output"], seedEnv)
+			if err != nil {
+				return nil, fmt.Errorf("evaluating emitted_ancestors seed has_output: %w", err)
+			}
+			curReas, err := dfxEvalBoolToks(eaSeedExprs["has_reasoning"], seedEnv)
+			if err != nil {
+				return nil, fmt.Errorf("evaluating emitted_ancestors seed has_reasoning: %w", err)
+			}
+			seedPath, err := dfxEvalStringArrayToks(eaSeedExprs["path_span_ids"], seedEnv)
+			if err != nil {
+				return nil, fmt.Errorf("evaluating emitted_ancestors seed path_span_ids: %w", err)
+			}
+			edge := ancEdge{
 				traceID:             c.traceID,
 				serviceName:         c.serviceName,
 				descendantSpanID:    c.spanID,
@@ -4599,10 +5291,83 @@ func dfxEvalOrphanTokensAssertion(sqlText string, rows []dfxSpanRow, windowStart
 				hasOutput:           curOut,
 				hasReasoning:        curReas,
 				ancestorSpanID:      p.spanID,
+				ancestorParentID:    p.parentSpanID,
 				ancestorStartTime:   p.startTime,
-			})
-			curParent = p.parentSpanID
+				hop:                 1,
+				pathSpanIDs:         seedPath,
+			}
+			edges = append(edges, edge)
+			frontier = append(frontier, edge)
 		}
+	}
+	for step := 0; len(frontier) > 0 && step <= maxHops+2; step++ {
+		var nextFrontier []ancEdge
+		for _, ea := range frontier {
+			for _, p := range context {
+				recEnv := maps.Clone(baseEnv)
+				bindRow(recEnv, "p.", p)
+				recEnv["ea.trace_id"] = ea.traceID
+				recEnv["ea.service_name"] = ea.serviceName
+				recEnv["ea.descendant_span_id"] = ea.descendantSpanID
+				recEnv["ea.descendant_start_time"] = ea.descendantStartTime
+				recEnv["ea.has_input"] = ea.hasInput
+				recEnv["ea.has_output"] = ea.hasOutput
+				recEnv["ea.has_reasoning"] = ea.hasReasoning
+				recEnv["ea.ancestor_span_id"] = ea.ancestorSpanID
+				recEnv["ea.ancestor_parent_span_id"] = ea.ancestorParentID
+				recEnv["ea.ancestor_start_time"] = ea.ancestorStartTime
+				recEnv["ea.hop"] = ea.hop
+				recEnv["ea.path_span_ids"] = ea.pathSpanIDs
+
+				joined, err := dfxEvalBoolToks(eaRecJoinOn, recEnv)
+				if err != nil {
+					return nil, fmt.Errorf("evaluating emitted_ancestors recursive JOIN ON: %w", err)
+				}
+				if !joined {
+					continue
+				}
+				keep, err := dfxEvalBoolToks(eaRecWhere, recEnv)
+				if err != nil {
+					return nil, fmt.Errorf("evaluating emitted_ancestors recursive WHERE: %w", err)
+				}
+				if !keep {
+					continue
+				}
+				curIn, err := dfxEvalBoolToks(eaRecExprs["has_input"], recEnv)
+				if err != nil {
+					return nil, fmt.Errorf("evaluating emitted_ancestors recursive has_input: %w", err)
+				}
+				curOut, err := dfxEvalBoolToks(eaRecExprs["has_output"], recEnv)
+				if err != nil {
+					return nil, fmt.Errorf("evaluating emitted_ancestors recursive has_output: %w", err)
+				}
+				curReas, err := dfxEvalBoolToks(eaRecExprs["has_reasoning"], recEnv)
+				if err != nil {
+					return nil, fmt.Errorf("evaluating emitted_ancestors recursive has_reasoning: %w", err)
+				}
+				nextPath, err := dfxEvalStringArrayToks(eaRecExprs["path_span_ids"], recEnv)
+				if err != nil {
+					return nil, fmt.Errorf("evaluating emitted_ancestors recursive path_span_ids: %w", err)
+				}
+				edge := ancEdge{
+					traceID:             ea.traceID,
+					serviceName:         ea.serviceName,
+					descendantSpanID:    ea.descendantSpanID,
+					descendantStartTime: ea.descendantStartTime,
+					hasInput:            curIn,
+					hasOutput:           curOut,
+					hasReasoning:        curReas,
+					ancestorSpanID:      p.spanID,
+					ancestorParentID:    p.parentSpanID,
+					ancestorStartTime:   p.startTime,
+					hop:                 ea.hop + 1,
+					pathSpanIDs:         nextPath,
+				}
+				edges = append(edges, edge)
+				nextFrontier = append(nextFrontier, edge)
+			}
+		}
+		frontier = nextFrontier
 	}
 
 	// 4. token_parent_coverage with reverse_path cycle tie-breaker, using the
@@ -4742,21 +5507,17 @@ func dfxEvalOrphanTokensAssertion(sqlText string, rows []dfxSpanRow, windowStart
 		}
 	}
 
-	// 6. missing CTE evaluated from its parsed WHERE predicate and violation literal.
+	// 6. missing CTE evaluated from its parsed WHERE predicate (including the
+	// NOT EXISTS subquery over the trajectory mart) and violation literal.
 	for _, s := range staged {
-		missingEnv := map[string]any{
-			"s.raw_input_tokens":     s.rawInput,
-			"s.raw_output_tokens":    s.rawOutput,
-			"s.raw_reasoning_tokens": s.rawReasoning,
-		}
-		hasTok, err := dfxEvalBoolToks(missingTokenPred, missingEnv)
+		missingEnv := maps.Clone(baseEnv)
+		bindRow(missingEnv, "s.", s)
+		missingEnv["__mart_rows__"] = martRows
+		matched, err := dfxEvalBoolToks(missingWhere, missingEnv)
 		if err != nil {
-			return nil, fmt.Errorf("evaluating missing WHERE token predicate: %w", err)
+			return nil, fmt.Errorf("evaluating missing WHERE: %w", err)
 		}
-		if !hasTok {
-			continue
-		}
-		if _, ok := byKey[s.traceID+"|"+s.serviceName+"|"+s.spanID]; !ok {
+		if matched {
 			cteRows["missing"] = append(cteRows["missing"], candRow{
 				spanID:    s.spanID,
 				violation: missingViolation,
@@ -4819,6 +5580,18 @@ func TestDataformOrphanTokensAssertionSemantics(t *testing.T) {
 	run, err := dfxRender(a, true)
 	if err != nil {
 		t.Fatalf("dfxRender: %v", err)
+	}
+	trajAction := pkg.byName[dfxTraj]
+	if trajAction == nil {
+		t.Fatalf("missing %s", dfxTraj)
+	}
+	trajRun, err := dfxRender(trajAction, true)
+	if err != nil {
+		t.Fatalf("dfxRender(%s): %v", dfxTraj, err)
+	}
+	postOrphansSQL, err := dfxOrphanTokenTempTableSQL(trajRun.find("temp table orphan_token_violations"))
+	if err != nil {
+		t.Fatalf("dfxOrphanTokenTempTableSQL: %v", err)
 	}
 	upper := strings.ToUpper(run.body)
 	for _, required := range []string{
@@ -5019,6 +5792,112 @@ func TestDataformOrphanTokensAssertionSemantics(t *testing.T) {
 		}
 		if slices.Equal(got["orphan_cycle_span"], []string{"span_missing_from_trajectory"}) {
 			t.Errorf("appending WHERE FALSE to FROM missing still reported span_missing_from_trajectory; evaluator is not bound to final UNION ALL AST")
+		}
+	})
+
+	t.Run("SQL mutation changing seed join p.span_id = c.parent_span_id to p.span_id = c.span_id is caught by AST evaluator on both copies", func(t *testing.T) {
+		for _, sqlSrc := range []string{run.body, postOrphansSQL} {
+			mutatedSQL := strings.Replace(sqlSrc, "AND p.span_id = c.parent_span_id", "AND p.span_id = c.span_id", 1)
+			if mutatedSQL == sqlSrc {
+				t.Fatal("failed to mutate seed join ON in rendered SQL")
+			}
+			got, err := dfxEvalOrphanTokensAssertion(mutatedSQL, validTreeRows, windowStart)
+			if err != nil {
+				t.Fatalf("dfxEvalOrphanTokensAssertion on mutated SQL: %v", err)
+			}
+			if !slices.Equal(got["root"], []string{"rollup_token_changed"}) {
+				t.Errorf("mutating seed join ON to p.span_id = c.span_id gave %v on validTreeRows, want root:[rollup_token_changed]", got)
+			}
+		}
+	})
+
+	t.Run("SQL mutation breaking recursive join p.span_id = ea.ancestor_parent_span_id or adding AND FALSE to recursive WHERE is caught by AST evaluator on both copies", func(t *testing.T) {
+		for _, sqlSrc := range []string{run.body, postOrphansSQL} {
+			mutJoin := strings.Replace(sqlSrc, "AND p.span_id = ea.ancestor_parent_span_id", "AND p.span_id = ea.ancestor_span_id", 1)
+			if mutJoin == sqlSrc {
+				t.Fatal("failed to mutate recursive join ON in rendered SQL")
+			}
+			gotJoin, err := dfxEvalOrphanTokensAssertion(mutJoin, validTreeRows, windowStart)
+			if err != nil {
+				t.Fatalf("dfxEvalOrphanTokensAssertion on mutated recursive join SQL: %v", err)
+			}
+			if !slices.Equal(gotJoin["root"], []string{"rollup_token_changed"}) {
+				t.Errorf("mutating recursive join ON gave %v on validTreeRows, want root:[rollup_token_changed]", gotJoin)
+			}
+
+			mutWhere := strings.Replace(sqlSrc, "WHERE ea.hop < 32", "WHERE ea.hop < 32 AND FALSE", 1)
+			if mutWhere == sqlSrc {
+				t.Fatal("failed to mutate recursive WHERE in rendered SQL")
+			}
+			gotWhere, err := dfxEvalOrphanTokensAssertion(mutWhere, validTreeRows, windowStart)
+			if err != nil {
+				t.Fatalf("dfxEvalOrphanTokensAssertion on mutated recursive WHERE SQL: %v", err)
+			}
+			if !slices.Equal(gotWhere["root"], []string{"rollup_token_changed"}) {
+				t.Errorf("mutating recursive WHERE to AND FALSE gave %v on validTreeRows, want root:[rollup_token_changed]", gotWhere)
+			}
+		}
+	})
+
+	t.Run("SQL mutation removing p.span_id NOT IN UNNEST(ea.path_span_ids) from recursive WHERE is caught by AST evaluator on both copies", func(t *testing.T) {
+		for _, sqlSrc := range []string{run.body, postOrphansSQL} {
+			mutatedSQL := strings.Replace(sqlSrc, "AND p.span_id NOT IN UNNEST(ea.path_span_ids)", "", 1)
+			if mutatedSQL == sqlSrc {
+				t.Fatal("failed to remove path_span_ids cycle guard in rendered SQL")
+			}
+			if _, err := dfxEvalOrphanTokensAssertion(mutatedSQL, validTreeRows, windowStart); err == nil {
+				t.Errorf("removing p.span_id NOT IN UNNEST(ea.path_span_ids) succeeded, want error from cycle guard check")
+			}
+		}
+	})
+
+	t.Run("SQL mutation appending AND FALSE to missing NOT EXISTS subquery or outer WHERE is caught by AST evaluator on both copies", func(t *testing.T) {
+		for _, sqlSrc := range []string{run.body, postOrphansSQL} {
+			idx := strings.LastIndex(sqlSrc, "AND m.span_id = s.span_id")
+			if idx < 0 {
+				t.Fatal("failed to locate missing NOT EXISTS span_id predicate in rendered SQL")
+			}
+			mutInner := sqlSrc[:idx] + "AND m.span_id = s.span_id AND FALSE" + sqlSrc[idx+len("AND m.span_id = s.span_id"):]
+			gotInner, err := dfxEvalOrphanTokensAssertion(mutInner, validTreeRows, windowStart)
+			if err != nil {
+				t.Fatalf("dfxEvalOrphanTokensAssertion on inner NOT EXISTS mutation: %v", err)
+			}
+			if !slices.Contains(gotInner["root"], "span_missing_from_trajectory") ||
+				!slices.Contains(gotInner["leaf"], "span_missing_from_trajectory") {
+				t.Errorf("appending AND FALSE inside NOT EXISTS gave %v on validTreeRows, want span_missing_from_trajectory on emitted token spans", gotInner)
+			}
+		}
+	})
+
+	t.Run("SQL mutation breaking trajectory_context join or emitted_ancestors path_span_ids array is caught by AST evaluator on both copies", func(t *testing.T) {
+		for _, sqlSrc := range []string{run.body, postOrphansSQL} {
+			mutTC := strings.Replace(sqlSrc, "AND m.span_id = s.span_id", "AND m.span_id = s.parent_span_id", 1)
+			if mutTC == sqlSrc {
+				t.Fatal("failed to mutate trajectory_context JOIN ON in rendered SQL")
+			}
+			gotTC, err := dfxEvalOrphanTokensAssertion(mutTC, validTreeRows, windowStart)
+			if err != nil {
+				t.Fatalf("dfxEvalOrphanTokensAssertion on trajectory_context mutation: %v", err)
+			}
+			if len(gotTC) == 0 {
+				t.Errorf("mutating trajectory_context JOIN ON gave 0 violations on validTreeRows, want violations")
+			}
+
+			mutSeedPath := strings.Replace(sqlSrc, "[c.span_id, p.span_id] AS path_span_ids", "[c.span_id, c.span_id] AS path_span_ids", 1)
+			if mutSeedPath == sqlSrc {
+				t.Fatal("failed to mutate seed path_span_ids in rendered SQL")
+			}
+			if _, err := dfxEvalOrphanTokensAssertion(mutSeedPath, validTreeRows, windowStart); err == nil {
+				t.Errorf("mutating seed path_span_ids succeeded, want error")
+			}
+
+			mutRecPath := strings.Replace(sqlSrc, "ARRAY_CONCAT(ea.path_span_ids, [p.span_id]) AS path_span_ids", "[p.span_id] AS path_span_ids", 1)
+			if mutRecPath == sqlSrc {
+				t.Fatal("failed to mutate recursive path_span_ids in rendered SQL")
+			}
+			if _, err := dfxEvalOrphanTokensAssertion(mutRecPath, validTreeRows, windowStart); err == nil {
+				t.Errorf("mutating recursive path_span_ids succeeded, want error")
+			}
 		}
 	})
 }
