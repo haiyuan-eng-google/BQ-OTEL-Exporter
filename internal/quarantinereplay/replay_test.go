@@ -1965,6 +1965,9 @@ func (f *fakeQuarantineBigQuery) ServeHTTP(w http.ResponseWriter, r *http.Reques
 				}
 			}
 			if !matched {
+				if strings.Contains(req.Query, "(row_fp = @cursor_fp AND row_ord > @cursor_ord) OR NOT EXISTS (") {
+					cursor.RowFingerprint = math.MinInt64
+				}
 				cursor.DuplicateOrdinal = -1
 				cursor.CanonicalRowKey = ""
 				cursor.GroupCount = 0
@@ -2213,7 +2216,7 @@ func TestReplayBigQueryCheckpointResume(t *testing.T) {
 	req := fake.requests[len(fake.requests)-1]
 	for _, want := range []string{
 		"FROM `proj.ds.dead_letters`",
-		"WHERE ingest_time > @cursor_time OR (ingest_time = @cursor_time AND (row_fp > @cursor_fp OR (row_fp = @cursor_fp AND (row_ord > @cursor_ord OR NOT EXISTS (SELECT 1 FROM quarantined WHERE ingest_time = @cursor_time AND row_fp = @cursor_fp AND row_ord = @cursor_ord AND row_key = @cursor_key AND group_size = @cursor_group_count AND prefix_sha256 = @cursor_prefix_sha256 AND group_sha256 = @cursor_group_sha256)))))\nORDER BY ingest_time, row_fp, row_ord",
+		"WHERE ingest_time > @cursor_time OR (ingest_time = @cursor_time AND (row_fp > @cursor_fp OR (row_fp = @cursor_fp AND row_ord > @cursor_ord) OR NOT EXISTS (SELECT 1 FROM quarantined WHERE ingest_time = @cursor_time AND row_fp = @cursor_fp AND row_ord = @cursor_ord AND row_key = @cursor_key AND group_size = @cursor_group_count AND prefix_sha256 = @cursor_prefix_sha256 AND group_sha256 = @cursor_group_sha256)))\nORDER BY ingest_time, row_fp, row_ord",
 	} {
 		if !strings.Contains(req.Query, want) {
 			t.Errorf("resume query lacks %q:\n%s", want, req.Query)
@@ -2932,6 +2935,72 @@ func TestReplayBigQueryV2ChangedCollisionGroup(t *testing.T) {
 			t.Errorf("resumed run exported %v, want [collision-span-B collision-span-C collision-span-D] (B1 must not be skipped)", resumed.names)
 		}
 
+		quiet := &recordingSink{}
+		sumQuiet, err := ReplayBigQuery(context.Background(), pagedSrc, quiet, opts, bigQueryTestOptions(srv)...)
+		if err != nil || sumQuiet != (Summary{}) || len(quiet.names) != 0 {
+			t.Errorf("quiet final resume = (%+v, %v, %v), want TotalRead=0 and 0 exports", sumQuiet, err, quiet.names)
+		}
+	})
+
+	t.Run("pending row B in [A, B] moving to earlier fingerprint fp=76 across pages rewinds bucket and delivers B A later", func(t *testing.T) {
+		rowA := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-A")}
+		rowB77 := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-B")}
+		rowLater := fakeQuarantineRow{ingest: base.Add(time.Second), fp: 88, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "later-span")}
+		if rowA.canonicalKey() >= rowB77.canonicalKey() {
+			t.Fatalf("canonical keys not ordered A < B")
+		}
+		fake := &fakeQuarantineBigQuery{rows: []fakeQuarantineRow{rowA, rowB77, rowLater}}
+		srv := httptest.NewServer(fake)
+		defer srv.Close()
+
+		pagedSrc := BigQuerySource{Project: "proj", Dataset: "ds", Table: "dead_letters", PageSize: 1}
+		ckptPath := filepath.Join(t.TempDir(), "repro_cross_fp_76.ckpt")
+		opts := Options{Checkpoint: &CheckpointConfig{Path: ckptPath}}
+		// 1. Same-timestamp group [A(fp=77), B(fp=77)] plus a later row.
+		// Deliver A (ord=0), fail transiently on B (ord=1), leaving a valid v2
+		// checkpoint at A with full count/prefix/group digest.
+		flaky := &recordingSink{fail: func(call int) error {
+			if call == 2 {
+				return errors.New("transient failure on B")
+			}
+			return nil
+		}}
+		if _, err := ReplayBigQuery(context.Background(), pagedSrc, flaky, opts, bigQueryTestOptions(srv)...); err == nil {
+			t.Fatal("first run succeeded, want transient failure on B")
+		}
+		if !slices.Equal(flaky.names, []string{"collision-span-A"}) {
+			t.Fatalf("first run exported %v, want [collision-span-A]", flaky.names)
+		}
+		st1 := readCheckpointFile(t, ckptPath)
+		assertCursor(t, st1, base.UnixMicro(), 77, 0, rowA.canonicalKey(), 1)
+		if st1.Cursor.GroupCount != 2 {
+			t.Fatalf("first run cursor group_count = %d, want 2", st1.Cursor.GroupCount)
+		}
+
+		// 2. Before resume, change B so it is still a pending quarantine row at the
+		// same timestamp but now has row_fp=76 (earlier than cursor row_fp=77).
+		rowB76 := rowB77
+		rowB76.fp = 76
+		fake.mu.Lock()
+		fake.rows = []fakeQuarantineRow{rowA, rowB76, rowLater}
+		fake.mu.Unlock()
+
+		// 3. Resume: the fp=77 group's count/digest mismatch rewinds the entire
+		// cursor ingest_time bucket so B(fp=76), A(fp=77), and later-span are all
+		// delivered (in canonical (ingest_time, row_fp, row_ord) order: B, A, later).
+		resumed := &recordingSink{}
+		sum, err := ReplayBigQuery(context.Background(), pagedSrc, resumed, opts, bigQueryTestOptions(srv)...)
+		if err != nil {
+			t.Fatalf("resumed run after B moved from fp=77 to fp=76: %v", err)
+		}
+		if want := (Summary{TotalRead: 3, Matched: 3, ReplayedSpans: 3}); sum != want {
+			t.Errorf("resumed summary = %+v, want %+v", sum, want)
+		}
+		if !slices.Equal(resumed.names, []string{"collision-span-B", "collision-span-A", "later-span"}) {
+			t.Errorf("resumed run exported %v, want [collision-span-B collision-span-A later-span] (mutated B at fp=76 must not be skipped)", resumed.names)
+		}
+
+		// 4. Resume again: TotalRead=0, zero exports, error=nil.
 		quiet := &recordingSink{}
 		sumQuiet, err := ReplayBigQuery(context.Background(), pagedSrc, quiet, opts, bigQueryTestOptions(srv)...)
 		if err != nil || sumQuiet != (Summary{}) || len(quiet.names) != 0 {

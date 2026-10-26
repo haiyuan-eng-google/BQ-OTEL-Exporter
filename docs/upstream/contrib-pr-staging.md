@@ -915,12 +915,14 @@ request 2 changes `go.mod` and the generated tests.
   (`exporter/googlecloudexporter/go.mod` line 13). Align with the checkout at
   filing time. The library then builds against versions that this repository
   does not test.
-- **Generator version.** Only mdatagen v0.163.0 was run. Contrib's tools
-  module pins `go.opentelemetry.io/collector/cmd/mdatagen
+- **Generator version.** Only mdatagen v0.163.0 was run (author-reported
+  workstation observation on 2026-10-25, outside CI). Contrib's tools module
+  pins `go.opentelemetry.io/collector/cmd/mdatagen
   v0.163.1-0.20261022201525-42ee5d39b18f` (`internal/tools/go.mod` line 295),
   whose output was not checked.
 - **Linter version.** gci and gofumpt were checked with golangci-lint v2.14.0,
-  this repository's version. Contrib's tools module pins v2.13.2
+  this repository's version (author-reported workstation observation on
+  2026-10-25, outside CI). Contrib's tools module pins v2.13.2
   (`internal/tools/go.mod` line 136).
 - **Self-telemetry scope.** The library records its own metrics under its own
   instrumentation scope (`ScopeName` in this repository's

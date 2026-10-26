@@ -169,13 +169,21 @@ func (s BigQuerySource) Validate() error {
 // or 1) or empty-key cursor, or if the cursor's (ingest_time, row_fp) group
 // changed so its saved (canonical_row_key, group_count, prefix_sha256,
 // group_sha256) no longer matches, ReplayBigQuery rewinds and replays the whole
-// current (ingest_time, row_fp) group at least once while keeping earlier
-// groups excluded and later groups proceeding once. Both byte-for-byte
+// cursor ingest_time microsecond bucket across all row_fp groups (including a
+// row from the cursor's group whose row_fp changed to an earlier value at the
+// same ingest_time) at least once while keeping earlier ingest_time values
+// excluded and later ingest_time values proceeding once. Both byte-for-byte
 // duplicate rows and distinct rows that share an (ingest_time, row_fp) pair
-// receive deterministic ordinals and are preserved across crash-resume runs
-// (subject to the absence of unique row IDs in otel_quarantine if an
-// already-delivered duplicate is deleted and replaced by a byte-identical row
-// in the same microsecond bucket).
+// receive deterministic ordinals and are preserved across crash-resume runs.
+// Because ReplayBigQuery reads the live table with @since raised to the cursor
+// ingest_time rather than a multi-run point-in-time snapshot and
+// otel_quarantine has no unique row IDs, checkpoint resume assumes quarantine
+// rows are immutable once written; it cannot detect replacing an
+// already-delivered duplicate with a byte-identical row that leaves the
+// cursor's (ingest_time, row_fp) group's ordered row_key multiset unchanged,
+// mutating or inserting rows outside the cursor's (ingest_time, row_fp) group
+// to sort before the cursor while leaving the cursor's group unchanged, or
+// rewriting a pending row's ingest_time to an earlier timestamp before @cursor_time.
 //
 // The query runs in src.Project over the BigQuery REST API, using an HTTP
 // client from internal/googlehttp built with clientOpts (Application
@@ -249,11 +257,10 @@ func ReplayBigQuery(ctx context.Context, src BigQuerySource, sink Sink, opts Opt
 		if err != nil {
 			return rp.sum, rp.stop(err)
 		}
-		if !reconciledBoundary &&
-			row.pos.ingestMicros == cursor.IngestTimeMicros &&
-			row.pos.fingerprint == cursor.RowFingerprint {
+		if !reconciledBoundary && row.pos.ingestMicros == cursor.IngestTimeMicros {
 			reconciledBoundary = true
-			if row.pos.ordinal <= cursor.DuplicateOrdinal {
+			if row.pos.fingerprint < cursor.RowFingerprint ||
+				(row.pos.fingerprint == cursor.RowFingerprint && row.pos.ordinal <= cursor.DuplicateOrdinal) {
 				matched, rerr := rows.reconcileBoundaryGroup(ctx, row, *cursor)
 				if rerr != nil {
 					return rp.sum, rp.stop(rerr)
@@ -300,7 +307,7 @@ func quarantineQuery(table string, f Filter, cursor *bigQueryCursor) (string, []
 	}
 	resume := ""
 	if cursor != nil {
-		resume = "\nWHERE ingest_time > @cursor_time OR (ingest_time = @cursor_time AND (row_fp > @cursor_fp OR (row_fp = @cursor_fp AND (row_ord > @cursor_ord OR NOT EXISTS (SELECT 1 FROM quarantined WHERE ingest_time = @cursor_time AND row_fp = @cursor_fp AND row_ord = @cursor_ord AND row_key = @cursor_key AND group_size = @cursor_group_count AND prefix_sha256 = @cursor_prefix_sha256 AND group_sha256 = @cursor_group_sha256)))))"
+		resume = "\nWHERE ingest_time > @cursor_time OR (ingest_time = @cursor_time AND (row_fp > @cursor_fp OR (row_fp = @cursor_fp AND row_ord > @cursor_ord) OR NOT EXISTS (SELECT 1 FROM quarantined WHERE ingest_time = @cursor_time AND row_fp = @cursor_fp AND row_ord = @cursor_ord AND row_key = @cursor_key AND group_size = @cursor_group_count AND prefix_sha256 = @cursor_prefix_sha256 AND group_sha256 = @cursor_group_sha256)))"
 		params = append(params,
 			timestampParam("cursor_time", time.UnixMicro(cursor.IngestTimeMicros)),
 			int64Param("cursor_fp", cursor.RowFingerprint),
@@ -468,14 +475,17 @@ func (q *queryRows) readNext(ctx context.Context) (quarantineRow, error) {
 	return out, nil
 }
 
-// reconcileBoundaryGroup buffers the cursor's entire (ingest_time, row_fp)
-// boundary group (beginning with first) across result pages and reports whether
-// the group's total cardinality matches cursor.GroupCount, the row at
-// cursor.DuplicateOrdinal still has canonicalKey == cursor.CanonicalRowKey, the
-// SHA-256 digest of the handled prefix 0..cursor.DuplicateOrdinal matches
+// reconcileBoundaryGroup buffers all rows in the cursor's ingest_time bucket up
+// through cursor.RowFingerprint (beginning with first) across result pages and
+// reports whether the cursor's
+// (ingest_time, row_fp) group has total cardinality cursor.GroupCount, the row
+// at cursor.DuplicateOrdinal still has canonicalKey == cursor.CanonicalRowKey,
+// the SHA-256 digest of the handled prefix 0..cursor.DuplicateOrdinal matches
 // cursor.PrefixSHA256, and the SHA-256 digest of the full ordered group
-// 0..cursor.GroupCount-1 matches cursor.GroupSHA256. All inspected rows are
-// pushed back onto q.buffered in order so the caller can process them next.
+// 0..cursor.GroupCount-1 matches cursor.GroupSHA256. Each buffered (ingest_time,
+// row_fp) group has its groupSize, prefixSHA256, and groupSHA256 refreshed, and
+// all inspected rows are pushed back onto q.buffered in order so the caller can
+// process them next.
 func (q *queryRows) reconcileBoundaryGroup(ctx context.Context, first quarantineRow, cursor bigQueryCursor) (bool, error) {
 	seen := []quarantineRow{first}
 	var tail []quarantineRow
@@ -487,46 +497,58 @@ func (q *queryRows) reconcileBoundaryGroup(ctx context.Context, first quarantine
 		if err != nil {
 			return false, err
 		}
-		if r.pos.ingestMicros == cursor.IngestTimeMicros && r.pos.fingerprint == cursor.RowFingerprint {
+		if r.pos.ingestMicros == cursor.IngestTimeMicros && r.pos.fingerprint <= cursor.RowFingerprint {
 			seen = append(seen, r)
 			continue
 		}
 		tail = append(tail, r)
 		break
 	}
-	keys := make([]string, len(seen))
-	contiguous := true
-	for i := range seen {
-		if seen[i].pos.ordinal != int64(i) {
-			contiguous = false
+	matched := false
+	for start := 0; start < len(seen); {
+		fp := seen[start].pos.fingerprint
+		end := start + 1
+		for end < len(seen) && seen[end].pos.fingerprint == fp {
+			end++
 		}
-		keys[i] = seen[i].pos.canonicalKey
-	}
-	fullGroupSHA := ""
-	if contiguous {
-		fullGroupSHA = prefixDigest(keys)
-	}
-	matched := contiguous &&
-		cursor.DuplicateOrdinal >= 0 &&
-		cursor.CanonicalRowKey != "" &&
-		cursor.GroupCount > 0 &&
-		cursor.PrefixSHA256 != "" &&
-		cursor.GroupSHA256 != "" &&
-		len(seen) == cursor.GroupCount &&
-		int(cursor.DuplicateOrdinal) < len(seen) &&
-		seen[cursor.DuplicateOrdinal].pos.canonicalKey == cursor.CanonicalRowKey &&
-		prefixDigest(keys[:int(cursor.DuplicateOrdinal)+1]) == cursor.PrefixSHA256 &&
-		(seen[cursor.DuplicateOrdinal].pos.prefixSHA256 == "" || seen[cursor.DuplicateOrdinal].pos.prefixSHA256 == cursor.PrefixSHA256) &&
-		fullGroupSHA == cursor.GroupSHA256 &&
-		(seen[cursor.DuplicateOrdinal].pos.groupSHA256 == "" || seen[cursor.DuplicateOrdinal].pos.groupSHA256 == cursor.GroupSHA256)
-	for i := range seen {
-		if seen[i].pos.groupSize <= 0 || seen[i].pos.groupSize != len(seen) {
-			seen[i].pos.groupSize = len(seen)
+		group := seen[start:end]
+		keys := make([]string, len(group))
+		contiguous := true
+		for i := range group {
+			if group[i].pos.ordinal != int64(i) {
+				contiguous = false
+			}
+			keys[i] = group[i].pos.canonicalKey
 		}
+		fullGroupSHA := ""
 		if contiguous {
-			seen[i].pos.prefixSHA256 = prefixDigest(keys[:i+1])
-			seen[i].pos.groupSHA256 = fullGroupSHA
+			fullGroupSHA = prefixDigest(keys)
 		}
+		if fp == cursor.RowFingerprint {
+			matched = contiguous &&
+				cursor.DuplicateOrdinal >= 0 &&
+				cursor.CanonicalRowKey != "" &&
+				cursor.GroupCount > 0 &&
+				cursor.PrefixSHA256 != "" &&
+				cursor.GroupSHA256 != "" &&
+				len(group) == cursor.GroupCount &&
+				int(cursor.DuplicateOrdinal) < len(group) &&
+				group[cursor.DuplicateOrdinal].pos.canonicalKey == cursor.CanonicalRowKey &&
+				prefixDigest(keys[:int(cursor.DuplicateOrdinal)+1]) == cursor.PrefixSHA256 &&
+				(group[cursor.DuplicateOrdinal].pos.prefixSHA256 == "" || group[cursor.DuplicateOrdinal].pos.prefixSHA256 == cursor.PrefixSHA256) &&
+				fullGroupSHA == cursor.GroupSHA256 &&
+				(group[cursor.DuplicateOrdinal].pos.groupSHA256 == "" || group[cursor.DuplicateOrdinal].pos.groupSHA256 == cursor.GroupSHA256)
+		}
+		for i := range group {
+			if group[i].pos.groupSize <= 0 || group[i].pos.groupSize != len(group) {
+				group[i].pos.groupSize = len(group)
+			}
+			if contiguous {
+				group[i].pos.prefixSHA256 = prefixDigest(keys[:i+1])
+				group[i].pos.groupSHA256 = fullGroupSHA
+			}
+		}
+		start = end
 	}
 	q.buffered = append(append(seen, tail...), q.buffered...)
 	return matched, nil

@@ -414,11 +414,11 @@ func (p recordPosition) after(c bigQueryCursor) bool {
 	if p.ingestMicros != c.IngestTimeMicros {
 		return p.ingestMicros > c.IngestTimeMicros
 	}
-	if p.fingerprint != c.RowFingerprint {
-		return p.fingerprint > c.RowFingerprint
-	}
 	if c.DuplicateOrdinal < 0 || c.CanonicalRowKey == "" {
 		return true
+	}
+	if p.fingerprint != c.RowFingerprint {
+		return p.fingerprint > c.RowFingerprint
 	}
 	if p.ordinal == c.DuplicateOrdinal {
 		return p.canonicalKey != c.CanonicalRowKey
@@ -699,12 +699,19 @@ const (
 // prefix_sha256, group_sha256) with the current (ingest_time, row_fp) group
 // (because the group's cardinality, 0..duplicate_ordinal prefix digest, or
 // full-group 0..group_count-1 ordered row_key digest changed), the run rewinds
-// and replays the whole current (ingest_time, row_fp) group at least once while
-// keeping earlier groups excluded and later groups proceeding normally. Without
-// unique row identifiers in otel_quarantine or a point-in-time table snapshot,
-// deleting an already-delivered duplicate and inserting a byte-identical row
-// that leaves the group's ordered row_key multiset unchanged in the same
-// microsecond bucket cannot be distinguished from an unchanged group.
+// and replays the whole cursor ingest_time microsecond bucket across all row_fp
+// groups (including a row from the cursor's group whose row_fp changed to an
+// earlier value at the same ingest_time) at least once while keeping earlier
+// ingest_time values excluded and later ingest_time values proceeding normally.
+// Because ReplayBigQuery reads the live table with @since raised to the cursor
+// ingest_time rather than a multi-run point-in-time snapshot and
+// otel_quarantine has no unique row identifiers, checkpoint resume assumes
+// quarantine rows are immutable once written; it cannot detect replacing an
+// already-delivered duplicate with a byte-identical row that leaves the
+// cursor's (ingest_time, row_fp) group's ordered row_key multiset unchanged,
+// mutating or inserting rows outside the cursor's (ingest_time, row_fp) group
+// to sort before the cursor while leaving the cursor's group unchanged, or
+// rewriting a pending row's ingest_time to an earlier timestamp before @cursor_time.
 //
 // A record counts as handled once it is replayed, filtered out, or fails in
 // a way a retry cannot fix (no payload, an unparseable payload or time, an
@@ -746,13 +753,13 @@ type checkpointState struct {
 // still sits at DuplicateOrdinal and the current (ingest_time, row_fp) group's
 // total cardinality, 0..DuplicateOrdinal prefix digest, and full-group
 // 0..GroupCount-1 ordered digest still match GroupCount, PrefixSHA256, and
-// GroupSHA256, and rewinding that group at-least-once if the group's ordered
-// row_key sequence or cardinality changed; legacy version 0 or 1 cursors (or a
-// version 2 cursor with an empty CanonicalRowKey and no group metadata) are
-// rewound to replay their whole (ingest_time, row_fp) group at-least-once
-// before any delivery. Negative or unknown CursorOrderVersion values and
-// malformed or partially populated CanonicalRowKey, GroupCount, PrefixSHA256,
-// or GroupSHA256 values are rejected before querying.
+// GroupSHA256, and rewinding the cursor's ingest_time bucket across all row_fp
+// groups at-least-once if the cursor group's ordered row_key sequence or
+// cardinality changed; legacy version 0 or 1 cursors (or a version 2 cursor
+// with an empty CanonicalRowKey and no group metadata) are rewound before any
+// delivery. Negative or unknown CursorOrderVersion values and malformed or
+// partially populated CanonicalRowKey, GroupCount, PrefixSHA256, or GroupSHA256
+// values are rejected before querying.
 type bigQueryCursor struct {
 	IngestTimeMicros int64 `json:"ingest_time_micros"`
 	RowFingerprint   int64 `json:"row_fingerprint"`
@@ -986,12 +993,15 @@ func prefixDigest(keys []string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// rewindCursorGroup rewinds the BigQuery cursor's current (ingest_time, row_fp)
-// group when its saved (CanonicalRowKey, DuplicateOrdinal, GroupCount,
-// PrefixSHA256, GroupSHA256) no longer matches the group's rows, so every row
-// in that group is replayed at-least-once.
+// rewindCursorGroup rewinds the BigQuery cursor's current ingest_time bucket
+// when its saved (CanonicalRowKey, DuplicateOrdinal, GroupCount,
+// PrefixSHA256, GroupSHA256) no longer matches the cursor's (ingest_time,
+// row_fp) group, so every row in that ingest_time bucket (including a row from
+// the cursor's group whose row_fp moved to an earlier value at the same
+// ingest_time) is replayed at-least-once.
 func (c *checkpointer) rewindCursorGroup() {
 	if c != nil && c.state.Kind == checkpointKindBigQuery && c.state.Cursor != nil {
+		c.state.Cursor.RowFingerprint = math.MinInt64
 		c.state.Cursor.DuplicateOrdinal = -1
 		c.state.Cursor.CanonicalRowKey = ""
 		c.state.Cursor.GroupCount = 0
