@@ -116,7 +116,9 @@ func testLiveGCSAndBigQueryOffloadRoundTrip(t *testing.T) {
 		}
 		closeHTTP()
 	})
-	if err := createOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup); err != nil {
+	if err := createOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup, func(err error) {
+		t.Errorf("%v", err)
+	}); err != nil {
 		t.Fatalf("create dataset %s.%s: %v", project, dataset, err)
 	}
 	t.Cleanup(func() {
@@ -372,6 +374,9 @@ func testLiveGCSAndBigQueryOffloadRoundTrip(t *testing.T) {
 		qBlob, err := fetcher(ctx, uri+"?generation="+version)
 		if err != nil {
 			t.Fatalf("fetch generation-pinned quarantine GCS object %s?generation=%s: %v", uri, version, err)
+		}
+		if _, wrongGenErr := fetcher(ctx, uri+"?generation=1"); wrongGenErr == nil && version != "1" {
+			t.Errorf("quarantine row %d live GCS fetch with wrong generation=1 succeeded, want error", quarantineCount)
 		}
 		qSum := sha256.Sum256(qBlob)
 		qWantSHA := hex.EncodeToString(qSum[:])

@@ -466,35 +466,11 @@ func isAllowedContinuousQueryDryRunReason(reason string) bool {
 // topic is an expected environment/reservation/topic-permission rejection
 // rather than a SQL syntax/construct error, EXPORT DATA option error, missing
 // table/dataset, project-level bigquery.jobs.create denial, or 5xx/backend error.
-func isExpectedContinuousQueryDryRunError(err error) bool {
-	if err == nil {
-		return false
-	}
-	code := extractHTTPStatusCode(err)
-	// Only HTTP 400 (edition/reservation capability check) and HTTP 403
-	// (accessDenied on Pub/Sub topic or CONTINUOUS assignment) can qualify as
-	// expected environment capability rejections; 404, 5xx, and unknown errors
-	// must always fail the test.
-	if code != http.StatusBadRequest && code != http.StatusForbidden {
-		return false
-	}
-	var apiErr *googleapi.Error
-	if errors.As(err, &apiErr) && len(apiErr.Errors) > 0 {
-		for _, item := range apiErr.Errors {
-			if !isAllowedContinuousQueryDryRunReason(item.Reason) {
-				return false
-			}
-		}
-	}
-	rawMsg := primaryErrorMessage(err)
-	if idx := strings.LastIndex(rawMsg, ","); idx >= 0 {
-		if trailingReason := strings.TrimSpace(rawMsg[idx+1:]); trailingReason != "" && !strings.Contains(trailingReason, " ") {
-			if !isAllowedContinuousQueryDryRunReason(trailingReason) {
-				return false
-			}
-		}
-	}
-	msg := strings.ToLower(rawMsg)
+// rejectContinuousQueryMessage reports whether msg contains a substring that
+// indicates a SQL/construct/option error, missing resource, backend failure, or
+// quota/rate limit — none of which are eligible for an entitlement/topic skip.
+func rejectContinuousQueryMessage(msg string) bool {
+	m := strings.ToLower(msg)
 	for _, reject := range []string{
 		"syntax error",
 		"unrecognized",
@@ -525,26 +501,97 @@ func isExpectedContinuousQueryDryRunError(err error) bool {
 		"quota exceeded",
 		"resources exceeded",
 	} {
-		if strings.Contains(msg, reject) {
+		if strings.Contains(m, reject) {
+			return true
+		}
+	}
+	return false
+}
+
+// isAllowedContinuousQueryMessage reports whether msg contains a substring
+// indicating an expected entitlement, assignment, or topic-permission gate.
+func isAllowedContinuousQueryMessage(code int, msg string) bool {
+	m := strings.ToLower(msg)
+	hasReservationOrEditionGate := (strings.Contains(m, "continuous queries") || strings.Contains(m, "continuous query")) &&
+		(strings.Contains(m, "require the project to have a continuous assignment") ||
+			strings.Contains(m, "continuous assignment to a reservation") ||
+			strings.Contains(m, "require an enterprise or enterprise plus reservation") ||
+			strings.Contains(m, "continuous query reservation") ||
+			strings.Contains(m, "are not enabled") ||
+			strings.Contains(m, "is not enabled") ||
+			strings.Contains(m, "not supported in standard edition") ||
+			strings.Contains(m, "without an enterprise") ||
+			strings.Contains(m, "billing tier"))
+	hasPubSubPermGate := (code == http.StatusForbidden || strings.Contains(m, "access denied") || strings.Contains(m, "permission denied")) &&
+		(strings.Contains(m, "permission") || strings.Contains(m, "access denied")) &&
+		(strings.Contains(m, "pubsub.topics") ||
+			strings.Contains(m, "cloud_pubsub") ||
+			strings.Contains(m, "/topics/"))
+	return hasReservationOrEditionGate || hasPubSubPermGate
+}
+
+// isExpectedContinuousQueryDryRunError reports whether err from a dry-run
+// Continuous Query EXPORT DATA ... CLOUD_PUBSUB job on an on-demand project
+// without an Enterprise/Enterprise Plus CONTINUOUS reservation or Pub/Sub
+// topic is an expected environment/reservation/topic-permission rejection
+// rather than a SQL syntax/construct error, EXPORT DATA option error, missing
+// table/dataset, project-level bigquery.jobs.create denial, or 5xx/backend error.
+//
+// Every non-nil ErrorProto/ErrorItem message is classified independently:
+// the primary message and every secondary message must each be an allowed
+// entitlement, assignment, or topic rejection, and none may contain a
+// rejected substring. This prevents a valid primary reservation-rejection
+// from masking a secondary SQL syntax error.
+func isExpectedContinuousQueryDryRunError(err error) bool {
+	if err == nil {
+		return false
+	}
+	code := extractHTTPStatusCode(err)
+	// Only HTTP 400 (edition/reservation capability check) and HTTP 403
+	// (accessDenied on Pub/Sub topic or CONTINUOUS assignment) can qualify as
+	// expected environment capability rejections; 404, 5xx, and unknown errors
+	// must always fail the test.
+	if code != http.StatusBadRequest && code != http.StatusForbidden {
+		return false
+	}
+	// Collect every non-nil error message from the googleapi.Error.
+	var messages []string
+	var apiErr *googleapi.Error
+	if errors.As(err, &apiErr) {
+		if apiErr.Message != "" {
+			messages = append(messages, apiErr.Message)
+		}
+		for _, item := range apiErr.Errors {
+			if !isAllowedContinuousQueryDryRunReason(item.Reason) {
+				return false
+			}
+			if item.Message != "" {
+				messages = append(messages, item.Message)
+			}
+		}
+	}
+	if len(messages) == 0 {
+		messages = append(messages, primaryErrorMessage(err))
+	}
+	// Check the trailing reason on the primary message.
+	rawMsg := primaryErrorMessage(err)
+	if idx := strings.LastIndex(rawMsg, ","); idx >= 0 {
+		if trailingReason := strings.TrimSpace(rawMsg[idx+1:]); trailingReason != "" && !strings.Contains(trailingReason, " ") {
+			if !isAllowedContinuousQueryDryRunReason(trailingReason) {
+				return false
+			}
+		}
+	}
+	// Every collected message must pass the reject and allow checks independently.
+	for _, msg := range messages {
+		if rejectContinuousQueryMessage(msg) {
+			return false
+		}
+		if !isAllowedContinuousQueryMessage(code, msg) {
 			return false
 		}
 	}
-	hasReservationOrEditionGate := (strings.Contains(msg, "continuous queries") || strings.Contains(msg, "continuous query")) &&
-		(strings.Contains(msg, "require the project to have a continuous assignment") ||
-			strings.Contains(msg, "continuous assignment to a reservation") ||
-			strings.Contains(msg, "require an enterprise or enterprise plus reservation") ||
-			strings.Contains(msg, "continuous query reservation") ||
-			strings.Contains(msg, "are not enabled") ||
-			strings.Contains(msg, "is not enabled") ||
-			strings.Contains(msg, "not supported in standard edition") ||
-			strings.Contains(msg, "without an enterprise") ||
-			strings.Contains(msg, "billing tier"))
-	hasPubSubPermGate := (code == http.StatusForbidden || strings.Contains(msg, "access denied") || strings.Contains(msg, "permission denied")) &&
-		(strings.Contains(msg, "permission") || strings.Contains(msg, "access denied")) &&
-		(strings.Contains(msg, "pubsub.topics") ||
-			strings.Contains(msg, "cloud_pubsub") ||
-			strings.Contains(msg, "/topics/"))
-	return hasReservationOrEditionGate || hasPubSubPermGate
+	return true
 }
 
 var googleapiStatusRe = regexp.MustCompile(`googleapi:\s*Error\s+(\d{3})\b`)
@@ -596,7 +643,10 @@ func validateContinuousExportDryRunJob(job *bigqueryapi.Job, err error) (skipRea
 			return "", fmt.Errorf("job.Status.ErrorResult = %s: %s", job.Status.ErrorResult.Reason, job.Status.ErrorResult.Message)
 		}
 		for i, item := range job.Status.Errors {
-			if item != nil && !isAllowedContinuousQueryDryRunReason(item.Reason) {
+			if item == nil {
+				return "", fmt.Errorf("job.Status.Errors[%d] is nil", i)
+			}
+			if !isAllowedContinuousQueryDryRunReason(item.Reason) {
 				return "", fmt.Errorf("job.Status.Errors[%d] = %s: %s", i, item.Reason, item.Message)
 			}
 		}
@@ -604,6 +654,11 @@ func validateContinuousExportDryRunJob(job *bigqueryapi.Job, err error) (skipRea
 		if job.Status.ErrorResult.Reason == "accessDenied" {
 			code = http.StatusForbidden
 		}
+		// Build a composite message containing every error message so that
+		// isExpectedContinuousQueryDryRunError classifies each independently.
+		// Only the primary ErrorResult.Message was passed before, which let a
+		// secondary SQL syntax error hide behind a valid reservation rejection.
+		compositeMsg := job.Status.ErrorResult.Message
 		errItems := []googleapi.ErrorItem{{
 			Reason:  job.Status.ErrorResult.Reason,
 			Message: job.Status.ErrorResult.Message,
@@ -614,11 +669,14 @@ func validateContinuousExportDryRunJob(job *bigqueryapi.Job, err error) (skipRea
 					Reason:  item.Reason,
 					Message: item.Message,
 				})
+				if item.Message != "" && !strings.Contains(compositeMsg, item.Message) {
+					compositeMsg += " | " + item.Message
+				}
 			}
 		}
 		statusErr := &googleapi.Error{
 			Code:    code,
-			Message: job.Status.ErrorResult.Message,
+			Message: compositeMsg,
 			Errors:  errItems,
 		}
 		if isExpectedContinuousQueryDryRunError(statusErr) {
@@ -627,6 +685,11 @@ func validateContinuousExportDryRunJob(job *bigqueryapi.Job, err error) (skipRea
 		return "", fmt.Errorf("job.Status.ErrorResult = %s: %s", job.Status.ErrorResult.Reason, job.Status.ErrorResult.Message)
 	}
 	if len(job.Status.Errors) > 0 {
+		for i, item := range job.Status.Errors {
+			if item == nil {
+				return "", fmt.Errorf("job.Status.Errors[%d] is nil", i)
+			}
+		}
 		first := job.Status.Errors[0]
 		return "", fmt.Errorf("job.Status.Errors[0] = %s: %s", first.Reason, first.Message)
 	}
@@ -652,11 +715,14 @@ func uniqueEphemeralDatasetID(prefix string) string {
 
 // createOwnedEphemeralDataset creates dataset via Dataset.Create(ctx, &bq.DatasetMetadata{Location: location})
 // and registers DeleteWithContents on cleanup ONLY if Dataset.Create returns nil.
+// Deletion errors are reported through the reportCleanupError callback so they
+// are never silently discarded.
 func createOwnedEphemeralDataset(
 	ctx context.Context,
 	admin *bq.Client,
 	dataset, location string,
 	registerCleanup func(func()),
+	reportCleanupError func(error),
 ) error {
 	createErr := admin.Dataset(dataset).Create(ctx, &bq.DatasetMetadata{Location: location})
 	if !shouldDeleteDatasetOnCreate(createErr) {
@@ -665,7 +731,9 @@ func createOwnedEphemeralDataset(
 	registerCleanup(func() {
 		cleanCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		_ = admin.Dataset(dataset).DeleteWithContents(cleanCtx)
+		if err := admin.Dataset(dataset).DeleteWithContents(cleanCtx); err != nil {
+			reportCleanupError(fmt.Errorf("delete ephemeral dataset %s: %w", dataset, err))
+		}
 	})
 	return nil
 }
@@ -757,11 +825,56 @@ func TestIsExpectedContinuousQueryDryRunError(t *testing.T) {
 	if skipReason, fatalErr := validateContinuousExportDryRunJob(jobSecondaryBackendErr, nil); fatalErr == nil || skipReason != "" {
 		t.Fatalf("validateContinuousExportDryRunJob(Status.Errors backendError) = (skip=%q, err=%v), want non-nil fatalErr", skipReason, fatalErr)
 	}
+	// P1-1 regression: primary reservation-rejection message + secondary SQL
+	// syntax error must FAIL, not skip, even though the primary is a valid
+	// entitlement gate.  Both as a returned *bigqueryapi.Job and as a direct
+	// googleapi.Error.
+	jobMixedReservationAndSyntax := &bigqueryapi.Job{
+		Status: &bigqueryapi.JobStatus{
+			ErrorResult: &bigqueryapi.ErrorProto{
+				Reason:  "invalidQuery",
+				Message: "Continuous queries require the project to have a CONTINUOUS assignment to a reservation.",
+			},
+			Errors: []*bigqueryapi.ErrorProto{
+				{
+					Reason:  "invalidQuery",
+					Message: `Syntax error: Unexpected identifier "continuous"`,
+				},
+			},
+		},
+		Statistics: &bigqueryapi.JobStatistics{},
+	}
+	if skipReason, fatalErr := validateContinuousExportDryRunJob(jobMixedReservationAndSyntax, nil); fatalErr == nil || skipReason != "" {
+		t.Fatalf("validateContinuousExportDryRunJob(primary reservation + secondary SQL syntax) = (skip=%q, err=%v), want non-nil fatalErr", skipReason, fatalErr)
+	}
+	// P1-1 regression: same mixed case as a direct googleapi.Error (RPC path).
+	directMixedErr := &googleapi.Error{
+		Code:    http.StatusBadRequest,
+		Message: "Continuous queries require the project to have a CONTINUOUS assignment to a reservation.",
+		Errors: []googleapi.ErrorItem{
+			{Reason: "invalidQuery", Message: "Continuous queries require the project to have a CONTINUOUS assignment to a reservation."},
+			{Reason: "invalidQuery", Message: `Syntax error: Unexpected identifier "continuous"`},
+		},
+	}
+	if isExpectedContinuousQueryDryRunError(directMixedErr) {
+		t.Fatalf("isExpectedContinuousQueryDryRunError(primary reservation + secondary SQL syntax) = true, want false")
+	}
 	jobNilStats := &bigqueryapi.Job{
 		Status: &bigqueryapi.JobStatus{},
 	}
 	if skipReason, fatalErr := validateContinuousExportDryRunJob(jobNilStats, nil); fatalErr == nil || skipReason != "" {
 		t.Fatalf("validateContinuousExportDryRunJob(nil Statistics) = (skip=%q, err=%v), want non-nil fatalErr", skipReason, fatalErr)
+	}
+	// P2-1 regression: Status.Errors containing a nil entry must not panic;
+	// validateContinuousExportDryRunJob must return a fatal validation error.
+	jobNilErrorEntry := &bigqueryapi.Job{
+		Status: &bigqueryapi.JobStatus{
+			Errors: []*bigqueryapi.ErrorProto{nil},
+		},
+		Statistics: &bigqueryapi.JobStatistics{},
+	}
+	if skipReason, fatalErr := validateContinuousExportDryRunJob(jobNilErrorEntry, nil); fatalErr == nil || skipReason != "" {
+		t.Fatalf("validateContinuousExportDryRunJob(Status.Errors=[nil]) = (skip=%q, err=%v), want non-nil fatalErr for nil error entry", skipReason, fatalErr)
 	}
 	jobOK := &bigqueryapi.Job{
 		Status:     &bigqueryapi.JobStatus{},
@@ -815,10 +928,14 @@ func TestEphemeralDatasetOwnershipFake409NeverDeletes(t *testing.T) {
 	}
 	defer func() { _ = admin.Close() }()
 
+	// Use a callback pair that captures cleanup registration so we can
+	// verify delete-on-409 is NOT registered.
 	var cleanups []func()
-	createErr := createOwnedEphemeralDataset(ctx, admin, "preexisting_ds", "US", func(fn func()) {
-		cleanups = append(cleanups, fn)
-	})
+	var capturedErrors []string
+	createErr := createOwnedEphemeralDataset(ctx, admin, "preexisting_ds", "US",
+		func(fn func()) { cleanups = append(cleanups, fn) },
+		func(err error) { capturedErrors = append(capturedErrors, err.Error()) },
+	)
 	if createErr == nil {
 		t.Fatal("createOwnedEphemeralDataset on 409 response returned nil error, want 409 error")
 	}
@@ -932,6 +1049,126 @@ func TestEphemeralDatasetOwnershipFake409NeverDeletes(t *testing.T) {
 	}
 }
 
+// TestCreateOwnedEphemeralDatasetDeleteFailureReportsError verifies that when
+// Dataset.Create succeeds (200 OK) but DeleteWithContents fails (403/500), the
+// cleanup error is reported through the reportCleanupError callback rather than
+// silently discarded.
+func TestCreateOwnedEphemeralDatasetDeleteFailureReportsError(t *testing.T) {
+	var deleteCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/datasets"):
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"datasetReference":{"projectId":"test-proj","datasetId":"ephemeral_ds"},"location":"US"}`))
+		case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/datasets/"):
+			deleteCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":{"code":403,"message":"Permission denied: datasets.delete"}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	admin, err := bq.NewClient(ctx, "test-proj",
+		option.WithEndpoint(srv.URL),
+		option.WithoutAuthentication(),
+	)
+	if err != nil {
+		t.Fatalf("bq.NewClient: %v", err)
+	}
+	defer func() { _ = admin.Close() }()
+
+	var capturedErrors []string
+	cleanupFn := func(fn func()) { fn() }
+	createErr := createOwnedEphemeralDataset(ctx, admin, "ephemeral_ds", "US",
+		cleanupFn,
+		func(err error) { capturedErrors = append(capturedErrors, err.Error()) },
+	)
+	if createErr != nil {
+		t.Fatalf("createOwnedEphemeralDataset returned error on 200 OK: %v", createErr)
+	}
+	if deleteCalls.Load() == 0 {
+		t.Fatalf("DELETE /datasets calls = %d, want >= 1 (cleanup must attempt delete)", deleteCalls.Load())
+	}
+	if len(capturedErrors) == 0 {
+		t.Fatalf("DeleteWithContents failure was not reported through reportCleanupError; want >= 1 error")
+	}
+	if !strings.Contains(capturedErrors[0], "delete ephemeral dataset") {
+		t.Fatalf("DeleteWithContents error message = %q, want to contain 'delete ephemeral dataset'", capturedErrors[0])
+	}
+}
+
+// registerColdStartCleanup registers a DeleteWithContents cleanup for a
+// pre-created dataset only when owned is true. When owned is false (dataset
+// was pre-created and is not owned by this test), no DELETE is registered.
+func registerColdStartCleanup(registerCleanup func(func()), reportCleanupError func(error), admin *bq.Client, dataset string, owned bool) {
+	if !owned {
+		return
+	}
+	registerCleanup(func() {
+		cleanCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := admin.Dataset(dataset).DeleteWithContents(cleanCtx); err != nil {
+			reportCleanupError(fmt.Errorf("delete ephemeral dataset %s: %w", dataset, err))
+		}
+	})
+}
+
+// TestColdStartCleanupRegistration verifies that registerColdStartCleanup
+// issues zero DELETEs when owned=false and exactly one DELETE when owned=true,
+// and that deletion errors reach the reportCleanupError callback.
+func TestColdStartCleanupRegistration(t *testing.T) {
+	var deleteCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/datasets/"):
+			deleteCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":{"code":403,"message":"Permission denied"}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	admin, err := bq.NewClient(ctx, "test-proj",
+		option.WithEndpoint(srv.URL),
+		option.WithoutAuthentication(),
+	)
+	if err != nil {
+		t.Fatalf("bq.NewClient: %v", err)
+	}
+	defer func() { _ = admin.Close() }()
+
+	// owned=false: no DELETE should be registered.
+	deleteCalls.Store(0)
+	var errsFalse []string
+	registerColdStartCleanup(func(fn func()) { fn() }, func(err error) { errsFalse = append(errsFalse, err.Error()) }, admin, "ds_owned_false", false)
+	if deleteCalls.Load() != 0 {
+		t.Fatalf("owned=false: DELETE calls = %d, want 0", deleteCalls.Load())
+	}
+
+	// owned=true: exactly one DELETE, and the error must reach the callback.
+	deleteCalls.Store(0)
+	var errsTrue []string
+	registerColdStartCleanup(func(fn func()) { fn() }, func(err error) { errsTrue = append(errsTrue, err.Error()) }, admin, "ds_owned_true", true)
+	if deleteCalls.Load() != 1 {
+		t.Fatalf("owned=true: DELETE calls = %d, want 1", deleteCalls.Load())
+	}
+	if len(errsTrue) == 0 {
+		t.Fatalf("owned=true: DeleteWithContents 403 was not reported through reportCleanupError")
+	}
+	if !strings.Contains(errsTrue[0], "delete ephemeral dataset") {
+		t.Fatalf("owned=true: error = %q, want 'delete ephemeral dataset'", errsTrue[0])
+	}
+}
+
 func TestOffloadPayloadRefRejectsStaleOrWrongGenerationOnOverwrite(t *testing.T) {
 	store := newMemOffloadStore()
 	origBytes := bytes.Repeat([]byte("original-redacted-payload-"), 12)
@@ -965,15 +1202,19 @@ func TestOffloadPayloadRefRejectsStaleOrWrongGenerationOnOverwrite(t *testing.T)
 		t.Fatalf("assertFakeRowPayloadRef before overwrite: %v", err)
 	}
 
-	// Overwrite the same URI with a new generation and modified bytes.
-	ver2 := store.Overwrite(uri, bytes.Repeat([]byte("overwritten-corrupted-payload-"), 12))
+	// Overwrite the same URI with the ORIGINAL bytes (same bytes, new generation)
+	// so the stale-generation check is independent of payload integrity (size
+	// and checksum).  Removing the ?generation= parameter or disabling the fake
+	// store's generation comparison must make this test fail.
+	ver2 := store.Overwrite(uri, origBytes)
 	if ver2 == ver1 {
 		t.Fatalf("Overwrite version = %q, want != %q", ver2, ver1)
 	}
-	// Fetching with the original generation ver1 must fail on an overwritten store,
-	// whereas an unversioned fetch would have silently returned the overwritten bytes.
+	// Fetching with the original generation ver1 must fail on an overwritten
+	// store even though the bytes are identical, because the generation
+	// pinned in the payload_ref no longer matches the current object.
 	if err := assertFakeRowPayloadRef(store, row, "gs://hermetic-bucket/prefix/spans/", "us.conn", "attributes.gen_ai.prompt", "text/plain"); err == nil {
-		t.Fatal("assertFakeRowPayloadRef succeeded after object overwrite with new generation, want generation mismatch error")
+		t.Fatal("assertFakeRowPayloadRef succeeded after same-bytes overwrite with new generation, want generation mismatch error")
 	}
 
 	qRows := []map[string]any{

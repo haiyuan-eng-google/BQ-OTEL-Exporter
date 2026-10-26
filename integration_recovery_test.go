@@ -34,12 +34,12 @@ import (
 )
 
 // TestRecoveryAfterAttemptTimeoutsLiveBigQuery is the live half of issue #3.
-// Concurrent bursts across traces and logs run with attempt deadlines short
-// enough to expire after dispatch. Every failed batch is then replayed in the
-// same exporters, as exporterhelper's retry sender would, without a restart.
+// Concurrent bursts across traces, logs, and metrics run with attempt deadlines
+// short enough to expire after dispatch. Every failed batch is then replayed in
+// the same exporters, as exporterhelper's retry sender would, without a restart.
 // The test requires at least one timeout after dispatch, zero dropped batches,
-// both current-value gauges back at zero, and every logical record exactly
-// once in the dedup views.
+// both current-value gauges back at zero, and every logical record exactly once
+// in the dedup views.
 //
 // Opt-in like the auto-create test: it creates billable resources. Set
 // BQ_RECOVERY_BURST_TIMEOUT (default 25ms) below the project's append latency
@@ -84,7 +84,7 @@ func TestRecoveryAfterAttemptTimeoutsLiveBigQuery(t *testing.T) {
 	cfg.Project = project
 	cfg.Dataset = dataset
 	cfg.Location = location
-	cfg.AutoCreate.Dataset = true
+	cfg.AutoCreate.Dataset = false
 	cfg.AutoCreate.Tables = true
 
 	traces, err := newTracesExporter(settingsBySignal["traces"], cfg)
@@ -488,7 +488,9 @@ func newLiveBigQueryAdmin(ctx context.Context, t *testing.T, project, dataset, l
 		}
 		closeHTTP()
 	})
-	if err := createOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup); err != nil {
+	if err := createOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup, func(err error) {
+		t.Errorf("%v", err)
+	}); err != nil {
 		t.Fatalf("create dataset %s.%s: %v", project, dataset, err)
 	}
 	return admin

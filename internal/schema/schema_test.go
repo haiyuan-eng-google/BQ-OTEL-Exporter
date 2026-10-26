@@ -2137,7 +2137,7 @@ func TestBoundedWindowTVFDDLsAndStaticPartitionBounds(t *testing.T) {
 			if tc.tvfName == GenAIAgentTrajectoryTVFName {
 				// tvf_gen_ai_agent_trajectory computes step_index inside the trajectory CTE
 				// (before the outer [start_ts, end_ts) filter) and projects t.step_index in
-				// the outer SELECT so tiled window queries preserve trace-wide step_index.
+				// the outer SELECT so tiled window queries preserve context-wide step_index.
 				const viewStepIndexExpr = "  ROW_NUMBER() OVER (\n    PARTITION BY t.trace_id, t.service_name\n    ORDER BY t.start_time ASC, t.span_id ASC\n  ) AS step_index,"
 				if !strings.Contains(viewSelect, viewStepIndexExpr) {
 					t.Fatalf("%s companion view missing expected step_index expression", tc.tvfName)

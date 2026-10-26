@@ -64,7 +64,9 @@ func TestLiveContinuousQueriesDryRun(t *testing.T) {
 		}
 		closeHTTP()
 	})
-	if err := createOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup); err != nil {
+	if err := createOwnedEphemeralDataset(ctx, admin, dataset, location, t.Cleanup, func(err error) {
+		t.Errorf("%v", err)
+	}); err != nil {
 		t.Fatalf("create dataset %s.%s: %v", project, dataset, err)
 	}
 

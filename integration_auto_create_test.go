@@ -89,25 +89,16 @@ func TestAutoCreateLiveBigQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		if !traces.createdDataset.Load() {
-			return
-		}
-		cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cleanCancel()
-		if err := admin.Dataset(dataset).DeleteWithContents(cleanCtx); err != nil {
-			t.Errorf("delete ephemeral dataset %s: %v", dataset, err)
-		}
-	})
 	if err := traces.start(ctx, nil); err != nil {
 		t.Fatalf("first trace startup: %v", err)
 	}
+	registerColdStartCleanup(t.Cleanup, func(err error) { t.Errorf("%v", err) }, admin, dataset, traces.createdDataset.Load())
 	if !traces.createdDataset.Load() {
 		t.Fatalf("first trace startup did not cold-create dataset %s.%s (createdDataset=false)", project, dataset)
 	}
 	defer func() { _ = traces.shutdown(context.Background()) }()
 
-	if err := assertIntegrationTrajectoryDryRunAndPartitionFilter(ctx, admin, project, dataset); err != nil {
+	if err := assertIntegrationTrajectoryDryRunAndPartitionFilter(ctx, admin, project, dataset, t); err != nil {
 		t.Fatalf("trajectory and RPF TVF dry-run verification: %v", err)
 	}
 
@@ -681,7 +672,7 @@ func waitForRows(ctx context.Context, client *bq.Client, project, dataset, table
 	}
 }
 
-func assertIntegrationTrajectoryDryRunAndPartitionFilter(ctx context.Context, client *bq.Client, project, dataset string) error {
+func assertIntegrationTrajectoryDryRunAndPartitionFilter(ctx context.Context, client *bq.Client, project, dataset string, tb testing.TB) error {
 	dryRunQuery := client.Query(fmt.Sprintf(schema.GenAIAgentTrajectoryViewQuery, project, dataset))
 	dryRunQuery.DryRun = true
 	dryRunJob, err := dryRunQuery.Run(ctx)
@@ -996,6 +987,7 @@ func assertIntegrationTrajectoryDryRunAndPartitionFilter(ctx context.Context, cl
 		if err != nil {
 			return fmt.Errorf("%s wide dry-run failed: %w", tc.name, err)
 		}
+		tb.Logf("%s: narrowBytes=%d, wideBytes=%d (delta=%d)", tc.name, narrowBytes, wideBytes, wideBytes-narrowBytes)
 		if narrowBytes <= 0 || narrowBytes >= wideBytes {
 			return fmt.Errorf("%s partition pruning check: narrowBytes=%d, wideBytes=%d; want 0 < narrowBytes < wideBytes", tc.name, narrowBytes, wideBytes)
 		}

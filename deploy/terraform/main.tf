@@ -1609,11 +1609,15 @@ resource "google_bigquery_table" "v_mcp_tool_usage" {
 # otel_metrics, BigQuery's static partition-filter validator cannot push an
 # outer WHERE predicate through the per-row [-24h, +1h] span join window of
 # v_gen_ai_logs and v_gen_ai_metric_exemplars or the recursive CTE of
-# v_gen_ai_agent_trajectory. These three Table-Valued Functions accept explicit
-# (start_ts TIMESTAMP, end_ts TIMESTAMP) bounds and push static partition
-# predicates directly into the underlying deduplication / GenAI views so
-# queries succeed with full partition pruning even when
-# require_partition_filter = true.
+# v_gen_ai_agent_trajectory. The two Table-Valued Functions tvf_gen_ai_logs
+# and tvf_gen_ai_metric_exemplars accept two arguments (start_ts TIMESTAMP,
+# end_ts TIMESTAMP) and push static partition predicates directly into the
+# underlying deduplication / GenAI views. The trajectory TVF
+# tvf_gen_ai_agent_trajectory accepts four arguments (start_ts TIMESTAMP,
+# end_ts TIMESTAMP, context_start_ts TIMESTAMP, context_end_ts TIMESTAMP)
+# where the first pair bounds the emitted segment and the second pair bounds
+# the recursive ancestor context. All three succeed with full partition
+# pruning even when require_partition_filter = true.
 
 resource "google_bigquery_routine" "tvf_gen_ai_logs" {
   project      = var.project_id
