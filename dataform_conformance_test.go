@@ -2375,10 +2375,20 @@ func dfxCheckAssertion(a *dfxAction, rule dfxAssertionRule, run *dfxRun, tables 
 		p.addf("%s: reads the staging table and the trajectory mart %d times, want %d, each read with its own window predicate", a.name, n, rule.wantRefs)
 	}
 	if a.name == "assert_no_orphan_tokens" {
+		if st := dfxCTE(q, "staged"); st != nil && len(st.branches) == 1 {
+			wantStagedWhere := repl.Replace("START_TIME >= %R")
+			if gotStagedWhere := dashJoin(st.branches[0].clauses["WHERE"]); gotStagedWhere != wantStagedWhere {
+				p.addf("%s: the WHERE of the WITH table staged is %q, want %q", a.name, gotStagedWhere, wantStagedWhere)
+			}
+		}
 		if tc := dfxCTE(q, "trajectory_context"); tc != nil && len(tc.branches) == 1 {
 			wantTCFrom := "ref.m_gen_ai_agent_trajectory AS M JOIN ref.stg_spans_dedup AS S ON M . TRACE_ID = S . TRACE_ID AND M . SERVICE_NAME IS NOT DISTINCT FROM S . SERVICE_NAME AND M . SPAN_ID = S . SPAN_ID"
 			if gotTCFrom := dashJoin(tc.branches[0].clauses["FROM"]); gotTCFrom != wantTCFrom {
 				p.addf("%s: trajectory_context FROM is %q, want %q", a.name, gotTCFrom, wantTCFrom)
+			}
+			wantTCWhere := repl.Replace("M . START_TIME >= %R AND S . START_TIME >= %R")
+			if gotTCWhere := dashJoin(tc.branches[0].clauses["WHERE"]); gotTCWhere != wantTCWhere {
+				p.addf("%s: the WHERE of the WITH table trajectory_context is %q, want %q", a.name, gotTCWhere, wantTCWhere)
 			}
 		}
 		if ea := dfxCTE(q, "emitted_ancestors"); ea != nil && len(ea.branches) == 2 {
@@ -2463,6 +2473,10 @@ func dfxCheckAssertion(a *dfxAction, rule dfxAssertionRule, run *dfxRun, tables 
 			if gotEmittedFrom := dashJoin(em.branches[0].clauses["FROM"]); gotEmittedFrom != wantEmittedFrom {
 				p.addf("%s: emitted FROM is %q, want %q", a.name, gotEmittedFrom, wantEmittedFrom)
 			}
+			wantEmittedWhere := repl.Replace("M . START_TIME >= %R")
+			if gotEmittedWhere := dashJoin(em.branches[0].clauses["WHERE"]); gotEmittedWhere != wantEmittedWhere {
+				p.addf("%s: the WHERE of the WITH table emitted is %q, want %q", a.name, gotEmittedWhere, wantEmittedWhere)
+			}
 		}
 		if rv := dfxCTE(q, "row_violations"); rv != nil && len(rv.branches) == 1 {
 			joined := dashJoin(rv.branches[0].toks)
@@ -2496,6 +2510,69 @@ func dfxCheckAssertion(a *dfxAction, rule dfxAssertionRule, run *dfxRun, tables 
 		}
 		if d := dfxDiffSeq(dfxQuerySig(q), wantFinalSig); d != "" {
 			p.addf("%s: final UNION ALL branches: %s", a.name, d)
+		}
+	}
+	if a.name == "assert_no_unhandled_cycles" {
+		if st := dfxCTE(q, "staged"); st != nil && len(st.branches) == 1 {
+			sb := st.branches[0]
+			if len(sb.toks) < 2 || sb.toks[1].up != "DISTINCT" {
+				p.addf("%s: staged WITH table must use SELECT DISTINCT", a.name)
+			}
+			wantStagedItems := []string{"TRACE_ID", "SERVICE_NAME", "SPAN_ID"}
+			if d := dfxDiffSeq(dfxItemSigs(sb), wantStagedItems); d != "" {
+				p.addf("%s: staged select items: %s", a.name, d)
+			}
+			if gotFrom, wantFrom := dashJoin(sb.clauses["FROM"]), "ref."+dfxStaging; gotFrom != wantFrom {
+				p.addf("%s: staged FROM is %q, want %q", a.name, gotFrom, wantFrom)
+			}
+			wantStagedWhere := repl.Replace("START_TIME >= %R")
+			if gotWhere := dashJoin(sb.clauses["WHERE"]); gotWhere != wantStagedWhere {
+				p.addf("%s: the WHERE of the WITH table staged is %q, want %q", a.name, gotWhere, wantStagedWhere)
+			}
+		}
+		if em := dfxCTE(q, "emitted"); em != nil && len(em.branches) == 1 {
+			eb := em.branches[0]
+			wantEmittedItems := []string{
+				"TRACE_ID",
+				"SERVICE_NAME",
+				"SPAN_ID",
+				"COUNT ( * ) AS EMITTED_ROWS",
+			}
+			if d := dfxDiffSeq(dfxItemSigs(eb), wantEmittedItems); d != "" {
+				p.addf("%s: emitted select items: %s", a.name, d)
+			}
+			if gotFrom, wantFrom := dashJoin(eb.clauses["FROM"]), "ref."+dfxTraj; gotFrom != wantFrom {
+				p.addf("%s: emitted FROM is %q, want %q", a.name, gotFrom, wantFrom)
+			}
+			wantEmittedWhere := repl.Replace("START_TIME >= %R")
+			if gotWhere := dashJoin(eb.clauses["WHERE"]); gotWhere != wantEmittedWhere {
+				p.addf("%s: the WHERE of the WITH table emitted is %q, want %q", a.name, gotWhere, wantEmittedWhere)
+			}
+			wantGroupBy := "TRACE_ID , SERVICE_NAME , SPAN_ID"
+			if gotGroupBy := dashJoin(eb.clauses["GROUP BY"]); gotGroupBy != wantGroupBy {
+				p.addf("%s: emitted GROUP BY is %q, want %q", a.name, gotGroupBy, wantGroupBy)
+			}
+		}
+		if len(q.branches) == 1 {
+			fb := q.branches[0]
+			wantFinalItems := []string{
+				"STAGED . TRACE_ID",
+				"STAGED . SERVICE_NAME",
+				"STAGED . SPAN_ID",
+				"COALESCE ( EMITTED . EMITTED_ROWS , 0 ) AS EMITTED_ROWS",
+				"IF ( EMITTED . EMITTED_ROWS IS NULL , 'span_missing_from_trajectory' , 'span_in_trajectory_more_than_once' ) AS VIOLATION",
+			}
+			if d := dfxDiffSeq(dfxItemSigs(fb), wantFinalItems); d != "" {
+				p.addf("%s: final SELECT items: %s", a.name, d)
+			}
+			wantFinalFrom := "STAGED LEFT JOIN EMITTED ON STAGED . TRACE_ID = EMITTED . TRACE_ID AND STAGED . SERVICE_NAME IS NOT DISTINCT FROM EMITTED . SERVICE_NAME AND STAGED . SPAN_ID = EMITTED . SPAN_ID"
+			if gotFinalFrom := dashJoin(fb.clauses["FROM"]); gotFinalFrom != wantFinalFrom {
+				p.addf("%s: final SELECT FROM is %q, want %q", a.name, gotFinalFrom, wantFinalFrom)
+			}
+			wantFinalWhere := "EMITTED . EMITTED_ROWS IS NULL OR EMITTED . EMITTED_ROWS != 1"
+			if gotFinalWhere := dashJoin(fb.clauses["WHERE"]); gotFinalWhere != wantFinalWhere {
+				p.addf("%s: final SELECT WHERE is %q, want %q", a.name, gotFinalWhere, wantFinalWhere)
+			}
 		}
 	}
 	wantWindowDoc := fmt.Sprintf("%d-hour context window anchored at %s.window_start", reach, dfxRunWindow)
@@ -3269,6 +3346,18 @@ var dfxMutations = []dfxMutation{
 			dfxFTraj: dashReplaceFirst("AND m.span_id = cov.span_id", "AND m.span_id = cov.span_id AND FALSE"),
 		},
 		want: "assert_no_orphan_tokens: emitted FROM is"},
+	{area: "assertions", name: "orphans_coverage_left_join_to_inner_join_paired", file: dfxFOrphans,
+		edit: dashReplaceFirst("LEFT JOIN emitted_ancestors AS reverse_path", "INNER JOIN emitted_ancestors AS reverse_path"),
+		also: map[string]func(string) (string, error){
+			dfxFTraj: dashReplaceFirst("LEFT JOIN emitted_ancestors AS reverse_path", "INNER JOIN emitted_ancestors AS reverse_path"),
+		},
+		want: "assert_no_orphan_tokens: token_parent_coverage FROM is"},
+	{area: "assertions", name: "orphans_emitted_left_join_to_inner_join_paired", file: dfxFOrphans,
+		edit: dashReplaceFirst("LEFT JOIN token_parent_coverage AS cov", "INNER JOIN token_parent_coverage AS cov"),
+		also: map[string]func(string) (string, error){
+			dfxFTraj: dashReplaceFirst("LEFT JOIN token_parent_coverage AS cov", "INNER JOIN token_parent_coverage AS cov"),
+		},
+		want: "assert_no_orphan_tokens: emitted FROM is"},
 	{area: "assertions", name: "orphans_missing_not_exists_and_false", file: dfxFOrphans,
 		edit: dashReplaceFirst("          AND m.span_id = s.span_id\n      )", "          AND m.span_id = s.span_id\n          AND FALSE\n      )"), want: "assert_no_orphan_tokens: the WHERE of the WITH table missing is"},
 	{area: "assertions", name: "orphans_missing_branch_where_false", file: dfxFOrphans,
@@ -3301,6 +3390,24 @@ var dfxMutations = []dfxMutation{
 		edit: dashReplaceAll("INTERVAL 24 HOUR", "INTERVAL 12 HOUR"), want: "assert_no_unhandled_cycles: the WHERE of the WITH table emitted is"},
 	{area: "assertions", name: "cycles_staged_window_longer", file: dfxFCycles,
 		edit: dashReplaceFirst("  WHERE start_time >= TIMESTAMP_SUB(\n    (SELECT rw.window_start FROM ${ref(\"stg_run_window\")} AS rw),\n    INTERVAL 24 HOUR\n  )\n),", "  WHERE start_time >= TIMESTAMP_SUB((SELECT rw.window_start FROM ${ref(\"stg_run_window\")} AS rw), INTERVAL 3 HOUR)\n),"), want: "assert_no_unhandled_cycles: the WHERE of the WITH table staged is"},
+	{area: "assertions", name: "cycles_left_join_to_inner_join_paired", file: dfxFCycles,
+		edit: dashReplaceFirst("LEFT JOIN emitted", "INNER JOIN emitted"),
+		also: map[string]func(string) (string, error){
+			dfxFTraj: dashReplaceFirst("LEFT JOIN emitted", "INNER JOIN emitted"),
+		},
+		want: "assert_no_unhandled_cycles: final SELECT FROM is"},
+	{area: "assertions", name: "cycles_emitted_where_and_false_paired", file: dfxFCycles,
+		edit: dashReplaceFirst("  FROM ${ref(\"m_gen_ai_agent_trajectory\")}\n  WHERE start_time >= TIMESTAMP_SUB(\n    (SELECT rw.window_start FROM ${ref(\"stg_run_window\")} AS rw),\n    INTERVAL 24 HOUR\n  )", "  FROM ${ref(\"m_gen_ai_agent_trajectory\")}\n  WHERE start_time >= TIMESTAMP_SUB(\n    (SELECT rw.window_start FROM ${ref(\"stg_run_window\")} AS rw),\n    INTERVAL 24 HOUR\n  ) AND FALSE"),
+		also: map[string]func(string) (string, error){
+			dfxFTraj: dashReplaceFirst("      FROM ${self()}\n      WHERE start_time >= context_start", "      FROM ${self()}\n      WHERE start_time >= context_start AND FALSE"),
+		},
+		want: "assert_no_unhandled_cycles: the WHERE of the WITH table emitted is"},
+	{area: "assertions", name: "cycles_join_on_broken_paired", file: dfxFCycles,
+		edit: dashReplaceFirst("AND staged.span_id = emitted.span_id", "AND staged.trace_id = emitted.trace_id"),
+		also: map[string]func(string) (string, error){
+			dfxFTraj: dashReplaceFirst("AND staged.span_id = emitted.span_id", "AND staged.trace_id = emitted.trace_id"),
+		},
+		want: "assert_no_unhandled_cycles: final SELECT FROM is"},
 
 	// The README.
 	{area: "docs", name: "partition_column_documented_wrongly", file: dfxDoc,
@@ -4163,12 +4270,12 @@ func TestDataformSharedRunWindowAcrossHourBoundary(t *testing.T) {
 
 	// Timeline 2 (P1-1): staging-success / trajectory-success / assertion-failure /
 	// next-invocation and >24h-persistence for two cycle spans (09:00Z, 09:30Z)
-	// plus one isolated root (10:15Z).
+	// plus one isolated root (10:15Z) in the same trace.
 	t.Run("P1-1 two-cycle-spans plus isolated root stays pinned across hourly and >24h retries until repaired", func(t *testing.T) {
 		cycleSpans := []dfxSpanRow{
 			{traceID: "t_cyc", serviceName: "svc", spanID: "s_cyc_0900", parentSpanID: "s_cyc_0930", startTime: time.Date(2026, 10, 25, 9, 0, 0, 0, time.UTC)},
 			{traceID: "t_cyc", serviceName: "svc", spanID: "s_cyc_0930", parentSpanID: "s_cyc_0900", startTime: time.Date(2026, 10, 25, 9, 30, 0, 0, time.UTC)},
-			{traceID: "t_ok", serviceName: "svc", spanID: "s_ok_1015", parentSpanID: "", startTime: time.Date(2026, 10, 25, 10, 15, 0, 0, time.UTC), rawInput: dfxInt64(15)},
+			{traceID: "t_cyc", serviceName: "svc", spanID: "s_ok_1015", parentSpanID: "", startTime: time.Date(2026, 10, 25, 10, 15, 0, 0, time.UTC), rawInput: dfxInt64(15)},
 		}
 
 		// Run at 2026-10-25 12:00Z: 3 staged / 1 materialized / 2 violations, is_committed = false.
@@ -4315,6 +4422,47 @@ func TestDataformSharedRunWindowAcrossHourBoundary(t *testing.T) {
 		reordered := []dfxStmt{trajRun.post[0], trajRun.post[1], trajRun.post[4], trajRun.post[2], trajRun.post[3]}
 		if _, _, _, err := evalTrajectoryPostOps(reordered, cleanRow, want0900); err == nil {
 			t.Fatal("expected UPDATE before assert no_orphan_tokens to fail")
+		}
+
+		// Verify AST evaluation of assert_no_unhandled_cycles.sqlx and the inline
+		// post_operations cycle gate against SQL mutations (INNER JOIN, emitted
+		// WHERE ... AND FALSE, and broken JOIN ON).
+		mixedTraceRows := []dfxSpanRow{
+			{traceID: "t_mix", serviceName: "svc", spanID: "s_ok", parentSpanID: "", startTime: time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC), inMart: true},
+			{traceID: "t_mix", serviceName: "svc", spanID: "s_cyc", parentSpanID: "s_cyc", startTime: time.Date(2026, 10, 25, 10, 5, 0, 0, time.UTC), inMart: false},
+		}
+		for _, cycSQL := range []string{cyclesRun.body, postCyclesSQL} {
+			mutInnerJoin := strings.Replace(cycSQL, "LEFT JOIN emitted", "INNER JOIN emitted", 1)
+			if mutInnerJoin == cycSQL {
+				t.Fatal("failed to mutate LEFT JOIN emitted in cycle assertion SQL")
+			}
+			if _, err := dfxEvalUnhandledCyclesAssertion(mutInnerJoin, mixedTraceRows, want0900); err == nil {
+				t.Errorf("mutating LEFT JOIN emitted -> INNER JOIN emitted succeeded, want error")
+			}
+
+			mutEmittedWhere := strings.Replace(cycSQL, "GROUP BY trace_id, service_name, span_id", "  AND FALSE\n  GROUP BY trace_id, service_name, span_id", 1)
+			if mutEmittedWhere == cycSQL {
+				t.Fatal("failed to mutate emitted WHERE in cycle assertion SQL")
+			}
+			gotEmittedWhere, err := dfxEvalUnhandledCyclesAssertion(mutEmittedWhere, cleanRow, want0900)
+			if err != nil {
+				t.Fatalf("dfxEvalUnhandledCyclesAssertion on emitted WHERE ... AND FALSE: %v", err)
+			}
+			if !slices.Equal(gotEmittedWhere["s_clean"], []string{"span_missing_from_trajectory"}) {
+				t.Errorf("appending AND FALSE to emitted WHERE on cleanRow gave %v, want s_clean:[span_missing_from_trajectory]", gotEmittedWhere)
+			}
+
+			mutJoinOn := strings.Replace(cycSQL, "AND staged.span_id = emitted.span_id", "AND staged.trace_id = emitted.trace_id", 1)
+			if mutJoinOn == cycSQL {
+				t.Fatal("failed to mutate staged.span_id = emitted.span_id in cycle assertion SQL")
+			}
+			gotJoinOn, err := dfxEvalUnhandledCyclesAssertion(mutJoinOn, mixedTraceRows, want0900)
+			if err != nil {
+				t.Fatalf("dfxEvalUnhandledCyclesAssertion on broken JOIN ON: %v", err)
+			}
+			if slices.Equal(gotJoinOn["s_cyc"], []string{"span_missing_from_trajectory"}) {
+				t.Errorf("breaking staged.span_id = emitted.span_id was not reflected in cycle AST evaluation on mixedTraceRows: %v", gotJoinOn)
+			}
 		}
 	})
 }
@@ -4836,64 +4984,312 @@ func dfxParseCaseBranches(toks []dashTok) ([]dfxCaseWhen, error) {
 
 var dfxHopLimitRE = regexp.MustCompile(`\bEA \. HOP < (\d+)\b`)
 
+// dfxParseIfViolation extracts the condition and the true/false string literal
+// branches of an IF(<cond>, '<trueLit>', '<falseLit>') expression.
+func dfxParseIfViolation(toks []dashTok) ([]dashTok, string, string, error) {
+	if len(toks) < 6 || toks[0].up != "IF" || !toks[1].is("(") || !toks[len(toks)-1].is(")") {
+		return nil, "", "", fmt.Errorf("expected IF(<cond>, '<true>', '<false>'), got %q", dashJoin(toks))
+	}
+	inner := toks[2 : len(toks)-1]
+	argDepth := toks[1].depth + 1
+	var commas []int
+	for i, t := range inner {
+		if t.depth == argDepth && t.is(",") {
+			commas = append(commas, i)
+		}
+	}
+	if len(commas) != 2 {
+		return nil, "", "", fmt.Errorf("expected 3 arguments in IF(...), got %d commas in %q", len(commas), dashJoin(toks))
+	}
+	condToks := inner[:commas[0]]
+	trueToks := inner[commas[0]+1 : commas[1]]
+	falseToks := inner[commas[1]+1:]
+	if len(condToks) == 0 || len(trueToks) != 1 || len(falseToks) != 1 {
+		return nil, "", "", fmt.Errorf("malformed IF(...) branches in %q", dashJoin(toks))
+	}
+	tm := dfxViolationRE.FindStringSubmatch(trueToks[0].text)
+	fm := dfxViolationRE.FindStringSubmatch(falseToks[0].text)
+	if tm == nil || fm == nil {
+		return nil, "", "", fmt.Errorf("expected violation string literals in IF(...), got %q and %q", trueToks[0].text, falseToks[0].text)
+	}
+	return condToks, tm[1], fm[1], nil
+}
+
 // dfxEvalUnhandledCyclesAssertion parses sqlText (the rendered SQL of
 // assert_no_unhandled_cycles.sqlx or the first ASSERT NOT EXISTS query in
-// m_gen_ai_agent_trajectory's post_operations) and evaluates it against rows
-// in the 24-hour context window anchored at windowStart.
+// m_gen_ai_agent_trajectory's post_operations) and evaluates its staged CTE
+// (SELECT DISTINCT, FROM, WHERE), emitted CTE (FROM, WHERE, GROUP BY,
+// COUNT(*)), and outer SELECT (FROM staged LEFT JOIN emitted ON ..., WHERE,
+// and IF(...) violation expression) directly from the parsed SQL AST against
+// rows in the 24-hour context window anchored at windowStart.
 func dfxEvalUnhandledCyclesAssertion(sqlText string, rows []dfxSpanRow, windowStart time.Time) (map[string][]string, error) {
 	q, err := dashParseSQL(sqlText)
 	if err != nil {
 		return nil, fmt.Errorf("parsing unhandled cycles assertion SQL: %w", err)
 	}
-	if dfxCTE(q, "staged") == nil || dfxCTE(q, "emitted") == nil || len(q.branches) != 1 {
+	stagedCTE := dfxCTE(q, "staged")
+	emittedCTE := dfxCTE(q, "emitted")
+	if stagedCTE == nil || len(stagedCTE.branches) != 1 || emittedCTE == nil || len(emittedCTE.branches) != 1 || len(q.branches) != 1 {
 		return nil, errors.New("expected staged and emitted CTEs and 1 final SELECT branch")
 	}
-	b := q.branches[0]
-	if gotWhere := dashJoin(b.clauses["WHERE"]); gotWhere != "EMITTED . EMITTED_ROWS IS NULL OR EMITTED . EMITTED_ROWS != 1" {
-		return nil, fmt.Errorf("unexpected WHERE clause %q", gotWhere)
+
+	contextStart := windowStart.Add(-24 * time.Hour)
+	baseEnv := map[string]any{
+		"window_start":                       windowStart,
+		"context_start":                      contextStart,
+		dfxSharedWindowExpr:                  windowStart,
+		strings.ToUpper(dfxSharedWindowExpr): windowStart,
+		"( SELECT RW . WINDOW_START FROM REF . STG_RUN_WINDOW AS RW )": windowStart,
 	}
-	missingViolation := "span_missing_from_trajectory"
-	duplicateViolation := "span_in_trajectory_more_than_once"
+	bindRow := func(env map[string]any, prefix string, r dfxSpanRow) {
+		env[prefix+"trace_id"] = r.traceID
+		env[prefix+"service_name"] = r.serviceName
+		env[prefix+"span_id"] = r.spanID
+		env[prefix+"parent_span_id"] = r.parentSpanID
+		env[prefix+"start_time"] = r.startTime
+		env[prefix+"is_token_leaf"] = r.isTokenLeaf
+		env[prefix+"input_tokens"] = r.inputTokens
+		env[prefix+"output_tokens"] = r.outputTokens
+		env[prefix+"reasoning_tokens"] = r.reasoningTokens
+		env[prefix+"raw_input_tokens"] = r.rawInput
+		env[prefix+"raw_output_tokens"] = r.rawOutput
+		env[prefix+"raw_reasoning_tokens"] = r.rawReasoning
+	}
+
+	// 1. Parse and evaluate staged CTE (SELECT DISTINCT ... FROM ref.stg_spans_dedup WHERE ...).
+	sb := stagedCTE.branches[0]
+	if len(sb.toks) < 2 || sb.toks[1].up != "DISTINCT" {
+		return nil, errors.New("staged CTE must use SELECT DISTINCT")
+	}
+	if gotFrom, wantFrom := dashJoin(sb.clauses["FROM"]), "ref."+dfxStaging; gotFrom != wantFrom {
+		return nil, fmt.Errorf("staged CTE FROM is %q, want %q", gotFrom, wantFrom)
+	}
+	stagedWhere := sb.clauses["WHERE"]
+	if len(stagedWhere) == 0 {
+		return nil, errors.New("staged CTE missing WHERE clause")
+	}
+	stagedKeySource := map[string]string{}
+	for _, it := range sb.items {
+		stagedKeySource[strings.ToLower(it.name)] = strings.ToLower(strings.ReplaceAll(dashJoin(it.body), " ", ""))
+	}
+	for _, keyCol := range []string{"trace_id", "service_name", "span_id"} {
+		if stagedKeySource[keyCol] == "" {
+			return nil, fmt.Errorf("staged CTE missing key item %s", keyCol)
+		}
+	}
+	type stagedRow struct {
+		traceID, serviceName, spanID string
+	}
+	var stagedRows []stagedRow
+	seenStaged := map[stagedRow]bool{}
+	for _, r := range rows {
+		env := maps.Clone(baseEnv)
+		bindRow(env, "", r)
+		bindRow(env, "s.", r)
+		keep, err := dfxEvalBoolToks(stagedWhere, env)
+		if err != nil {
+			return nil, fmt.Errorf("evaluating staged WHERE: %w", err)
+		}
+		if !keep {
+			continue
+		}
+		sr := stagedRow{
+			traceID:     fmt.Sprint(env[stagedKeySource["trace_id"]]),
+			serviceName: fmt.Sprint(env[stagedKeySource["service_name"]]),
+			spanID:      fmt.Sprint(env[stagedKeySource["span_id"]]),
+		}
+		if !seenStaged[sr] {
+			seenStaged[sr] = true
+			stagedRows = append(stagedRows, sr)
+		}
+	}
+
+	// 2. Parse and evaluate emitted CTE (SELECT ..., COUNT(*) AS emitted_rows FROM ref.m_gen_ai_agent_trajectory WHERE ... GROUP BY ...).
+	eb := emittedCTE.branches[0]
+	if gotFrom, wantFrom := dashJoin(eb.clauses["FROM"]), "ref."+dfxTraj; gotFrom != wantFrom {
+		return nil, fmt.Errorf("emitted CTE FROM is %q, want %q", gotFrom, wantFrom)
+	}
+	emittedWhere := eb.clauses["WHERE"]
+	if len(emittedWhere) == 0 {
+		return nil, errors.New("emitted CTE missing WHERE clause")
+	}
+	emittedGroupByToks := eb.clauses["GROUP BY"]
+	if len(emittedGroupByToks) == 0 {
+		return nil, errors.New("emitted CTE missing GROUP BY clause")
+	}
+	var emittedGroupKeys []string
+	{
+		start := 0
+		for i, t := range emittedGroupByToks {
+			if t.is(",") {
+				if k := strings.ToLower(strings.ReplaceAll(dashJoin(emittedGroupByToks[start:i]), " ", "")); k != "" {
+					emittedGroupKeys = append(emittedGroupKeys, k)
+				}
+				start = i + 1
+			}
+		}
+		if lastKey := strings.ToLower(strings.ReplaceAll(dashJoin(emittedGroupByToks[start:]), " ", "")); lastKey != "" {
+			emittedGroupKeys = append(emittedGroupKeys, lastKey)
+		}
+	}
+	if len(emittedGroupKeys) == 0 {
+		return nil, errors.New("emitted CTE GROUP BY has no keys")
+	}
+	emittedKeySource := map[string]string{}
+	hasCountStar := false
+	for _, it := range eb.items {
+		joined := dashJoin(it.body)
+		if strings.EqualFold(it.name, "emitted_rows") && joined == "COUNT ( * )" {
+			hasCountStar = true
+			continue
+		}
+		emittedKeySource[strings.ToLower(it.name)] = strings.ToLower(strings.ReplaceAll(joined, " ", ""))
+	}
+	if !hasCountStar {
+		return nil, errors.New("emitted CTE missing COUNT(*) AS emitted_rows item")
+	}
+	for _, keyCol := range []string{"trace_id", "service_name", "span_id"} {
+		srcExpr := emittedKeySource[keyCol]
+		if srcExpr == "" {
+			return nil, fmt.Errorf("emitted CTE missing key item %s", keyCol)
+		}
+		if !slices.Contains(emittedGroupKeys, srcExpr) {
+			return nil, fmt.Errorf("emitted CTE SELECT item %s (%s) is not in GROUP BY %v", keyCol, srcExpr, emittedGroupKeys)
+		}
+	}
+	type emittedRow struct {
+		traceID, serviceName, spanID string
+		emittedRows                  int64
+	}
+	emittedByGroup := map[string]*emittedRow{}
+	var emittedRows []*emittedRow
+	for _, r := range rows {
+		if !r.inMart {
+			continue
+		}
+		env := maps.Clone(baseEnv)
+		bindRow(env, "", r)
+		bindRow(env, "m.", r)
+		keep, err := dfxEvalBoolToks(emittedWhere, env)
+		if err != nil {
+			return nil, fmt.Errorf("evaluating emitted WHERE: %w", err)
+		}
+		if !keep {
+			continue
+		}
+		var gkParts []string
+		for _, gk := range emittedGroupKeys {
+			v, ok := env[gk]
+			if !ok {
+				return nil, fmt.Errorf("unknown emitted GROUP BY key %q", gk)
+			}
+			gkParts = append(gkParts, fmt.Sprint(v))
+		}
+		gk := strings.Join(gkParts, "|")
+		er, exists := emittedByGroup[gk]
+		if !exists {
+			er = &emittedRow{
+				traceID:     fmt.Sprint(env[emittedKeySource["trace_id"]]),
+				serviceName: fmt.Sprint(env[emittedKeySource["service_name"]]),
+				spanID:      fmt.Sprint(env[emittedKeySource["span_id"]]),
+			}
+			emittedByGroup[gk] = er
+			emittedRows = append(emittedRows, er)
+		}
+		er.emittedRows++
+	}
+
+	// 3. Parse and evaluate outer SELECT (FROM staged LEFT JOIN emitted ON ... WHERE ...).
+	b := q.branches[0]
+	outerJoinOn, err := dfxExtractLeftJoinOn(b.clauses["FROM"])
+	if err != nil {
+		return nil, fmt.Errorf("unhandled cycles outer FROM: %w", err)
+	}
+	if !strings.HasPrefix(dashJoin(b.clauses["FROM"]), "STAGED LEFT JOIN EMITTED ON ") {
+		return nil, fmt.Errorf("unhandled cycles outer FROM %q must start with STAGED LEFT JOIN EMITTED ON", dashJoin(b.clauses["FROM"]))
+	}
+	outerWhere := b.clauses["WHERE"]
+	if len(outerWhere) == 0 {
+		return nil, errors.New("unhandled cycles outer SELECT missing WHERE clause")
+	}
+	var ifCondToks []dashTok
+	var missingViolation, duplicateViolation string
 	for _, it := range b.items {
 		if strings.EqualFold(it.name, "violation") {
-			lits := dfxViolations(it.body)
-			if len(lits) != 2 {
-				return nil, fmt.Errorf("expected 2 violation literals in IF(...), got %v", lits)
+			ifCondToks, missingViolation, duplicateViolation, err = dfxParseIfViolation(it.body)
+			if err != nil {
+				return nil, fmt.Errorf("unhandled cycles violation item: %w", err)
 			}
 		}
 	}
-	contextStart := windowStart.Add(-24 * time.Hour)
-	type spanKey struct{ traceID, serviceName, spanID string }
-	var stagedKeys []spanKey
-	seenStaged := map[spanKey]bool{}
-	emittedCounts := map[spanKey]int{}
-	for _, r := range rows {
-		if r.startTime.Before(contextStart) {
-			continue
-		}
-		k := spanKey{r.traceID, r.serviceName, r.spanID}
-		if !seenStaged[k] {
-			seenStaged[k] = true
-			stagedKeys = append(stagedKeys, k)
-		}
-		if r.inMart {
-			emittedCounts[k]++
-		}
+	if len(ifCondToks) == 0 {
+		return nil, errors.New("unhandled cycles outer SELECT missing violation item")
 	}
+
 	violations := map[string][]string{}
-	for _, k := range stagedKeys {
-		switch cnt := emittedCounts[k]; {
-		case cnt == 0:
-			violations[k.spanID] = append(violations[k.spanID], missingViolation)
-		case cnt != 1:
-			violations[k.spanID] = append(violations[k.spanID], duplicateViolation)
+	for _, sr := range stagedRows {
+		var matchedEmitted []*emittedRow
+		for _, er := range emittedRows {
+			joinEnv := maps.Clone(baseEnv)
+			joinEnv["staged.trace_id"] = sr.traceID
+			joinEnv["staged.service_name"] = sr.serviceName
+			joinEnv["staged.span_id"] = sr.spanID
+			joinEnv["emitted.trace_id"] = er.traceID
+			joinEnv["emitted.service_name"] = er.serviceName
+			joinEnv["emitted.span_id"] = er.spanID
+			joinEnv["emitted.emitted_rows"] = dfxInt64(er.emittedRows)
+			matched, err := dfxEvalBoolToks(outerJoinOn, joinEnv)
+			if err != nil {
+				return nil, fmt.Errorf("evaluating unhandled cycles LEFT JOIN ON: %w", err)
+			}
+			if matched {
+				matchedEmitted = append(matchedEmitted, er)
+			}
+		}
+		if len(matchedEmitted) == 0 {
+			matchedEmitted = []*emittedRow{nil}
+		}
+		for _, erPtr := range matchedEmitted {
+			whereEnv := maps.Clone(baseEnv)
+			whereEnv["staged.trace_id"] = sr.traceID
+			whereEnv["staged.service_name"] = sr.serviceName
+			whereEnv["staged.span_id"] = sr.spanID
+			if erPtr == nil {
+				whereEnv["emitted.trace_id"] = nil
+				whereEnv["emitted.service_name"] = nil
+				whereEnv["emitted.span_id"] = nil
+				whereEnv["emitted.emitted_rows"] = (*int64)(nil)
+			} else {
+				whereEnv["emitted.trace_id"] = erPtr.traceID
+				whereEnv["emitted.service_name"] = erPtr.serviceName
+				whereEnv["emitted.span_id"] = erPtr.spanID
+				whereEnv["emitted.emitted_rows"] = dfxInt64(erPtr.emittedRows)
+			}
+			keep, err := dfxEvalBoolToks(outerWhere, whereEnv)
+			if err != nil {
+				return nil, fmt.Errorf("evaluating unhandled cycles outer WHERE: %w", err)
+			}
+			if !keep {
+				continue
+			}
+			condTrue, err := dfxEvalBoolToks(ifCondToks, whereEnv)
+			if err != nil {
+				return nil, fmt.Errorf("evaluating unhandled cycles IF condition: %w", err)
+			}
+			v := duplicateViolation
+			if condTrue {
+				v = missingViolation
+			}
+			if !slices.Contains(violations[sr.spanID], v) {
+				violations[sr.spanID] = append(violations[sr.spanID], v)
+			}
 		}
 	}
 	return violations, nil
 }
 
-// dfxExtractJoinOn extracts the ON <expr> tokens of a JOIN or LEFT JOIN from a
-// FROM clause token slice.
+// dfxExtractJoinOn extracts the ON <expr> tokens of a JOIN from a FROM clause
+// token slice.
 func dfxExtractJoinOn(fromToks []dashTok) ([]dashTok, error) {
 	if len(fromToks) == 0 {
 		return nil, errors.New("empty FROM clause")
@@ -4905,6 +5301,37 @@ func dfxExtractJoinOn(fromToks []dashTok) ([]dashTok, error) {
 		}
 	}
 	return nil, fmt.Errorf("FROM clause %q has no top-level ON predicate", dashJoin(fromToks))
+}
+
+// dfxExtractLeftJoinOn extracts the ON <expr> tokens of a top-level LEFT JOIN
+// from a FROM clause token slice, rejecting INNER JOIN or bare JOIN so outer
+// join semantics cannot be silently replaced with an inner join.
+func dfxExtractLeftJoinOn(fromToks []dashTok) ([]dashTok, error) {
+	if len(fromToks) == 0 {
+		return nil, errors.New("empty FROM clause")
+	}
+	base := fromToks[0].depth
+	sawLeftJoin := false
+	for i, t := range fromToks {
+		if t.depth != base {
+			continue
+		}
+		if t.up == "JOIN" {
+			prevLeft := i > 0 && fromToks[i-1].depth == base &&
+				(fromToks[i-1].up == "LEFT" || (fromToks[i-1].up == "OUTER" && i > 1 && fromToks[i-2].depth == base && fromToks[i-2].up == "LEFT"))
+			if !prevLeft {
+				return nil, fmt.Errorf("FROM clause %q uses non-LEFT JOIN", dashJoin(fromToks))
+			}
+			sawLeftJoin = true
+		}
+		if t.up == "ON" && i+1 < len(fromToks) {
+			if !sawLeftJoin {
+				return nil, fmt.Errorf("FROM clause %q has ON without LEFT JOIN", dashJoin(fromToks))
+			}
+			return fromToks[i+1:], nil
+		}
+	}
+	return nil, fmt.Errorf("FROM clause %q has no top-level LEFT JOIN ... ON predicate", dashJoin(fromToks))
 }
 
 // dfxEvalStringArrayToks evaluates a targeted GoogleSQL string-array expression
@@ -5198,7 +5625,7 @@ func dfxEvalOrphanTokensAssertion(sqlText string, rows []dfxSpanRow, windowStart
 	if covCTE == nil || len(covCTE.branches) != 1 {
 		return nil, errors.New("missing token_parent_coverage CTE")
 	}
-	covJoinOn, err := dfxExtractJoinOn(covCTE.branches[0].clauses["FROM"])
+	covJoinOn, err := dfxExtractLeftJoinOn(covCTE.branches[0].clauses["FROM"])
 	if err != nil {
 		return nil, fmt.Errorf("token_parent_coverage FROM: %w", err)
 	}
@@ -5264,7 +5691,7 @@ func dfxEvalOrphanTokensAssertion(sqlText string, rows []dfxSpanRow, windowStart
 	if emittedCTE == nil || len(emittedCTE.branches) != 1 {
 		return nil, errors.New("missing emitted CTE")
 	}
-	emittedJoinOn, err := dfxExtractJoinOn(emittedCTE.branches[0].clauses["FROM"])
+	emittedJoinOn, err := dfxExtractLeftJoinOn(emittedCTE.branches[0].clauses["FROM"])
 	if err != nil {
 		return nil, fmt.Errorf("emitted FROM: %w", err)
 	}
@@ -6179,6 +6606,22 @@ func TestDataformOrphanTokensAssertionSemantics(t *testing.T) {
 			}
 			if !slices.Contains(gotCycleBroken["cyc_late"], "token_double_counted_with_child") {
 				t.Errorf("appending AND FALSE to reverse_path LEFT JOIN ON gave %v on cycleRows, want cyc_late:[token_double_counted_with_child]", gotCycleBroken)
+			}
+
+			// Mutating LEFT JOIN -> INNER JOIN on token_parent_coverage or emitted is rejected by dfxExtractLeftJoinOn.
+			mutCovInnerJoin := strings.Replace(sqlSrc, "LEFT JOIN emitted_ancestors AS reverse_path", "INNER JOIN emitted_ancestors AS reverse_path", 1)
+			if mutCovInnerJoin == sqlSrc {
+				t.Fatal("failed to mutate token_parent_coverage LEFT JOIN in rendered SQL")
+			}
+			if _, err := dfxEvalOrphanTokensAssertion(mutCovInnerJoin, validTreeRows, windowStart); err == nil {
+				t.Errorf("mutating token_parent_coverage LEFT JOIN -> INNER JOIN succeeded, want error")
+			}
+			mutEmittedInnerJoin := strings.Replace(sqlSrc, "LEFT JOIN token_parent_coverage AS cov", "INNER JOIN token_parent_coverage AS cov", 1)
+			if mutEmittedInnerJoin == sqlSrc {
+				t.Fatal("failed to mutate emitted LEFT JOIN in rendered SQL")
+			}
+			if _, err := dfxEvalOrphanTokensAssertion(mutEmittedInnerJoin, validTreeRows, windowStart); err == nil {
+				t.Errorf("mutating emitted LEFT JOIN -> INNER JOIN succeeded, want error")
 			}
 		}
 	})
