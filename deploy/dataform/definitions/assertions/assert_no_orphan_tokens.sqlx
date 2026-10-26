@@ -49,7 +49,10 @@ WITH RECURSIVE
       gen_ai_usage_output_tokens AS raw_output_tokens,
       gen_ai_usage_reasoning_tokens AS raw_reasoning_tokens
     FROM ${ref("stg_spans_dedup")}
-    WHERE start_time >= (SELECT rw.window_start FROM ${ref("stg_run_window")} AS rw)
+    WHERE start_time >= TIMESTAMP_SUB(
+      (SELECT rw.window_start FROM ${ref("stg_run_window")} AS rw),
+      INTERVAL 24 HOUR
+    )
   ),
   trajectory_context AS (
     SELECT
@@ -175,7 +178,10 @@ WITH RECURSIVE
       ON m.trace_id = cov.trace_id
       AND m.span_id = cov.span_id
       AND m.service_name IS NOT DISTINCT FROM cov.service_name
-    WHERE m.start_time >= (SELECT rw.window_start FROM ${ref("stg_run_window")} AS rw)
+    WHERE m.start_time >= TIMESTAMP_SUB(
+      (SELECT rw.window_start FROM ${ref("stg_run_window")} AS rw),
+      INTERVAL 24 HOUR
+    )
   ),
   row_violations AS (
     SELECT

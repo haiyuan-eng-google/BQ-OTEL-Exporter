@@ -4,28 +4,56 @@
  */
 
 config {
-  type: "table",
+  type: "incremental",
   tags: ["otel_marts"],
-  description: "Single run-start timestamp and 3-hour lookback boundary shared by every staging table, mart and assertion in one Dataform invocation."
+  description: "Single run-start timestamp, 3-hour lookback boundary, and DAG commit state shared by every staging table, mart and assertion in one Dataform invocation."
 }
 
 -- Capture the invocation timestamp once when the DAG begins, or use the
 -- explicit ISO-8601 UTC vars.run_timestamp override when supplied, so every
 -- downstream staging table, mart and assertion evaluates the exact same
--- window_start even if execution crosses an hour boundary.
+-- window_start even if execution crosses an hour boundary. If the previous
+-- invocation did not reach m_gen_ai_agent_trajectory's post_operations
+-- (is_committed = FALSE), retain its earlier window_start via LEAST so the
+-- next run re-covers the uncommitted window without a lookback gap.
+
+pre_operations {
+  DECLARE prev_window_start TIMESTAMP DEFAULT ${when(incremental(), `(SELECT MIN(IF(is_committed, TIMESTAMP('9999-12-31 23:59:59+00'), window_start)) FROM ${self()})`, `TIMESTAMP('9999-12-31 23:59:59+00')`)}
+  ---
+  ${when(incremental(), `BEGIN TRANSACTION`)}
+  ---
+  ${when(incremental(), `DELETE FROM ${self()} WHERE TRUE`)}
+}
 
 WITH
   clock AS (
     SELECT
       COALESCE(
-        CAST(NULLIF(${JSON.stringify(dataform.projectConfig.vars.run_timestamp)}, '') AS TIMESTAMP),
+        CAST(
+          CASE
+            WHEN ${JSON.stringify(dataform.projectConfig.vars.run_timestamp ?? "")} = '' THEN NULL
+            WHEN REGEXP_CONTAINS(
+              ${JSON.stringify(dataform.projectConfig.vars.run_timestamp ?? "")},
+              r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|\+00:00)$'
+            ) THEN ${JSON.stringify(dataform.projectConfig.vars.run_timestamp ?? "")}
+            ELSE CONCAT('INVALID_ISO8601_UTC_RUN_TIMESTAMP:', ${JSON.stringify(dataform.projectConfig.vars.run_timestamp ?? "")})
+          END AS TIMESTAMP
+        ),
         CURRENT_TIMESTAMP()
       ) AS run_ts
   )
 SELECT
   run_ts,
-  TIMESTAMP_TRUNC(
-    TIMESTAMP_SUB(run_ts, INTERVAL 3 HOUR),
-    HOUR
-  ) AS window_start
+  LEAST(
+    TIMESTAMP_TRUNC(
+      TIMESTAMP_SUB(run_ts, INTERVAL 3 HOUR),
+      HOUR
+    ),
+    COALESCE(prev_window_start, TIMESTAMP('9999-12-31 23:59:59+00'))
+  ) AS window_start,
+  FALSE AS is_committed
 FROM clock
+
+post_operations {
+  ${when(incremental(), `COMMIT TRANSACTION`)}
+}

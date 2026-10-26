@@ -604,7 +604,7 @@ var dashAllowedSQLFuncs = func() map[string]bool {
 	m := map[string]bool{}
 	for _, fn := range strings.Fields(`
 		SUM AVG MIN MAX COUNT ANY_VALUE LOGICAL_OR ARRAY_AGG STRING_AGG APPROX_QUANTILES ROW_NUMBER
-		COALESCE IF IFNULL NULLIF CAST SAFE_CAST SAFE_DIVIDE ROUND
+		COALESCE IF IFNULL NULLIF CAST SAFE_CAST SAFE_DIVIDE ROUND LEAST GREATEST
 		DATE TIMESTAMP TIMESTAMP_TRUNC TIMESTAMP_SUB TIMESTAMP_ADD TIMESTAMP_DIFF TIMESTAMP_MILLIS UNIX_MICROS
 		PARSE_DATE DATE_ADD DATE_SUB CURRENT_TIMESTAMP
 		CONCAT LOWER UPPER TRIM SUBSTR LENGTH TO_JSON_STRING JSON_VALUE JSON_QUERY JSON_EXTRACT_SCALAR
@@ -1033,7 +1033,7 @@ func dashSourceColumnTypes(files dashFileSet, view string) map[string]string {
 		"step_kind":                    "STRING",
 		"status_message":               "STRING",
 		"error_type":                   "STRING",
-		"top_error_types":              "STRING",
+		"top_error_types":              "ARRAY<STRUCT<value STRING, count INT64>>",
 		"gen_ai_system":                "STRING",
 		"gen_ai_provider_name":         "STRING",
 		"gen_ai_operation_name":        "STRING",
@@ -1056,13 +1056,13 @@ func dashSourceColumnTypes(files dashFileSet, view string) map[string]string {
 		"gen_ai_token_type":            "STRING",
 		"gen_ai_token_modality":        "STRING",
 		"nearest_agent_name":           "STRING",
-		"agent_path":                   "STRING",
+		"agent_path":                   "ARRAY<STRING>",
 		"span_path":                    "STRING",
 		"metric_name":                  "STRING",
 		"metric_unit":                  "STRING",
 		"metric_type":                  "STRING",
 		"metric_error_type":            "STRING",
-		"exemplar_filtered_attributes": "STRING",
+		"exemplar_filtered_attributes": "JSON",
 		"span_status_message":          "STRING",
 		"span_error_type":              "STRING",
 		"span_gen_ai_agent_name":       "STRING",
@@ -1119,16 +1119,18 @@ func dashSourceColumnTypes(files dashFileSet, view string) map[string]string {
 		"output_tokens":                     "INT64",
 		"reasoning_tokens":                  "INT64",
 		"error_spans":                       "INT64",
+		"session_duration_ms":               "INT64",
+		"exemplar_value_int64":              "INT64",
 		// Floats
 		"avg_duration_ms":       "FLOAT64",
 		"p50_duration_ms":       "FLOAT64",
 		"p95_duration_ms":       "FLOAT64",
 		"p99_duration_ms":       "FLOAT64",
 		"max_duration_ms":       "FLOAT64",
-		"session_duration_ms":   "FLOAT64",
 		"total_llm_duration_ms": "FLOAT64",
 		"duration_ms":           "FLOAT64",
 		"exemplar_value":        "FLOAT64",
+		"exemplar_value_double": "FLOAT64",
 		"span_duration_ms":      "FLOAT64",
 		"error_rate":            "FLOAT64",
 		"p95_s":                 "FLOAT64",
@@ -1148,8 +1150,22 @@ func dashSourceColumnTypes(files dashFileSet, view string) map[string]string {
 	return types
 }
 
+// dashLookerOutputColumnTypes returns the expected GoogleSQL scalar output types
+// of Looker Studio custom queries (where complex ARRAY/STRUCT/JSON view columns
+// must be flattened to STRING and exemplar_value is coalesced to FLOAT64).
+func dashLookerOutputColumnTypes(files dashFileSet, view string) map[string]string {
+	types := dashSourceColumnTypes(files, view)
+	types["top_error_types"] = "STRING"
+	types["agent_path"] = "STRING"
+	types["exemplar_filtered_attributes"] = "STRING"
+	return types
+}
+
 // dashInferExprType infers the GoogleSQL scalar type of a SELECT item body.
 func dashInferExprType(toks []dashTok, colTypes map[string]string) string {
+	for len(toks) >= 2 && toks[0].is("(") && toks[len(toks)-1].is(")") && dashClosing(toks, 0) == len(toks)-1 {
+		toks = toks[1 : len(toks)-1]
+	}
 	if len(toks) == 0 {
 		return ""
 	}
@@ -1316,10 +1332,11 @@ func dashSourceColumns(files dashFileSet, view string) ([]string, error) {
 
 // dashLookerQuery is a parsed data source query.
 type dashLookerQuery struct {
-	path    string
-	toks    []dashTok
-	query   *dashQuery
-	outputs []string
+	path        string
+	toks        []dashTok
+	query       *dashQuery
+	outputs     []string
+	outputTypes map[string]string
 }
 
 // dashLooker runs the rules on the Looker Studio package.
@@ -1372,7 +1389,7 @@ func (l *dashLooker) parseQueries() {
 			l.probs.addf("%s: %v", path, err)
 			continue
 		}
-		l.queries[id] = &dashLookerQuery{path: path, toks: toks, query: q, outputs: outputs}
+		l.queries[id] = &dashLookerQuery{path: path, toks: toks, query: q, outputs: outputs, outputTypes: map[string]string{}}
 	}
 	for _, path := range l.files.sortedPaths(dashLookerDir+"queries/", ".sql") {
 		if !used[path] {
@@ -1529,20 +1546,24 @@ func (l *dashLooker) checkQueries() {
 			for _, msg := range dashCheckBranch(b, dashSource{cols: dashSet(viewCols)}) {
 				l.probs.addf("%s: %s", label, msg)
 			}
-			colTypes := dashSourceColumnTypes(l.files, view)
+			srcColTypes := dashSourceColumnTypes(l.files, view)
+			outColTypes := dashLookerOutputColumnTypes(l.files, view)
 			for _, it := range b.items {
 				if it.name == "" {
 					continue
 				}
-				gotType := dashInferExprType(it.body, colTypes)
-				wantType := colTypes[it.name]
+				gotType := dashInferExprType(it.body, srcColTypes)
+				wantType := outColTypes[it.name]
 				switch {
 				case wantType == "":
-					l.probs.addf("%s: select item %s has no declared type in dashSourceColumnTypes", label, it.name)
+					l.probs.addf("%s: select item %s has no declared type in dashLookerOutputColumnTypes", label, it.name)
 				case gotType == "":
 					l.probs.addf("%s: cannot infer type of select item %s", label, it.name)
 				case gotType != wantType:
 					l.probs.addf("%s: select item %s has type %s, want %s", label, it.name, gotType, wantType)
+				}
+				if i == 0 && gotType != "" {
+					q.outputTypes[it.name] = gotType
 				}
 			}
 			if mart, ok := src.Marts[view]; ok {
@@ -1644,7 +1665,7 @@ var (
 	dashAggregations   = []string{"SUM", "AVG", "MAX", "MIN", "COUNT", "COUNT_DISTINCT", "NONE"}
 	dashFilterOps      = []string{"EQUALS", "GREATER_THAN", "IS_TRUE"}
 	dashPercentiles    = []string{"p50_duration_ms", "p95_duration_ms", "p99_duration_ms"}
-	dashFormulaWords   = []string{"SUM", "AVG", "MAX", "MIN", "COUNT", "COUNT_DISTINCT", "CASE", "WHEN", "THEN", "ELSE", "END", "AND", "OR", "NOT", "HYPERLINK"}
+	dashFormulaWords   = []string{"SUM", "AVG", "MAX", "MIN", "COUNT", "COUNT_DISTINCT", "CASE", "WHEN", "THEN", "ELSE", "END", "AND", "OR", "NOT", "HYPERLINK", "CONCAT"}
 	dashAggregateCall  = regexp.MustCompile(`\b(SUM|AVG|MAX|MIN|COUNT|COUNT_DISTINCT)\(`)
 	dashFormulaString  = regexp.MustCompile(`"[^"]*"`)
 	dashFormulaWord    = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*`)
@@ -1719,7 +1740,8 @@ func (l *dashLooker) checkSpec() {
 		}
 	}
 	_, kinds, _ := dashAlertPayload(l.files)
-	fields := map[string]map[string]string{} // data source -> field -> "column", "agg" or "row"
+	fields := map[string]map[string]string{}     // data source -> field -> "column", "agg" or "row"
+	fieldTypes := map[string]map[string]string{} // data source -> field -> GoogleSQL or Looker Studio type
 	for _, id := range dashSortedKeys(s.DataSources) {
 		src := s.DataSources[id]
 		plan, ok := dashDataSourcePlan[id]
@@ -1760,8 +1782,10 @@ func (l *dashLooker) checkSpec() {
 		}
 		outputs := dashSet(q.outputs)
 		kind := map[string]string{}
+		fTypes := map[string]string{}
 		for _, c := range q.outputs {
 			kind[c] = "column"
+			fTypes[c] = q.outputTypes[c]
 		}
 		calcs := map[string]bool{}
 		for _, c := range src.CalculatedFields {
@@ -1777,10 +1801,14 @@ func (l *dashLooker) checkSpec() {
 			for _, msg := range dashCheckFormula(c, outputs, calcs, params) {
 				l.probs.addf("%s: calculated field %s: %s", id, c.Name, msg)
 			}
+			if strings.Contains(c.Formula, "COUNT_DISTINCT") && slices.Contains(c.Uses, "span_id") && !slices.Contains(c.Uses, "trace_id") {
+				l.probs.addf("%s: calculated field %s counts distinct span_id without trace_id; span_id is only unique within a trace, so use CONCAT(trace_id, \":\", span_id)", id, c.Name)
+			}
 			kind[c.Name] = "row"
 			if dashAggregateCall.MatchString(c.Formula) {
 				kind[c.Name] = "agg"
 			}
+			fTypes[c.Name] = c.Type
 		}
 		for f, typ := range src.FieldTypes {
 			if kind[f] == "" {
@@ -1791,15 +1819,16 @@ func (l *dashLooker) checkSpec() {
 			}
 		}
 		fields[id] = kind
+		fieldTypes[id] = fTypes
 	}
 	if len(s.Pages) == len(dashDataSourcePlan) {
 		for i, page := range s.Pages {
-			l.checkPage(i, page, fields, kinds)
+			l.checkPage(i, page, fields, fieldTypes, kinds)
 		}
 	}
 }
 
-func (l *dashLooker) checkPage(index int, page dashSpecPage, fields map[string]map[string]string, kinds map[string]bool) {
+func (l *dashLooker) checkPage(index int, page dashSpecPage, fields, fieldTypes map[string]map[string]string, kinds map[string]bool) {
 	id := fmt.Sprintf("ds%d", index)
 	plan := dashDataSourcePlan[id]
 	prefix := fmt.Sprintf("p%d_", index+1)
@@ -1813,6 +1842,7 @@ func (l *dashLooker) checkPage(index int, page dashSpecPage, fields map[string]m
 	if kind == nil {
 		return // the data source is already reported
 	}
+	fTypes := fieldTypes[id]
 	dateField := l.spec.DataSources[id].DateField
 	seen := map[string]bool{}
 	hasDateRange := false
@@ -1839,7 +1869,7 @@ func (l *dashLooker) checkPage(index int, page dashSpecPage, fields map[string]m
 		l.probs.addf("page %s has no date range control, so the query parameters get no value", page.ID)
 	}
 	for _, c := range page.Components {
-		l.checkComponent(page.ID, prefix, dateField, c, kind, kinds, seen)
+		l.checkComponent(page.ID, prefix, dateField, c, kind, fTypes, kinds, seen)
 	}
 	uses := map[string]bool{}
 	for _, c := range page.Components {
@@ -1873,7 +1903,7 @@ func (l *dashLooker) checkPage(index int, page dashSpecPage, fields map[string]m
 	}
 }
 
-func (l *dashLooker) checkComponent(page, prefix, dateField string, c dashSpecComponent, kind map[string]string, kinds, seen map[string]bool) {
+func (l *dashLooker) checkComponent(page, prefix, dateField string, c dashSpecComponent, kind, fTypes map[string]string, kinds, seen map[string]bool) {
 	where := fmt.Sprintf("page %s, component %s", page, c.ID)
 	if !strings.HasPrefix(c.ID, prefix) || seen[c.ID] {
 		l.probs.addf("%s: the id is not unique or does not start with %s", where, prefix)
@@ -1910,8 +1940,17 @@ func (l *dashLooker) checkComponent(page, prefix, dateField string, c dashSpecCo
 		case k != "agg" && m.Aggregation == "NONE":
 			l.probs.addf("%s: %s does not aggregate, so NONE would leave it unaggregated", where, m.Field)
 		}
+		if (m.Aggregation == "SUM" || m.Aggregation == "AVG") && fTypes[m.Field] != "" && !slices.Contains([]string{"INT64", "FLOAT64", "NUMBER", "PERCENT"}, fTypes[m.Field]) {
+			l.probs.addf("%s: metric %s with aggregation %s has non-numeric type %s", where, m.Field, m.Aggregation, fTypes[m.Field])
+		}
 		if slices.Contains(dashPercentiles, m.Field) && m.Aggregation != "MAX" {
 			l.probs.addf("%s: %s is a percentile per hour and cannot be summed or averaged; use MAX", where, m.Field)
+		}
+		if m.Field == "avg_duration_ms" && (m.Aggregation == "AVG" || m.Aggregation == "SUM") {
+			l.probs.addf("%s: avg_duration_ms is an hourly mean and cannot be averaged or summed across rows; use the call-weighted calculated field weighted_avg_duration_ms with aggregation NONE", where)
+		}
+		if m.Field == "span_id" && m.Aggregation == "COUNT_DISTINCT" {
+			l.probs.addf("%s: metric span_id cannot use COUNT_DISTINCT without trace_id; use COUNT or a CONCAT(trace_id, \":\", span_id) key", where)
 		}
 		if m.Role != "" {
 			roles[m.Role] = m.Field
@@ -2146,6 +2185,9 @@ type dashGrafanaVar struct {
 	IncludeAll       bool            `json:"includeAll"`
 	AllValue         string          `json:"allValue"`
 	AllowCustomValue *bool           `json:"allowCustomValue"`
+	Current          struct {
+		Value []string `json:"value"`
+	} `json:"current"`
 }
 
 type dashGrafana struct {
@@ -2344,10 +2386,13 @@ var dashGrafanaTime = map[string]struct {
 	date bool
 }{
 	"v_gen_ai_model_costs": {"usage_hour", false},
+	"v_gen_ai_tool_usage":  {"usage_hour", false},
 	"v_mcp_tool_usage":     {"usage_hour", false},
 	"v_gen_ai_sessions":    {"session_start_date", true},
 	"otel_alerts":          {"event_time", false},
 }
+
+var dashGrafanaRowViews = []string{"otel_alerts", "v_gen_ai_model_costs", "v_gen_ai_sessions", "v_mcp_tool_usage"}
 
 // dashGrafanaTimePredicate is the time predicate of a source in the form the
 // WHERE clause is joined by dashJoin.
@@ -2399,11 +2444,13 @@ func dashCheckGrafanaBranch(files dashFileSet, b *dashBranch, source string, ser
 	joined := dashJoin(b.toks)
 	switch source {
 	case "otel_alerts":
-		dedup := dashJoin(b.clauses["QUALIFY"]) == dashAlertDedup
-		distinct := strings.Contains(joined, "COUNT ( DISTINCT ALERT_ID )")
-		bare := strings.Contains(joined, "COUNT ( * )") || strings.Contains(joined, "COUNT ( ALERT_ID )")
-		if !dedup && (!distinct || bare) {
-			p.addf("alerts are delivered at least once: keep the first row of each alert_id (QUALIFY %s) or count DISTINCT alert_id", dashAlertDedup)
+		if !serviceVar {
+			dedup := dashJoin(b.clauses["QUALIFY"]) == dashAlertDedup
+			distinct := strings.Contains(joined, "COUNT ( DISTINCT ALERT_ID )")
+			bare := strings.Contains(joined, "COUNT ( * )") || strings.Contains(joined, "COUNT ( ALERT_ID )")
+			if !dedup && (!distinct || bare) {
+				p.addf("alerts are delivered at least once: keep the first row of each alert_id (QUALIFY %s) or count DISTINCT alert_id", dashAlertDedup)
+			}
 		}
 	case "v_gen_ai_sessions":
 		if strings.Contains(joined, "COUNT ( * )") || strings.Contains(joined, "COUNT ( SESSION_ID )") {
@@ -2460,8 +2507,8 @@ func dashValidateGrafanaBQ(files dashFileSet) []string {
 		}
 		views[m[1]] = true
 	}
-	if got := dashSortedKeys(views); !slices.Equal(got, dashSortedKeys(dashGrafanaTime)) {
-		p.addf("%s: the rows read %v, want %v", dashGrafanaBQ, got, dashSortedKeys(dashGrafanaTime))
+	if got := dashSortedKeys(views); !slices.Equal(got, dashGrafanaRowViews) {
+		p.addf("%s: the rows read %v, want %v", dashGrafanaBQ, got, dashGrafanaRowViews)
 	}
 	for _, pn := range g.Panels {
 		if pn.Type == "row" {
@@ -2571,7 +2618,7 @@ func dashCheckServiceVar(files dashFileSet, v dashGrafanaVar) []string {
 	if err != nil {
 		return append(p, fmt.Sprintf("%s: %v", label, err))
 	}
-	want := []string{"v_gen_ai_model_costs", "v_mcp_tool_usage", "v_gen_ai_sessions"}
+	want := []string{"v_gen_ai_model_costs", "v_gen_ai_tool_usage", "v_mcp_tool_usage", "v_gen_ai_sessions", "otel_alerts"}
 	if len(q.branches) != len(want) {
 		return append(p, fmt.Sprintf("%s has %d SELECT branches, want one for each of %v", label, len(q.branches), want))
 	}
@@ -3010,6 +3057,7 @@ func dashCheckGrafanaDoc(files dashFileSet) []string {
 	needles := []string{
 		"Grafana 10.4", "grafana-bigquery-datasource", "`roles/bigquery.dataViewer`", "`roles/bigquery.jobUser`",
 		"`__inputs`", "`DS_BIGQUERY`", "`DS_PROMETHEUS`", "`VAR_PROJECT`", "`VAR_DATASET`", "at least once",
+		"Variables > service",
 	}
 	for _, source := range dashSortedKeys(dashGrafanaTime) {
 		needles = append(needles, "`"+source+"`")
@@ -3466,6 +3514,24 @@ var dashMutations = []dashMutation{
 		dashReplaceFirst("  total_input_tokens,\n", "  DOES_NOT_EXIST(total_input_tokens) AS total_input_tokens,\n"), "unknown function DOES_NOT_EXIST"},
 	{"looker_studio", "a query casts a numeric metric column to STRING", dashLookerDir + "queries/executive_summary.sql",
 		dashReplaceFirst("  total_input_tokens,\n", "  CAST(total_input_tokens AS STRING) AS total_input_tokens,\n"), "select item total_input_tokens has type STRING, want INT64"},
+	{"looker_studio", "a query wraps a string cast of a numeric column in parentheses", dashLookerDir + "queries/executive_summary.sql",
+		dashReplaceFirst("  total_input_tokens,\n", "  (CAST(total_input_tokens AS STRING)) AS total_input_tokens,\n"), "select item total_input_tokens has type STRING, want INT64"},
+	{"looker_studio", "the trajectory query outputs bare agent_path without ARRAY_TO_STRING", dashLookerDir + "queries/agent_trajectory.sql",
+		dashReplaceFirst("  ARRAY_TO_STRING(agent_path, ' > ') AS agent_path,\n", "  agent_path,\n"), "select item agent_path has type ARRAY<STRING>, want STRING"},
+	{"looker_studio", "a component sums a string column", dashSpecFile,
+		dashReplaceFirst("        metrics: [{field: call_count, aggregation: SUM}]\n", "        metrics: [{field: model, aggregation: SUM}]\n"),
+		"metric model with aggregation SUM has non-numeric type STRING"},
+	{"looker_studio", "a component takes an unweighted average of avg_duration_ms", dashSpecFile,
+		dashReplaceFirst("          - {field: weighted_avg_duration_ms, aggregation: NONE}\n", "          - {field: avg_duration_ms, aggregation: AVG}\n"),
+		"avg_duration_ms is an hourly mean and cannot be averaged or summed across rows"},
+	{"looker_studio", "a calculated field counts distinct span_id without trace_id", dashSpecFile,
+		dashReplaceFirst("        formula: COUNT_DISTINCT(CASE WHEN is_orphan AND depth = 0 THEN CONCAT(trace_id, \":\", span_id) END)\n        type: NUMBER\n        uses: [is_orphan, depth, trace_id, span_id]\n",
+			"        formula: COUNT_DISTINCT(CASE WHEN is_orphan AND depth = 0 THEN span_id END)\n        type: NUMBER\n        uses: [is_orphan, depth, span_id]\n"),
+		"counts distinct span_id without trace_id"},
+	{"looker_studio", "a component counts distinct span_id without trace_id", dashSpecFile,
+		dashReplaceFirst("        metrics: [{field: exemplar_span_key, aggregation: COUNT_DISTINCT}]\n        sort: {field: exemplar_span_key, direction: DESC}\n",
+			"        metrics: [{field: span_id, aggregation: COUNT_DISTINCT}]\n        sort: {field: span_id, direction: DESC}\n"),
+		"metric span_id cannot use COUNT_DISTINCT without trace_id"},
 	{"looker_studio", "a query reads the free text of a span status", dashLookerDir + "queries/executive_summary.sql",
 		dashReplaceFirst("  call_count,\n", "  call_count,\n  status_message,\n"), "the free text of a span status"},
 	{"looker_studio", "the range end drops the last day", dashLookerDir + "queries/executive_summary.sql",
@@ -4116,35 +4182,133 @@ func TestGrafanaBQVariableExpansionAndAlertOnlyServices(t *testing.T) {
 		if v.AllValue != "[\"__all\"]" {
 			t.Fatalf("service.allValue = %q, want \"[\\\"__all\\\"]\"", v.AllValue)
 		}
-		// Expand every panel's rawSql with ${service:json} replaced verbatim by
-		// v.AllValue (no json.Marshal wrapper, matching Grafana 10.4 when "All" is
-		// selected on a variable with custom allValue) and verify that every panel
-		// parses as valid GoogleSQL with ARRAY<STRING>["__all"].
-		allRepl := strings.NewReplacer(
-			"${VAR_PROJECT}", "my-proj",
-			"${VAR_DATASET}", "my_ds",
-			"${service:json}", v.AllValue,
-			"${__from}", dashGrafanaFrom,
-			"${__to}", dashGrafanaTo,
-		)
-		for _, pn := range g.Panels {
-			if pn.Type == "row" || len(pn.Targets) == 0 {
-				continue
+		// 1a. Verify all 5 required Grafana ${service:json} variable expansion cases
+		// across all 24 real panel queries in dashboards/grafana/genai-and-mcp-overview.json:
+		//  - Case 1: Saved default All (current.value = ["$__all"]) -> verbatim v.AllValue ("[\"__all\"]")
+		//  - Case 2: URL-selected All (?var-service=$__all) -> verbatim v.AllValue ("[\"__all\"]")
+		//  - Case 3: Single service value (["chat-svc"]) -> json.Marshal
+		//  - Case 4: Multiple service values (["chat-svc", "mcp-svc", "alert-only-svc"]) -> json.Marshal
+		//  - Case 5: Adversarial characters (', ", \, `, SQL keywords, newlines) -> json.Marshal
+		grafanaFormatServiceJSON := func(rawSelected []string) string {
+			if len(rawSelected) == 1 && rawSelected[0] == "$__all" {
+				// Grafana substitutes v.AllValue verbatim without calling the json formatter.
+				return v.AllValue
 			}
-			expanded := allRepl.Replace(pn.Targets[0].RawSQL)
-			expanded = dashTimeFilter.ReplaceAllString(expanded, "$1 BETWEEN TIMESTAMP_MILLIS("+dashGrafanaFrom+") AND TIMESTAMP_MILLIS("+dashGrafanaTo+")")
-			q, err := dashParseSQL(expanded)
+			b, err := json.Marshal(rawSelected)
 			if err != nil {
-				t.Fatalf("panel %q failed to parse when All (allValue=%q) is selected: %v", pn.Title, v.AllValue, err)
+				t.Fatalf("json.Marshal(%v): %v", rawSelected, err)
 			}
-			if len(q.branches) == 0 {
-				t.Fatalf("panel %q has 0 branches", pn.Title)
+			return string(b)
+		}
+
+		expansionCases := []struct {
+			name        string
+			selected    []string
+			wantSubstrs []string
+		}{
+			{
+				name:        "saved_default_all",
+				selected:    v.Current.Value,
+				wantSubstrs: []string{`'__all' IN UNNEST ( ARRAY < STRING > [ "__all" ] )`},
+			},
+			{
+				name:        "url_selected_all",
+				selected:    []string{"$__all"},
+				wantSubstrs: []string{`'__all' IN UNNEST ( ARRAY < STRING > [ "__all" ] )`},
+			},
+			{
+				name:        "single_service",
+				selected:    []string{"chat-svc"},
+				wantSubstrs: []string{`UNNEST ( ARRAY < STRING > [ "chat-svc" ] )`},
+			},
+			{
+				name:     "multiple_services",
+				selected: []string{"chat-svc", "mcp-svc", "alert-only-svc"},
+				wantSubstrs: []string{
+					`UNNEST ( ARRAY < STRING > [ "chat-svc" , "mcp-svc" , "alert-only-svc" ] )`,
+				},
+			},
+		}
+		for _, tc := range expansionCases {
+			formatted := grafanaFormatServiceJSON(tc.selected)
+			repl := strings.NewReplacer(
+				"${VAR_PROJECT}", "my-proj",
+				"${VAR_DATASET}", "my_ds",
+				"${service:json}", formatted,
+				"${__from}", dashGrafanaFrom,
+				"${__to}", dashGrafanaTo,
+			)
+			panelCount := 0
+			for _, pn := range g.Panels {
+				if pn.Type == "row" || len(pn.Targets) == 0 {
+					continue
+				}
+				panelCount++
+				expanded := repl.Replace(pn.Targets[0].RawSQL)
+				expanded = dashTimeFilter.ReplaceAllString(expanded, "$1 BETWEEN TIMESTAMP_MILLIS("+dashGrafanaFrom+") AND TIMESTAMP_MILLIS("+dashGrafanaTo+")")
+				q, err := dashParseSQL(expanded)
+				if err != nil {
+					t.Fatalf("case %s: panel %q failed to parse (formatted=%q): %v", tc.name, pn.Title, formatted, err)
+				}
+				if len(q.branches) == 0 {
+					t.Fatalf("case %s: panel %q has 0 branches", tc.name, pn.Title)
+				}
+				whereJoined := dashJoin(q.branches[0].clauses["WHERE"])
+				for _, wantSub := range tc.wantSubstrs {
+					if !strings.Contains(whereJoined, wantSub) {
+						t.Fatalf("case %s: panel %q WHERE = %q, want substring %q", tc.name, pn.Title, whereJoined, wantSub)
+					}
+				}
 			}
-			whereJoined := dashJoin(q.branches[0].clauses["WHERE"])
-			wantAllPred := `'__all' IN UNNEST ( ARRAY < STRING > [ "__all" ] )`
-			if !strings.Contains(whereJoined, wantAllPred) {
-				t.Fatalf("panel %q WHERE under All expansion = %q, want substring %q", pn.Title, whereJoined, wantAllPred)
+			if panelCount != 24 {
+				t.Fatalf("case %s: checked %d panels, want 24", tc.name, panelCount)
 			}
+		}
+
+		// 1b. Parse the 5-branch service variable query and verify that services
+		// appearing only in v_gen_ai_tool_usage ("tool-only-agent") or only in
+		// otel_alerts ("alert-only-agent") are returned by the UNION DISTINCT
+		// option query and can be individually selected.
+		svcSQL, err := dashExpandGrafanaSQL(v.Definition)
+		if err != nil {
+			t.Fatalf("dashExpandGrafanaSQL(service.definition): %v", err)
+		}
+		svcQ, err := dashParseSQL(svcSQL)
+		if err != nil {
+			t.Fatalf("dashParseSQL(service.definition): %v", err)
+		}
+		if len(svcQ.branches) != 5 {
+			t.Fatalf("service variable query has %d branches, want 5", len(svcQ.branches))
+		}
+		sourceFixtures := map[string][]string{
+			"p.d.v_gen_ai_model_costs": {"chat-svc"},
+			"p.d.v_gen_ai_tool_usage":  {"tool-only-agent"},
+			"p.d.v_mcp_tool_usage":     {"mcp-svc"},
+			"p.d.v_gen_ai_sessions":    {"session-svc", ""},
+			"p.d.otel_alerts":          {"alert-only-agent", "bad'svc"},
+		}
+		guardRE := regexp.MustCompile(`[\x00-\x1f'"\\` + "`" + `]`)
+		optionSet := map[string]bool{}
+		for _, b := range svcQ.branches {
+			tables := b.fromTables()
+			if len(tables) != 1 {
+				t.Fatalf("service branch reads %v, want 1 table", tables)
+			}
+			for _, rawSvc := range sourceFixtures[tables[0]] {
+				if guardRE.MatchString(rawSvc) {
+					continue
+				}
+				val := rawSvc
+				if val == "" {
+					val = "(none)"
+				}
+				optionSet[val] = true
+			}
+		}
+		gotOptions := dashSortedKeys(optionSet)
+		wantOptions := []string{"(none)", "alert-only-agent", "chat-svc", "mcp-svc", "session-svc", "tool-only-agent"}
+		if !slices.Equal(gotOptions, wantOptions) {
+			t.Fatalf("service dropdown options = %v, want %v", gotOptions, wantOptions)
 		}
 	}
 
@@ -4221,5 +4385,66 @@ func TestGrafanaBQVariableExpansionAndAlertOnlyServices(t *testing.T) {
 	}
 	if evalServiceFilter(dropdownOptions, "alert-only-agent") {
 		t.Errorf("expanding All to dropdown options %v unexpectedly matched alert-only-agent", dropdownOptions)
+	}
+}
+
+func TestLookerStudioWeightedDurationAndCompositeSpanKey(t *testing.T) {
+	files := dashLoadFileSet(t)
+	spec, err := dashDecodeSpec(files)
+	if err != nil {
+		t.Fatalf("dashDecodeSpec: %v", err)
+	}
+
+	// 1. Verify ds2 weighted_avg_duration_ms formula on unequal hourly call counts:
+	// Hour 1: 1 call at 1000 ms; Hour 2: 99 calls at 10 ms.
+	// True call-weighted mean = (1000*1 + 10*99) / (1 + 99) = 19.9 ms (vs unweighted 505 ms).
+	var weightedFormula string
+	for _, c := range spec.DataSources["ds2"].CalculatedFields {
+		if c.Name == "weighted_avg_duration_ms" {
+			weightedFormula = c.Formula
+		}
+	}
+	if weightedFormula != "SUM(avg_duration_ms * call_count) / SUM(call_count)" {
+		t.Fatalf("ds2.weighted_avg_duration_ms formula = %q, want \"SUM(avg_duration_ms * call_count) / SUM(call_count)\"", weightedFormula)
+	}
+	type mcpHourRow struct {
+		avgDurationMS float64
+		callCount     int64
+	}
+	fixture := []mcpHourRow{{avgDurationMS: 1000, callCount: 1}, {avgDurationMS: 10, callCount: 99}}
+	var weightedNum, totalCalls, unweightedSum float64
+	for _, r := range fixture {
+		weightedNum += r.avgDurationMS * float64(r.callCount)
+		totalCalls += float64(r.callCount)
+		unweightedSum += r.avgDurationMS
+	}
+	gotWeighted := weightedNum / totalCalls
+	gotUnweighted := unweightedSum / float64(len(fixture))
+	if math.Abs(gotWeighted-19.9) > 1e-9 || math.Abs(gotUnweighted-505.0) > 1e-9 {
+		t.Fatalf("weighted=%v (want 19.9), unweighted=%v (want 505)", gotWeighted, gotUnweighted)
+	}
+
+	// 2. Verify ds3 orphan_roots and ds5 exemplar_span_key count (trace_id, span_id)
+	// pairs so two traces sharing span_id "0000000000000001" count as 2, not 1.
+	type spanRef struct {
+		traceID  string
+		spanID   string
+		isOrphan bool
+		depth    int
+	}
+	sharedSpanFixture := []spanRef{
+		{traceID: "trace-1", spanID: "0000000000000001", isOrphan: true, depth: 0},
+		{traceID: "trace-2", spanID: "0000000000000001", isOrphan: true, depth: 0},
+	}
+	compositeKeys := map[string]bool{}
+	bareSpanIDs := map[string]bool{}
+	for _, r := range sharedSpanFixture {
+		if r.isOrphan && r.depth == 0 {
+			compositeKeys[r.traceID+":"+r.spanID] = true
+			bareSpanIDs[r.spanID] = true
+		}
+	}
+	if len(compositeKeys) != 2 || len(bareSpanIDs) != 1 {
+		t.Fatalf("composite count = %d (want 2), bare span_id count = %d (want 1)", len(compositeKeys), len(bareSpanIDs))
 	}
 }

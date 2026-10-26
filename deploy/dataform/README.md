@@ -21,7 +21,7 @@ All actions except the declarations carry the tag `otel_marts`.
 | Action | Type | Reads | Partition by | Cluster by |
 |:---|:---|:---|:---|:---|
 | `v_gen_ai_spans`, `v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_mcp_tool_usage` | declaration | the exporter views (not written) | | |
-| `stg_run_window` | table | | | |
+| `stg_run_window` | incremental | | | |
 | `stg_spans_dedup` | incremental | `stg_run_window`, `v_gen_ai_spans` | `DATE(start_time)` | `service_name`, `trace_id` |
 | `m_gen_ai_model_costs_hourly` | incremental | `stg_run_window`, `v_gen_ai_model_costs` | `DATE(usage_hour)` | `service_name`, `model` |
 | `m_mcp_tool_usage_hourly` | incremental | `stg_run_window`, `v_mcp_tool_usage` | `DATE(usage_hour)` | `service_name`, `mcp_method_name` |
@@ -54,7 +54,7 @@ instead of re-reading the raw spans through the view chain on every run.
    | `defaultLocation` | Location of the marts datasets. It must equal the location of the exporter dataset: a query cannot read across locations |
    | `defaultDataset`, `defaultAssertionDataset` | Datasets for the marts and the assertion views. Dataform creates them when they do not exist |
    | `vars.source_project`, `vars.source_dataset` | `project_id` and `dataset_id` of the exporter. Only read |
-   | `vars.run_timestamp` | Optional ISO-8601 UTC timestamp override for `stg_run_window` (empty uses the run-start `CURRENT_TIMESTAMP()`; an invalid non-empty value fails the `CAST`) |
+   | `vars.run_timestamp` | Optional ISO-8601 UTC timestamp override (`YYYY-MM-DDTHH:MM:SSZ` or `YYYY-MM-DDTHH:MM:SS+00:00`, with optional fractional seconds) for `stg_run_window` (empty or omitted uses the run-start `CURRENT_TIMESTAMP()`; any non-empty value that does not match strict ISO-8601 UTC fails the `CAST`) |
 
    Always set `defaultProject` and `defaultLocation` in
    [`workflow_settings.yaml`](workflow_settings.yaml) before running (`--vars`
@@ -120,15 +120,22 @@ window_start = TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 HOU
 
 so `T - 4h < window_start <= T - 3h`: the lookback `L` is 3 to 4 hours.
 `stg_run_window` captures `T` and `window_start` once at the start of the
-invocation (or from `vars.run_timestamp` when set), and every incremental
-action and assertion reads `stg_run_window.window_start` so the whole DAG
-shares a single cutoff even if execution crosses an hour boundary. A first
-run or a full refresh uses the Unix epoch as `window_start` and rebuilds
-everything. A rerun gives the same rows, and each individual table action is
-atomic (`BEGIN TRANSACTION` ... `DELETE` ... `INSERT` ... `COMMIT TRANSACTION`):
-if a table action fails, its own transaction rolls back and leaves that table
-as it was, while upstream table actions that already committed keep their
-refreshed rows until the next run.
+invocation (or from `vars.run_timestamp` when set) with `is_committed = FALSE`,
+and every incremental action and assertion reads `stg_run_window.window_start`
+so the whole DAG shares a single cutoff even if execution crosses an hour
+boundary. `m_gen_ai_agent_trajectory` depends on `stg_spans_dedup` and the three
+aggregate marts, and its `post_operations` set `stg_run_window.is_committed = TRUE`
+only after all staging and mart refreshes have succeeded. If any action fails
+mid-DAG, its own transaction (`BEGIN TRANSACTION` ... `DELETE` ... `INSERT` ...
+`COMMIT TRANSACTION`) rolls back and `stg_run_window.is_committed` remains
+`FALSE`; on the next incremental run, `stg_run_window` retains the uncommitted
+`prev_window_start` via `LEAST(candidate_window_start, prev_window_start)` so
+every staging table and mart automatically re-covers the failed run's window. In
+addition, `m_gen_ai_agent_trajectory` includes any trace in the 24-hour
+`context_start` window that has a staged span in `stg_spans_dedup` not yet
+present in the trajectory mart, and both assertions validate staged and emitted
+spans across the full 24-hour `context_start` window. A first run or a full
+refresh uses the Unix epoch as `window_start` and rebuilds everything.
 
 | Mart | What one run recomputes | Row is exact when |
 |:---|:---|:---|
@@ -314,8 +321,10 @@ also needs a full refresh, because an incremental run only inserts rows.
 
 ## Dataform core versions
 
-`workflow_settings.yaml` pins `dataformCoreVersion: 3.1.2`, and the package has
-been compiled and graph-validated with that version. Dataform core 3 rejects a project that has both
+`workflow_settings.yaml` pins `dataformCoreVersion: 3.1.2`, and the SQLX
+definitions, dependency graph, and view-to-mart column parity are validated
+offline by the repository's Go conformance tests (`dataform_conformance_test.go`).
+Dataform core 3 rejects a project that has both
 `workflow_settings.yaml` and `dataform.json`, so this directory has no
 `dataform.json`. A project that must stay on Dataform core 2.x needs a
 `dataform.json` with the same settings in place of `workflow_settings.yaml`

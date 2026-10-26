@@ -19,7 +19,7 @@ how.
 
 | File | Dashboard | Data source | Reads |
 |:---|:---|:---|:---|
-| [`grafana/genai-and-mcp-overview.json`](grafana/genai-and-mcp-overview.json) | GenAI, MCP & Trajectory Analytics | Google BigQuery | `v_gen_ai_model_costs`, `v_gen_ai_sessions`, `v_mcp_tool_usage`, `otel_alerts` |
+| [`grafana/genai-and-mcp-overview.json`](grafana/genai-and-mcp-overview.json) | GenAI, MCP & Trajectory Analytics | Google BigQuery | `v_gen_ai_model_costs`, `v_gen_ai_tool_usage`, `v_gen_ai_sessions`, `v_mcp_tool_usage`, `otel_alerts` |
 | [`grafana/collector-self-telemetry.json`](grafana/collector-self-telemetry.json) | Collector BigQuery Exporter Self-Telemetry | Prometheus | The `otelcol_exporter_bigquery_*` metrics that [`metadata.yaml`](../metadata.yaml) declares |
 
 ### Requirements
@@ -71,12 +71,12 @@ The dashboard has one template variable (`service`) and two import-time
 
 - `service` filters every panel with `ARRAY<STRING>${service:json}` so selected
   values are JSON-encoded as string literals and cannot break out of the array
-  literal. It lists the services that have GenAI or MCP activity in the time
-  range (`v_gen_ai_model_costs`, `v_mcp_tool_usage`, `v_gen_ai_sessions`), and
-  **All** sets the variable to the `["__all"]` sentinel (`allValue: "[\"__all\"]"`),
-  which satisfies `'__all' IN UNNEST(ARRAY<STRING>${service:json})` and leaves
-  every panel (including `otel_alerts` for alert-only services) unfiltered by
-  the option list.
+  literal. It lists the services that have GenAI, tool, MCP or alert activity
+  in the time range (`v_gen_ai_model_costs`, `v_gen_ai_tool_usage`,
+  `v_mcp_tool_usage`, `v_gen_ai_sessions`, `otel_alerts`), and **All** sets the
+  variable to the `["__all"]` sentinel (`allValue: "[\"__all\"]"`), which
+  satisfies `'__all' IN UNNEST(ARRAY<STRING>${service:json})` and leaves every
+  panel unfiltered by the option list.
 - `VAR_PROJECT` and `VAR_DATASET` are import-time `__inputs` constants
   substituted directly into the table identifiers when Grafana imports the
   JSON; they are not runtime template variables and cannot be overridden by
@@ -153,7 +153,7 @@ dashboard's JSON model, replace `${VAR_DATASET}.v_gen_ai_model_costs` (or the
 imported dataset name) by `<marts dataset>.m_gen_ai_model_costs_hourly`, and
 likewise for the sessions and MCP views. The mapping is in the
 [Dataform README](../deploy/dataform/README.md#pointing-the-dashboards-at-the-marts).
-`otel_alerts` has no mart.
+`v_gen_ai_tool_usage` and `otel_alerts` have no mart.
 
 ### Troubleshooting
 
@@ -161,7 +161,35 @@ likewise for the sessions and MCP views. The mapping is in the
 |:---|:---|
 | `Not found: Dataset ... was not found in location ...` | The processing location of the data source differs from the location of the dataset |
 | `Access Denied` | The data source identity lacks `roles/bigquery.dataViewer` on the dataset or `roles/bigquery.jobUser` on the project that runs the queries |
-| The `Alerts` row fails with `Not found: Table ... otel_alerts` | `enable_continuous_queries` is `false`. Enable it, or delete the row |
+| The `Alerts` row or `service` dropdown fails with `Not found: Table ... otel_alerts` | `enable_continuous_queries` is `false`. Enable it, or delete the `Alerts` row and replace the `service` variable query with the four-view query below (which omits the `otel_alerts` `UNION DISTINCT` branch) |
 | Every BigQuery panel is empty and `service` lists nothing | No GenAI or MCP spans in the time range, or the views do not exist yet |
 | A line chart reports that the data has no time field | The query's **Format** is wrong. Open the panel's query and set **Format** to **Time series** for line charts and to **Table** for the other panels |
 | A Prometheus panel is empty | The collector does not expose the metric under the expected name; look the name up in Prometheus and adjust the selector |
+
+When `enable_continuous_queries` is `false` (so `otel_alerts` does not exist),
+delete the `Alerts` row and update the `service` variable query in **Dashboard
+settings > Variables > service** to omit the `otel_alerts` branch:
+
+```sql
+SELECT COALESCE(service_name, '(none)') AS service_name
+FROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_model_costs`
+WHERE $__timeFilter(usage_hour)
+  AND NOT REGEXP_CONTAINS(COALESCE(service_name, ''), r'[\x00-\x1f\'"\\`]')
+UNION DISTINCT
+SELECT COALESCE(service_name, '(none)')
+FROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_tool_usage`
+WHERE $__timeFilter(usage_hour)
+  AND NOT REGEXP_CONTAINS(COALESCE(service_name, ''), r'[\x00-\x1f\'"\\`]')
+UNION DISTINCT
+SELECT COALESCE(service_name, '(none)')
+FROM `${VAR_PROJECT}.${VAR_DATASET}.v_mcp_tool_usage`
+WHERE $__timeFilter(usage_hour)
+  AND NOT REGEXP_CONTAINS(COALESCE(service_name, ''), r'[\x00-\x1f\'"\\`]')
+UNION DISTINCT
+SELECT COALESCE(service_name, '(none)')
+FROM `${VAR_PROJECT}.${VAR_DATASET}.v_gen_ai_sessions`
+WHERE session_start_date >= DATE(TIMESTAMP_MILLIS(${__from}))
+  AND session_start_date <= DATE(TIMESTAMP_MILLIS(${__to}))
+  AND NOT REGEXP_CONTAINS(COALESCE(service_name, ''), r'[\x00-\x1f\'"\\`]')
+ORDER BY service_name
+```

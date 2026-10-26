@@ -126,6 +126,10 @@ data_sources:
         formula: SUM(gen_ai_tagged_call_count) / SUM(call_count)
         type: PERCENT
         uses: [gen_ai_tagged_call_count, call_count]
+      - name: weighted_avg_duration_ms
+        formula: SUM(avg_duration_ms * call_count) / SUM(call_count)
+        type: NUMBER
+        uses: [avg_duration_ms, call_count]
 
   ds3:
     name: Agent trajectory
@@ -143,9 +147,9 @@ data_sources:
         type: TEXT
         uses: [trace_url, trace_id]
       - name: orphan_roots
-        formula: COUNT_DISTINCT(CASE WHEN is_orphan AND depth = 0 THEN span_id END)
+        formula: COUNT_DISTINCT(CASE WHEN is_orphan AND depth = 0 THEN CONCAT(trace_id, ":", span_id) END)
         type: NUMBER
-        uses: [is_orphan, depth, span_id]
+        uses: [is_orphan, depth, trace_id, span_id]
 
   ds4:
     name: Security and SLA alerts
@@ -176,6 +180,10 @@ data_sources:
         formula: HYPERLINK(trace_url, trace_id)
         type: TEXT
         uses: [trace_url, trace_id]
+      - name: exemplar_span_key
+        formula: CONCAT(trace_id, ":", span_id)
+        type: TEXT
+        uses: [trace_id, span_id]
 
 pages:
   # --- Page 1 -------------------------------------------------------------
@@ -430,7 +438,7 @@ pages:
           - {field: call_count, aggregation: SUM}
           - {field: error_rate, aggregation: NONE}
           - {field: dual_tagged_share, aggregation: NONE}
-          - {field: avg_duration_ms, aggregation: AVG}
+          - {field: weighted_avg_duration_ms, aggregation: NONE}
           - {field: p50_duration_ms, aggregation: MAX}
           - {field: p95_duration_ms, aggregation: MAX}
           - {field: p99_duration_ms, aggregation: MAX}
@@ -634,8 +642,8 @@ pages:
         type: bar_chart
         title: Exemplars by metric
         dimensions: [metric_name]
-        metrics: [{field: span_id, aggregation: COUNT_DISTINCT}]
-        sort: {field: span_id, direction: DESC}
+        metrics: [{field: exemplar_span_key, aggregation: COUNT_DISTINCT}]
+        sort: {field: exemplar_span_key, direction: DESC}
       - id: p6_value_vs_duration
         type: scatter_chart
         title: Exemplar value vs span duration

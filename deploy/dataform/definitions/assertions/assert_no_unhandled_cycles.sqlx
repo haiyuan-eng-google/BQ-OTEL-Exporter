@@ -30,7 +30,10 @@ WITH staged AS (
     service_name,
     span_id
   FROM ${ref("stg_spans_dedup")}
-  WHERE start_time >= (SELECT rw.window_start FROM ${ref("stg_run_window")} AS rw)
+  WHERE start_time >= TIMESTAMP_SUB(
+    (SELECT rw.window_start FROM ${ref("stg_run_window")} AS rw),
+    INTERVAL 24 HOUR
+  )
 ),
 emitted AS (
   SELECT

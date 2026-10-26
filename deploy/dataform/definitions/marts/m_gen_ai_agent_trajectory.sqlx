@@ -42,7 +42,7 @@
 config {
   type: "incremental",
   tags: ["otel_marts"],
-  dependencies: ["stg_run_window", "stg_spans_dedup"],
+  dependencies: ["stg_run_window", "stg_spans_dedup", "m_gen_ai_model_costs_hourly", "m_mcp_tool_usage_hourly", "m_gen_ai_sessions_daily"],
   description: "Per-span multi-agent trajectory (depth, agent path, orphan and token-leaf flags), refreshed incrementally.",
   bigquery: {
     partitionBy: "DATE(start_time)",
@@ -57,10 +57,21 @@ pre_operations {
   ---
   CREATE TEMP TABLE touched_traces AS
   SELECT DISTINCT
-    trace_id,
-    service_name
-  FROM ${ref("stg_spans_dedup")}
-  WHERE start_time >= window_start
+    s.trace_id,
+    s.service_name
+  FROM ${ref("stg_spans_dedup")} AS s
+  WHERE s.start_time >= window_start
+    ${when(incremental(), `OR (
+      s.start_time >= context_start
+      AND NOT EXISTS (
+        SELECT 1
+        FROM ${self()} AS m
+        WHERE m.start_time >= context_start
+          AND m.trace_id = s.trace_id
+          AND m.service_name IS NOT DISTINCT FROM s.service_name
+          AND m.span_id = s.span_id
+      )
+    )`)}
   ---
   CREATE TEMP TABLE trajectory_rows AS
   WITH RECURSIVE
@@ -455,4 +466,6 @@ FROM trajectory_rows
 
 post_operations {
   ${when(incremental(), `COMMIT TRANSACTION`)}
+  ---
+  UPDATE ${ref("stg_run_window")} SET is_committed = TRUE WHERE TRUE
 }
