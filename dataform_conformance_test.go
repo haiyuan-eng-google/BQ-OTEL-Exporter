@@ -2445,6 +2445,24 @@ func dfxCheckAssertion(a *dfxAction, rule dfxAssertionRule, run *dfxRun, tables 
 			if d := dfxDiffSeq(dfxItemSigs(cov.branches[0]), wantItems); d != "" {
 				p.addf("%s: token_parent_coverage select items: %s", a.name, d)
 			}
+			wantCovFrom := "EMITTED_ANCESTORS AS EA LEFT JOIN EMITTED_ANCESTORS AS REVERSE_PATH ON REVERSE_PATH . TRACE_ID = EA . TRACE_ID AND REVERSE_PATH . SERVICE_NAME IS NOT DISTINCT FROM EA . SERVICE_NAME AND REVERSE_PATH . DESCENDANT_SPAN_ID = EA . ANCESTOR_SPAN_ID AND REVERSE_PATH . ANCESTOR_SPAN_ID = EA . DESCENDANT_SPAN_ID"
+			if gotCovFrom := dashJoin(cov.branches[0].clauses["FROM"]); gotCovFrom != wantCovFrom {
+				p.addf("%s: token_parent_coverage FROM is %q, want %q", a.name, gotCovFrom, wantCovFrom)
+			}
+			wantCovWhere := "( EA . HAS_INPUT OR EA . HAS_OUTPUT OR EA . HAS_REASONING ) AND ( REVERSE_PATH . ANCESTOR_SPAN_ID IS NULL OR EA . DESCENDANT_START_TIME > EA . ANCESTOR_START_TIME OR ( EA . DESCENDANT_START_TIME = EA . ANCESTOR_START_TIME AND EA . DESCENDANT_SPAN_ID > EA . ANCESTOR_SPAN_ID ) )"
+			if gotCovWhere := dashJoin(cov.branches[0].clauses["WHERE"]); gotCovWhere != wantCovWhere {
+				p.addf("%s: token_parent_coverage WHERE is %q, want %q", a.name, gotCovWhere, wantCovWhere)
+			}
+			wantCovGroupBy := "EA . TRACE_ID , EA . SERVICE_NAME , EA . ANCESTOR_SPAN_ID"
+			if gotCovGroupBy := dashJoin(cov.branches[0].clauses["GROUP BY"]); gotCovGroupBy != wantCovGroupBy {
+				p.addf("%s: token_parent_coverage GROUP BY is %q, want %q", a.name, gotCovGroupBy, wantCovGroupBy)
+			}
+		}
+		if em := dfxCTE(q, "emitted"); em != nil && len(em.branches) == 1 {
+			wantEmittedFrom := "TRAJECTORY_CONTEXT AS M LEFT JOIN TOKEN_PARENT_COVERAGE AS COV ON M . TRACE_ID = COV . TRACE_ID AND M . SPAN_ID = COV . SPAN_ID AND M . SERVICE_NAME IS NOT DISTINCT FROM COV . SERVICE_NAME"
+			if gotEmittedFrom := dashJoin(em.branches[0].clauses["FROM"]); gotEmittedFrom != wantEmittedFrom {
+				p.addf("%s: emitted FROM is %q, want %q", a.name, gotEmittedFrom, wantEmittedFrom)
+			}
 		}
 		if rv := dfxCTE(q, "row_violations"); rv != nil && len(rv.branches) == 1 {
 			joined := dashJoin(rv.branches[0].toks)
@@ -2913,6 +2931,7 @@ type dfxMutation struct {
 	// mutation with create adds a file that the package does not have, and its
 	// edit receives the empty string.
 	edit   func(content string) (string, error)
+	also   map[string]func(content string) (string, error)
 	create bool
 	want   string // a piece of the problem
 }
@@ -2964,6 +2983,20 @@ func TestDataformConformanceDetectsBrokenAssets(t *testing.T) {
 					t.Fatalf("the edit left %s as it was", m.file)
 				}
 				broken[m.file] = edited
+				for alsoFile, alsoEdit := range m.also {
+					alsoContent, ok := broken[alsoFile]
+					if !ok {
+						t.Fatalf("%s is not one of the files the rules read", alsoFile)
+					}
+					alsoEdited, err := alsoEdit(alsoContent)
+					if err != nil {
+						t.Fatalf("editing %s: %v", alsoFile, err)
+					}
+					if alsoEdited == alsoContent {
+						t.Fatalf("the edit left %s as it was", alsoFile)
+					}
+					broken[alsoFile] = alsoEdited
+				}
 			}
 			if problems := run(broken); !containsText(problems, m.want) {
 				t.Errorf("the defect was not reported as %q; the problems are:\n  %s", m.want, strings.Join(problems, "\n  "))
@@ -3212,6 +3245,30 @@ var dfxMutations = []dfxMutation{
 		edit: dashReplaceFirst("WHERE ea.hop < 32", "WHERE ea.hop < 32 AND FALSE"), want: "assert_no_orphan_tokens: emitted_ancestors recursive WHERE is"},
 	{area: "assertions", name: "orphans_recursive_cycle_guard_removed", file: dfxFOrphans,
 		edit: dashReplaceFirst("    WHERE ea.hop < 32\n      AND p.span_id NOT IN UNNEST(ea.path_span_ids)", "    WHERE ea.hop < 32"), want: "assert_no_orphan_tokens: emitted_ancestors recursive WHERE is"},
+	{area: "assertions", name: "orphans_coverage_join_broken_paired", file: dfxFOrphans,
+		edit: dashReplaceFirst("AND reverse_path.ancestor_span_id = ea.descendant_span_id", "AND reverse_path.ancestor_span_id = ea.ancestor_span_id"),
+		also: map[string]func(string) (string, error){
+			dfxFTraj: dashReplaceFirst("AND reverse_path.ancestor_span_id = ea.descendant_span_id", "AND reverse_path.ancestor_span_id = ea.ancestor_span_id"),
+		},
+		want: "assert_no_orphan_tokens: token_parent_coverage FROM is"},
+	{area: "assertions", name: "orphans_coverage_where_false_and_paired", file: dfxFOrphans,
+		edit: dashReplaceFirst("WHERE (ea.has_input OR ea.has_output OR ea.has_reasoning)", "WHERE FALSE AND (ea.has_input OR ea.has_output OR ea.has_reasoning)"),
+		also: map[string]func(string) (string, error){
+			dfxFTraj: dashReplaceFirst("WHERE (ea.has_input OR ea.has_output OR ea.has_reasoning)", "WHERE FALSE AND (ea.has_input OR ea.has_output OR ea.has_reasoning)"),
+		},
+		want: "assert_no_orphan_tokens: token_parent_coverage WHERE is"},
+	{area: "assertions", name: "orphans_coverage_group_by_broken_paired", file: dfxFOrphans,
+		edit: dashReplaceFirst("GROUP BY ea.trace_id, ea.service_name, ea.ancestor_span_id", "GROUP BY ea.trace_id, ea.service_name, ea.descendant_span_id"),
+		also: map[string]func(string) (string, error){
+			dfxFTraj: dashReplaceFirst("GROUP BY ea.trace_id, ea.service_name, ea.ancestor_span_id", "GROUP BY ea.trace_id, ea.service_name, ea.descendant_span_id"),
+		},
+		want: "assert_no_orphan_tokens: token_parent_coverage GROUP BY is"},
+	{area: "assertions", name: "orphans_emitted_join_and_false_paired", file: dfxFOrphans,
+		edit: dashReplaceFirst("AND m.span_id = cov.span_id", "AND m.span_id = cov.span_id AND FALSE"),
+		also: map[string]func(string) (string, error){
+			dfxFTraj: dashReplaceFirst("AND m.span_id = cov.span_id", "AND m.span_id = cov.span_id AND FALSE"),
+		},
+		want: "assert_no_orphan_tokens: emitted FROM is"},
 	{area: "assertions", name: "orphans_missing_not_exists_and_false", file: dfxFOrphans,
 		edit: dashReplaceFirst("          AND m.span_id = s.span_id\n      )", "          AND m.span_id = s.span_id\n          AND FALSE\n      )"), want: "assert_no_orphan_tokens: the WHERE of the WITH table missing is"},
 	{area: "assertions", name: "orphans_missing_branch_where_false", file: dfxFOrphans,
@@ -4945,15 +5002,15 @@ func dfxEvalStringArrayToks(toks []dashTok, env map[string]any) ([]string, error
 
 // dfxEvalOrphanTokensAssertion parses sqlText (the rendered SQL of
 // assert_no_orphan_tokens.sqlx or the temp table query in
-// m_gen_ai_agent_trajectory's post_operations) and evaluates its 32-hop
-// recursive emitted_ancestors -> token_parent_coverage -> emitted ->
-// (row_violations UNION ALL double_counted UNION ALL missing) AST on a set of
-// spans. Because the evaluator executes the parsed SQL AST of staged,
-// trajectory_context, emitted_ancestors (including JOIN ON, WHERE, and
-// path_span_ids cycle guard), token_parent_coverage, emitted, row_violations,
-// double_counted, missing (including the NOT EXISTS subquery), and the final
-// UNION ALL branches, mutating any of those SQL expressions changes the
-// evaluated result.
+// m_gen_ai_agent_trajectory's post_operations) and evaluates the conformance
+// subset of its 32-hop recursive emitted_ancestors -> token_parent_coverage ->
+// emitted -> (row_violations UNION ALL double_counted UNION ALL missing) AST on
+// a set of spans: staged WHERE, trajectory_context JOIN ON and WHERE,
+// emitted_ancestors seed/recursive JOIN ON, WHERE, has_* flags, and
+// path_span_ids array expressions, token_parent_coverage LEFT JOIN ON, WHERE,
+// GROUP BY, and select items, emitted LEFT JOIN ON, WHERE, and cov_*/expected_is_token_leaf
+// items, row_violations CASE WHEN branches, double_counted WHERE, missing WHERE
+// (including its NOT EXISTS subquery), and the final UNION ALL branches.
 func dfxEvalOrphanTokensAssertion(sqlText string, rows []dfxSpanRow, windowStart time.Time) (map[string][]string, error) {
 	q, err := dashParseSQL(sqlText)
 	if err != nil {
@@ -5135,18 +5192,55 @@ func dfxEvalOrphanTokensAssertion(sqlText string, rows []dfxSpanRow, windowStart
 		}
 	}
 
-	// Parse token_parent_coverage LOGICAL_OR(ea.<col>) mappings from the SQL AST.
+	// Parse token_parent_coverage FROM (LEFT JOIN ON), WHERE, GROUP BY, key
+	// columns, and LOGICAL_OR(ea.<col>) mappings from the SQL AST.
 	covCTE := dfxCTE(q, "token_parent_coverage")
 	if covCTE == nil || len(covCTE.branches) != 1 {
 		return nil, errors.New("missing token_parent_coverage CTE")
 	}
+	covJoinOn, err := dfxExtractJoinOn(covCTE.branches[0].clauses["FROM"])
+	if err != nil {
+		return nil, fmt.Errorf("token_parent_coverage FROM: %w", err)
+	}
+	covWhere := covCTE.branches[0].clauses["WHERE"]
+	if len(covWhere) == 0 {
+		return nil, errors.New("token_parent_coverage missing WHERE clause")
+	}
+	covGroupByToks := covCTE.branches[0].clauses["GROUP BY"]
+	if len(covGroupByToks) == 0 {
+		return nil, errors.New("token_parent_coverage missing GROUP BY clause")
+	}
+	var covGroupKeys []string
+	{
+		start := 0
+		for i, t := range covGroupByToks {
+			if t.is(",") {
+				if k := strings.ToLower(strings.ReplaceAll(dashJoin(covGroupByToks[start:i]), " ", "")); k != "" {
+					covGroupKeys = append(covGroupKeys, k)
+				}
+				start = i + 1
+			}
+		}
+		if lastKey := strings.ToLower(strings.ReplaceAll(dashJoin(covGroupByToks[start:]), " ", "")); lastKey != "" {
+			covGroupKeys = append(covGroupKeys, lastKey)
+		}
+	}
+	if len(covGroupKeys) == 0 {
+		return nil, errors.New("token_parent_coverage GROUP BY has no keys")
+	}
 	covSourceField := map[string]string{}
+	covKeySourceField := map[string]string{}
 	for _, it := range covCTE.branches[0].items {
 		joined := dashJoin(it.body)
+		matchedAgg := false
 		for _, srcField := range []string{"HAS_INPUT", "HAS_OUTPUT", "HAS_REASONING"} {
 			if joined == "LOGICAL_OR ( EA . "+srcField+" )" {
 				covSourceField[strings.ToLower(it.name)] = strings.ToLower(srcField)
+				matchedAgg = true
 			}
+		}
+		if !matchedAgg {
+			covKeySourceField[strings.ToLower(it.name)] = strings.ToLower(strings.ReplaceAll(joined, " ", ""))
 		}
 	}
 	for _, need := range []string{"has_input", "has_output", "has_reasoning"} {
@@ -5154,11 +5248,29 @@ func dfxEvalOrphanTokensAssertion(sqlText string, rows []dfxSpanRow, windowStart
 			return nil, fmt.Errorf("token_parent_coverage missing LOGICAL_OR mapping for %s", need)
 		}
 	}
+	for _, keyCol := range []string{"trace_id", "service_name", "span_id"} {
+		srcExpr := covKeySourceField[keyCol]
+		if srcExpr == "" {
+			return nil, fmt.Errorf("token_parent_coverage missing key item %s", keyCol)
+		}
+		if !slices.Contains(covGroupKeys, srcExpr) {
+			return nil, fmt.Errorf("token_parent_coverage SELECT item %s (%s) is not in GROUP BY %v", keyCol, srcExpr, covGroupKeys)
+		}
+	}
 
-	// Parse emitted CTE items (cov_input, cov_output, cov_reasoning, expected_is_token_leaf).
+	// Parse emitted CTE FROM (LEFT JOIN ON), WHERE, and items (cov_input,
+	// cov_output, cov_reasoning, expected_is_token_leaf) from the SQL AST.
 	emittedCTE := dfxCTE(q, "emitted")
 	if emittedCTE == nil || len(emittedCTE.branches) != 1 {
 		return nil, errors.New("missing emitted CTE")
+	}
+	emittedJoinOn, err := dfxExtractJoinOn(emittedCTE.branches[0].clauses["FROM"])
+	if err != nil {
+		return nil, fmt.Errorf("emitted FROM: %w", err)
+	}
+	emittedWhere := emittedCTE.branches[0].clauses["WHERE"]
+	if len(emittedWhere) == 0 {
+		return nil, errors.New("emitted CTE missing WHERE clause")
 	}
 	emittedExprs := map[string][]dashTok{}
 	for _, it := range emittedCTE.branches[0].items {
@@ -5370,9 +5482,10 @@ func dfxEvalOrphanTokensAssertion(sqlText string, rows []dfxSpanRow, windowStart
 		frontier = nextFrontier
 	}
 
-	// 4. token_parent_coverage with reverse_path cycle tie-breaker, using the
-	// column mapping parsed from token_parent_coverage's SQL AST.
-	type covFlags struct {
+	// 4. token_parent_coverage evaluated from its parsed LEFT JOIN ON, WHERE,
+	// GROUP BY, key items, and LOGICAL_OR(ea.<col>) select items.
+	type covRow struct {
+		traceID, serviceName, spanID      string
 		hasInput, hasOutput, hasReasoning bool
 	}
 	edgeFlag := func(ea ancEdge, field string) bool {
@@ -5387,34 +5500,90 @@ func dfxEvalOrphanTokensAssertion(sqlText string, rows []dfxSpanRow, windowStart
 			return false
 		}
 	}
-	coverage := map[string]covFlags{}
-	for _, ea := range edges {
-		if !ea.hasInput && !ea.hasOutput && !ea.hasReasoning {
-			continue
+	bindEdge := func(env map[string]any, prefix string, e *ancEdge) {
+		if e == nil {
+			env[prefix+"trace_id"] = nil
+			env[prefix+"service_name"] = nil
+			env[prefix+"descendant_span_id"] = nil
+			env[prefix+"descendant_start_time"] = nil
+			env[prefix+"has_input"] = nil
+			env[prefix+"has_output"] = nil
+			env[prefix+"has_reasoning"] = nil
+			env[prefix+"ancestor_span_id"] = nil
+			env[prefix+"ancestor_parent_span_id"] = nil
+			env[prefix+"ancestor_start_time"] = nil
+			env[prefix+"hop"] = nil
+			env[prefix+"path_span_ids"] = nil
+			return
 		}
-		hasReverse := false
-		for _, rev := range edges {
-			if rev.traceID == ea.traceID &&
-				rev.serviceName == ea.serviceName &&
-				rev.descendantSpanID == ea.ancestorSpanID &&
-				rev.ancestorSpanID == ea.descendantSpanID {
-				hasReverse = true
-				break
+		env[prefix+"trace_id"] = e.traceID
+		env[prefix+"service_name"] = e.serviceName
+		env[prefix+"descendant_span_id"] = e.descendantSpanID
+		env[prefix+"descendant_start_time"] = e.descendantStartTime
+		env[prefix+"has_input"] = e.hasInput
+		env[prefix+"has_output"] = e.hasOutput
+		env[prefix+"has_reasoning"] = e.hasReasoning
+		env[prefix+"ancestor_span_id"] = e.ancestorSpanID
+		env[prefix+"ancestor_parent_span_id"] = e.ancestorParentID
+		env[prefix+"ancestor_start_time"] = e.ancestorStartTime
+		env[prefix+"hop"] = e.hop
+		env[prefix+"path_span_ids"] = e.pathSpanIDs
+	}
+	covByGroup := map[string]*covRow{}
+	var covRows []*covRow
+	for i := range edges {
+		ea := &edges[i]
+		var matchedRevs []*ancEdge
+		for j := range edges {
+			rev := &edges[j]
+			joinEnv := maps.Clone(baseEnv)
+			bindEdge(joinEnv, "ea.", ea)
+			bindEdge(joinEnv, "reverse_path.", rev)
+			matched, err := dfxEvalBoolToks(covJoinOn, joinEnv)
+			if err != nil {
+				return nil, fmt.Errorf("evaluating token_parent_coverage LEFT JOIN ON: %w", err)
+			}
+			if matched {
+				matchedRevs = append(matchedRevs, rev)
 			}
 		}
-		if hasReverse {
-			later := ea.descendantStartTime.After(ea.ancestorStartTime) ||
-				(ea.descendantStartTime.Equal(ea.ancestorStartTime) && ea.descendantSpanID > ea.ancestorSpanID)
-			if !later {
+		if len(matchedRevs) == 0 {
+			matchedRevs = []*ancEdge{nil}
+		}
+		for _, revPtr := range matchedRevs {
+			whereEnv := maps.Clone(baseEnv)
+			bindEdge(whereEnv, "ea.", ea)
+			bindEdge(whereEnv, "reverse_path.", revPtr)
+			keep, err := dfxEvalBoolToks(covWhere, whereEnv)
+			if err != nil {
+				return nil, fmt.Errorf("evaluating token_parent_coverage WHERE: %w", err)
+			}
+			if !keep {
 				continue
 			}
+			var gkParts []string
+			for _, gk := range covGroupKeys {
+				v, ok := whereEnv[gk]
+				if !ok {
+					return nil, fmt.Errorf("unknown token_parent_coverage GROUP BY key %q", gk)
+				}
+				gkParts = append(gkParts, fmt.Sprint(v))
+			}
+			gk := strings.Join(gkParts, "|")
+			cr, exists := covByGroup[gk]
+			if !exists {
+				cr = &covRow{
+					traceID:     fmt.Sprint(whereEnv[covKeySourceField["trace_id"]]),
+					serviceName: fmt.Sprint(whereEnv[covKeySourceField["service_name"]]),
+					spanID:      fmt.Sprint(whereEnv[covKeySourceField["span_id"]]),
+				}
+				covByGroup[gk] = cr
+				covRows = append(covRows, cr)
+			}
+			cr.hasInput = cr.hasInput || edgeFlag(*ea, covSourceField["has_input"])
+			cr.hasOutput = cr.hasOutput || edgeFlag(*ea, covSourceField["has_output"])
+			cr.hasReasoning = cr.hasReasoning || edgeFlag(*ea, covSourceField["has_reasoning"])
 		}
-		k := ea.traceID + "|" + ea.serviceName + "|" + ea.ancestorSpanID
-		cf := coverage[k]
-		cf.hasInput = cf.hasInput || edgeFlag(ea, covSourceField["has_input"])
-		cf.hasOutput = cf.hasOutput || edgeFlag(ea, covSourceField["has_output"])
-		cf.hasReasoning = cf.hasReasoning || edgeFlag(ea, covSourceField["has_reasoning"])
-		coverage[k] = cf
 	}
 
 	type candRow struct {
@@ -5427,83 +5596,112 @@ func dfxEvalOrphanTokensAssertion(sqlText string, rows []dfxSpanRow, windowStart
 		"missing":        nil,
 	}
 
-	// 5. emitted (start_time >= contextStart) -> row_violations and double_counted,
-	// evaluated directly from the parsed SQL AST.
+	// 5. emitted (LEFT JOIN token_parent_coverage AS cov ON ... WHERE ...) ->
+	// row_violations and double_counted, evaluated directly from the parsed SQL AST.
 	for _, m := range context {
-		if m.startTime.Before(contextStart) {
-			continue
-		}
-		cov, hasCovRow := coverage[m.traceID+"|"+m.serviceName+"|"+m.spanID]
-		var covInVal, covOutVal, covReasVal any
-		if hasCovRow {
-			covInVal = cov.hasInput
-			covOutVal = cov.hasOutput
-			covReasVal = cov.hasReasoning
-		}
-		emittedEnv := map[string]any{
-			"m.raw_input_tokens":     m.rawInput,
-			"m.raw_output_tokens":    m.rawOutput,
-			"m.raw_reasoning_tokens": m.rawReasoning,
-			"cov.has_input":          covInVal,
-			"cov.has_output":         covOutVal,
-			"cov.has_reasoning":      covReasVal,
-		}
-		covInput, err := dfxEvalBoolToks(emittedExprs["cov_input"], emittedEnv)
-		if err != nil {
-			return nil, fmt.Errorf("evaluating emitted.cov_input: %w", err)
-		}
-		covOutput, err := dfxEvalBoolToks(emittedExprs["cov_output"], emittedEnv)
-		if err != nil {
-			return nil, fmt.Errorf("evaluating emitted.cov_output: %w", err)
-		}
-		covReasoning, err := dfxEvalBoolToks(emittedExprs["cov_reasoning"], emittedEnv)
-		if err != nil {
-			return nil, fmt.Errorf("evaluating emitted.cov_reasoning: %w", err)
-		}
-		expectedLeaf, err := dfxEvalBoolToks(emittedExprs["expected_is_token_leaf"], emittedEnv)
-		if err != nil {
-			return nil, fmt.Errorf("evaluating emitted.expected_is_token_leaf: %w", err)
-		}
-
-		rowEnv := map[string]any{
-			"e.is_token_leaf":          m.isTokenLeaf,
-			"e.input_tokens":           m.inputTokens,
-			"e.output_tokens":          m.outputTokens,
-			"e.reasoning_tokens":       m.reasoningTokens,
-			"e.raw_input_tokens":       m.rawInput,
-			"e.raw_output_tokens":      m.rawOutput,
-			"e.raw_reasoning_tokens":   m.rawReasoning,
-			"e.cov_input":              covInput,
-			"e.cov_output":             covOutput,
-			"e.cov_reasoning":          covReasoning,
-			"e.expected_is_token_leaf": expectedLeaf,
-		}
-
-		rvMatchedViolation := ""
-		for _, br := range rvBranches {
-			matched, err := dfxEvalBoolToks(br.cond, rowEnv)
+		var matchedCovs []*covRow
+		for _, cr := range covRows {
+			joinEnv := maps.Clone(baseEnv)
+			bindRow(joinEnv, "m.", m)
+			joinEnv["cov.trace_id"] = cr.traceID
+			joinEnv["cov.service_name"] = cr.serviceName
+			joinEnv["cov.span_id"] = cr.spanID
+			joinEnv["cov.has_input"] = cr.hasInput
+			joinEnv["cov.has_output"] = cr.hasOutput
+			joinEnv["cov.has_reasoning"] = cr.hasReasoning
+			matched, err := dfxEvalBoolToks(emittedJoinOn, joinEnv)
 			if err != nil {
-				return nil, fmt.Errorf("evaluating row_violations WHEN for %s: %w", br.violation, err)
+				return nil, fmt.Errorf("evaluating emitted LEFT JOIN ON: %w", err)
 			}
 			if matched {
-				rvMatchedViolation = br.violation
-				break
+				matchedCovs = append(matchedCovs, cr)
 			}
 		}
-		cteRows["row_violations"] = append(cteRows["row_violations"], candRow{
-			spanID:    m.spanID,
-			violation: rvMatchedViolation,
-		})
-
-		dcMatched, err := dfxEvalBoolToks(dcWhere, rowEnv)
-		if err != nil {
-			return nil, fmt.Errorf("evaluating double_counted WHERE: %w", err)
+		if len(matchedCovs) == 0 {
+			matchedCovs = []*covRow{nil}
 		}
-		if dcMatched {
-			cteRows["double_counted"] = append(cteRows["double_counted"], candRow{
+		for _, cr := range matchedCovs {
+			emittedEnv := maps.Clone(baseEnv)
+			bindRow(emittedEnv, "m.", m)
+			if cr != nil {
+				emittedEnv["cov.trace_id"] = cr.traceID
+				emittedEnv["cov.service_name"] = cr.serviceName
+				emittedEnv["cov.span_id"] = cr.spanID
+				emittedEnv["cov.has_input"] = cr.hasInput
+				emittedEnv["cov.has_output"] = cr.hasOutput
+				emittedEnv["cov.has_reasoning"] = cr.hasReasoning
+			} else {
+				emittedEnv["cov.trace_id"] = nil
+				emittedEnv["cov.service_name"] = nil
+				emittedEnv["cov.span_id"] = nil
+				emittedEnv["cov.has_input"] = nil
+				emittedEnv["cov.has_output"] = nil
+				emittedEnv["cov.has_reasoning"] = nil
+			}
+			keepEmitted, err := dfxEvalBoolToks(emittedWhere, emittedEnv)
+			if err != nil {
+				return nil, fmt.Errorf("evaluating emitted WHERE: %w", err)
+			}
+			if !keepEmitted {
+				continue
+			}
+			covInput, err := dfxEvalBoolToks(emittedExprs["cov_input"], emittedEnv)
+			if err != nil {
+				return nil, fmt.Errorf("evaluating emitted.cov_input: %w", err)
+			}
+			covOutput, err := dfxEvalBoolToks(emittedExprs["cov_output"], emittedEnv)
+			if err != nil {
+				return nil, fmt.Errorf("evaluating emitted.cov_output: %w", err)
+			}
+			covReasoning, err := dfxEvalBoolToks(emittedExprs["cov_reasoning"], emittedEnv)
+			if err != nil {
+				return nil, fmt.Errorf("evaluating emitted.cov_reasoning: %w", err)
+			}
+			expectedLeaf, err := dfxEvalBoolToks(emittedExprs["expected_is_token_leaf"], emittedEnv)
+			if err != nil {
+				return nil, fmt.Errorf("evaluating emitted.expected_is_token_leaf: %w", err)
+			}
+
+			rowEnv := map[string]any{
+				"e.is_token_leaf":          m.isTokenLeaf,
+				"e.input_tokens":           m.inputTokens,
+				"e.output_tokens":          m.outputTokens,
+				"e.reasoning_tokens":       m.reasoningTokens,
+				"e.raw_input_tokens":       m.rawInput,
+				"e.raw_output_tokens":      m.rawOutput,
+				"e.raw_reasoning_tokens":   m.rawReasoning,
+				"e.cov_input":              covInput,
+				"e.cov_output":             covOutput,
+				"e.cov_reasoning":          covReasoning,
+				"e.expected_is_token_leaf": expectedLeaf,
+			}
+
+			rvMatchedViolation := ""
+			for _, br := range rvBranches {
+				matched, err := dfxEvalBoolToks(br.cond, rowEnv)
+				if err != nil {
+					return nil, fmt.Errorf("evaluating row_violations WHEN for %s: %w", br.violation, err)
+				}
+				if matched {
+					rvMatchedViolation = br.violation
+					break
+				}
+			}
+			cteRows["row_violations"] = append(cteRows["row_violations"], candRow{
 				spanID:    m.spanID,
-				violation: dcViolation,
+				violation: rvMatchedViolation,
 			})
+
+			dcMatched, err := dfxEvalBoolToks(dcWhere, rowEnv)
+			if err != nil {
+				return nil, fmt.Errorf("evaluating double_counted WHERE: %w", err)
+			}
+			if dcMatched {
+				cteRows["double_counted"] = append(cteRows["double_counted"], candRow{
+					spanID:    m.spanID,
+					violation: dcViolation,
+				})
+			}
 		}
 	}
 
@@ -5897,6 +6095,90 @@ func TestDataformOrphanTokensAssertionSemantics(t *testing.T) {
 			}
 			if _, err := dfxEvalOrphanTokensAssertion(mutRecPath, validTreeRows, windowStart); err == nil {
 				t.Errorf("mutating recursive path_span_ids succeeded, want error")
+			}
+		}
+	})
+
+	t.Run("SQL mutation prepending FALSE AND to token_parent_coverage WHERE or appending AND FALSE to emitted LEFT JOIN ON is caught by AST evaluator on both copies", func(t *testing.T) {
+		for _, sqlSrc := range []string{run.body, postOrphansSQL} {
+			mutCovWhere := strings.Replace(sqlSrc, "WHERE (ea.has_input OR ea.has_output OR ea.has_reasoning)", "WHERE FALSE AND (ea.has_input OR ea.has_output OR ea.has_reasoning)", 1)
+			if mutCovWhere == sqlSrc {
+				t.Fatal("failed to mutate token_parent_coverage WHERE in rendered SQL")
+			}
+			gotCovWhere, err := dfxEvalOrphanTokensAssertion(mutCovWhere, validTreeRows, windowStart)
+			if err != nil {
+				t.Fatalf("dfxEvalOrphanTokensAssertion on coverage WHERE mutation: %v", err)
+			}
+			if !slices.Equal(gotCovWhere["root"], []string{"rollup_token_changed"}) {
+				t.Errorf("prepending FALSE AND to token_parent_coverage WHERE gave %v on validTreeRows, want root:[rollup_token_changed]", gotCovWhere)
+			}
+
+			mutEmittedJoin := strings.Replace(sqlSrc, "AND m.span_id = cov.span_id", "AND m.span_id = cov.span_id AND FALSE", 1)
+			if mutEmittedJoin == sqlSrc {
+				t.Fatal("failed to mutate emitted LEFT JOIN ON in rendered SQL")
+			}
+			gotEmittedJoin, err := dfxEvalOrphanTokensAssertion(mutEmittedJoin, validTreeRows, windowStart)
+			if err != nil {
+				t.Fatalf("dfxEvalOrphanTokensAssertion on emitted LEFT JOIN ON mutation: %v", err)
+			}
+			if !slices.Equal(gotEmittedJoin["root"], []string{"rollup_token_changed"}) {
+				t.Errorf("appending AND FALSE to emitted LEFT JOIN ON gave %v on validTreeRows, want root:[rollup_token_changed]", gotEmittedJoin)
+			}
+
+			mutCovGroup := strings.Replace(sqlSrc, "GROUP BY ea.trace_id, ea.service_name, ea.ancestor_span_id", "GROUP BY ea.trace_id, ea.service_name, ea.descendant_span_id", 1)
+			if mutCovGroup == sqlSrc {
+				t.Fatal("failed to mutate token_parent_coverage GROUP BY in rendered SQL")
+			}
+			if _, err := dfxEvalOrphanTokensAssertion(mutCovGroup, validTreeRows, windowStart); err == nil {
+				t.Errorf("mutating token_parent_coverage GROUP BY without matching SELECT key succeeded, want error")
+			}
+
+			// Mutate both SELECT key and GROUP BY key of token_parent_coverage from ea.ancestor_span_id to ea.descendant_span_id.
+			mutCovKeyAndGroup := strings.Replace(mutCovGroup, "ea.ancestor_span_id AS span_id", "ea.descendant_span_id AS span_id", 1)
+			if mutCovKeyAndGroup == mutCovGroup {
+				t.Fatal("failed to mutate token_parent_coverage span_id key in rendered SQL")
+			}
+			gotCovKey, err := dfxEvalOrphanTokensAssertion(mutCovKeyAndGroup, validTreeRows, windowStart)
+			if err != nil {
+				t.Fatalf("dfxEvalOrphanTokensAssertion on coverage key+group mutation: %v", err)
+			}
+			if !slices.Equal(gotCovKey["root"], []string{"rollup_token_changed"}) {
+				t.Errorf("mutating token_parent_coverage key+GROUP BY to ea.descendant_span_id gave %v on validTreeRows, want root:[rollup_token_changed]", gotCovKey)
+			}
+
+			// Verify reverse_path LEFT JOIN ON evaluation on a 2-node mutual cycle where
+			// cyc_late (T+2m) covers cyc_early (T+1m): breaking the reverse_path join so
+			// reverse_path always self-matches causes cyc_late's reverse_path check to fail
+			// when reverse_path.ancestor_span_id IS NULL is removed/broken.
+			cycleRows := []dfxSpanRow{
+				{
+					traceID: "tr-cyc", serviceName: "svc", spanID: "cyc_early", parentSpanID: "cyc_late",
+					startTime: windowStart.Add(-2 * time.Minute), inMart: true, isTokenLeaf: false,
+					rawInput: dfxInt64(20), inputTokens: dfxInt64(20),
+				},
+				{
+					traceID: "tr-cyc", serviceName: "svc", spanID: "cyc_late", parentSpanID: "cyc_early",
+					startTime: windowStart.Add(-1 * time.Minute), inMart: true, isTokenLeaf: true,
+					rawInput: dfxInt64(10), inputTokens: dfxInt64(10),
+				},
+			}
+			gotCycleClean, err := dfxEvalOrphanTokensAssertion(sqlSrc, cycleRows, windowStart)
+			if err != nil {
+				t.Fatalf("dfxEvalOrphanTokensAssertion on valid 2-node cycle: %v", err)
+			}
+			if len(gotCycleClean) != 0 {
+				t.Fatalf("valid 2-node cycle produced unexpected violations %v, want empty", gotCycleClean)
+			}
+			mutRevJoin := strings.Replace(sqlSrc, "AND reverse_path.ancestor_span_id = ea.descendant_span_id", "AND reverse_path.ancestor_span_id = ea.descendant_span_id AND FALSE", 1)
+			if mutRevJoin == sqlSrc {
+				t.Fatal("failed to mutate token_parent_coverage reverse_path LEFT JOIN ON in rendered SQL")
+			}
+			gotCycleBroken, err := dfxEvalOrphanTokensAssertion(mutRevJoin, cycleRows, windowStart)
+			if err != nil {
+				t.Fatalf("dfxEvalOrphanTokensAssertion on broken reverse_path JOIN ON: %v", err)
+			}
+			if !slices.Contains(gotCycleBroken["cyc_late"], "token_double_counted_with_child") {
+				t.Errorf("appending AND FALSE to reverse_path LEFT JOIN ON gave %v on cycleRows, want cyc_late:[token_double_counted_with_child]", gotCycleBroken)
 			}
 		}
 	})
