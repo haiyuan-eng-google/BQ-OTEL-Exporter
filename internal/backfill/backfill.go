@@ -989,9 +989,9 @@ func (l *lineReader) next() ([]byte, error) {
 // errNotExportRequest reports valid JSON that carries no telemetry.
 var errNotExportRequest = errors.New("not an OTLP JSON export request: no resourceSpans, resourceLogs, or resourceMetrics")
 
-// detectSignal names the signal of one export request from its first
-// recognized top-level key. In the usual line that key comes first, so the
-// rest of the line is not scanned.
+// detectSignal validates that line is a single JSON object with no trailing
+// non-whitespace data and names the signal of the export request from its
+// first recognized top-level key.
 func detectSignal(line []byte) (string, error) {
 	dec := json.NewDecoder(bytes.NewReader(line))
 	tok, err := dec.Token()
@@ -1001,25 +1001,47 @@ func detectSignal(line []byte) (string, error) {
 	if tok != json.Delim('{') {
 		return "", errors.New("not a JSON object")
 	}
+	var signal string
 	for dec.More() {
 		tok, err := dec.Token()
 		if err != nil {
 			return "", fmt.Errorf("not valid JSON: %w", err)
 		}
-		switch key, _ := tok.(string); key {
-		case "resourceSpans", "resource_spans":
-			return SignalTraces, nil
-		case "resourceLogs", "resource_logs":
-			return SignalLogs, nil
-		case "resourceMetrics", "resource_metrics":
-			return SignalMetrics, nil
+		if signal == "" {
+			switch key, _ := tok.(string); key {
+			case "resourceSpans", "resource_spans":
+				signal = SignalTraces
+			case "resourceLogs", "resource_logs":
+				signal = SignalLogs
+			case "resourceMetrics", "resource_metrics":
+				signal = SignalMetrics
+			}
 		}
 		var skip json.RawMessage
 		if err := dec.Decode(&skip); err != nil {
 			return "", fmt.Errorf("not valid JSON: %w", err)
 		}
 	}
-	return "", errNotExportRequest
+	tok, err = dec.Token()
+	if err != nil {
+		return "", fmt.Errorf("not valid JSON: %w", err)
+	}
+	if tok != json.Delim('}') {
+		return "", errors.New("not a JSON object")
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		if err != nil {
+			return "", fmt.Errorf("not valid JSON: %w", err)
+		}
+		return "", errors.New("not valid JSON: trailing data after JSON object")
+	}
+	if !json.Valid(line) {
+		return "", errors.New("not valid JSON: trailing data after JSON object")
+	}
+	if signal == "" {
+		return "", errNotExportRequest
+	}
+	return signal, nil
 }
 
 // line converts one export request and queues its rows. It returns only

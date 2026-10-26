@@ -8,7 +8,10 @@
 // logs, and metrics, and writes replayed OTLP JSON envelopes to an output
 // stream or file, or sends them to an OTLP/HTTP receiver (-otlp-endpoint).
 // -rate-limit paces the replay, and -checkpoint-file records its progress
-// so that a crashed run can be rerun from where it stopped.
+// so that a crashed run can be rerun from where it stopped (or, for legacy,
+// empty-key, or group-changed BigQuery cursors, replay the current
+// (ingest_time, row_fp) group at least once while keeping earlier groups
+// excluded and later groups proceeding normally).
 //
 // Exit status: 0 when every record was handled without error, 1 when the
 // run failed or some records failed, and 2 for invalid flags.
@@ -56,7 +59,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		bqTable        = fs.String("bq-table", quarantinereplay.DefaultQuarantineTable, "BigQuery quarantine table (with -bq-project and -bq-dataset)")
 		otlpEndpoint   = fs.String("otlp-endpoint", "", "Send replayed batches to this OTLP/HTTP receiver instead of -output, for example 'http://localhost:4318'")
 		rateLimit      = fs.Float64("rate-limit", 0, "Maximum records replayed per second (0 means no limit)")
-		checkpointPath = fs.String("checkpoint-file", "", "File that records the run's progress; a rerun with the same file, source, and filters resumes after the last handled record")
+		checkpointPath = fs.String("checkpoint-file", "", "File that records the run's progress; a rerun with the same file, source, and filters resumes after the last handled record (or replays the current (ingest_time, row_fp) BigQuery group at least once when a legacy, empty-key, or group-changed cursor is rewound, while earlier groups stay excluded and later groups proceed normally)")
 	)
 
 	if err := fs.Parse(args); err != nil {

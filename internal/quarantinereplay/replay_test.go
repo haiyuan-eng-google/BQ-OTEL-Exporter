@@ -540,10 +540,9 @@ func assertDirHolds(t *testing.T, dir string, want ...string) {
 }
 
 // assertCursor checks that the checkpoint's BigQuery cursor matches the
-// expected (ingest_time, row_fp, row_ord) and that it was written with the
-// canonical row-ordering version. CanonicalRowKey is not compared because it
-// depends on the row's content columns.
-func assertCursor(t *testing.T, st checkpointState, wantIngestMicros, wantFP, wantOrd int64, wantHandled int64) {
+// expected (ingest_time, row_fp, row_ord, canonical_row_key) and that it was
+// written with the canonical row-ordering version.
+func assertCursor(t *testing.T, st checkpointState, wantIngestMicros, wantFP, wantOrd int64, wantKey string, wantHandled int64) {
 	t.Helper()
 	if st.Cursor == nil {
 		t.Fatalf("cursor is nil, want ingest=%d fp=%d ord=%d", wantIngestMicros, wantFP, wantOrd)
@@ -555,6 +554,9 @@ func assertCursor(t *testing.T, st checkpointState, wantIngestMicros, wantFP, wa
 	}
 	if st.Cursor.CursorOrderVersion != cursorOrderVersionCanonical {
 		t.Errorf("cursor order version = %d, want %d", st.Cursor.CursorOrderVersion, cursorOrderVersionCanonical)
+	}
+	if st.Cursor.CanonicalRowKey != wantKey {
+		t.Errorf("cursor canonical_row_key = %q, want %q", st.Cursor.CanonicalRowKey, wantKey)
 	}
 	if st.Handled != wantHandled {
 		t.Errorf("handled = %d, want %d", st.Handled, wantHandled)
@@ -1684,18 +1686,62 @@ func (r fakeQuarantineRow) canonicalKey() string {
 	return string(b)
 }
 
-func (r fakeQuarantineRow) json() map[string]any {
+func (r fakeQuarantineRow) jsonForCols(cols []string) map[string]any {
 	cell := func(v string) map[string]any {
 		if v == "" {
 			return map[string]any{"v": nil}
 		}
 		return map[string]any{"v": v}
 	}
-	return map[string]any{"f": []any{
-		cell(strconv.FormatInt(r.ingest.UnixMicro(), 10)), cell(r.signal), cell(r.code), cell("rejected"),
-		cell("checkout"), cell(""), cell(""), cell(r.payload), cell(""), cell(""),
-		cell(strconv.FormatInt(r.fp, 10)), cell(strconv.FormatInt(r.ord, 10)), cell(r.canonicalKey()),
-	}}
+	byCol := map[string]map[string]any{
+		"ingest_time_us":      cell(strconv.FormatInt(r.ingest.UnixMicro(), 10)),
+		"signal":              cell(r.signal),
+		"error_code":          cell(r.code),
+		"error_message":       cell("rejected"),
+		"service_name":        cell("checkout"),
+		"trace_id":            cell(""),
+		"span_id":             cell(""),
+		"raw_payload":         cell(r.payload),
+		"payload_ref_uri":     cell(""),
+		"payload_ref_version": cell(""),
+		"row_fp":              cell(strconv.FormatInt(r.fp, 10)),
+		"row_ord":             cell(strconv.FormatInt(r.ord, 10)),
+		"row_key":             cell(r.canonicalKey()),
+	}
+	f := make([]any, len(cols))
+	for i, c := range cols {
+		f[i] = byCol[c]
+	}
+	return map[string]any{"f": f}
+}
+
+// selectedQuarantineColumns extracts the column names projected by the outer
+// `SELECT ... FROM quarantined` clause of query so fakeQuarantineBigQuery only
+// returns columns the query actually selected.
+func selectedQuarantineColumns(query string) []string {
+	fromIdx := strings.Index(query, "FROM quarantined")
+	if fromIdx < 0 {
+		return slices.Clone(quarantineResultColumns)
+	}
+	selectIdx := strings.LastIndex(query[:fromIdx], "SELECT")
+	if selectIdx < 0 {
+		return slices.Clone(quarantineResultColumns)
+	}
+	proj := query[selectIdx+len("SELECT") : fromIdx]
+	var cols []string
+	for _, part := range strings.Split(proj, ",") {
+		item := strings.TrimSpace(part)
+		if item == "" {
+			continue
+		}
+		if idx := strings.LastIndex(strings.ToUpper(item), " AS "); idx >= 0 {
+			item = strings.TrimSpace(item[idx+len(" AS "):])
+		}
+		if slices.Contains(quarantineResultColumns, item) {
+			cols = append(cols, item)
+		}
+	}
+	return cols
 }
 
 // fakeQuarantineBigQuery serves the BigQuery REST calls ReplayBigQuery
@@ -1710,6 +1756,7 @@ type fakeQuarantineBigQuery struct {
 	status int
 
 	selected     []fakeQuarantineRow
+	selectedCols []string
 	requests     []*bigqueryapi.QueryRequest
 	resultsCalls []url.Values
 }
@@ -1738,6 +1785,7 @@ func (f *fakeQuarantineBigQuery) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		}
 		cursor, resume := cursorParams(req)
 		f.selected = nil
+		f.selectedCols = selectedQuarantineColumns(req.Query)
 		ordered := slices.Clone(f.rows)
 		if strings.Contains(req.Query, "ROW_NUMBER() OVER (PARTITION BY ingest_time, row_fp ORDER BY row_key)") &&
 			strings.Contains(req.Query, "ORDER BY ingest_time, row_fp, row_ord, row_key") {
@@ -1762,10 +1810,28 @@ func (f *fakeQuarantineBigQuery) ServeHTTP(w http.ResponseWriter, r *http.Reques
 			fp int64
 		}
 		ords := map[rowKey]int64{}
-		for _, row := range ordered {
-			k := rowKey{us: row.ingest.UnixMicro(), fp: row.fp}
-			row.ord = ords[k]
+		for i := range ordered {
+			k := rowKey{us: ordered[i].ingest.UnixMicro(), fp: ordered[i].fp}
+			ordered[i].ord = ords[k]
 			ords[k]++
+		}
+		if resume && strings.Contains(req.Query, "@cursor_key") {
+			matched := false
+			for _, row := range ordered {
+				if row.ingest.UnixMicro() == cursor.IngestTimeMicros &&
+					row.fp == cursor.RowFingerprint &&
+					row.ord == cursor.DuplicateOrdinal &&
+					row.canonicalKey() == cursor.CanonicalRowKey {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				cursor.DuplicateOrdinal = -1
+				cursor.CanonicalRowKey = ""
+			}
+		}
+		for _, row := range ordered {
 			if !resume || row.after(cursor) {
 				f.selected = append(f.selected, row)
 			}
@@ -1786,12 +1852,16 @@ func (f *fakeQuarantineBigQuery) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		}
 		start = min(start, len(f.selected))
 		end := min(start+pageSize, len(f.selected))
+		cols := f.selectedCols
+		if len(cols) == 0 {
+			cols = quarantineResultColumns
+		}
 		rows := []any{}
 		for _, row := range f.selected[start:end] {
-			rows = append(rows, row.json())
+			rows = append(rows, row.jsonForCols(cols))
 		}
-		fields := make([]any, len(quarantineResultColumns))
-		for i, name := range quarantineResultColumns {
+		fields := make([]any, len(cols))
+		for i, name := range cols {
 			typ := "STRING"
 			if name == "ingest_time_us" || name == "row_fp" || name == "row_ord" {
 				typ = "INTEGER"
@@ -1837,6 +1907,8 @@ func cursorParams(req *bigqueryapi.QueryRequest) (bigQueryCursor, bool) {
 			if ord, err := strconv.ParseInt(p.ParameterValue.Value, 10, 64); err == nil {
 				c.DuplicateOrdinal = ord
 			}
+		case "cursor_key":
+			c.CanonicalRowKey = p.ParameterValue.Value
 		}
 	}
 	return c, haveTime && haveFP
@@ -1975,7 +2047,7 @@ func TestReplayBigQueryCheckpointResume(t *testing.T) {
 	if st.Kind != checkpointKindBigQuery || st.Source != "bigquery:proj.ds.dead_letters" {
 		t.Fatalf("checkpoint = %+v, want kind=%s source=%q", st, checkpointKindBigQuery, "bigquery:proj.ds.dead_letters")
 	}
-	assertCursor(t, st, base.UnixMicro(), -9, 0, 1)
+	assertCursor(t, st, base.UnixMicro(), -9, 0, fake.rows[0].canonicalKey(), 1)
 
 	// The rerun asks BigQuery only for the rows after the cursor.
 	resumed := &recordingSink{}
@@ -1992,18 +2064,22 @@ func TestReplayBigQueryCheckpointResume(t *testing.T) {
 	req := fake.requests[len(fake.requests)-1]
 	for _, want := range []string{
 		"FROM `proj.ds.dead_letters`",
-		"WHERE ingest_time > @cursor_time OR (ingest_time = @cursor_time AND (row_fp > @cursor_fp OR (row_fp = @cursor_fp AND row_ord > @cursor_ord)))\nORDER BY ingest_time, row_fp, row_ord",
+		"WHERE ingest_time > @cursor_time OR (ingest_time = @cursor_time AND (row_fp > @cursor_fp OR (row_fp = @cursor_fp AND (row_ord > @cursor_ord OR NOT EXISTS (SELECT 1 FROM quarantined WHERE ingest_time = @cursor_time AND row_fp = @cursor_fp AND row_ord = @cursor_ord AND row_key = @cursor_key)))))\nORDER BY ingest_time, row_fp, row_ord",
 	} {
 		if !strings.Contains(req.Query, want) {
 			t.Errorf("resume query lacks %q:\n%s", want, req.Query)
 		}
 	}
 	params := queryParamValues(req)
-	if params["since"] != "TIMESTAMP 2026-10-11 10:00:00+00:00" || params["cursor_time"] != "TIMESTAMP 2026-10-11 10:00:00+00:00" || params["cursor_fp"] != "INT64 -9" || params["cursor_ord"] != "INT64 0" {
-		t.Errorf("resume parameters = %v, want the partition bound raised to the cursor", params)
+	if params["since"] != "TIMESTAMP 2026-10-11 10:00:00+00:00" ||
+		params["cursor_time"] != "TIMESTAMP 2026-10-11 10:00:00+00:00" ||
+		params["cursor_fp"] != "INT64 -9" ||
+		params["cursor_ord"] != "INT64 0" ||
+		params["cursor_key"] != "STRING "+fake.rows[0].canonicalKey() {
+		t.Errorf("resume parameters = %v, want the partition bound raised to the cursor with cursor_key", params)
 	}
 	st = readCheckpointFile(t, opts.Checkpoint.Path)
-	assertCursor(t, st, base.Add(time.Second).UnixMicro(), -1, 0, 3)
+	assertCursor(t, st, base.Add(time.Second).UnixMicro(), -1, 0, fake.rows[2].canonicalKey(), 3)
 	assertDirHolds(t, dir, "bq.ckpt")
 }
 
@@ -2034,7 +2110,7 @@ func TestReplayBigQueryDuplicateRowsWithCheckpoint(t *testing.T) {
 		t.Errorf("uninterrupted replayed %d spans, want 3", len(sink1.names))
 	}
 	st1 := readCheckpointFile(t, opts1.Checkpoint.Path)
-	assertCursor(t, st1, base.UnixMicro(), 77, 2, 3)
+	assertCursor(t, st1, base.UnixMicro(), 77, 2, fake.rows[2].canonicalKey(), 3)
 
 	// 2. Interrupted run failing transiently on the 2nd duplicate, followed by a resume,
 	// must deliver all three duplicate rows across the two runs without dropping any.
@@ -2051,7 +2127,7 @@ func TestReplayBigQueryDuplicateRowsWithCheckpoint(t *testing.T) {
 		t.Fatalf("first interrupted run = %v, want transient OTLP timeout", err)
 	}
 	st2 := readCheckpointFile(t, opts2.Checkpoint.Path)
-	assertCursor(t, st2, base.UnixMicro(), 77, 0, 1)
+	assertCursor(t, st2, base.UnixMicro(), 77, 0, fake.rows[0].canonicalKey(), 1)
 
 	resumed := &recordingSink{}
 	sum2, err := ReplayBigQuery(context.Background(), src, resumed, opts2, bigQueryTestOptions(srv)...)
@@ -2065,7 +2141,7 @@ func TestReplayBigQueryDuplicateRowsWithCheckpoint(t *testing.T) {
 		t.Errorf("total replayed duplicates across both runs = %d, want 3", total)
 	}
 	st2 = readCheckpointFile(t, opts2.Checkpoint.Path)
-	assertCursor(t, st2, base.UnixMicro(), 77, 2, 3)
+	assertCursor(t, st2, base.UnixMicro(), 77, 2, fake.rows[2].canonicalKey(), 3)
 
 	// 3. Two distinct rows sharing (ingest_time, row_fp) must receive a
 	// deterministic row_ord across restarts even when the underlying table scan
@@ -2183,12 +2259,12 @@ func TestReplayBigQueryLegacyCursorRewind(t *testing.T) {
 	}
 	// The resumed checkpoint must now be a v2 cursor at the last row.
 	st := readCheckpointFile(t, ckptPath)
-	assertCursor(t, st, base.UnixMicro(), 77, 1, 3) // 1 legacy + 2 replayed
+	assertCursor(t, st, base.UnixMicro(), 77, 1, fake.rows[1].canonicalKey(), 3) // 1 legacy + 2 replayed
 }
 
-// TestReplayBigQueryV2CursorResume tests that a v2 BigQuery cursor (written
-// with CursorOrderVersion=2 and CanonicalRowKey) resumes correctly after
-// the last handled row, without rewinding.
+// TestReplayBigQueryV2CursorResume tests that a v2 BigQuery cursor written by
+// ReplayBigQuery (with CursorOrderVersion=2 and the returned row's exact
+// CanonicalRowKey) resumes after the last handled row without rewinding.
 func TestReplayBigQueryV2CursorResume(t *testing.T) {
 	base := time.Date(2026, 10, 11, 10, 0, 0, 0, time.UTC)
 	spanA := sampleSpanJSON(t, "v2-span-A")
@@ -2204,34 +2280,26 @@ func TestReplayBigQueryV2CursorResume(t *testing.T) {
 	src := BigQuerySource{Project: "proj", Dataset: "ds", Table: "dead_letters"}
 	dir := t.TempDir()
 	ckptPath := filepath.Join(dir, "v2.ckpt")
+	opts := Options{Checkpoint: &CheckpointConfig{Path: ckptPath, Source: "bigquery:proj.ds.dead_letters"}}
 
-	// Simulate a first run that delivered A (ordinal 0) and stopped on
-	// a transient failure at B. The checkpoint is a v2 cursor at A.
-	v2Cursor := checkpointState{
-		Version: checkpointVersion,
-		Kind:    checkpointKindBigQuery,
-		Source:  "bigquery:proj.ds.dead_letters",
-		Filter:  (Filter{}).fingerprint(),
-		Cursor: &bigQueryCursor{
-			IngestTimeMicros:   base.UnixMicro(),
-			RowFingerprint:     77,
-			DuplicateOrdinal:   0,
-			CursorOrderVersion: cursorOrderVersionCanonical,
-			CanonicalRowKey:    `{"signal":"spans","error_code":"OVERSIZE_ROW","raw_payload":"` + spanA + `"}`,
-		},
-		Handled: 1,
+	// Run 1: real ReplayBigQuery writer delivers A (ordinal 0) and fails
+	// transiently on B (ordinal 1), writing a v2 checkpoint at A.
+	flaky := &recordingSink{fail: func(call int) error {
+		if call == 2 {
+			return errors.New("transient v2 sink error")
+		}
+		return nil
+	}}
+	if _, err := ReplayBigQuery(context.Background(), src, flaky, opts, bigQueryTestOptions(srv)...); err == nil || !strings.Contains(err.Error(), "transient v2 sink error") {
+		t.Fatalf("first v2 run = %v, want transient v2 sink error", err)
 	}
-	data, err := json.MarshalIndent(v2Cursor, "", "  ")
-	if err != nil {
-		t.Fatal(err)
+	if !slices.Equal(flaky.names, []string{"v2-span-A"}) {
+		t.Fatalf("first v2 run exported %v, want [v2-span-A]", flaky.names)
 	}
-	data = append(data, '\n')
-	if err := os.WriteFile(ckptPath, data, 0644); err != nil {
-		t.Fatal(err)
-	}
+	st1 := readCheckpointFile(t, ckptPath)
+	assertCursor(t, st1, base.UnixMicro(), 77, 0, fake.rows[0].canonicalKey(), 1)
 
 	// Resuming must skip A (already handled) and replay B and C.
-	opts := Options{Checkpoint: &CheckpointConfig{Path: ckptPath, Source: "bigquery:proj.ds.dead_letters"}}
 	sink := &recordingSink{}
 	sum, err := ReplayBigQuery(context.Background(), src, sink, opts, bigQueryTestOptions(srv)...)
 	if err != nil {
@@ -2244,7 +2312,337 @@ func TestReplayBigQueryV2CursorResume(t *testing.T) {
 		t.Errorf("v2 resume replayed %v, want [v2-span-B, v2-span-C] (A must be skipped)", sink.names)
 	}
 	st := readCheckpointFile(t, ckptPath)
-	assertCursor(t, st, base.Add(time.Second).UnixMicro(), 88, 0, 3) // 1 prior + 2 replayed
+	assertCursor(t, st, base.Add(time.Second).UnixMicro(), 88, 0, fake.rows[2].canonicalKey(), 3) // 1 prior + 2 replayed
+}
+
+// TestReplayBigQueryV2ChangedCollisionGroup verifies that when a collision or
+// duplicate group's membership changes between runs (for example, an already
+// acknowledged row is deleted from the quarantine table) or a checkpoint carries
+// a canonical_row_key that does not match the row at duplicate_ordinal, both
+// the server query and the client-side reconciliation rewind that group so no
+// undelivered row is skipped.
+func TestReplayBigQueryV2ChangedCollisionGroup(t *testing.T) {
+	base := time.Date(2026, 10, 11, 10, 0, 0, 0, time.UTC)
+	src := BigQuerySource{Project: "proj", Dataset: "ds", Table: "dead_letters"}
+
+	t.Run("deleted acknowledged row in collision group delivers remaining row", func(t *testing.T) {
+		spanEarly := sampleSpanJSON(t, "early-span")
+		spanA := sampleSpanJSON(t, "collision-span-A")
+		spanB := sampleSpanJSON(t, "collision-span-B")
+		spanLater := sampleSpanJSON(t, "later-span")
+		rowEarly := fakeQuarantineRow{ingest: base.Add(-time.Second), fp: 10, signal: "spans", code: "OVERSIZE_ROW", payload: spanEarly}
+		rowA := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: spanA}
+		rowB := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: spanB}
+		rowLater := fakeQuarantineRow{ingest: base.Add(time.Second), fp: 88, signal: "spans", code: "OVERSIZE_ROW", payload: spanLater}
+		fake := &fakeQuarantineBigQuery{rows: []fakeQuarantineRow{rowEarly, rowA, rowB, rowLater}}
+		srv := httptest.NewServer(fake)
+		defer srv.Close()
+
+		ckptPath := filepath.Join(t.TempDir(), "deleted_a.ckpt")
+		opts := Options{Checkpoint: &CheckpointConfig{Path: ckptPath}}
+
+		// Run 1 delivers rowEarly and rowA (ord=0 in (base, 77)) and fails transiently on rowB (ord=1).
+		flaky := &recordingSink{fail: func(call int) error {
+			if call == 3 {
+				return errors.New("transient failure on B")
+			}
+			return nil
+		}}
+		if _, err := ReplayBigQuery(context.Background(), src, flaky, opts, bigQueryTestOptions(srv)...); err == nil || !strings.Contains(err.Error(), "transient failure on B") {
+			t.Fatalf("first run = %v, want transient failure on B", err)
+		}
+		if !slices.Equal(flaky.names, []string{"early-span", "collision-span-A"}) {
+			t.Fatalf("first run exported %v, want [early-span collision-span-A]", flaky.names)
+		}
+		st1 := readCheckpointFile(t, ckptPath)
+		assertCursor(t, st1, base.UnixMicro(), 77, 0, rowA.canonicalKey(), 2)
+
+		// Delete already-handled rowA from the quarantine table before resuming.
+		// rowB now shifts from ord=1 to ord=0 inside (base, 77).
+		fake.mu.Lock()
+		fake.rows = []fakeQuarantineRow{rowEarly, rowB, rowLater}
+		fake.mu.Unlock()
+
+		resumed := &recordingSink{}
+		sum, err := ReplayBigQuery(context.Background(), src, resumed, opts, bigQueryTestOptions(srv)...)
+		if err != nil {
+			t.Fatalf("resumed run after deleting A: %v", err)
+		}
+		if want := (Summary{TotalRead: 2, Matched: 2, ReplayedSpans: 2}); sum != want {
+			t.Errorf("resumed summary = %+v, want %+v", sum, want)
+		}
+		if !slices.Equal(resumed.names, []string{"collision-span-B", "later-span"}) {
+			t.Errorf("resumed run exported %v, want [collision-span-B later-span] (B must not be skipped and early-span must stay excluded)", resumed.names)
+		}
+		st2 := readCheckpointFile(t, ckptPath)
+		assertCursor(t, st2, base.Add(time.Second).UnixMicro(), 88, 0, rowLater.canonicalKey(), 4)
+	})
+
+	t.Run("deleted two acknowledged rows in 3-way collision group delivers third row", func(t *testing.T) {
+		rowA := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-A")}
+		rowB := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-B")}
+		rowC := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-C")}
+		fake := &fakeQuarantineBigQuery{rows: []fakeQuarantineRow{rowA, rowB, rowC}}
+		srv := httptest.NewServer(fake)
+		defer srv.Close()
+
+		ckptPath := filepath.Join(t.TempDir(), "deleted_ab.ckpt")
+		opts := Options{Checkpoint: &CheckpointConfig{Path: ckptPath}}
+		flaky := &recordingSink{fail: func(call int) error {
+			if call == 3 {
+				return errors.New("transient failure on C")
+			}
+			return nil
+		}}
+		if _, err := ReplayBigQuery(context.Background(), src, flaky, opts, bigQueryTestOptions(srv)...); err == nil {
+			t.Fatal("first run succeeded, want transient failure on C")
+		}
+		assertCursor(t, readCheckpointFile(t, ckptPath), base.UnixMicro(), 77, 1, rowB.canonicalKey(), 2)
+
+		// Delete both A and B so C shifts from ord=2 to ord=0.
+		fake.mu.Lock()
+		fake.rows = []fakeQuarantineRow{rowC}
+		fake.mu.Unlock()
+
+		resumed := &recordingSink{}
+		sum, err := ReplayBigQuery(context.Background(), src, resumed, opts, bigQueryTestOptions(srv)...)
+		if err != nil {
+			t.Fatalf("resumed run after deleting A and B: %v", err)
+		}
+		if want := (Summary{TotalRead: 1, Matched: 1, ReplayedSpans: 1}); sum != want {
+			t.Errorf("resumed summary = %+v, want %+v", sum, want)
+		}
+		if !slices.Equal(resumed.names, []string{"collision-span-C"}) {
+			t.Errorf("resumed run exported %v, want [collision-span-C]", resumed.names)
+		}
+	})
+
+	t.Run("stamped legacy cursor with v2 and B key at ord 0 rewinds group and delivers A and B", func(t *testing.T) {
+		rowA := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-A")}
+		rowB := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-B")}
+		fake := &fakeQuarantineBigQuery{rows: []fakeQuarantineRow{rowA, rowB}}
+		srv := httptest.NewServer(fake)
+		defer srv.Close()
+
+		ckptPath := filepath.Join(t.TempDir(), "stamped_v2.ckpt")
+		// Under unordered legacy ROW_NUMBER(), B got ord=0 and A got ord=1.
+		// Even if that checkpoint is stamped with cursor_order_version=2 and
+		// B's canonical_row_key at duplicate_ordinal=0, row_ord=0 in canonical
+		// order holds A's key != B's key, so the group must rewind and deliver both.
+		stamped := checkpointState{
+			Version: checkpointVersion,
+			Kind:    checkpointKindBigQuery,
+			Source:  "bigquery:proj.ds.dead_letters",
+			Filter:  (Filter{}).fingerprint(),
+			Cursor: &bigQueryCursor{
+				IngestTimeMicros:   base.UnixMicro(),
+				RowFingerprint:     77,
+				DuplicateOrdinal:   0,
+				CursorOrderVersion: cursorOrderVersionCanonical,
+				CanonicalRowKey:    rowB.canonicalKey(),
+			},
+			Handled: 1,
+		}
+		raw, err := json.MarshalIndent(stamped, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(ckptPath, append(raw, '\n'), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		resumed := &recordingSink{}
+		sum, err := ReplayBigQuery(context.Background(), src, resumed, Options{Checkpoint: &CheckpointConfig{Path: ckptPath}}, bigQueryTestOptions(srv)...)
+		if err != nil {
+			t.Fatalf("resumed stamped v2 run: %v", err)
+		}
+		if want := (Summary{TotalRead: 2, Matched: 2, ReplayedSpans: 2}); sum != want {
+			t.Errorf("stamped v2 summary = %+v, want %+v", sum, want)
+		}
+		if !slices.Equal(resumed.names, []string{"collision-span-A", "collision-span-B"}) {
+			t.Errorf("stamped v2 run exported %v, want [collision-span-A collision-span-B] (A must not be lost)", resumed.names)
+		}
+	})
+
+	t.Run("client-side position comparison and boundary reconciliation reject mismatched key at ordinal", func(t *testing.T) {
+		rowA := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-A")}
+		rowB := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "collision-span-B")}
+		cursorAtA := bigQueryCursor{
+			IngestTimeMicros:   base.UnixMicro(),
+			RowFingerprint:     77,
+			DuplicateOrdinal:   0,
+			CursorOrderVersion: cursorOrderVersionCanonical,
+			CanonicalRowKey:    rowA.canonicalKey(),
+		}
+		// If A is deleted and B shifts to ordinal 0, B's position at ordinal 0
+		// must still sort after cursorAtA on the client side.
+		posBAtZero := recordPosition{
+			ingestMicros: base.UnixMicro(),
+			fingerprint:  77,
+			ordinal:      0,
+			canonicalKey: rowB.canonicalKey(),
+		}
+		if !posBAtZero.after(cursorAtA) {
+			t.Errorf("posBAtZero.after(cursorAtA) = false, want true when B shifted to ordinal 0 after A was deleted")
+		}
+		// Conversely, A itself at ordinal 0 was already handled.
+		posAAtZero := recordPosition{
+			ingestMicros: base.UnixMicro(),
+			fingerprint:  77,
+			ordinal:      0,
+			canonicalKey: rowA.canonicalKey(),
+		}
+		if posAAtZero.after(cursorAtA) {
+			t.Errorf("posAAtZero.after(cursorAtA) = true, want false for already-handled row A")
+		}
+	})
+}
+
+// TestReplayBigQueryCursorVersionAndKeyValidation tests all branches of
+// cursor_order_version (<0, 0, 1, 2 with empty key, 2 with malformed key, >2).
+func TestReplayBigQueryCursorVersionAndKeyValidation(t *testing.T) {
+	base := time.Date(2026, 10, 11, 10, 0, 0, 0, time.UTC)
+	rowEarly := fakeQuarantineRow{ingest: base.Add(-time.Second), fp: 10, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "early-span")}
+	rowA := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "group-span-A")}
+	rowB := fakeQuarantineRow{ingest: base, fp: 77, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "group-span-B")}
+	rowLater := fakeQuarantineRow{ingest: base.Add(time.Second), fp: 88, signal: "spans", code: "OVERSIZE_ROW", payload: sampleSpanJSON(t, "later-span")}
+	src := BigQuerySource{Project: "proj", Dataset: "ds", Table: "dead_letters"}
+
+	writeCkpt := func(t *testing.T, c bigQueryCursor) string {
+		t.Helper()
+		p := filepath.Join(t.TempDir(), "cursor.ckpt")
+		st := checkpointState{
+			Version: checkpointVersion,
+			Kind:    checkpointKindBigQuery,
+			Source:  "bigquery:proj.ds.dead_letters",
+			Filter:  (Filter{}).fingerprint(),
+			Cursor:  &c,
+			Handled: 1,
+		}
+		raw, err := json.MarshalIndent(st, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, append(raw, '\n'), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	// 1. Invalid versions (<0, >2) and malformed v2 keys must be rejected before querying.
+	for _, tc := range []struct {
+		name string
+		cur  bigQueryCursor
+		want string
+	}{
+		{
+			name: "negative cursor_order_version -1",
+			cur:  bigQueryCursor{IngestTimeMicros: base.UnixMicro(), RowFingerprint: 77, DuplicateOrdinal: 0, CursorOrderVersion: -1, CanonicalRowKey: rowA.canonicalKey()},
+			want: "unsupported cursor_order_version -1",
+		},
+		{
+			name: "unknown cursor_order_version 99 with bogus key",
+			cur:  bigQueryCursor{IngestTimeMicros: base.UnixMicro(), RowFingerprint: 77, DuplicateOrdinal: 0, CursorOrderVersion: 99, CanonicalRowKey: "not-a-row"},
+			want: "unsupported cursor_order_version 99",
+		},
+		{
+			name: "unknown cursor_order_version 99 with valid key",
+			cur:  bigQueryCursor{IngestTimeMicros: base.UnixMicro(), RowFingerprint: 77, DuplicateOrdinal: 0, CursorOrderVersion: 99, CanonicalRowKey: rowA.canonicalKey()},
+			want: "unsupported cursor_order_version 99",
+		},
+		{
+			name: "v2 cursor with non-JSON canonical_row_key",
+			cur:  bigQueryCursor{IngestTimeMicros: base.UnixMicro(), RowFingerprint: 77, DuplicateOrdinal: 0, CursorOrderVersion: 2, CanonicalRowKey: "not-a-row"},
+			want: "invalid canonical_row_key",
+		},
+		{
+			name: "v2 cursor with incomplete JSON object canonical_row_key",
+			cur:  bigQueryCursor{IngestTimeMicros: base.UnixMicro(), RowFingerprint: 77, DuplicateOrdinal: 0, CursorOrderVersion: 2, CanonicalRowKey: `{"signal":"spans"}`},
+			want: "invalid canonical_row_key",
+		},
+		{
+			name: "v2 cursor with unexpected field in canonical_row_key",
+			cur:  bigQueryCursor{IngestTimeMicros: base.UnixMicro(), RowFingerprint: 77, DuplicateOrdinal: 0, CursorOrderVersion: 2, CanonicalRowKey: `{"signal":"spans","error_code":"OVERSIZE_ROW","raw_payload":"{}","extra":"x"}`},
+			want: "invalid canonical_row_key",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeQuarantineBigQuery{rows: []fakeQuarantineRow{rowEarly, rowA, rowB, rowLater}}
+			srv := httptest.NewServer(fake)
+			defer srv.Close()
+
+			ckptPath := writeCkpt(t, tc.cur)
+			sink := &recordingSink{}
+			_, err := ReplayBigQuery(context.Background(), src, sink, Options{Checkpoint: &CheckpointConfig{Path: ckptPath}}, bigQueryTestOptions(srv)...)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ReplayBigQuery() error = %v, want substring %q", err, tc.want)
+			}
+			if len(fake.requests) != 0 || len(sink.names) != 0 {
+				t.Errorf("queries=%d exported=%v, want 0 queries and 0 exports before rejecting checkpoint", len(fake.requests), sink.names)
+			}
+		})
+	}
+
+	// 2. Legacy versions (0 and 1) and v2 with empty key must rewind only the
+	// cursor's (ingest_time, row_fp) group, excluding earlier groups and
+	// replaying the cursor's group + later groups once.
+	for _, tc := range []struct {
+		name string
+		cur  bigQueryCursor
+	}{
+		{
+			name: "legacy version 0",
+			cur:  bigQueryCursor{IngestTimeMicros: base.UnixMicro(), RowFingerprint: 77, DuplicateOrdinal: 0, CursorOrderVersion: 0},
+		},
+		{
+			name: "legacy version 1",
+			cur:  bigQueryCursor{IngestTimeMicros: base.UnixMicro(), RowFingerprint: 77, DuplicateOrdinal: 0, CursorOrderVersion: 1},
+		},
+		{
+			name: "v2 with empty canonical_row_key",
+			cur:  bigQueryCursor{IngestTimeMicros: base.UnixMicro(), RowFingerprint: 77, DuplicateOrdinal: 0, CursorOrderVersion: 2, CanonicalRowKey: ""},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeQuarantineBigQuery{rows: []fakeQuarantineRow{rowEarly, rowA, rowB, rowLater}}
+			srv := httptest.NewServer(fake)
+			defer srv.Close()
+
+			ckptPath := writeCkpt(t, tc.cur)
+			sink := &recordingSink{}
+			sum, err := ReplayBigQuery(context.Background(), src, sink, Options{Checkpoint: &CheckpointConfig{Path: ckptPath}}, bigQueryTestOptions(srv)...)
+			if err != nil {
+				t.Fatalf("ReplayBigQuery() = %v", err)
+			}
+			if want := (Summary{TotalRead: 3, Matched: 3, ReplayedSpans: 3}); sum != want {
+				t.Errorf("summary = %+v, want %+v", sum, want)
+			}
+			if want := []string{"group-span-A", "group-span-B", "later-span"}; !slices.Equal(sink.names, want) {
+				t.Errorf("exported %v, want %v (early-span excluded, group A+B rewound, later-span replayed once)", sink.names, want)
+			}
+		})
+	}
+}
+
+// TestFakeQuarantineBigQueryHonorsSelectedProjection verifies that
+// fakeQuarantineBigQuery only returns columns present in the outer
+// `SELECT ... FROM quarantined` projection, so omitting `row_key` from the
+// outer SELECT leaves CanonicalRowKey empty.
+func TestFakeQuarantineBigQueryHonorsSelectedProjection(t *testing.T) {
+	withRowKey := selectedQuarantineColumns(quarantineQueryTemplate)
+	if !slices.Contains(withRowKey, "row_key") {
+		t.Fatalf("selectedQuarantineColumns(quarantineQueryTemplate) = %v, want row_key included", withRowKey)
+	}
+	withoutRowKeyQuery := strings.Replace(
+		quarantineQueryTemplate,
+		"payload_ref_uri, payload_ref_version, row_fp, row_ord, row_key\nFROM quarantined",
+		"payload_ref_uri, payload_ref_version, row_fp, row_ord\nFROM quarantined",
+		1,
+	)
+	withoutRowKey := selectedQuarantineColumns(withoutRowKeyQuery)
+	if slices.Contains(withoutRowKey, "row_key") {
+		t.Fatalf("selectedQuarantineColumns(withoutRowKeyQuery) = %v, want row_key omitted when dropped from outer SELECT", withoutRowKey)
+	}
 }
 
 func TestReplayBigQueryErrors(t *testing.T) {

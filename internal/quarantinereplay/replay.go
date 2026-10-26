@@ -383,15 +383,20 @@ type recordPosition struct {
 	fingerprint  int64
 	ordinal      int64
 	// canonicalKey is the row's canonical JSON content key (row_key),
-	// written into v2 BigQuery cursors so the resume position is
-	// unambiguous even when the underlying ROW_NUMBER() ordering
-	// changes. It is not used for ordering itself (row_key is already
-	// reflected in the deterministic ordinal), but it ties a cursor to the
-	// canonical ordering it was written under.
+	// written into v2 BigQuery cursors and checked alongside ordinal when
+	// resuming inside the cursor's (ingest_time, row_fp) group. If the
+	// current group no longer has canonicalKey at ordinal (for example,
+	// because earlier rows in the group were deleted or a cursor carries a
+	// mismatched key), both the query and the client rewind that
+	// (ingest_time, row_fp) group to replay it at-least-once.
 	canonicalKey string
 }
 
-// after reports whether p sorts after the BigQuery cursor c.
+// after reports whether p sorts after the BigQuery cursor c. Within the
+// cursor's (ingest_time, row_fp) group, a v2 cursor with a non-empty
+// CanonicalRowKey only treats a position at or before DuplicateOrdinal as
+// already handled when its canonicalKey is consistent with c.CanonicalRowKey
+// (equal at DuplicateOrdinal, and <= c.CanonicalRowKey before it).
 func (p recordPosition) after(c bigQueryCursor) bool {
 	if p.ingestMicros != c.IngestTimeMicros {
 		return p.ingestMicros > c.IngestTimeMicros
@@ -399,7 +404,16 @@ func (p recordPosition) after(c bigQueryCursor) bool {
 	if p.fingerprint != c.RowFingerprint {
 		return p.fingerprint > c.RowFingerprint
 	}
-	return p.ordinal > c.DuplicateOrdinal
+	if c.DuplicateOrdinal < 0 || c.CanonicalRowKey == "" {
+		return true
+	}
+	if p.ordinal == c.DuplicateOrdinal {
+		return p.canonicalKey != c.CanonicalRowKey
+	}
+	if p.ordinal < c.DuplicateOrdinal {
+		return p.canonicalKey > c.CanonicalRowKey
+	}
+	return true
 }
 
 // process replays rec, the record numbered i at pos. A non-nil error means
@@ -663,9 +677,16 @@ const (
 // CheckpointConfig makes a replay resumable. After every record it handles,
 // the run records its position in Path, replacing the file atomically: it
 // writes a temporary file in the same directory, syncs it, renames it over
-// Path, and syncs the directory. A run that finds Path skips the records an
-// earlier run handled, so after a crash only the record in flight can be
-// replayed twice (at-least-once delivery).
+// Path, and syncs the directory. For file inputs and unchanged v2 BigQuery
+// cursors, a run that finds Path skips the records an earlier run handled, so
+// after a crash only the record in flight can be replayed twice (at-least-once
+// delivery). For BigQuery checkpoints whose cursor is legacy
+// (cursor_order_version 0 or 1), carries an empty canonical_row_key, or cannot
+// reconcile its saved (canonical_row_key, duplicate_ordinal) with the current
+// (ingest_time, row_fp) group (for example, when earlier rows in that group
+// were removed from the table), the run rewinds and replays the whole current
+// (ingest_time, row_fp) group at least once while keeping earlier groups
+// excluded and later groups proceeding normally.
 //
 // A record counts as handled once it is replayed, filtered out, or fails in
 // a way a retry cannot fix (no payload, an unparseable payload or time, an
@@ -701,21 +722,22 @@ type checkpointState struct {
 
 // bigQueryCursor is the (ingest_time, row_fp, row_ord) sort key of a
 // quarantine row read by ReplayBigQuery. CursorOrderVersion records the
-// row-ordering version the cursor was written under: version 2 (or later)
-// cursors carry CanonicalRowKey and use the canonical row_key ordering, so
-// their DuplicateOrdinal is unambiguous; legacy version 0 or 1 cursors (the
-// zero value or an explicit value less than 2, or an empty CanonicalRowKey)
-// were written under an unordered ROW_NUMBER() assignment and are rewound to
-// replay their whole (ingest_time, row_fp) group at-least-once before any
-// delivery.
+// row-ordering version the cursor was written under: version 2 cursors carry a
+// validated CanonicalRowKey and use the canonical row_key ordering, skipping
+// handled rows when CanonicalRowKey still sits at DuplicateOrdinal in the
+// current (ingest_time, row_fp) group and rewinding that group at-least-once
+// if the group's membership changed; legacy version 0 or 1 cursors (or a
+// version 2 cursor with an empty CanonicalRowKey) are rewound to replay their
+// whole (ingest_time, row_fp) group at-least-once before any delivery.
+// Negative or unknown CursorOrderVersion values and malformed CanonicalRowKey
+// values are rejected before querying.
 type bigQueryCursor struct {
 	IngestTimeMicros int64 `json:"ingest_time_micros"`
 	RowFingerprint   int64 `json:"row_fingerprint"`
 	DuplicateOrdinal int64 `json:"duplicate_ordinal,omitempty"`
 	// CursorOrderVersion is the row-ordering version this cursor was
-	// written under (currently cursorOrderVersionCanonical = 2). A
-	// cursor with a version less than 2 or an empty CanonicalRowKey is
-	// treated as legacy and rewound.
+	// written under (supported: legacy 0 or 1, and current
+	// cursorOrderVersionCanonical = 2).
 	CursorOrderVersion int    `json:"cursor_order_version,omitempty"`
 	CanonicalRowKey    string `json:"canonical_row_key,omitempty"`
 }
@@ -791,23 +813,93 @@ func openCheckpoint(cfg CheckpointConfig, kind string, f Filter, sink Sink) (*ch
 	if got.Next < 0 || got.Handled < 0 || (got.Cursor != nil && got.Cursor.DuplicateOrdinal < 0) {
 		return nil, fmt.Errorf("checkpoint %q holds a negative position", cfg.Path)
 	}
-	// A BigQuery cursor written with an earlier row-ordering version (before
-	// canonical row_key ordering was introduced) has CursorOrderVersion < 2
-	// or an empty CanonicalRowKey. Its DuplicateOrdinal was assigned by an
-	// unordered ROW_NUMBER(), so resuming after it can skip undelivered rows
-	// in the same (ingest_time, row_fp) group. Rewind it to replay the
-	// whole group under the current canonical ordering at-least-once.
-	// The rewind sets DuplicateOrdinal to -1 so every row in the group
-	// sorts after the cursor and the query's `row_ord > @cursor_ord`
-	// condition admits row_ord 0 onward.
-	if got.Kind == checkpointKindBigQuery && got.Cursor != nil &&
-		(got.Cursor.CursorOrderVersion < cursorOrderVersionCanonical || got.Cursor.CanonicalRowKey == "") {
-		got.Cursor.DuplicateOrdinal = -1
-		got.Cursor.CursorOrderVersion = cursorOrderVersionCanonical
-		got.Cursor.CanonicalRowKey = ""
+	if got.Kind == checkpointKindBigQuery && got.Cursor != nil {
+		switch got.Cursor.CursorOrderVersion {
+		case 0, 1:
+			// A BigQuery cursor written with an earlier row-ordering version
+			// (before canonical row_key ordering was introduced) has
+			// CursorOrderVersion 0 or 1. Its DuplicateOrdinal was assigned by
+			// an unordered ROW_NUMBER(), so resuming after it can skip
+			// undelivered rows in the same (ingest_time, row_fp) group.
+			// Rewind it to replay the whole group under canonical ordering
+			// at-least-once.
+			got.Cursor.DuplicateOrdinal = -1
+			got.Cursor.CursorOrderVersion = cursorOrderVersionCanonical
+			got.Cursor.CanonicalRowKey = ""
+		case cursorOrderVersionCanonical:
+			if got.Cursor.CanonicalRowKey == "" {
+				// An explicit v2 cursor with an empty CanonicalRowKey cannot
+				// be reconciled with a specific row in its group; rewind the
+				// group to replay it at-least-once.
+				got.Cursor.DuplicateOrdinal = -1
+			} else if err := validateCanonicalRowKey(got.Cursor.CanonicalRowKey); err != nil {
+				return nil, fmt.Errorf("checkpoint %q has invalid canonical_row_key: %w", cfg.Path, err)
+			}
+		default:
+			return nil, fmt.Errorf(
+				"checkpoint %q has unsupported cursor_order_version %d (supported: 0, 1, %d)",
+				cfg.Path, got.Cursor.CursorOrderVersion, cursorOrderVersionCanonical)
+		}
 	}
 	c.state = got
 	return c, nil
+}
+
+var allowedCanonicalRowKeyFields = map[string]bool{
+	"signal":              true,
+	"error_code":          true,
+	"error_message":       true,
+	"service_name":        true,
+	"trace_id":            true,
+	"span_id":             true,
+	"raw_payload":         true,
+	"payload_ref_uri":     true,
+	"payload_ref_version": true,
+}
+
+func validateCanonicalRowKey(raw string) error {
+	dec := json.NewDecoder(strings.NewReader(raw))
+	var fields map[string]json.RawMessage
+	if err := dec.Decode(&fields); err != nil {
+		return fmt.Errorf("not a JSON object: %w", err)
+	}
+	if fields == nil {
+		return errors.New("not a JSON object")
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return errors.New("unexpected trailing data after JSON object")
+	}
+	if !json.Valid([]byte(raw)) {
+		return errors.New("not valid JSON")
+	}
+	for k, v := range fields {
+		if !allowedCanonicalRowKeyFields[k] {
+			return fmt.Errorf("unexpected field %q", k)
+		}
+		if string(v) == "null" {
+			continue
+		}
+		var s string
+		if err := json.Unmarshal(v, &s); err != nil {
+			return fmt.Errorf("field %q is not a string: %w", k, err)
+		}
+	}
+	for _, req := range []string{"signal", "error_code", "raw_payload"} {
+		if _, ok := fields[req]; !ok {
+			return fmt.Errorf("missing required field %q", req)
+		}
+	}
+	return nil
+}
+
+// rewindCursorGroup rewinds the BigQuery cursor's current (ingest_time, row_fp)
+// group when its saved (CanonicalRowKey, DuplicateOrdinal) no longer matches
+// the group's rows, so every row in that group is replayed at-least-once.
+func (c *checkpointer) rewindCursorGroup() {
+	if c != nil && c.state.Kind == checkpointKindBigQuery && c.state.Cursor != nil {
+		c.state.Cursor.DuplicateOrdinal = -1
+		c.state.Cursor.CanonicalRowKey = ""
+	}
 }
 
 // handled reports whether an earlier run already handled the record at pos.

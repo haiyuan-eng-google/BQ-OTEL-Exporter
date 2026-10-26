@@ -1023,6 +1023,8 @@ func TestRunReportsLineProblems(t *testing.T) {
 		`[1,2,3]`,
 		`{"resourceSpans":"nope"}`,
 		strings.Repeat("x", 3000),
+		spansLine(t, 1, "trailing-html", spanStart)+"<html>502 Bad Gateway</html>",
+		spansLine(t, 1, "first-env", spanStart)+spansLine(t, 1, "second-env", spanStart),
 		"",
 		logsLine(t, 1, "good", logTime),
 	))
@@ -1035,8 +1037,8 @@ func TestRunReportsLineProblems(t *testing.T) {
 	if rep.Complete() {
 		t.Error("Complete() = true, want false")
 	}
-	if rep.Lines != 7 || rep.MalformedLines != 5 || rep.FailedObjects != 1 || rep.FailureCount != 5 {
-		t.Errorf("lines %d, malformed %d, failed objects %d, failures %d; want 7, 5, 1, 5",
+	if rep.Lines != 9 || rep.MalformedLines != 7 || rep.FailedObjects != 1 || rep.FailureCount != 7 {
+		t.Errorf("lines %d, malformed %d, failed objects %d, failures %d; want 9, 7, 1, 7",
 			rep.Lines, rep.MalformedLines, rep.FailedObjects, rep.FailureCount)
 	}
 	wantErrs := map[int64]string{
@@ -1045,6 +1047,8 @@ func TestRunReportsLineProblems(t *testing.T) {
 		4: "not a JSON object",
 		5: "decoding OTLP JSON traces",
 		6: "line longer than 2048 bytes",
+		7: "not valid JSON",
+		8: "not valid JSON: trailing data after JSON object",
 	}
 	for _, f := range rep.Failures {
 		want, ok := wantErrs[f.Line]
@@ -1059,7 +1063,7 @@ func TestRunReportsLineProblems(t *testing.T) {
 	if signalReport(t, rep, SignalTraces).Appended != 1 || signalReport(t, rep, SignalLogs).Appended != 1 {
 		t.Errorf("the good lines were not appended: %+v", rep.Signals)
 	}
-	if len(results) != 1 || results[0].Lines != 7 || results[0].Failures != 5 || results[0].Err != nil {
+	if len(results) != 1 || results[0].Lines != 9 || results[0].Failures != 7 || results[0].Err != nil {
 		t.Errorf("OnObject saw %+v", results)
 	}
 }

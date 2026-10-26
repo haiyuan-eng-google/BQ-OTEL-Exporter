@@ -148,12 +148,18 @@ func (s BigQuerySource) Validate() error {
 // row_key is the canonical JSON representation of the row's content columns,
 // row_fp is FARM_FINGERPRINT(row_key), and row_ord is the 0-based ordinal
 // within (ingest_time, row_fp) ordered by row_key. With opts.Checkpoint set,
-// a resumed run passes the last handled row's (ingest_time, row_fp, row_ord)
-// cursor to the query, which raises the partition bound and skips the handled
-// rows on the server; they are therefore not counted in SkippedCheckpointed.
-// Both byte-for-byte duplicate rows and distinct rows that share an
-// (ingest_time, row_fp) pair receive deterministic ordinals and are preserved
-// across crash-resume runs.
+// a resumed run passes the last handled row's (ingest_time, row_fp, row_ord,
+// canonical_row_key) cursor to the query, which raises the partition bound and
+// skips the handled rows on the server when the saved canonical_row_key still
+// sits at row_ord in the cursor's (ingest_time, row_fp) group; rows skipped on
+// the server are not counted in SkippedCheckpointed. If the checkpoint holds a
+// legacy (cursor_order_version 0 or 1) or empty-key cursor, or if the cursor's
+// (ingest_time, row_fp) group changed so the saved key can no longer be
+// reconciled with the saved ordinal, ReplayBigQuery rewinds and replays the
+// whole current (ingest_time, row_fp) group at least once while keeping
+// earlier groups excluded and later groups proceeding once. Both byte-for-byte
+// duplicate rows and distinct rows that share an (ingest_time, row_fp) pair
+// receive deterministic ordinals and are preserved across crash-resume runs.
 //
 // The query runs in src.Project over the BigQuery REST API, using an HTTP
 // client from internal/googlehttp built with clientOpts (Application
@@ -215,6 +221,7 @@ func ReplayBigQuery(ctx context.Context, src BigQuerySource, sink Sink, opts Opt
 			TimeoutMs:       queryWaitMillis,
 		},
 	}
+	reconciledBoundary := cursor == nil || cursor.DuplicateOrdinal < 0 || cursor.CanonicalRowKey == ""
 	for i := 0; ; i++ {
 		if err := ctx.Err(); err != nil {
 			return rp.sum, err
@@ -225,6 +232,24 @@ func ReplayBigQuery(ctx context.Context, src BigQuerySource, sink Sink, opts Opt
 		}
 		if err != nil {
 			return rp.sum, rp.stop(err)
+		}
+		if !reconciledBoundary &&
+			row.pos.ingestMicros == cursor.IngestTimeMicros &&
+			row.pos.fingerprint == cursor.RowFingerprint {
+			reconciledBoundary = true
+			if row.pos.ordinal <= cursor.DuplicateOrdinal {
+				matched, rerr := rows.reconcileBoundaryGroup(ctx, row, *cursor)
+				if rerr != nil {
+					return rp.sum, rp.stop(rerr)
+				}
+				if !matched {
+					rp.cp.rewindCursorGroup()
+				}
+				row, err = rows.next(ctx)
+				if err != nil {
+					return rp.sum, rp.stop(err)
+				}
+			}
 		}
 		if err := rp.process(i, row.pos, row.rec); err != nil {
 			return rp.sum, rp.stop(err)
@@ -259,11 +284,12 @@ func quarantineQuery(table string, f Filter, cursor *bigQueryCursor) (string, []
 	}
 	resume := ""
 	if cursor != nil {
-		resume = "\nWHERE ingest_time > @cursor_time OR (ingest_time = @cursor_time AND (row_fp > @cursor_fp OR (row_fp = @cursor_fp AND row_ord > @cursor_ord)))"
+		resume = "\nWHERE ingest_time > @cursor_time OR (ingest_time = @cursor_time AND (row_fp > @cursor_fp OR (row_fp = @cursor_fp AND (row_ord > @cursor_ord OR NOT EXISTS (SELECT 1 FROM quarantined WHERE ingest_time = @cursor_time AND row_fp = @cursor_fp AND row_ord = @cursor_ord AND row_key = @cursor_key)))))"
 		params = append(params,
 			timestampParam("cursor_time", time.UnixMicro(cursor.IngestTimeMicros)),
 			int64Param("cursor_fp", cursor.RowFingerprint),
-			int64Param("cursor_ord", cursor.DuplicateOrdinal))
+			int64Param("cursor_ord", cursor.DuplicateOrdinal),
+			stringParam("cursor_key", cursor.CanonicalRowKey))
 	}
 	return fmt.Sprintf(quarantineQueryTemplate, table, strings.Join(where, "\n    AND "), resume), params
 }
@@ -334,6 +360,14 @@ func int64Param(name string, v int64) *bigqueryapi.QueryParameter {
 	}
 }
 
+func stringParam(name, v string) *bigqueryapi.QueryParameter {
+	return &bigqueryapi.QueryParameter{
+		Name:           name,
+		ParameterType:  &bigqueryapi.QueryParameterType{Type: "STRING"},
+		ParameterValue: &bigqueryapi.QueryParameterValue{Value: v, ForceSendFields: []string{"Value"}},
+	}
+}
+
 func stringArrayParam(name string, values []string) *bigqueryapi.QueryParameter {
 	vals := make([]*bigqueryapi.QueryParameterValue, len(values))
 	for i, v := range values {
@@ -369,6 +403,7 @@ type queryRows struct {
 	fields     []*bigqueryapi.TableFieldSchema
 	page       []*bigqueryapi.TableRow
 	token      string
+	buffered   []quarantineRow
 	hasPrev    bool
 	prevIngest int64
 	prevFP     int64
@@ -377,6 +412,15 @@ type queryRows struct {
 
 // next returns the next result row, or io.EOF after the last one.
 func (q *queryRows) next(ctx context.Context) (quarantineRow, error) {
+	if len(q.buffered) > 0 {
+		out := q.buffered[0]
+		q.buffered = q.buffered[1:]
+		return out, nil
+	}
+	return q.readNext(ctx)
+}
+
+func (q *queryRows) readNext(ctx context.Context) (quarantineRow, error) {
 	for len(q.page) == 0 {
 		if q.started && q.token == "" {
 			return quarantineRow{}, io.EOF
@@ -403,6 +447,39 @@ func (q *queryRows) next(ctx context.Context) (quarantineRow, error) {
 	q.prevFP = out.pos.fingerprint
 	q.hasPrev = true
 	return out, nil
+}
+
+// reconcileBoundaryGroup buffers the cursor's (ingest_time, row_fp) boundary
+// group up through cursor.DuplicateOrdinal (beginning with first) and reports
+// whether the row at cursor.DuplicateOrdinal still has canonicalKey ==
+// cursor.CanonicalRowKey. All inspected rows are pushed back onto q.buffered
+// in order so the caller can process them next.
+func (q *queryRows) reconcileBoundaryGroup(ctx context.Context, first quarantineRow, cursor bigQueryCursor) (bool, error) {
+	seen := []quarantineRow{first}
+	for seen[len(seen)-1].pos.ingestMicros == cursor.IngestTimeMicros &&
+		seen[len(seen)-1].pos.fingerprint == cursor.RowFingerprint &&
+		seen[len(seen)-1].pos.ordinal < cursor.DuplicateOrdinal {
+		r, err := q.readNext(ctx)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return false, err
+		}
+		seen = append(seen, r)
+	}
+	matched := false
+	for _, r := range seen {
+		if r.pos.ingestMicros == cursor.IngestTimeMicros &&
+			r.pos.fingerprint == cursor.RowFingerprint &&
+			r.pos.ordinal == cursor.DuplicateOrdinal &&
+			r.pos.canonicalKey == cursor.CanonicalRowKey {
+			matched = true
+			break
+		}
+	}
+	q.buffered = append(seen, q.buffered...)
+	return matched, nil
 }
 
 // fetch starts the query, or fetches the page after the current one.
