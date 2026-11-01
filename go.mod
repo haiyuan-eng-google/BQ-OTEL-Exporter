@@ -9,7 +9,7 @@ require (
 	cloud.google.com/go/bigquery v1.85.0
 	github.com/dlclark/regexp2 v1.12.0
 	github.com/googleapis/gax-go/v2 v2.27.0
-	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 	go.opentelemetry.io/collector/component v1.70.0
 	go.opentelemetry.io/collector/component/componentstatus v0.164.0
 	go.opentelemetry.io/collector/component/componenttest v0.164.0
