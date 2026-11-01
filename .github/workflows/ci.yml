@@ -145,7 +145,7 @@ jobs:
       BQ_LOCATION: US
       IMAGE: bq-otel-collector:0.1.0-dev
       # Used only to show that the stock distribution rejects the example.
-      STOCK_IMAGE: otel/opentelemetry-collector-contrib:0.163.0@sha256:1175b03003053962012f5a231f5567f66a3e8fdb960c7835c0e48f7aa1555806
+      STOCK_IMAGE: otel/opentelemetry-collector-contrib:0.164.0@sha256:340c9ca6a36617084c6661bdc4f0fe92b7cda5a805d61673ec8db375fddc522b
     steps:
       - uses: actions/checkout@v7
 
@@ -346,7 +346,7 @@ jobs:
         run: |
           bin="${RUNNER_TEMP}/bin"
           mkdir -p "${bin}"
-          GOBIN="${bin}" GOTOOLCHAIN=local go install go.opentelemetry.io/collector/cmd/builder@v0.163.0
+          GOBIN="${bin}" GOTOOLCHAIN=local go install go.opentelemetry.io/collector/cmd/builder@v0.164.0
           ln -sf "${bin}/builder" "${bin}/ocb"
           echo "${bin}" >> "${GITHUB_PATH}"
 

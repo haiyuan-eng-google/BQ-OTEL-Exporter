@@ -23,7 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Column-Level Security & Data Masking (`deploy/terraform/governance.tf`)**: Added opt-in Data Catalog taxonomy (`otel_sensitivity`), the `sensitive_payload` policy tag (`google_data_catalog_policy_tag.sensitive_payload`), the `sensitive_payload_mask` BigQuery data masking policy (`google_bigquery_datapolicy_data_policy.sensitive_payload_mask`), fine-grained/masked reader IAM bindings (`roles/datacatalog.categoryFineGrainedReader`, `roles/bigquerydatapolicy.maskedReader`), and redacted views (`enable_column_level_security`).
 
 ### Changed
-- **Toolchain & Collector Baseline**: Pinned Go toolchain to `1.27.3` (`GO-2026-6809`) and OpenTelemetry Collector modules to `v0.163.0` / `v1.69.0` across `go.mod`, `Makefile`, Dockerfiles, OCB manifests, and GitHub Actions workflows.
+- **Toolchain & Collector Baseline**: Pinned Go toolchain to `1.27.3` (`GO-2026-6809`) and OpenTelemetry Collector modules to `v0.164.0` / `v1.70.0` across `go.mod`, `Makefile`, Dockerfiles, OCB manifests, and GitHub Actions workflows.
 
 ### Fixed
 - **HTTP Transport Leak Checks**: Restored goroutine leak checks (`goleak`) for exporter-owned HTTP transports in unit and integration test suites while isolating ambient mTLS helper processes in live integration runs.
