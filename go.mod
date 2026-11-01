@@ -5,8 +5,8 @@ go 1.26.5
 toolchain go1.27.3
 
 require (
-	cloud.google.com/go/auth v0.24.1-0.20261001053825-dbc26066f70a
-	cloud.google.com/go/bigquery v1.85.0
+	cloud.google.com/go/auth v0.24.2
+	cloud.google.com/go/bigquery v1.86.1
 	github.com/dlclark/regexp2 v1.12.0
 	github.com/googleapis/gax-go/v2 v2.27.0
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
@@ -29,9 +29,9 @@ require (
 	go.uber.org/zap v1.28.0
 	go.yaml.in/yaml/v3 v3.0.6
 	golang.org/x/oauth2 v0.37.0
-	google.golang.org/api v0.307.0
+	google.golang.org/api v0.310.0
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20261019180522-ce908d29299b
-	google.golang.org/grpc v1.84.0
+	google.golang.org/grpc v1.85.0
 	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -53,11 +53,11 @@ require (
 	github.com/google/flatbuffers v23.5.26+incompatible // indirect
 	github.com/google/s2a-go v0.1.11 // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/googleapis/enterprise-certificate-proxy v0.3.23 // indirect
+	github.com/googleapis/enterprise-certificate-proxy v0.3.24 // indirect
 	github.com/hashicorp/go-version v1.9.0 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
-	github.com/klauspost/compress v1.16.7 // indirect
+	github.com/klauspost/compress v1.18.7 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.5 // indirect
 	github.com/knadh/koanf/maps v0.1.3 // indirect
 	github.com/knadh/koanf/providers/confmap v1.0.1 // indirect
@@ -87,8 +87,8 @@ require (
 	go.opentelemetry.io/collector/receiver v1.70.0 // indirect
 	go.opentelemetry.io/collector/receiver/receivertest v0.164.0 // indirect
 	go.opentelemetry.io/collector/receiver/xreceiver v0.164.0 // indirect
-	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.67.0 // indirect
-	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.69.0 // indirect
+	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.72.0 // indirect
+	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.72.0 // indirect
 	go.opentelemetry.io/otel/log v1.47.0 // indirect
 	go.opentelemetry.io/otel/sdk v1.47.0 // indirect
 	go.opentelemetry.io/otel/trace v1.47.0 // indirect
